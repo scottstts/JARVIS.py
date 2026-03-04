@@ -1,0 +1,21 @@
+# Dockerfile.dev
+FROM python:3.12-slim
+
+# Basic utilities + tini for proper signal handling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash git curl ca-certificates tini \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Astral's installer)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+  && ln -s /root/.local/bin/uv /usr/local/bin/uv
+
+# (Optional but handy) common python dev env vars
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Work in the mounted repo by default
+WORKDIR /repo
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash"]

@@ -1,0 +1,29 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+
+    # Optional: a friendly fixed name (change if you want)
+    container_name: jarvis
+
+    # Your repo on macOS is mounted into /repo in the container
+    volumes:
+      - ./:/repo
+
+      # Persistent "agent world" (memory/sessions/cache) on your Mac
+      # Change the left side if you want a different host path.
+      - ${AGENT_WORLD:-${HOME}/agent_world}:/world
+
+      # Persist uv cache between container rebuilds (fast installs)
+      - uv_cache:/root/.cache/uv
+
+    # Start in the repo by default
+    working_dir: /repo
+
+    # Keep it interactive-friendly
+    tty: true
+    stdin_open: true
+
+volumes:
+  uv_cache:
