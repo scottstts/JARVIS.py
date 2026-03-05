@@ -81,3 +81,15 @@ docker compose exec dev bash -lc "cd /repo && uv run <...>"
 - throughout the implementation, you will constantly ask me design choice questions like "option ABC, which do you want". This is because I'm not sure about some design choices yet, so constantly offer me options, alternatives, and challenge me when something doesn't seem to make obvious sense.
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
 - No need to delete __pycache__/
+
+# Notes & Lessons
+
+`notes/notes.md` is a scratch pad that you will write to concisely about things you've notes and learned during the implementation, including but not limited to design choices. Whenever you feel like there's something that other coding agents after you will benefit from in later implementation, write to it
+
+This serves as the agent continuous memory so even when i start a new coding agent, you will also benefit from the notes the agents before you have noted.
+
+You can write to it and read it as well. Over time, this notes.md will contain all the accumulated lessons about this project, dos and don'ts, preferred and not preferred
+
+Try MOSTLY to append to it. only delete or edit existing notes when they explicitly contradict with new approved design choices
+
+Write to it concisely, try to use single sentence for each entry, include only valuable information, do NOT be verbose

@@ -1,0 +1,5 @@
+- Implemented the AI service layer 
+- Added provider adapters for OpenAI, Anthropic, Gemini (google-genai SDK), and OpenRouter (direct HTTP), and normalized generation responses/tool calls in the LLM layer.
+- Anthropic config now supports `JARVIS_ANTHROPIC_EFFORT` and model-aware thinking behavior (adaptive/effort only applied where model support exists).
+- Gemini thinking is model-aware: `gemini-3*` uses `thinking_level`, while `gemini-2.5*` uses `thinking_budget`.
+- Embeddings are now globally configured via `JARVIS_EMBEDDING_PROVIDER` and `JARVIS_EMBEDDING_MODEL`, decoupled from chat provider selection.
