@@ -6,7 +6,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from ui.config import UIConfigurationError, UISettings
+from ui.telegram.config import UIConfigurationError, UISettings
 
 
 class UISettingsTests(unittest.TestCase):

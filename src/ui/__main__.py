@@ -1,20 +1,8 @@
-"""Telegram UI process entrypoint."""
+"""UI package entrypoint.
 
-from __future__ import annotations
+This remains a compatibility shim and currently launches the Telegram UI.
+"""
 
-import asyncio
-import logging
-
-from .telegram_bot import run_telegram_ui
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    asyncio.run(run_telegram_ui())
-
-
+from .telegram.__main__ import main
 if __name__ == "__main__":
     main()

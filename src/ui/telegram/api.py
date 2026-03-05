@@ -12,10 +12,19 @@ import requests
 class TelegramAPIError(RuntimeError):
     """Raised when Telegram API returns an error response."""
 
-    def __init__(self, *, code: str, message: str) -> None:
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        status_code: int | None = None,
+        retry_after_seconds: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(slots=True, frozen=True)
@@ -79,14 +88,20 @@ class TelegramBotAPIClient:
             )
         return [item for item in result if isinstance(item, dict)]
 
-    async def send_message(self, *, chat_id: int, text: str) -> dict[str, Any]:
-        result = await self._call_method(
-            "sendMessage",
-            payload={
-                "chat_id": chat_id,
-                "text": text,
-            },
-        )
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+        }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        result = await self._call_method("sendMessage", payload=payload)
         if not isinstance(result, dict):
             raise TelegramAPIError(
                 code="invalid_telegram_response",
@@ -94,15 +109,21 @@ class TelegramBotAPIClient:
             )
         return result
 
-    async def send_message_draft(self, *, chat_id: int, draft: DraftMessage) -> bool:
-        result = await self._call_method(
-            "sendMessageDraft",
-            payload={
-                "chat_id": chat_id,
-                "draft_id": draft.id,
-                "text": draft.text,
-            },
-        )
+    async def send_message_draft(
+        self,
+        *,
+        chat_id: int,
+        draft: DraftMessage,
+        parse_mode: str | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "draft_id": draft.id,
+            "text": draft.text,
+        }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        result = await self._call_method("sendMessageDraft", payload=payload)
         return bool(result)
 
     async def _call_method(
@@ -133,7 +154,6 @@ class TelegramBotAPIClient:
         url = f"{self._api_base_url}/bot{self._token}/{method}"
         try:
             response = self._session.post(url, json=payload, timeout=timeout)
-            response.raise_for_status()
         except requests.RequestException as exc:
             raise TelegramAPIError(
                 code="telegram_http_error",
@@ -146,20 +166,36 @@ class TelegramBotAPIClient:
             raise TelegramAPIError(
                 code="telegram_http_error",
                 message=f"Telegram returned non-JSON response for method '{method}'.",
+                status_code=response.status_code,
             ) from exc
 
         if not isinstance(parsed, dict):
             raise TelegramAPIError(
                 code="telegram_http_error",
                 message=f"Telegram returned unexpected payload for method '{method}'.",
+                status_code=response.status_code,
             )
 
-        if not parsed.get("ok", False):
+        if response.status_code >= 400 or not parsed.get("ok", False):
             description = str(parsed.get("description", "Telegram API error"))
             error_code = parsed.get("error_code")
+            retry_after_seconds: int | None = None
+            parameters = parsed.get("parameters")
+            if isinstance(parameters, dict):
+                retry_after = parameters.get("retry_after")
+                if isinstance(retry_after, int):
+                    retry_after_seconds = retry_after
+                elif isinstance(retry_after, float):
+                    retry_after_seconds = int(retry_after)
             raise TelegramAPIError(
-                code=f"telegram_api_error_{error_code}" if error_code is not None else "telegram_api_error",
+                code=(
+                    f"telegram_api_error_{error_code}"
+                    if error_code is not None
+                    else "telegram_api_error"
+                ),
                 message=description,
+                status_code=response.status_code,
+                retry_after_seconds=retry_after_seconds,
             )
 
         return parsed.get("result")

@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .config import UISettings
+from .formatting import render_markdown_to_telegram_html
 from .gateway_client import GatewayBridgeError, GatewayDeltaEvent, GatewayDoneEvent, GatewayWebSocketClient
-from .telegram_api import DraftMessage, TelegramAPIError, TelegramBotAPIClient
+from .api import DraftMessage, TelegramAPIError, TelegramBotAPIClient
 
 LOGGER = logging.getLogger(__name__)
 _GENERIC_ERROR_REPLY = "I hit an internal error while processing that message."
@@ -35,10 +36,22 @@ class TelegramClientLike(Protocol):
     ) -> list[dict[str, Any]]:
         """Long-polls Telegram updates."""
 
-    async def send_message(self, *, chat_id: int, text: str) -> dict[str, Any]:
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
         """Sends a standard Telegram message."""
 
-    async def send_message_draft(self, *, chat_id: int, draft: DraftMessage) -> bool:
+    async def send_message_draft(
+        self,
+        *,
+        chat_id: int,
+        draft: DraftMessage,
+        parse_mode: str | None = None,
+    ) -> bool:
         """Sends/updates Telegram draft message content."""
 
     async def aclose(self) -> None:
@@ -73,6 +86,7 @@ class TelegramGatewayBridge:
             connect_timeout_seconds=self._settings.gateway_connect_timeout_seconds,
         )
         self._next_draft_ids: dict[int, int] = {}
+        self._draft_retry_until_by_chat: dict[int, float] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -121,7 +135,7 @@ class TelegramGatewayBridge:
         accumulated_text = ""
         last_draft_text = ""
         last_draft_at = 0.0
-        drafts_enabled = True
+        drafts_enabled = time.monotonic() >= self._draft_retry_until_by_chat.get(message.chat_id, 0.0)
 
         try:
             async for event in self._gateway.stream_turn(route_id=route_id, user_text=message.text):
@@ -148,11 +162,19 @@ class TelegramGatewayBridge:
                             )
                             last_draft_text = accumulated_text
                             last_draft_at = now
-                        except TelegramAPIError:
+                        except TelegramAPIError as exc:
                             drafts_enabled = False
-                            LOGGER.exception(
-                                "sendMessageDraft failed; continuing this turn without drafts."
-                            )
+                            self._record_draft_backoff(chat_id=message.chat_id, exc=exc)
+                            if exc.retry_after_seconds is not None:
+                                LOGGER.warning(
+                                    "sendMessageDraft rate-limited for chat_id=%s; pausing drafts for %ss.",
+                                    message.chat_id,
+                                    exc.retry_after_seconds,
+                                )
+                            else:
+                                LOGGER.exception(
+                                    "sendMessageDraft failed; continuing this turn without drafts."
+                                )
                     continue
 
                 if isinstance(event, GatewayDoneEvent):
@@ -191,15 +213,45 @@ class TelegramGatewayBridge:
         if len(draft_text) > max_chars:
             draft_text = f"{draft_text[: max_chars - 1]}…"
         draft_text = draft_text or "."
-        await self._telegram.send_message_draft(
-            chat_id=chat_id,
-            draft=DraftMessage(id=draft_id, text=draft_text),
-        )
+        draft = DraftMessage(id=draft_id, text=render_markdown_to_telegram_html(draft_text))
+        try:
+            await self._telegram.send_message_draft(
+                chat_id=chat_id,
+                draft=draft,
+                parse_mode="HTML",
+            )
+        except TelegramAPIError as exc:
+            if not _is_formatting_error(exc):
+                raise
+            await self._telegram.send_message_draft(
+                chat_id=chat_id,
+                draft=DraftMessage(id=draft_id, text=draft_text),
+            )
 
     async def _send_final_text(self, *, chat_id: int, text: str) -> None:
         chunks = split_telegram_message(text, max_chars=self._settings.telegram_max_message_chars)
         for chunk in chunks:
-            await self._telegram.send_message(chat_id=chat_id, text=chunk)
+            await self._send_formatted_message(chat_id=chat_id, text=chunk)
+
+    async def _send_formatted_message(self, *, chat_id: int, text: str) -> None:
+        formatted_text = render_markdown_to_telegram_html(text)
+        try:
+            await self._telegram.send_message(
+                chat_id=chat_id,
+                text=formatted_text,
+                parse_mode="HTML",
+            )
+        except TelegramAPIError as exc:
+            if not _is_formatting_error(exc):
+                raise
+            await self._telegram.send_message(chat_id=chat_id, text=text)
+
+    def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
+        if exc.retry_after_seconds is None:
+            return
+        self._draft_retry_until_by_chat[chat_id] = (
+            time.monotonic() + max(1, exc.retry_after_seconds)
+        )
 
     def _next_draft_id_for_chat(self, chat_id: int) -> int:
         next_id = self._next_draft_ids.get(chat_id, 1)
@@ -289,6 +341,19 @@ def split_telegram_message(text: str, *, max_chars: int = 4_096) -> list[str]:
         chunks.append(text[start:end])
         start = end
     return chunks
+
+
+def _is_formatting_error(exc: TelegramAPIError) -> bool:
+    if exc.code != "telegram_api_error_400":
+        return False
+    lowered = exc.message.lower()
+    formatting_markers = (
+        "parse entities",
+        "unsupported start tag",
+        "unexpected end tag",
+        "can't find end tag",
+    )
+    return any(marker in lowered for marker in formatting_markers)
 
 
 async def run_telegram_ui(settings: UISettings | None = None) -> None:

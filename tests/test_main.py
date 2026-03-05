@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import main
 from gateway import GatewaySettings
-from ui import UISettings
+from ui.telegram import UISettings
 
 from runtime_env import load_dotenv_if_present
 

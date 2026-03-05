@@ -11,7 +11,7 @@ import uvicorn
 
 from gateway import GatewaySettings, create_app
 from runtime_env import load_dotenv_if_present
-from ui import UISettings, run_telegram_ui
+from ui.telegram import UISettings, run_telegram_ui
 
 LOGGER = logging.getLogger(__name__)
 

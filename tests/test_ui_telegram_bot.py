@@ -7,35 +7,47 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from ui.config import UISettings
-from ui.gateway_client import GatewayBridgeError, GatewayDeltaEvent, GatewayDoneEvent
-from ui.telegram_api import DraftMessage
-from ui.telegram_bot import (
+from ui.telegram.api import DraftMessage, TelegramAPIError
+from ui.telegram.bot import (
     IncomingTextMessage,
     TelegramGatewayBridge,
     parse_incoming_text_message,
     route_id_for_chat,
     split_telegram_message,
 )
+from ui.telegram.config import UISettings
+from ui.telegram.gateway_client import GatewayBridgeError, GatewayDeltaEvent, GatewayDoneEvent
 
 
 @dataclass(slots=True)
 class _SentMessage:
     chat_id: int
     text: str
+    parse_mode: str | None
 
 
 @dataclass(slots=True)
 class _SentDraft:
     chat_id: int
     draft: DraftMessage
+    parse_mode: str | None
 
 
 class _FakeTelegramClient:
-    def __init__(self, updates: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        updates: list[dict[str, Any]] | None = None,
+        *,
+        draft_errors: list[TelegramAPIError] | None = None,
+        message_errors: list[TelegramAPIError] | None = None,
+    ) -> None:
         self._updates = updates or []
+        self._draft_errors = draft_errors or []
+        self._message_errors = message_errors or []
         self.sent_messages: list[_SentMessage] = []
         self.sent_drafts: list[_SentDraft] = []
+        self.message_attempts = 0
+        self.draft_attempts = 0
         self.closed = False
 
     async def get_me(self) -> dict[str, Any]:
@@ -53,12 +65,34 @@ class _FakeTelegramClient:
         self._updates = []
         return updates
 
-    async def send_message(self, *, chat_id: int, text: str) -> dict[str, Any]:
-        self.sent_messages.append(_SentMessage(chat_id=chat_id, text=text))
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
+        self.message_attempts += 1
+        if self._message_errors:
+            raise self._message_errors.pop(0)
+        self.sent_messages.append(
+            _SentMessage(chat_id=chat_id, text=text, parse_mode=parse_mode)
+        )
         return {"message_id": len(self.sent_messages)}
 
-    async def send_message_draft(self, *, chat_id: int, draft: DraftMessage) -> bool:
-        self.sent_drafts.append(_SentDraft(chat_id=chat_id, draft=draft))
+    async def send_message_draft(
+        self,
+        *,
+        chat_id: int,
+        draft: DraftMessage,
+        parse_mode: str | None = None,
+    ) -> bool:
+        self.draft_attempts += 1
+        if self._draft_errors:
+            raise self._draft_errors.pop(0)
+        self.sent_drafts.append(
+            _SentDraft(chat_id=chat_id, draft=draft, parse_mode=parse_mode)
+        )
         return True
 
     async def aclose(self) -> None:
@@ -168,6 +202,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([draft.draft.text for draft in telegram.sent_drafts], ["stream-", "stream-reply"])
         self.assertEqual([message.text for message in telegram.sent_messages], ["stream-reply"])
+        self.assertEqual([draft.parse_mode for draft in telegram.sent_drafts], ["HTML", "HTML"])
+        self.assertEqual([message.parse_mode for message in telegram.sent_messages], ["HTML"])
 
     async def test_handle_message_ignores_non_private_chat(self) -> None:
         telegram = _FakeTelegramClient()
@@ -224,6 +260,93 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([message.text for message in telegram.sent_messages], ["gateway failed"])
+
+    async def test_draft_rate_limit_disables_drafts_for_current_and_next_turn(self) -> None:
+        telegram = _FakeTelegramClient(
+            draft_errors=[
+                TelegramAPIError(
+                    code="telegram_api_error_429",
+                    message="Too Many Requests",
+                    retry_after_seconds=3,
+                )
+            ]
+        )
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="stream-"),
+                GatewayDoneEvent(session_id="session", text="stream-reply"),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="again"),
+        )
+
+        self.assertEqual(telegram.draft_attempts, 1)
+        self.assertEqual(telegram.sent_drafts, [])
+        self.assertEqual([message.text for message in telegram.sent_messages], ["stream-reply", "stream-reply"])
+
+    async def test_final_message_renders_markdown_as_html(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDoneEvent(
+                    session_id="session",
+                    text="**bold** and `code` with [link](https://example.com)",
+                )
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(telegram.sent_messages[0].parse_mode, "HTML")
+        self.assertEqual(
+            telegram.sent_messages[0].text,
+            '<b>bold</b> and <code>code</code> with <a href="https://example.com">link</a>',
+        )
+
+    async def test_final_message_falls_back_to_plain_text_on_formatting_error(self) -> None:
+        telegram = _FakeTelegramClient(
+            message_errors=[
+                TelegramAPIError(
+                    code="telegram_api_error_400",
+                    message="Bad Request: can't parse entities",
+                )
+            ]
+        )
+        gateway = _FakeGatewayClient(
+            events=[GatewayDoneEvent(session_id="session", text="**bold**")],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(telegram.message_attempts, 2)
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(telegram.sent_messages[0].text, "**bold**")
+        self.assertIsNone(telegram.sent_messages[0].parse_mode)
 
 
 class TelegramBotHelpersTests(unittest.TestCase):

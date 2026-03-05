@@ -92,8 +92,8 @@ class UISettings:
     poll_error_backoff_seconds: float = 2.0
     gateway_ws_base_url: str = "ws://127.0.0.1:8080/ws"
     gateway_connect_timeout_seconds: float = 15.0
-    stream_draft_min_interval_seconds: float = 0.4
-    stream_draft_min_chars: int = 20
+    stream_draft_min_interval_seconds: float = 1.0
+    stream_draft_min_chars: int = 80
     telegram_max_message_chars: int = 4_096
 
     def __post_init__(self) -> None:
@@ -152,9 +152,9 @@ class UISettings:
             ),
             stream_draft_min_interval_seconds=_parse_float_env(
                 "JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS",
-                0.4,
+                1.0,
             ),
-            stream_draft_min_chars=_parse_int_env("JARVIS_UI_STREAM_DRAFT_MIN_CHARS", 20),
+            stream_draft_min_chars=_parse_int_env("JARVIS_UI_STREAM_DRAFT_MIN_CHARS", 80),
             telegram_max_message_chars=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS",
                 4_096,
