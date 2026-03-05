@@ -285,9 +285,10 @@ class OpenAIProvider:
         content: list[dict[str, Any]] = []
         for part in message.parts:
             if isinstance(part, TextPart):
+                text_part_type = "output_text" if message.role == "assistant" else "input_text"
                 content.append(
                     {
-                        "type": "input_text",
+                        "type": text_part_type,
                         "text": part.text,
                     }
                 )

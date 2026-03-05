@@ -13,3 +13,7 @@
 - Added real token streaming path in core AgentLoop and gateway websocket (`assistant_delta` events + final `assistant_message` done event), including overflow-compaction retry support for streaming turns.
 - Added explicit provider/client lifecycle cleanup (`aclose`) across LLMService and providers, and wired real integration tests to close services to avoid event-loop-closed teardown warnings.
 - Added `src/ui/` Telegram bridge that long-polls Bot API, forwards messages to gateway websocket per-chat route (`tg_<chat_id>`), and streams assistant deltas via `sendMessageDraft` before final `sendMessage`.
+- Added `src/main.py` as the combined runtime entrypoint: it loads `.env`, starts the gateway in-process, binds the Telegram UI to that local gateway, and shuts both down together.
+- Added repo-root `main.py` bootstrap so `uv run -m main` works with the current `src/` layout without extra `PYTHONPATH` setup.
+- Fixed OpenAI multi-turn chat history shaping: assistant transcript messages must be resent to the Responses API as `output_text`, not `input_text`, or turn two fails with a 400.
+- Renamed host/container workspace envs to avoid Docker confusion: `AGENT_ROOT` is the host bind-mount source for compose, while `AGENT_WORKSPACE` is the in-container app workspace path used to derive storage.

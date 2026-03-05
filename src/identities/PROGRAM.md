@@ -5,7 +5,7 @@
 
 ## Workspace
 
-Your workspace is ~/.jarvis/labs/, this is your world, create files, store data, manage it, clean it. You own it.
+Your workspace is /workspace/, this is your world, create files, store data, manage it, clean it. You own it.
 
 ## Temp Note (dev)
 

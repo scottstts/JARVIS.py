@@ -91,9 +91,9 @@ class CoreSettings:
     def from_env(cls) -> "CoreSettings":
         storage_root = _optional_env("JARVIS_STORAGE_DIR")
         if storage_root is None:
-            agent_world = _optional_env("AGENT_WORLD")
-            if agent_world is not None:
-                storage_root = str(Path(agent_world).expanduser() / "storage")
+            agent_workspace = _optional_env("AGENT_WORKSPACE")
+            if agent_workspace is not None:
+                storage_root = str(Path(agent_workspace).expanduser() / "storage")
             else:
                 storage_root = "~/.jarvis/storage"
 
