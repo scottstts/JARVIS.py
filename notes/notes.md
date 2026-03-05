@@ -9,3 +9,6 @@
 - Compaction policy is now provider-agnostic and driven by global `.env` knobs: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
 - Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
 - Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
+- Added Starlette websocket gateway under src/gateway with route-scoped SessionRouter, one AgentLoop per route, and JSON events (ready, assistant_message, error).
+- Added real token streaming path in core AgentLoop and gateway websocket (`assistant_delta` events + final `assistant_message` done event), including overflow-compaction retry support for streaming turns.
+- Added explicit provider/client lifecycle cleanup (`aclose`) across LLMService and providers, and wired real integration tests to close services to avoid event-loop-closed teardown warnings.

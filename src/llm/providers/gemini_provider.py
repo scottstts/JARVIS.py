@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Sequence
@@ -130,6 +131,27 @@ class GeminiProvider:
             embeddings=embeddings,
             usage=None,
         )
+
+    async def aclose(self) -> None:
+        async with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is None:
+            return
+
+        async_client = getattr(client, "aio", None)
+        if async_client is not None:
+            aclose = getattr(async_client, "aclose", None)
+            if aclose is not None:
+                maybe = aclose()
+                if inspect.isawaitable(maybe):
+                    await maybe
+
+        close = getattr(client, "close", None)
+        if close is not None:
+            maybe = close()
+            if inspect.isawaitable(maybe):
+                await maybe
 
     async def _client_instance(self) -> genai.Client:
         if self._client is not None:

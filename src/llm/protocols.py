@@ -34,3 +34,6 @@ class LLMProvider(Protocol):
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         """Embeddings API."""
+
+    async def aclose(self) -> None:
+        """Release any underlying provider client resources."""

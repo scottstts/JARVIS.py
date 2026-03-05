@@ -126,6 +126,9 @@ class OpenRouterProvider:
             usage=usage,
         )
 
+    async def aclose(self) -> None:
+        return
+
     def _build_chat_payload(self, request: LLMRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,

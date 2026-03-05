@@ -38,29 +38,32 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_overhead_tokens=64,
             )
             storage = SessionStorage(settings.storage_dir)
+            llm_service = LLMService()
             loop = AgentLoop(
-                llm_service=LLMService(),
+                llm_service=llm_service,
                 settings=settings,
                 storage=storage,
             )
+            try:
+                result = await loop.handle_user_input("Reply with ACK only.")
+                self.assertTrue(result.response_text.strip())
 
-            result = await loop.handle_user_input("Reply with ACK only.")
-            self.assertTrue(result.response_text.strip())
-
-            records = storage.load_records(result.session_id)
-            message_records = [record for record in records if record.kind == "message"]
-            self.assertGreaterEqual(len(message_records), 4)
-            self.assertEqual(message_records[0].role, "system")
-            self.assertEqual(message_records[0].content, "PROGRAM PROMPT")
-            self.assertEqual(message_records[1].role, "system")
-            self.assertEqual(message_records[1].content, "REACTOR PROMPT")
-            self.assertEqual(message_records[2].role, "user")
-            self.assertEqual(message_records[2].content, "Reply with ACK only.")
-            self.assertEqual(message_records[3].role, "assistant")
-            self.assertNotIn(
-                "README SHOULD NOT BE INJECTED",
-                "\n".join(record.content for record in message_records),
-            )
+                records = storage.load_records(result.session_id)
+                message_records = [record for record in records if record.kind == "message"]
+                self.assertGreaterEqual(len(message_records), 4)
+                self.assertEqual(message_records[0].role, "system")
+                self.assertEqual(message_records[0].content, "PROGRAM PROMPT")
+                self.assertEqual(message_records[1].role, "system")
+                self.assertEqual(message_records[1].content, "REACTOR PROMPT")
+                self.assertEqual(message_records[2].role, "user")
+                self.assertEqual(message_records[2].content, "Reply with ACK only.")
+                self.assertEqual(message_records[3].role, "assistant")
+                self.assertNotIn(
+                    "README SHOULD NOT BE INJECTED",
+                    "\n".join(record.content for record in message_records),
+                )
+            finally:
+                await llm_service.aclose()
 
     async def test_manual_compaction_creates_new_session_with_summary_seed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,39 +73,42 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_overhead_tokens=64,
             )
             storage = SessionStorage(settings.storage_dir)
+            llm_service = LLMService()
             loop = AgentLoop(
-                llm_service=LLMService(),
+                llm_service=llm_service,
                 settings=settings,
                 storage=storage,
             )
+            try:
+                first = await loop.handle_user_input("Remember marker CODE-12345. Reply with OK.")
+                old_session_id = first.session_id
 
-            first = await loop.handle_user_input("Remember marker CODE-12345. Reply with OK.")
-            old_session_id = first.session_id
+                compacted = await loop.handle_user_input("/compact keep constraints and marker")
+                self.assertTrue(compacted.compaction_performed)
+                self.assertNotEqual(compacted.session_id, old_session_id)
 
-            compacted = await loop.handle_user_input("/compact keep constraints and marker")
-            self.assertTrue(compacted.compaction_performed)
-            self.assertNotEqual(compacted.session_id, old_session_id)
+                old_session = storage.get_session(old_session_id)
+                self.assertIsNotNone(old_session)
+                self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
+                old_records = storage.load_records(old_session_id)
+                self.assertTrue(any(record.kind == "compaction" for record in old_records))
 
-            old_session = storage.get_session(old_session_id)
-            self.assertIsNotNone(old_session)
-            self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
-            old_records = storage.load_records(old_session_id)
-            self.assertTrue(any(record.kind == "compaction" for record in old_records))
+                new_records = storage.load_records(compacted.session_id)
+                summary_records = [
+                    record
+                    for record in new_records
+                    if record.role == "developer" and record.metadata.get("summary_seed")
+                ]
+                self.assertEqual(len(summary_records), 1)
+                self.assertTrue(summary_records[0].content.strip())
 
-            new_records = storage.load_records(compacted.session_id)
-            summary_records = [
-                record
-                for record in new_records
-                if record.role == "developer" and record.metadata.get("summary_seed")
-            ]
-            self.assertEqual(len(summary_records), 1)
-            self.assertTrue(summary_records[0].content.strip())
-
-            follow_up = await loop.handle_user_input(
-                "What marker do you have from previous context?"
-            )
-            self.assertEqual(follow_up.session_id, compacted.session_id)
-            self.assertTrue(follow_up.response_text.strip())
+                follow_up = await loop.handle_user_input(
+                    "What marker do you have from previous context?"
+                )
+                self.assertEqual(follow_up.session_id, compacted.session_id)
+                self.assertTrue(follow_up.response_text.strip())
+            finally:
+                await llm_service.aclose()
 
     async def test_new_command_starts_fresh_session_without_summary_seed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,26 +118,29 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_overhead_tokens=64,
             )
             storage = SessionStorage(settings.storage_dir)
+            llm_service = LLMService()
             loop = AgentLoop(
-                llm_service=LLMService(),
+                llm_service=llm_service,
                 settings=settings,
                 storage=storage,
             )
+            try:
+                first = await loop.handle_user_input("Say OK.")
+                reset = await loop.handle_user_input("/new")
 
-            first = await loop.handle_user_input("Say OK.")
-            reset = await loop.handle_user_input("/new")
+                self.assertEqual(reset.command, "/new")
+                self.assertNotEqual(first.session_id, reset.session_id)
 
-            self.assertEqual(reset.command, "/new")
-            self.assertNotEqual(first.session_id, reset.session_id)
+                new_records = storage.load_records(reset.session_id)
+                message_records = [record for record in new_records if record.kind == "message"]
+                self.assertEqual([record.role for record in message_records], ["system", "system"])
+                self.assertFalse(any(record.metadata.get("summary_seed") for record in message_records))
 
-            new_records = storage.load_records(reset.session_id)
-            message_records = [record for record in new_records if record.kind == "message"]
-            self.assertEqual([record.role for record in message_records], ["system", "system"])
-            self.assertFalse(any(record.metadata.get("summary_seed") for record in message_records))
-
-            continued = await loop.handle_user_input("Confirm reset session is active.")
-            self.assertEqual(continued.session_id, reset.session_id)
-            self.assertTrue(continued.response_text.strip())
+                continued = await loop.handle_user_input("Confirm reset session is active.")
+                self.assertEqual(continued.session_id, reset.session_id)
+                self.assertTrue(continued.response_text.strip())
+            finally:
+                await llm_service.aclose()
 
 
 def _load_dotenv_if_present() -> None:

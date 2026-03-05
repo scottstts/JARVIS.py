@@ -1,12 +1,21 @@
 """Core loop public API."""
 
-from .agent_loop import AgentLoop, AgentTurnResult
+from .agent_loop import (
+    AgentLoop,
+    AgentTextDeltaEvent,
+    AgentTurnDoneEvent,
+    AgentTurnResult,
+    AgentTurnStreamEvent,
+)
 from .config import ContextPolicySettings, CoreSettings
 from .errors import ContextBudgetError, CoreConfigurationError, CoreError
 
 __all__ = [
     "AgentLoop",
+    "AgentTextDeltaEvent",
+    "AgentTurnDoneEvent",
     "AgentTurnResult",
+    "AgentTurnStreamEvent",
     "ContextBudgetError",
     "ContextPolicySettings",
     "CoreConfigurationError",

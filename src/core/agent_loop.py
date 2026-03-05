@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Literal, Sequence
 from uuid import uuid4
 
 from llm import (
@@ -45,6 +45,33 @@ class AgentTurnResult:
     compaction_performed: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class AgentTextDeltaEvent:
+    session_id: str
+    delta: str
+    type: Literal["text_delta"] = "text_delta"
+
+
+@dataclass(slots=True, frozen=True)
+class AgentTurnDoneEvent:
+    session_id: str
+    response_text: str
+    command: str | None = None
+    compaction_performed: bool = False
+    type: Literal["done"] = "done"
+
+    def to_result(self) -> AgentTurnResult:
+        return AgentTurnResult(
+            session_id=self.session_id,
+            response_text=self.response_text,
+            command=self.command,
+            compaction_performed=self.compaction_performed,
+        )
+
+
+AgentTurnStreamEvent = AgentTextDeltaEvent | AgentTurnDoneEvent
+
+
 class AgentLoop:
     """Stateful agent loop over a single long-running DM thread."""
 
@@ -73,6 +100,19 @@ class AgentLoop:
         if command.kind == "compact":
             return await self._handle_compact_command(command)
         return await self._handle_message_turn(command.body)
+
+    async def stream_user_input(self, user_text: str) -> AsyncIterator[AgentTurnStreamEvent]:
+        command = parse_user_command(user_text)
+        if command.kind == "new":
+            async for event in self._stream_new_command(command):
+                yield event
+            return
+        if command.kind == "compact":
+            async for event in self._stream_compact_command(command):
+                yield event
+            return
+        async for event in self._stream_message_turn(command.body):
+            yield event
 
     def active_session_id(self) -> str | None:
         active = self._storage.get_active_session()
@@ -108,40 +148,49 @@ class AgentLoop:
             compaction_performed=True,
         )
 
+    async def _stream_new_command(
+        self,
+        command: ParsedCommand,
+    ) -> AsyncIterator[AgentTurnStreamEvent]:
+        session = self._start_session(start_reason="user_new")
+        if command.body:
+            async for event in self._stream_message_turn(
+                command.body,
+                force_session_id=session.session_id,
+                command_override="/new",
+            ):
+                yield event
+            return
+
+        yield AgentTurnDoneEvent(
+            session_id=session.session_id,
+            response_text="Started a new session.",
+            command="/new",
+            compaction_performed=False,
+        )
+
+    async def _stream_compact_command(
+        self,
+        command: ParsedCommand,
+    ) -> AsyncIterator[AgentTurnStreamEvent]:
+        result = await self._handle_compact_command(command)
+        yield AgentTurnDoneEvent(
+            session_id=result.session_id,
+            response_text=result.response_text,
+            command=result.command,
+            compaction_performed=result.compaction_performed,
+        )
+
     async def _handle_message_turn(
         self,
         user_text: str,
         *,
         force_session_id: str | None = None,
     ) -> AgentTurnResult:
-        session = self._storage.get_session(force_session_id) if force_session_id else None
-        if session is None:
-            session = self._ensure_active_session()
-
-        did_compaction = False
-        if session.pending_reactive_compaction:
-            compacted = await self._compact_session(session, reason="reactive")
-            if compacted is not None:
-                session = compacted
-                did_compaction = True
-
-        records = self._storage.load_records(session.session_id)
-        request = self._build_request(records, pending_user_text=user_text)
-        estimated_input_tokens = estimate_request_input_tokens(request)
-
-        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
-            compacted = await self._compact_session(session, reason="preflight")
-            if compacted is not None:
-                session = compacted
-                did_compaction = True
-                records = self._storage.load_records(session.session_id)
-                request = self._build_request(records, pending_user_text=user_text)
-                estimated_input_tokens = estimate_request_input_tokens(request)
-
-        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
-            raise ContextBudgetError(
-                "Request is still over the preflight context budget after compaction."
-            )
+        session, request, estimated_input_tokens, did_compaction = await self._prepare_message_turn(
+            user_text=user_text,
+            force_session_id=force_session_id,
+        )
 
         (
             session,
@@ -184,6 +233,136 @@ class AgentLoop:
             response_text=response.text,
             compaction_performed=did_compaction,
         )
+
+    async def _stream_message_turn(
+        self,
+        user_text: str,
+        *,
+        force_session_id: str | None = None,
+        command_override: str | None = None,
+    ) -> AsyncIterator[AgentTurnStreamEvent]:
+        session, request, estimated_input_tokens, did_compaction = await self._prepare_message_turn(
+            user_text=user_text,
+            force_session_id=force_session_id,
+        )
+
+        overflow_compacted = False
+        overflow_retry_attempted = False
+        final_response: LLMResponse | None = None
+        final_estimated_input_tokens = estimated_input_tokens
+
+        while True:
+            streamed_response: LLMResponse | None = None
+            emitted_any = False
+            try:
+                async for event in self._llm_service.stream_generate(request):
+                    if event.type == "text_delta":
+                        emitted_any = True
+                        if event.delta:
+                            yield AgentTextDeltaEvent(
+                                session_id=session.session_id,
+                                delta=event.delta,
+                            )
+                    elif event.type == "done":
+                        streamed_response = event.response
+
+                if streamed_response is None:
+                    raise RuntimeError(
+                        "Streaming generation completed without a final done event."
+                    )
+                final_response = streamed_response
+                break
+            except ProviderBadRequestError as exc:
+                if overflow_retry_attempted or emitted_any or not _is_context_overflow_error(exc):
+                    raise
+
+            compacted = await self._compact_session(session, reason="overflow")
+            if compacted is None:
+                raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
+
+            records = self._storage.load_records(compacted.session_id)
+            request = self._build_request(records, pending_user_text=user_text)
+            retry_estimate = estimate_request_input_tokens(request)
+            if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
+                raise ContextBudgetError(
+                    "Overflow retry aborted: compacted request still exceeds preflight limit."
+                )
+
+            session = compacted
+            final_estimated_input_tokens = retry_estimate
+            overflow_compacted = True
+            overflow_retry_attempted = True
+
+        if final_response is None:
+            raise RuntimeError("Streaming generation produced no final response.")
+        if overflow_compacted:
+            did_compaction = True
+
+        self._persist_successful_turn(
+            session_id=session.session_id,
+            user_text=user_text,
+            response=final_response,
+            estimated_input_tokens=final_estimated_input_tokens,
+        )
+
+        refreshed = self._storage.get_session(session.session_id)
+        threshold_observed = (
+            final_response.usage.input_tokens
+            if final_response.usage is not None and final_response.usage.input_tokens is not None
+            else final_estimated_input_tokens
+        )
+        should_enqueue_reactive = (
+            threshold_observed >= self._settings.context_policy.compact_threshold_tokens
+        )
+        if refreshed is not None:
+            self._storage.update_session(
+                refreshed.session_id,
+                pending_reactive_compaction=should_enqueue_reactive,
+            )
+
+        yield AgentTurnDoneEvent(
+            session_id=session.session_id,
+            response_text=final_response.text,
+            command=command_override,
+            compaction_performed=did_compaction,
+        )
+
+    async def _prepare_message_turn(
+        self,
+        *,
+        user_text: str,
+        force_session_id: str | None = None,
+    ) -> tuple[SessionMetadata, LLMRequest, int, bool]:
+        session = self._storage.get_session(force_session_id) if force_session_id else None
+        if session is None:
+            session = self._ensure_active_session()
+
+        did_compaction = False
+        if session.pending_reactive_compaction:
+            compacted = await self._compact_session(session, reason="reactive")
+            if compacted is not None:
+                session = compacted
+                did_compaction = True
+
+        records = self._storage.load_records(session.session_id)
+        request = self._build_request(records, pending_user_text=user_text)
+        estimated_input_tokens = estimate_request_input_tokens(request)
+
+        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+            compacted = await self._compact_session(session, reason="preflight")
+            if compacted is not None:
+                session = compacted
+                did_compaction = True
+                records = self._storage.load_records(session.session_id)
+                request = self._build_request(records, pending_user_text=user_text)
+                estimated_input_tokens = estimate_request_input_tokens(request)
+
+        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+            raise ContextBudgetError(
+                "Request is still over the preflight context budget after compaction."
+            )
+
+        return session, request, estimated_input_tokens, did_compaction
 
     async def _generate_with_overflow_retry(
         self,

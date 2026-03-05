@@ -47,6 +47,9 @@ class ProviderRegistry:
             raise ProviderNotFoundError(f"Provider '{provider_name}' is not registered.")
         return provider
 
+    def all(self) -> tuple[LLMProvider, ...]:
+        return tuple(self._providers.values())
+
 
 class LLMService:
     """Entry point used by core agent loop for LLM/embedding operations."""
@@ -83,6 +86,12 @@ class LLMService:
                 ),
             )
         self.registry = ProviderRegistry(providers)
+
+    async def aclose(self) -> None:
+        providers = self.registry.all()
+        if not providers:
+            return
+        await asyncio.gather(*(provider.aclose() for provider in providers))
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         resolved = self._resolve_generate_request(request)

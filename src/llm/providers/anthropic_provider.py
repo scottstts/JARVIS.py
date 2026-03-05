@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Sequence
@@ -111,6 +112,19 @@ class AnthropicProvider:
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         raise UnsupportedCapabilityError("Provider 'anthropic' does not support embeddings.")
+
+    async def aclose(self) -> None:
+        async with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is None:
+            return
+        close = getattr(client, "close", None)
+        if close is None:
+            return
+        maybe = close()
+        if inspect.isawaitable(maybe):
+            await maybe
 
     async def _client_instance(self) -> AsyncAnthropic:
         if self._client is not None:
