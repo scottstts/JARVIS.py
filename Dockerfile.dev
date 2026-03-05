@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
   && ln -s /root/.local/bin/uv /usr/local/bin/uv
 
+# Install ruff (Astral's installer)
+RUN curl -LsSf https://astral.sh/ruff/install.sh | sh \
+  && ln -s /root/.local/bin/ruff /usr/local/bin/ruff
+
 # (Optional but handy) common python dev env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
