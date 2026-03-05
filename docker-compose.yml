@@ -11,9 +11,9 @@ services:
     volumes:
       - ./:/repo
 
-      # Persistent "agent world" (memory/sessions/cache) on your Mac
+      # Persistent agent workspace (memory/sessions/cache) on your Mac
       # Change the left side if you want a different host path.
-      - ${AGENT_WORLD:-${HOME}/agent_world}:/world
+      - ${AGENT_WORLD:-${HOME}/.jarvis/labs}:/workspace
 
       # Persist uv cache between container rebuilds (fast installs)
       - uv_cache:/root/.cache/uv
