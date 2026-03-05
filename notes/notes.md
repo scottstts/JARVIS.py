@@ -3,3 +3,9 @@
 - Anthropic config now supports `JARVIS_ANTHROPIC_EFFORT` and model-aware thinking behavior (adaptive/effort only applied where model support exists).
 - Gemini thinking is model-aware: `gemini-3*` uses `thinking_level`, while `gemini-2.5*` uses `thinking_budget`.
 - Embeddings are now globally configured via `JARVIS_EMBEDDING_PROVIDER` and `JARVIS_EMBEDDING_MODEL`, decoupled from chat provider selection.
+- Added a custom `src/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
+- Implemented file-backed `src/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
+- Session bootstrap now injects only `src/identities/PROGRAM.md` and `src/identities/REACTOR.md`, and compacted sessions additionally inject the generated summary seed.
+- Compaction policy is now provider-agnostic and driven by global `.env` knobs: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
+- Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
+- Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
