@@ -2,6 +2,7 @@
 
 from .config import (
     AnthropicProviderSettings,
+    EmbeddingSettings,
     GeminiProviderSettings,
     LLMSettings,
     OpenAIProviderSettings,
@@ -48,6 +49,7 @@ __all__ = [
     "DoneEvent",
     "EmbeddingRequest",
     "EmbeddingResponse",
+    "EmbeddingSettings",
     "ImagePart",
     "LLMConfigurationError",
     "LLMError",

@@ -259,14 +259,8 @@ class LLMService:
         )
 
     def _resolve_embedding_request(self, request: EmbeddingRequest) -> EmbeddingRequest:
-        provider = request.provider or self.settings.default_provider
-        model: str | None = request.model
-        if provider == "openai":
-            model = model or self.settings.openai.embedding_model
-        elif provider == "gemini":
-            model = model or self.settings.gemini.embedding_model
-        elif provider == "openrouter":
-            model = model or self.settings.openrouter.embedding_model
+        provider = request.provider or self.settings.embedding.provider
+        model = request.model or self.settings.embedding.model
         return replace(request, provider=provider, model=model)
 
     def _assert_generation_capabilities(

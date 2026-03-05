@@ -81,13 +81,35 @@ def _parse_optional_float_env(name: str) -> float | None:
 
 
 @dataclass(slots=True, frozen=True)
+class EmbeddingSettings:
+    provider: str = ""
+    model: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.provider.strip():
+            raise LLMConfigurationError("JARVIS_EMBEDDING_PROVIDER cannot be empty.")
+        if self.provider not in {"openai", "gemini", "openrouter"}:
+            raise LLMConfigurationError(
+                "JARVIS_EMBEDDING_PROVIDER must be one of: openai, gemini, openrouter."
+            )
+        if not self.model.strip():
+            raise LLMConfigurationError("JARVIS_EMBEDDING_MODEL cannot be empty.")
+
+    @classmethod
+    def from_env(cls) -> "EmbeddingSettings":
+        return cls(
+            provider=_required_env("JARVIS_EMBEDDING_PROVIDER"),
+            model=_required_env("JARVIS_EMBEDDING_MODEL"),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class OpenAIProviderSettings:
     api_key: str | None = None
     base_url: str | None = None
     organization: str | None = None
     project: str | None = None
     chat_model: str | None = None
-    embedding_model: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
     reasoning_effort: str | None = None
@@ -106,7 +128,6 @@ class OpenAIProviderSettings:
             organization=_optional_env("OPENAI_ORG_ID"),
             project=_optional_env("OPENAI_PROJECT_ID"),
             chat_model=_optional_env("JARVIS_OPENAI_CHAT_MODEL"),
-            embedding_model=_optional_env("JARVIS_OPENAI_EMBEDDING_MODEL"),
             temperature=_parse_optional_float_env("JARVIS_OPENAI_TEMPERATURE"),
             max_output_tokens=_parse_optional_int_env("JARVIS_OPENAI_MAX_OUTPUT_TOKENS"),
             reasoning_effort=_optional_choice_env(
@@ -164,7 +185,6 @@ class AnthropicProviderSettings:
 class GeminiProviderSettings:
     api_key: str | None = None
     chat_model: str | None = None
-    embedding_model: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
     thinking_level: str | None = None
@@ -181,7 +201,6 @@ class GeminiProviderSettings:
         return cls(
             api_key=_optional_env("GOOGLE_API_KEY"),
             chat_model=_optional_env("JARVIS_GEMINI_CHAT_MODEL"),
-            embedding_model=_optional_env("JARVIS_GEMINI_EMBEDDING_MODEL"),
             temperature=_parse_optional_float_env("JARVIS_GEMINI_TEMPERATURE"),
             max_output_tokens=_parse_optional_int_env("JARVIS_GEMINI_MAX_OUTPUT_TOKENS"),
             thinking_level=_optional_lower_env("JARVIS_GEMINI_THINKING_LEVEL"),
@@ -194,7 +213,6 @@ class OpenRouterProviderSettings:
     api_key: str | None = None
     base_url: str = "https://openrouter.ai/api/v1"
     chat_model: str | None = None
-    embedding_model: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
     site_url: str | None = None
@@ -210,7 +228,6 @@ class OpenRouterProviderSettings:
             api_key=_optional_env("OPENROUTER_API_KEY"),
             base_url=_optional_env("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1",
             chat_model=_optional_env("JARVIS_OPENROUTER_CHAT_MODEL"),
-            embedding_model=_optional_env("JARVIS_OPENROUTER_EMBEDDING_MODEL"),
             temperature=_parse_optional_float_env("JARVIS_OPENROUTER_TEMPERATURE"),
             max_output_tokens=_parse_optional_int_env("JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS"),
             site_url=_optional_env("OPENROUTER_SITE_URL"),
@@ -221,6 +238,7 @@ class OpenRouterProviderSettings:
 @dataclass(slots=True, frozen=True)
 class LLMSettings:
     default_provider: str = ""
+    embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings.from_env)
     request_timeout_seconds: float = 60.0
     retry_attempts: int = 2
     retry_backoff_seconds: float = 0.5
@@ -245,6 +263,7 @@ class LLMSettings:
     def from_env(cls) -> "LLMSettings":
         return cls(
             default_provider=_required_env("JARVIS_LLM_DEFAULT_PROVIDER"),
+            embedding=EmbeddingSettings.from_env(),
             request_timeout_seconds=_parse_float_env("JARVIS_LLM_TIMEOUT_SECONDS", 60.0),
             retry_attempts=_parse_int_env("JARVIS_LLM_RETRY_ATTEMPTS", 2),
             retry_backoff_seconds=_parse_float_env("JARVIS_LLM_RETRY_BACKOFF_SECONDS", 0.5),
