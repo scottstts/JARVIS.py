@@ -80,3 +80,4 @@ docker compose exec dev bash -lc "cd /repo && uv run <...>"
 - do NOT git commit code, I will **always** do that myself
 - throughout the implementation, you will constantly ask me design choice questions like "option ABC, which do you want". This is because I'm not sure about some design choices yet, so constantly offer me options, alternatives, and challenge me when something doesn't seem to make obvious sense.
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
+- No need to delete __pycache__/
