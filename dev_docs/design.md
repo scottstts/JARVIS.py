@@ -8,7 +8,7 @@ The agent should have below components, some of which can be straightforward, so
 
 - core/ . this is the agent loop. we're not using any agent framework here, we're constructing our own agent loop, which will use the LLM service layer from llm/ 
 
-- identities/ . this mainly contains a series of "starter context content" md files, possibly using a similar design as openclaw, which means things like SOUL.md (persona, boundaries, tone), USER.md (user preferences + address/how to speak), AGENTS.md (operating rules like “how I run tasks, when I write memory, what I optimize for”), etc.
+- identities/ . this mainly contains a series of "starter context content" md files, possibly using a similar design as openclaw, which means things like REACTOR.md (persona, boundaries, tone, like SOUL.md for openclaw), USER.md (user preferences + address/how to speak), PROGRAM.md (operating rules like “how I run tasks, when I write memory, what I optimize for”, like AGENTS.md for openclaw), etc.
 
 - gateway/ . this is the control surface of the agent system's connection to outside. use Starlette with a minimal design (websocket), also handles session routing
 
