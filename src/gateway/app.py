@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -27,6 +28,7 @@ from .protocol import (
 from .session_router import InvalidRouteIDError, SessionRouter, validate_route_id
 
 _INTERNAL_ERROR_MESSAGE = "Internal error while processing message."
+LOGGER = logging.getLogger(__name__)
 
 
 def create_app(
@@ -138,6 +140,7 @@ def create_app(
                 )
                 continue
             except Exception:
+                LOGGER.exception("Unhandled gateway turn error for route_id=%s", route_id)
                 await websocket.send_json(
                     build_error_event(
                         code="internal_error",

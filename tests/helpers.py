@@ -16,7 +16,9 @@ def build_core_settings(
     compact_reserve_overhead_tokens: int = 10_000,
 ) -> CoreSettings:
     identities_dir = root_dir / "identities"
+    workspace_dir = root_dir / "workspace"
     identities_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
     (identities_dir / "PROGRAM.md").write_text("PROGRAM PROMPT", encoding="utf-8")
     (identities_dir / "REACTOR.md").write_text("REACTOR PROMPT", encoding="utf-8")
 
@@ -27,6 +29,7 @@ def build_core_settings(
             compact_reserve_output_tokens=compact_reserve_output_tokens,
             compact_reserve_overhead_tokens=compact_reserve_overhead_tokens,
         ),
+        workspace_dir=workspace_dir,
         storage_dir=root_dir / "storage",
         identities_dir=identities_dir,
     )

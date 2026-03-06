@@ -71,6 +71,14 @@ Then run normally:
 docker compose exec dev bash -lc "cd /repo && uv run <...>"
 ```
 
+### Specific Doc for Agent Tools development
+
+During the development of agent tools (src/tools/), you need to follow a dedicated tool dev doc: /dev_docs/tool_dev_docs.md.
+
+Here you'll see the basic protocol and structure of how tools are built, what tools have been built, what yet to be built.
+
+For tools listed as yet to be built, doesn't mean you'll just build them unprompted. ONLY build those I ask you to.
+
 ## Dev Rules and Preferences
 
 - Use ruff for python lint checking at the end of each turn

@@ -11,7 +11,9 @@ from llm.types import (
     LLMMessage,
     LLMRequest,
     TextPart,
+    ToolCall,
     ToolChoiceMode,
+    ToolResultPart,
 )
 
 
@@ -52,6 +54,26 @@ def _serialize_message(message: LLMMessage) -> dict[str, Any]:
                     "image_url": part.image_url,
                     "file_id": part.file_id,
                     "detail": part.detail,
+                }
+            )
+        elif isinstance(part, ToolCall):
+            parts.append(
+                {
+                    "type": "tool_call",
+                    "call_id": part.call_id,
+                    "name": part.name,
+                    "arguments": part.arguments,
+                    "provider_metadata": part.provider_metadata,
+                }
+            )
+        elif isinstance(part, ToolResultPart):
+            parts.append(
+                {
+                    "type": "tool_result",
+                    "call_id": part.call_id,
+                    "name": part.name,
+                    "content": part.content,
+                    "is_error": part.is_error,
                 }
             )
     return {"role": message.role, "parts": parts}

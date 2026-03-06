@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
 from openai import (
@@ -50,9 +51,15 @@ from ..types import (
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
+    ToolResultPart,
     UsageDeltaEvent,
 )
-from ..validation import build_tool_schema_map, parse_and_validate_tool_call
+from ..validation import (
+    build_tool_schema_map,
+    get_tool_schema,
+    load_tool_call_arguments,
+    validate_tool_call_arguments,
+)
 
 
 class OpenAIProvider:
@@ -240,7 +247,11 @@ class OpenAIProvider:
 
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "input": [self._to_openai_message(message) for message in request.messages],
+            "input": [
+                item
+                for message in request.messages
+                for item in self._to_openai_input_items(message)
+            ],
             "stream": stream,
             "parallel_tool_calls": request.parallel_tool_calls,
         }
@@ -281,6 +292,82 @@ class OpenAIProvider:
 
         return kwargs
 
+    def _to_openai_input_items(self, message: LLMMessage) -> list[dict[str, Any]]:
+        if message.role == "tool":
+            return self._to_openai_tool_result_items(message)
+
+        content: list[dict[str, Any]] = []
+        tool_call_items: list[dict[str, Any]] = []
+
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                text_part_type = "output_text" if message.role == "assistant" else "input_text"
+                content.append(
+                    {
+                        "type": text_part_type,
+                        "text": part.text,
+                    }
+                )
+            elif isinstance(part, ImagePart):
+                if message.role == "assistant":
+                    raise LLMConfigurationError(
+                        "OpenAI provider does not support assistant image history items."
+                    )
+                image_item: dict[str, Any] = {
+                    "type": "input_image",
+                    "detail": part.detail,
+                }
+                if part.image_url is not None:
+                    image_item["image_url"] = part.image_url
+                elif part.file_id is not None:
+                    image_item["file_id"] = part.file_id
+                content.append(image_item)
+            elif isinstance(part, ToolCall):
+                if message.role != "assistant":
+                    raise LLMConfigurationError(
+                        "Tool call history can only appear on assistant messages."
+                    )
+                tool_call_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": part.call_id,
+                        "name": part.name,
+                        "arguments": part.raw_arguments,
+                    }
+                )
+            else:
+                raise LLMConfigurationError(
+                    f"Unsupported OpenAI message part type: {type(part).__name__}."
+                )
+
+        items: list[dict[str, Any]] = []
+        if content:
+            items.append(
+                {
+                    "type": "message",
+                    "role": message.role,
+                    "content": content,
+                }
+            )
+        items.extend(tool_call_items)
+        return items
+
+    def _to_openai_tool_result_items(self, message: LLMMessage) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                raise LLMConfigurationError(
+                    "Tool-role messages can only contain tool results for OpenAI."
+                )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": part.call_id,
+                    "output": part.content,
+                }
+            )
+        return items
+
     def _to_openai_message(self, message: LLMMessage) -> dict[str, Any]:
         content: list[dict[str, Any]] = []
         for part in message.parts:
@@ -310,11 +397,14 @@ class OpenAIProvider:
         }
 
     def _to_openai_tool(self, tool: ToolDefinition) -> dict[str, Any]:
+        parameters = dict(tool.input_schema)
+        if tool.strict:
+            parameters = _normalize_openai_strict_schema(parameters)
         return {
             "type": "function",
             "name": tool.name,
             "description": tool.description,
-            "parameters": dict(tool.input_schema),
+            "parameters": parameters,
             "strict": tool.strict,
         }
 
@@ -366,16 +456,37 @@ class OpenAIProvider:
         request_tools: Sequence[ToolDefinition],
     ) -> list[ToolCall]:
         tool_schemas = build_tool_schema_map(request_tools)
+        tool_definitions = {tool.name: tool for tool in request_tools}
         validated_calls: list[ToolCall] = []
         for item in response_output:
             if getattr(item, "type", None) != "function_call":
                 continue
+
+            schema = get_tool_schema(
+                call_id=item.call_id,
+                name=item.name,
+                tool_schemas=tool_schemas,
+            )
+            arguments = load_tool_call_arguments(
+                call_id=item.call_id,
+                name=item.name,
+                raw_arguments=item.arguments,
+            )
+            tool = tool_definitions.get(item.name)
+            if tool is not None and tool.strict:
+                arguments = _sanitize_openai_returned_arguments(arguments, schema)
+            validate_tool_call_arguments(
+                call_id=item.call_id,
+                name=item.name,
+                arguments=arguments,
+                schema=schema,
+            )
             validated_calls.append(
-                parse_and_validate_tool_call(
+                ToolCall(
                     call_id=item.call_id,
                     name=item.name,
+                    arguments=arguments,
                     raw_arguments=item.arguments,
-                    tool_schemas=tool_schemas,
                 )
             )
         return validated_calls
@@ -435,3 +546,120 @@ class OpenAIProvider:
         if isinstance(error, OpenAIError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _normalize_openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(schema)
+    return _normalize_openai_schema_node(normalized)
+
+
+def _normalize_openai_schema_node(node: Any) -> Any:
+    if not isinstance(node, dict):
+        return node
+
+    if "items" in node:
+        node["items"] = _normalize_openai_schema_node(node["items"])
+
+    for key in ("anyOf", "allOf", "oneOf", "prefixItems"):
+        value = node.get(key)
+        if isinstance(value, list):
+            node[key] = [_normalize_openai_schema_node(item) for item in value]
+
+    properties = node.get("properties")
+    if isinstance(properties, dict):
+        original_required = set(node.get("required", []) or [])
+        normalized_properties: dict[str, Any] = {}
+        required_names: list[str] = []
+
+        for name, child in properties.items():
+            normalized_child = _normalize_openai_schema_node(child)
+            if name not in original_required:
+                normalized_child = _wrap_schema_as_nullable(normalized_child)
+            normalized_properties[name] = normalized_child
+            required_names.append(name)
+
+        node["properties"] = normalized_properties
+        node["required"] = required_names
+        node.setdefault("additionalProperties", False)
+
+    return node
+
+
+def _wrap_schema_as_nullable(schema: dict[str, Any]) -> dict[str, Any]:
+    if _schema_allows_null(schema):
+        return schema
+    return {
+        "anyOf": [
+            schema,
+            {"type": "null"},
+        ]
+    }
+
+
+def _schema_allows_null(schema: dict[str, Any]) -> bool:
+    schema_type = schema.get("type")
+    if schema_type == "null":
+        return True
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return True
+
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        return any(_schema_allows_null(item) for item in any_of if isinstance(item, dict))
+    return False
+
+
+def _sanitize_openai_returned_arguments(
+    arguments: dict[str, Any],
+    schema: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _sanitize_openai_value(arguments, schema)
+
+
+def _sanitize_openai_value(value: Any, schema: Mapping[str, Any] | None) -> Any:
+    if schema is None:
+        return value
+
+    if isinstance(value, dict):
+        return _sanitize_openai_object(value, schema)
+
+    items_schema = schema.get("items")
+    if isinstance(value, list) and isinstance(items_schema, Mapping):
+        return [
+            _sanitize_openai_value(item, items_schema)
+            for item in value
+        ]
+
+    return value
+
+
+def _sanitize_openai_object(
+    value: dict[str, Any],
+    schema: Mapping[str, Any],
+) -> dict[str, Any]:
+    properties = schema.get("properties")
+    required = set(schema.get("required", []) or [])
+    if not isinstance(properties, Mapping):
+        return value
+
+    sanitized: dict[str, Any] = {}
+    for key, child_value in value.items():
+        child_schema = properties.get(key)
+        if (
+            child_value is None
+            and key not in required
+            and isinstance(child_schema, Mapping)
+            and not _schema_mapping_allows_null(child_schema)
+        ):
+            continue
+
+        if isinstance(child_schema, Mapping):
+            sanitized[key] = _sanitize_openai_value(child_value, child_schema)
+        else:
+            sanitized[key] = child_value
+
+    return sanitized
+
+
+def _schema_mapping_allows_null(schema: Mapping[str, Any]) -> bool:
+    return _schema_allows_null(dict(schema))

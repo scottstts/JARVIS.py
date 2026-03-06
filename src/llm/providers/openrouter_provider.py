@@ -37,6 +37,7 @@ from ..types import (
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
+    ToolResultPart,
     UsageDeltaEvent,
 )
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call
@@ -152,14 +153,15 @@ class OpenRouterProvider:
 
     def _to_openrouter_message(self, message: LLMMessage) -> dict[str, Any]:
         role = "system" if message.role in {"system", "developer"} else message.role
-        has_non_text = any(not isinstance(part, TextPart) for part in message.parts)
+        if role == "tool":
+            return self._to_openrouter_tool_result_message(message)
 
-        if not has_non_text and len(message.parts) == 1:
-            return {"role": role, "content": message.parts[0].text}
-
+        text_parts: list[str] = []
         content: list[dict[str, Any]] = []
+        tool_calls: list[dict[str, Any]] = []
         for part in message.parts:
             if isinstance(part, TextPart):
+                text_parts.append(part.text)
                 content.append({"type": "text", "text": part.text})
             elif isinstance(part, ImagePart):
                 if part.file_id is not None:
@@ -172,8 +174,51 @@ class OpenRouterProvider:
                         "image_url": {"url": part.image_url},
                     }
                 )
+            elif isinstance(part, ToolCall):
+                if role != "assistant":
+                    raise LLMConfigurationError(
+                        "Tool call history can only appear on assistant messages."
+                    )
+                tool_calls.append(
+                    {
+                        "id": part.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": part.name,
+                            "arguments": part.raw_arguments,
+                        },
+                    }
+                )
+            else:
+                raise LLMConfigurationError(
+                    f"Unsupported OpenRouter message part type: {type(part).__name__}."
+                )
 
-        return {"role": role, "content": content}
+        payload: dict[str, Any] = {"role": role}
+        if tool_calls:
+            payload["tool_calls"] = tool_calls
+            payload["content"] = "\n\n".join(text_parts) if text_parts else None
+            return payload
+        if len(content) == 1 and content[0]["type"] == "text":
+            payload["content"] = content[0]["text"]
+            return payload
+        payload["content"] = content
+        return payload
+
+    def _to_openrouter_tool_result_message(self, message: LLMMessage) -> dict[str, Any]:
+        if len(message.parts) != 1 or not isinstance(message.parts[0], ToolResultPart):
+            raise LLMConfigurationError(
+                "Tool-role messages must contain exactly one tool result for OpenRouter."
+            )
+        part = message.parts[0]
+        payload: dict[str, Any] = {
+            "role": "tool",
+            "tool_call_id": part.call_id,
+            "content": part.content,
+        }
+        if part.name:
+            payload["name"] = part.name
+        return payload
 
     def _to_openrouter_tool(self, tool: ToolDefinition) -> dict[str, Any]:
         function_obj: dict[str, Any] = {

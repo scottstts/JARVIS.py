@@ -92,6 +92,7 @@ class CoreSettings:
     """Core loop runtime settings."""
 
     context_policy: ContextPolicySettings
+    workspace_dir: Path
     storage_dir: Path
     identities_dir: Path
     program_file_name: str = "PROGRAM.md"
@@ -99,18 +100,19 @@ class CoreSettings:
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
+        workspace_root = _optional_env("AGENT_WORKSPACE") or app_settings.AGENT_WORKSPACE
+        if workspace_root is None:
+            workspace_root = "/workspace"
+
         storage_root = _optional_env("JARVIS_STORAGE_DIR") or app_settings.JARVIS_STORAGE_DIR
         if storage_root is None:
-            agent_workspace = _optional_env("AGENT_WORKSPACE")
-            if agent_workspace is not None:
-                storage_root = str(Path(agent_workspace).expanduser() / "storage")
-            else:
-                storage_root = "~/.jarvis/storage"
+            storage_root = str(Path(workspace_root).expanduser() / "storage")
 
         identities_dir = _optional_env("JARVIS_IDENTITIES_DIR") or app_settings.JARVIS_IDENTITIES_DIR
 
         return cls(
             context_policy=ContextPolicySettings.from_env(),
+            workspace_dir=Path(workspace_root).expanduser(),
             storage_dir=Path(storage_root).expanduser(),
             identities_dir=Path(identities_dir).expanduser(),
         )

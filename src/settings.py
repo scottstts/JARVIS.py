@@ -20,6 +20,13 @@ JARVIS_STORAGE_DIR: Final[str | None] = (
 )
 JARVIS_IDENTITIES_DIR: Final = "/workspace/identities"
 
+# Tool runtime defaults.
+JARVIS_TOOL_BASH_EXECUTABLE: Final = "/bin/bash"
+JARVIS_TOOL_BASH_DEFAULT_TIMEOUT_SECONDS: Final = 10.0
+JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS: Final = 30.0
+JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS: Final = 12_000
+JARVIS_TOOL_MAX_ROUNDS_PER_TURN: Final = 8
+
 # Telegram UI runtime.
 TELEGRAM_API_BASE_URL: Final = "https://api.telegram.org"
 JARVIS_UI_TELEGRAM_ALLOWED_USER_ID: Final[int | None] = None
@@ -45,7 +52,8 @@ JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS: Final = 10_000
 
 # Core LLM routing/runtime.
 # The provider chosen here will determine which API key is needed below
-JARVIS_LLM_DEFAULT_PROVIDER: Final = "gemini"
+# 'openai', 'gemini', 'anthropic', 'openrouter'
+JARVIS_LLM_DEFAULT_PROVIDER: Final = "openai"
 JARVIS_LLM_TIMEOUT_SECONDS: Final = 60.0
 JARVIS_LLM_RETRY_ATTEMPTS: Final = 2
 JARVIS_LLM_RETRY_BACKOFF_SECONDS: Final = 0.5
@@ -55,7 +63,7 @@ JARVIS_EMBEDDING_PROVIDER: Final = "openai"
 JARVIS_EMBEDDING_MODEL: Final = "text-embedding-3-small"
 
 # OpenAI provider defaults.
-JARVIS_OPENAI_CHAT_MODEL: Final = "gpt-5.2-2025-12-11"
+JARVIS_OPENAI_CHAT_MODEL: Final = "gpt-5.4-2026-03-05"
 JARVIS_OPENAI_TEMPERATURE: Final = 1.0
 JARVIS_OPENAI_MAX_OUTPUT_TOKENS: Final = 64_000
 JARVIS_OPENAI_REASONING_EFFORT: Final = "none"

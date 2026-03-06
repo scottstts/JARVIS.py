@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import os
@@ -39,6 +40,7 @@ from ..types import (
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
+    ToolResultPart,
     UsageDeltaEvent,
 )
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call
@@ -173,25 +175,36 @@ class GeminiProvider:
     def _build_generate_payload(self, request: LLMRequest) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         contents: list[dict[str, Any]] = []
         system_parts: list[str] = []
+        pending_function_responses: list[dict[str, Any]] = []
 
         for message in request.messages:
-            text_parts: list[str] = []
-            for part in message.parts:
-                if isinstance(part, ImagePart):
-                    raise LLMConfigurationError("Gemini provider does not support image input in this layer yet.")
-                if isinstance(part, TextPart):
-                    text_parts.append(part.text)
-
-            text = "\n".join(text_parts).strip()
-            if not text:
-                continue
-
             if message.role in {"system", "developer"}:
-                system_parts.append(text)
+                text = _join_text_parts(
+                    message.parts,
+                    unsupported_message="Gemini system/developer history only supports text parts.",
+                )
+                if text:
+                    system_parts.append(text)
                 continue
 
+            if message.role == "tool":
+                pending_function_responses.extend(
+                    self._to_gemini_function_response_parts(message)
+                )
+                continue
+
+            if pending_function_responses:
+                contents.append({"role": "user", "parts": pending_function_responses})
+                pending_function_responses = []
+
+            parts = self._to_gemini_content_parts(message)
+            if not parts:
+                continue
             role = "model" if message.role == "assistant" else "user"
-            contents.append({"role": role, "parts": [{"text": text}]})
+            contents.append({"role": role, "parts": parts})
+
+        if pending_function_responses:
+            contents.append({"role": "user", "parts": pending_function_responses})
 
         config: dict[str, Any] = {}
         system_instruction = "\n\n".join(system_parts).strip()
@@ -211,7 +224,7 @@ class GeminiProvider:
                 {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": dict(tool.input_schema),
+                    "parameters_json_schema": dict(tool.input_schema),
                 }
                 for tool in request.tools
             ]
@@ -265,6 +278,58 @@ class GeminiProvider:
             function_calling_config["allowed_function_names"] = allowed
         return {"function_calling_config": function_calling_config}
 
+    def _to_gemini_content_parts(self, message: Any) -> list[dict[str, Any]]:
+        parts: list[dict[str, Any]] = []
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                parts.append({"text": part.text})
+            elif isinstance(part, ToolCall):
+                if message.role != "assistant":
+                    raise LLMConfigurationError(
+                        "Tool call history can only appear on assistant messages."
+                    )
+                function_call_part: dict[str, Any] = {
+                    "function_call": {
+                        "name": part.name,
+                        "args": part.arguments,
+                    }
+                }
+                thought_signature = _decode_gemini_thought_signature(
+                    part.provider_metadata
+                )
+                if thought_signature is not None:
+                    function_call_part["thought_signature"] = thought_signature
+                parts.append(function_call_part)
+            elif isinstance(part, ImagePart):
+                raise LLMConfigurationError(
+                    "Gemini provider does not support image input in this layer yet."
+                )
+            else:
+                raise LLMConfigurationError(
+                    f"Unsupported Gemini message part type: {type(part).__name__}."
+                )
+        return parts
+
+    def _to_gemini_function_response_parts(self, message: Any) -> list[dict[str, Any]]:
+        parts: list[dict[str, Any]] = []
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                raise LLMConfigurationError(
+                    "Tool-role messages can only contain tool results for Gemini."
+                )
+            parts.append(
+                {
+                    "function_response": {
+                        "name": part.name,
+                        "response": {
+                            "ok": not part.is_error,
+                            "content": part.content,
+                        },
+                    }
+                }
+            )
+        return parts
+
     def _normalize_generate_response(self, *, request: LLMRequest, response: Any) -> LLMResponse:
         tool_calls = self._extract_tool_calls(
             candidates=response.candidates or [],
@@ -310,7 +375,7 @@ class GeminiProvider:
         return LLMResponse(
             provider=self.name,
             model=request.model or "",
-            text=response.text or "",
+            text=self._extract_text_response(response),
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
@@ -320,6 +385,18 @@ class GeminiProvider:
                 "finish_reason": candidate_finish,
             },
         )
+
+    def _extract_text_response(self, response: Any) -> str:
+        text_parts: list[str] = []
+        for candidate in response.candidates or []:
+            content = getattr(candidate, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                text = getattr(part, "text", None)
+                if isinstance(text, str) and text:
+                    text_parts.append(text)
+        return "".join(text_parts)
 
     def _extract_tool_calls(
         self,
@@ -342,6 +419,16 @@ class GeminiProvider:
                 call_id = getattr(function_call, "id", None) or function_call.name
                 arguments = function_call.args or {}
                 raw_arguments = json.dumps(arguments)
+                thought_signature = _extract_gemini_thought_signature(part)
+                provider_metadata = (
+                    {
+                        "thought_signature_b64": base64.b64encode(thought_signature).decode(
+                            "ascii"
+                        )
+                    }
+                    if thought_signature is not None
+                    else {}
+                )
                 tool_calls.append(
                     parse_and_validate_tool_call(
                         call_id=call_id,
@@ -350,6 +437,14 @@ class GeminiProvider:
                         tool_schemas=tool_schemas,
                     )
                 )
+                if provider_metadata:
+                    tool_calls[-1] = ToolCall(
+                        call_id=tool_calls[-1].call_id,
+                        name=tool_calls[-1].name,
+                        arguments=tool_calls[-1].arguments,
+                        raw_arguments=tool_calls[-1].raw_arguments,
+                        provider_metadata=provider_metadata,
+                    )
 
         return tool_calls
 
@@ -377,3 +472,32 @@ class GeminiProvider:
                 return ProviderTemporaryError(str(error))
             return ProviderBadRequestError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _extract_gemini_thought_signature(part: Any) -> bytes | None:
+    signature = getattr(part, "thought_signature", None)
+    if signature is None:
+        signature = getattr(part, "thoughtSignature", None)
+    if isinstance(signature, bytes) and signature:
+        return signature
+    return None
+
+
+def _decode_gemini_thought_signature(provider_metadata: dict[str, Any]) -> bytes | None:
+    encoded = provider_metadata.get("thought_signature_b64")
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    try:
+        return base64.b64decode(encoded)
+    except (ValueError, TypeError):
+        return None
+
+
+def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:
+    text_parts: list[str] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            text_parts.append(part.text)
+            continue
+        raise LLMConfigurationError(unsupported_message)
+    return "\n".join(text_parts).strip()

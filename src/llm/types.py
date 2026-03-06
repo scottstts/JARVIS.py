@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Mapping, Sequence, TypeAlias
 
-LLMRole: TypeAlias = Literal["system", "developer", "user", "assistant"]
+LLMRole: TypeAlias = Literal["system", "developer", "user", "assistant", "tool"]
 ImageDetail: TypeAlias = Literal["low", "high", "auto"]
 FinishReason: TypeAlias = Literal[
     "stop",
@@ -51,13 +51,31 @@ class ImagePart:
         )
 
 
-InputPart: TypeAlias = TextPart | ImagePart
+@dataclass(slots=True, frozen=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    raw_arguments: str
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class ToolResultPart:
+    call_id: str
+    name: str
+    content: str
+    is_error: bool = False
+    type: Literal["tool_result"] = "tool_result"
+
+
+MessagePart: TypeAlias = TextPart | ImagePart | ToolCall | ToolResultPart
 
 
 @dataclass(slots=True, frozen=True)
 class LLMMessage:
     role: LLMRole
-    parts: tuple[InputPart, ...]
+    parts: tuple[MessagePart, ...]
 
     def __post_init__(self) -> None:
         if not self.parts:
@@ -66,18 +84,6 @@ class LLMMessage:
     @classmethod
     def text(cls, role: LLMRole, text: str) -> "LLMMessage":
         return cls(role=role, parts=(TextPart(text=text),))
-
-
-@dataclass(slots=True, frozen=True)
-class ToolDefinition:
-    name: str
-    input_schema: Mapping[str, Any]
-    description: str | None = None
-    strict: bool = True
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("ToolDefinition.name cannot be empty.")
 
 
 class ToolChoiceMode(StrEnum):
@@ -123,11 +129,15 @@ class LLMUsage:
 
 
 @dataclass(slots=True, frozen=True)
-class ToolCall:
-    call_id: str
+class ToolDefinition:
     name: str
-    arguments: dict[str, Any]
-    raw_arguments: str
+    input_schema: Mapping[str, Any]
+    description: str | None = None
+    strict: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("ToolDefinition.name cannot be empty.")
 
 
 @dataclass(slots=True, frozen=True)

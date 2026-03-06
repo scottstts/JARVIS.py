@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import unittest
 
 from llm.config import (
@@ -12,7 +13,7 @@ from llm.config import (
 from llm.providers.anthropic_provider import AnthropicProvider
 from llm.providers.gemini_provider import GeminiProvider
 from llm.providers.openrouter_provider import OpenRouterProvider
-from llm.types import LLMMessage, LLMRequest
+from llm.types import LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
 
 
 class AnthropicProviderRequestShapeTests(unittest.TestCase):
@@ -40,6 +41,46 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(kwargs["messages"][1]["content"][0]["type"], "text")
         self.assertEqual(kwargs["messages"][2]["role"], "user")
 
+    def test_tool_roundtrip_uses_tool_use_and_tool_result_blocks(self) -> None:
+        provider = AnthropicProvider(
+            settings=AnthropicProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="claude-sonnet-4-6",
+            max_output_tokens=1024,
+            messages=(
+                LLMMessage(
+                    role="assistant",
+                    parts=(
+                        ToolCall(
+                            call_id="bash_1",
+                            name="bash",
+                            arguments={"command": "pwd"},
+                            raw_arguments='{"command":"pwd"}',
+                        ),
+                    ),
+                ),
+                LLMMessage(
+                    role="tool",
+                    parts=(
+                        ToolResultPart(
+                            call_id="bash_1",
+                            name="bash",
+                            content="Bash execution result\nstatus: success",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        kwargs = provider._build_messages_create_kwargs(request)
+        self.assertEqual(kwargs["messages"][0]["role"], "assistant")
+        self.assertEqual(kwargs["messages"][0]["content"][0]["type"], "tool_use")
+        self.assertEqual(kwargs["messages"][1]["role"], "user")
+        self.assertEqual(kwargs["messages"][1]["content"][0]["type"], "tool_result")
+        self.assertEqual(kwargs["messages"][1]["content"][0]["tool_use_id"], "bash_1")
+
 
 class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_maps_assistant_to_model_role(self) -> None:
@@ -65,6 +106,85 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(contents[1]["parts"][0]["text"], "Hi there")
         self.assertEqual(contents[2]["role"], "user")
 
+    def test_tool_definitions_use_parameters_json_schema(self) -> None:
+        provider = GeminiProvider(
+            settings=GeminiProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="gemini-3-flash-preview",
+            messages=(LLMMessage.text("user", "List files."),),
+            tools=(
+                ToolDefinition(
+                    name="bash",
+                    description="Run bash.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+        )
+
+        _contents, config = provider._build_generate_payload(request)
+        declaration = config["tools"][0]["function_declarations"][0]
+        self.assertIn("parameters_json_schema", declaration)
+        self.assertNotIn("parameters", declaration)
+        self.assertEqual(
+            declaration["parameters_json_schema"]["additionalProperties"],
+            False,
+        )
+
+    def test_tool_roundtrip_uses_function_call_and_function_response_parts(self) -> None:
+        provider = GeminiProvider(
+            settings=GeminiProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="gemini-3-flash-preview",
+            messages=(
+                LLMMessage(
+                    role="assistant",
+                    parts=(
+                        ToolCall(
+                            call_id="bash_1",
+                            name="bash",
+                            arguments={"command": "pwd"},
+                            raw_arguments='{"command":"pwd"}',
+                            provider_metadata={
+                                "thought_signature_b64": base64.b64encode(b"sig_123").decode(
+                                    "ascii"
+                                )
+                            },
+                        ),
+                    ),
+                ),
+                LLMMessage(
+                    role="tool",
+                    parts=(
+                        ToolResultPart(
+                            call_id="bash_1",
+                            name="bash",
+                            content="Bash execution result\nstatus: success",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        contents, _config = provider._build_generate_payload(request)
+        self.assertEqual(contents[0]["role"], "model")
+        self.assertIn("function_call", contents[0]["parts"][0])
+        self.assertEqual(contents[0]["parts"][0]["function_call"]["name"], "bash")
+        self.assertEqual(contents[0]["parts"][0]["thought_signature"], b"sig_123")
+        self.assertEqual(contents[1]["role"], "user")
+        self.assertIn("function_response", contents[1]["parts"][0])
+        self.assertEqual(contents[1]["parts"][0]["function_response"]["name"], "bash")
+
 
 class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
@@ -87,3 +207,42 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(payload["messages"][1], {"role": "user", "content": "Hello"})
         self.assertEqual(payload["messages"][2], {"role": "assistant", "content": "Hi there"})
         self.assertEqual(payload["messages"][3], {"role": "user", "content": "Second turn"})
+
+    def test_tool_roundtrip_uses_assistant_tool_calls_and_tool_role_messages(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="minimax/minimax-m2.5",
+            messages=(
+                LLMMessage(
+                    role="assistant",
+                    parts=(
+                        ToolCall(
+                            call_id="bash_1",
+                            name="bash",
+                            arguments={"command": "pwd"},
+                            raw_arguments='{"command":"pwd"}',
+                        ),
+                    ),
+                ),
+                LLMMessage(
+                    role="tool",
+                    parts=(
+                        ToolResultPart(
+                            call_id="bash_1",
+                            name="bash",
+                            content="Bash execution result\nstatus: success",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        payload = provider._build_chat_payload(request)
+        self.assertEqual(payload["messages"][0]["role"], "assistant")
+        self.assertEqual(payload["messages"][0]["tool_calls"][0]["id"], "bash_1")
+        self.assertIsNone(payload["messages"][0]["content"])
+        self.assertEqual(payload["messages"][1]["role"], "tool")
+        self.assertEqual(payload["messages"][1]["tool_call_id"], "bash_1")

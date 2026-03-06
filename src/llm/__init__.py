@@ -42,6 +42,7 @@ from .types import (
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
+    ToolResultPart,
     UsageDeltaEvent,
 )
 
@@ -84,6 +85,7 @@ __all__ = [
     "ToolChoice",
     "ToolChoiceMode",
     "ToolDefinition",
+    "ToolResultPart",
     "UnsupportedCapabilityError",
     "UsageDeltaEvent",
 ]

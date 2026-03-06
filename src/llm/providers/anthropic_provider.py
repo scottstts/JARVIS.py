@@ -50,6 +50,7 @@ from ..types import (
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
+    ToolResultPart,
     UsageDeltaEvent,
 )
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call
@@ -197,33 +198,99 @@ class AnthropicProvider:
     ) -> tuple[str | None, list[dict[str, Any]]]:
         system_parts: list[str] = []
         out_messages: list[dict[str, Any]] = []
+        pending_tool_results: list[dict[str, Any]] = []
 
         for message in messages:
-            text_parts: list[str] = []
-            for part in message.parts:
-                if isinstance(part, ImagePart):
-                    raise LLMConfigurationError("Anthropic provider does not support image input in this layer yet.")
-                if isinstance(part, TextPart):
-                    text_parts.append(part.text)
-
-            text = "\n".join(text_parts).strip()
-            if not text:
-                continue
-
             if message.role in {"system", "developer"}:
-                system_parts.append(text)
+                text = _join_text_parts(
+                    message.parts,
+                    unsupported_message=(
+                        "System/developer Anthropic history only supports text parts."
+                    ),
+                )
+                if text:
+                    system_parts.append(text)
                 continue
 
+            if message.role == "tool":
+                pending_tool_results.extend(self._to_anthropic_tool_result_blocks(message))
+                continue
+
+            if pending_tool_results:
+                out_messages.append(
+                    {
+                        "role": "user",
+                        "content": pending_tool_results,
+                    }
+                )
+                pending_tool_results = []
+
+            content_blocks = self._to_anthropic_content_blocks(message)
+            if not content_blocks:
+                continue
             role = "assistant" if message.role == "assistant" else "user"
             out_messages.append(
                 {
                     "role": role,
-                    "content": [{"type": "text", "text": text}],
+                    "content": content_blocks,
+                }
+            )
+
+        if pending_tool_results:
+            out_messages.append(
+                {
+                    "role": "user",
+                    "content": pending_tool_results,
                 }
             )
 
         system_prompt = "\n\n".join(system_parts).strip() or None
         return system_prompt, out_messages
+
+    def _to_anthropic_content_blocks(self, message: LLMMessage) -> list[dict[str, Any]]:
+        content_blocks: list[dict[str, Any]] = []
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                content_blocks.append({"type": "text", "text": part.text})
+            elif isinstance(part, ToolCall):
+                if message.role != "assistant":
+                    raise LLMConfigurationError(
+                        "Tool call history can only appear on assistant messages."
+                    )
+                content_blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": part.call_id,
+                        "name": part.name,
+                        "input": part.arguments,
+                    }
+                )
+            elif isinstance(part, ImagePart):
+                raise LLMConfigurationError(
+                    "Anthropic provider does not support image input in this layer yet."
+                )
+            else:
+                raise LLMConfigurationError(
+                    f"Unsupported Anthropic message part type: {type(part).__name__}."
+                )
+        return content_blocks
+
+    def _to_anthropic_tool_result_blocks(self, message: LLMMessage) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                raise LLMConfigurationError(
+                    "Tool-role messages can only contain tool results for Anthropic."
+                )
+            block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": part.call_id,
+                "content": part.content,
+            }
+            if part.is_error:
+                block["is_error"] = True
+            blocks.append(block)
+        return blocks
 
     def _to_anthropic_tool(self, tool: ToolDefinition) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -386,3 +453,13 @@ class AnthropicProvider:
         if isinstance(error, AnthropicError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:
+    text_parts: list[str] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            text_parts.append(part.text)
+            continue
+        raise LLMConfigurationError(unsupported_message)
+    return "\n".join(text_parts).strip()

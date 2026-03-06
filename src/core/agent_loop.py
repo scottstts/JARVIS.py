@@ -1,7 +1,6 @@
 """Core agentic loop with sessioning and context compaction policies."""
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Literal, Sequence
@@ -13,10 +12,13 @@ from llm import (
     LLMResponse,
     LLMService,
     ProviderBadRequestError,
+    TextPart,
+    ToolCall,
     ToolChoice,
-    ToolDefinition,
+    ToolResultPart,
 )
 from storage import ConversationRecord, SessionMetadata, SessionStorage
+from tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 
 from .commands import ParsedCommand, parse_user_command
 from .compaction import CompactionOutcome, ContextCompactor
@@ -81,7 +83,8 @@ class AgentLoop:
         llm_service: LLMService,
         settings: CoreSettings | None = None,
         storage: SessionStorage | None = None,
-        tools: Sequence[ToolDefinition] = (),
+        tool_registry: ToolRegistry | None = None,
+        tool_runtime: ToolRuntime | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
@@ -91,7 +94,10 @@ class AgentLoop:
             llm_service=self._llm_service,
             context_policy=self._settings.context_policy,
         )
-        self._tools = tuple(tools)
+        self._tool_settings = ToolSettings.from_workspace_dir(self._settings.workspace_dir)
+        self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
+        self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
+        self._tool_context = ToolExecutionContext(workspace_dir=self._tool_settings.workspace_dir)
 
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         command = parse_user_command(user_text)
@@ -187,7 +193,13 @@ class AgentLoop:
         *,
         force_session_id: str | None = None,
     ) -> AgentTurnResult:
-        session, request, estimated_input_tokens, did_compaction = await self._prepare_message_turn(
+        (
+            session,
+            base_records,
+            request,
+            estimated_input_tokens,
+            did_compaction,
+        ) = await self._prepare_message_turn(
             user_text=user_text,
             force_session_id=force_session_id,
         )
@@ -206,17 +218,36 @@ class AgentLoop:
         if overflow_compacted:
             did_compaction = True
 
+        base_records = self._storage.load_records(session.session_id)
+        pending_records = [
+            self._build_message_record(
+                session_id=session.session_id,
+                role="user",
+                content=user_text,
+            ),
+            self._build_assistant_record(session.session_id, response),
+        ]
+        final_response, final_estimated_input_tokens, _used_tool_rounds = (
+            await self._execute_followup_tool_rounds(
+                session=session,
+                base_records=base_records,
+                pending_records=pending_records,
+                current_response=response,
+                current_estimated_input_tokens=final_estimated_input_tokens,
+            )
+        )
+
         self._persist_successful_turn(
             session_id=session.session_id,
-            user_text=user_text,
-            response=response,
+            records=pending_records,
+            response=final_response,
             estimated_input_tokens=final_estimated_input_tokens,
         )
 
         refreshed = self._storage.get_session(session.session_id)
         threshold_observed = (
-            response.usage.input_tokens
-            if response.usage is not None and response.usage.input_tokens is not None
+            final_response.usage.input_tokens
+            if final_response.usage is not None and final_response.usage.input_tokens is not None
             else final_estimated_input_tokens
         )
         should_enqueue_reactive = (
@@ -230,7 +261,7 @@ class AgentLoop:
 
         return AgentTurnResult(
             session_id=session.session_id,
-            response_text=response.text,
+            response_text=final_response.text,
             compaction_performed=did_compaction,
         )
 
@@ -241,14 +272,20 @@ class AgentLoop:
         force_session_id: str | None = None,
         command_override: str | None = None,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
-        session, request, estimated_input_tokens, did_compaction = await self._prepare_message_turn(
+        (
+            session,
+            _base_records,
+            request,
+            estimated_input_tokens,
+            did_compaction,
+        ) = await self._prepare_message_turn(
             user_text=user_text,
             force_session_id=force_session_id,
         )
 
         overflow_compacted = False
         overflow_retry_attempted = False
-        final_response: LLMResponse | None = None
+        initial_response: LLMResponse | None = None
         final_estimated_input_tokens = estimated_input_tokens
 
         while True:
@@ -270,7 +307,7 @@ class AgentLoop:
                     raise RuntimeError(
                         "Streaming generation completed without a final done event."
                     )
-                final_response = streamed_response
+                initial_response = streamed_response
                 break
             except ProviderBadRequestError as exc:
                 if overflow_retry_attempted or emitted_any or not _is_context_overflow_error(exc):
@@ -281,7 +318,16 @@ class AgentLoop:
                 raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
 
             records = self._storage.load_records(compacted.session_id)
-            request = self._build_request(records, pending_user_text=user_text)
+            request = self._build_request(
+                records
+                + [
+                    self._build_message_record(
+                        session_id=compacted.session_id,
+                        role="user",
+                        content=user_text,
+                    )
+                ]
+            )
             retry_estimate = estimate_request_input_tokens(request)
             if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
                 raise ContextBudgetError(
@@ -293,14 +339,38 @@ class AgentLoop:
             overflow_compacted = True
             overflow_retry_attempted = True
 
-        if final_response is None:
+        if initial_response is None:
             raise RuntimeError("Streaming generation produced no final response.")
         if overflow_compacted:
             did_compaction = True
 
+        base_records = self._storage.load_records(session.session_id)
+        pending_records = [
+            self._build_message_record(
+                session_id=session.session_id,
+                role="user",
+                content=user_text,
+            ),
+            self._build_assistant_record(session.session_id, initial_response),
+        ]
+        final_response, final_estimated_input_tokens, used_tool_rounds = (
+            await self._execute_followup_tool_rounds(
+                session=session,
+                base_records=base_records,
+                pending_records=pending_records,
+                current_response=initial_response,
+                current_estimated_input_tokens=final_estimated_input_tokens,
+            )
+        )
+        if used_tool_rounds and final_response.text:
+            yield AgentTextDeltaEvent(
+                session_id=session.session_id,
+                delta=final_response.text,
+            )
+
         self._persist_successful_turn(
             session_id=session.session_id,
-            user_text=user_text,
+            records=pending_records,
             response=final_response,
             estimated_input_tokens=final_estimated_input_tokens,
         )
@@ -332,7 +402,7 @@ class AgentLoop:
         *,
         user_text: str,
         force_session_id: str | None = None,
-    ) -> tuple[SessionMetadata, LLMRequest, int, bool]:
+    ) -> tuple[SessionMetadata, list[ConversationRecord], LLMRequest, int, bool]:
         session = self._storage.get_session(force_session_id) if force_session_id else None
         if session is None:
             session = self._ensure_active_session()
@@ -345,7 +415,16 @@ class AgentLoop:
                 did_compaction = True
 
         records = self._storage.load_records(session.session_id)
-        request = self._build_request(records, pending_user_text=user_text)
+        request = self._build_request(
+            records
+            + [
+                self._build_message_record(
+                    session_id=session.session_id,
+                    role="user",
+                    content=user_text,
+                )
+            ]
+        )
         estimated_input_tokens = estimate_request_input_tokens(request)
 
         if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
@@ -354,7 +433,16 @@ class AgentLoop:
                 session = compacted
                 did_compaction = True
                 records = self._storage.load_records(session.session_id)
-                request = self._build_request(records, pending_user_text=user_text)
+                request = self._build_request(
+                    records
+                    + [
+                        self._build_message_record(
+                            session_id=session.session_id,
+                            role="user",
+                            content=user_text,
+                        )
+                    ]
+                )
                 estimated_input_tokens = estimate_request_input_tokens(request)
 
         if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
@@ -362,7 +450,7 @@ class AgentLoop:
                 "Request is still over the preflight context budget after compaction."
             )
 
-        return session, request, estimated_input_tokens, did_compaction
+        return session, records, request, estimated_input_tokens, did_compaction
 
     async def _generate_with_overflow_retry(
         self,
@@ -384,7 +472,16 @@ class AgentLoop:
             raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
 
         records = self._storage.load_records(compacted.session_id)
-        retry_request = self._build_request(records, pending_user_text=user_text)
+        retry_request = self._build_request(
+            records
+            + [
+                self._build_message_record(
+                    session_id=compacted.session_id,
+                    role="user",
+                    content=user_text,
+                )
+            ]
+        )
         retry_estimate = estimate_request_input_tokens(retry_request)
         if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
             raise ContextBudgetError(
@@ -397,35 +494,12 @@ class AgentLoop:
         self,
         *,
         session_id: str,
-        user_text: str,
+        records: Sequence[ConversationRecord],
         response: LLMResponse,
         estimated_input_tokens: int,
     ) -> None:
-        self._append_message(
-            session_id=session_id,
-            role="user",
-            content=user_text,
-        )
-        assistant_metadata: dict[str, Any] = {
-            "provider": response.provider,
-            "model": response.model,
-            "response_id": response.response_id,
-            "finish_reason": response.finish_reason,
-            "tool_calls": [
-                {
-                    "call_id": call.call_id,
-                    "name": call.name,
-                    "arguments": call.arguments,
-                }
-                for call in response.tool_calls
-            ],
-        }
-        self._append_message(
-            session_id=session_id,
-            role="assistant",
-            content=response.text,
-            metadata=assistant_metadata,
-        )
+        for record in records:
+            self._storage.append_record(session_id, record)
 
         usage = response.usage
         self._storage.update_session(
@@ -439,21 +513,60 @@ class AgentLoop:
     def _build_request(
         self,
         records: Sequence[ConversationRecord],
-        *,
-        pending_user_text: str,
     ) -> LLMRequest:
-        messages = [
-            LLMMessage.text(record.role, record.content)
-            for record in records
-            if record.kind == "message"
-            and record.role in {"system", "developer", "user", "assistant"}
-        ]
-        messages.append(LLMMessage.text("user", pending_user_text))
+        messages: list[LLMMessage] = []
+        for record in records:
+            if record.kind != "message":
+                continue
+            llm_message = _record_to_llm_message(record)
+            if llm_message is not None:
+                messages.append(llm_message)
         return LLMRequest(
             messages=tuple(messages),
-            tools=self._tools,
+            tools=self._tool_registry.basic_definitions(),
             tool_choice=ToolChoice.auto(),
         )
+
+    async def _execute_followup_tool_rounds(
+        self,
+        *,
+        session: SessionMetadata,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        current_response: LLMResponse,
+        current_estimated_input_tokens: int,
+    ) -> tuple[LLMResponse, int, bool]:
+        tool_rounds = 0
+
+        while current_response.tool_calls:
+            tool_rounds += 1
+            if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
+                raise RuntimeError(
+                    "Tool loop exceeded max rounds for a single turn."
+                )
+
+            for tool_call in current_response.tool_calls:
+                tool_result = await self._tool_runtime.execute(
+                    tool_call=tool_call,
+                    context=self._tool_context,
+                )
+                pending_records.append(
+                    self._build_tool_record(session.session_id, tool_result)
+                )
+
+            request = self._build_request(list(base_records) + pending_records)
+            current_estimated_input_tokens = estimate_request_input_tokens(request)
+            if current_estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+                raise ContextBudgetError(
+                    "Tool output exceeded the context budget during the current turn."
+                )
+
+            current_response = await self._llm_service.generate(request)
+            pending_records.append(
+                self._build_assistant_record(session.session_id, current_response)
+            )
+
+        return current_response, current_estimated_input_tokens, tool_rounds > 0
 
     def _ensure_active_session(self) -> SessionMetadata:
         active = self._storage.get_active_session()
@@ -565,6 +678,72 @@ class AgentLoop:
         )
         self._storage.append_record(session_id, record)
 
+    def _build_message_record(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> ConversationRecord:
+        return ConversationRecord(
+            record_id=uuid4().hex,
+            session_id=session_id,
+            created_at=_utc_now_iso(),
+            role=role,  # type: ignore[arg-type]
+            content=content,
+            kind="message",
+            metadata=metadata or {},
+        )
+
+    def _build_assistant_record(
+        self,
+        session_id: str,
+        response: LLMResponse,
+    ) -> ConversationRecord:
+        assistant_metadata: dict[str, Any] = {
+            "provider": response.provider,
+            "model": response.model,
+            "response_id": response.response_id,
+            "finish_reason": response.finish_reason,
+            "tool_calls": [
+                {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "raw_arguments": call.raw_arguments,
+                    "provider_metadata": dict(call.provider_metadata),
+                }
+                for call in response.tool_calls
+            ],
+        }
+        return self._build_message_record(
+            session_id=session_id,
+            role="assistant",
+            content=response.text,
+            metadata=assistant_metadata,
+        )
+
+    def _build_tool_record(
+        self,
+        session_id: str,
+        result: ToolExecutionResult,
+    ) -> ConversationRecord:
+        metadata = dict(result.metadata)
+        metadata.update(
+            {
+                "tool_name": result.name,
+                "call_id": result.call_id,
+                "ok": result.ok,
+            }
+        )
+        return self._build_message_record(
+            session_id=session_id,
+            role="tool",
+            content=result.content,
+            metadata=metadata,
+        )
+
     def _append_message(
         self,
         *,
@@ -573,14 +752,11 @@ class AgentLoop:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        record = ConversationRecord(
-            record_id=uuid4().hex,
+        record = self._build_message_record(
             session_id=session_id,
-            created_at=_utc_now_iso(),
-            role=role,  # type: ignore[arg-type]
+            role=role,
             content=content,
-            kind="message",
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self._storage.append_record(session_id, record)
 
@@ -592,3 +768,58 @@ def _utc_now_iso() -> str:
 def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:
     message = str(exc).lower()
     return any(hint in message for hint in _OVERFLOW_ERROR_HINTS)
+
+
+def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
+    if record.role in {"system", "developer", "user"}:
+        if not record.content:
+            return None
+        return LLMMessage.text(record.role, record.content)
+
+    if record.role == "assistant":
+        parts: list[TextPart | ToolCall] = []
+        if record.content:
+            parts.append(TextPart(text=record.content))
+        for tool_call in record.metadata.get("tool_calls", []):
+            if not isinstance(tool_call, dict):
+                continue
+            call_id = str(tool_call.get("call_id", "")).strip()
+            name = str(tool_call.get("name", "")).strip()
+            raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
+            arguments = tool_call.get("arguments", {})
+            provider_metadata = tool_call.get("provider_metadata", {})
+            if not call_id or not name or not raw_arguments or not isinstance(arguments, dict):
+                continue
+            if not isinstance(provider_metadata, dict):
+                provider_metadata = {}
+            parts.append(
+                ToolCall(
+                    call_id=call_id,
+                    name=name,
+                    arguments=dict(arguments),
+                    raw_arguments=raw_arguments,
+                    provider_metadata=dict(provider_metadata),
+                )
+            )
+        if not parts:
+            return None
+        return LLMMessage(role="assistant", parts=tuple(parts))
+
+    if record.role == "tool":
+        call_id = str(record.metadata.get("call_id", "")).strip()
+        tool_name = str(record.metadata.get("tool_name", "")).strip()
+        if not call_id or not tool_name:
+            return None
+        return LLMMessage(
+            role="tool",
+            parts=(
+                ToolResultPart(
+                    call_id=call_id,
+                    name=tool_name,
+                    content=record.content,
+                    is_error=not bool(record.metadata.get("ok", False)),
+                ),
+            ),
+        )
+
+    return None

@@ -24,3 +24,11 @@
 - Telegram UI can be restricted to a single owner by setting `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; unauthorized private messages are ignored without a reply.
 - Telegram file messages now download the original attachment into `JARVIS_UI_TELEGRAM_TEMP_DIR` (default `/workspace/temp`), inject a metadata-only user message pointing at that local path, and expose an owner-file send interface for future agent tools. **important:** this file send telegram interface (for agent to send files to user's telegram) will be used later for agent's send_file tool implementation.
 - In docker compose added command to copy src/identities/. to /workspace/identities/, and wire the agent runtime to use /workspace/identities/ for starter files instead
+- Added `src/tools/` with a registry/runtime/policy split and exposure classes (`basic` vs `discoverable`); only the `bash` tool is actually registered and auto-exposed right now.
+- Bash tool v1 is intentionally restrictive: sequential tool rounds, workspace-only writes, conservative shell syntax allowlist, and executor failures are converted into structured tool-error results instead of crashing the turn.
+- Tool-specific code under `src/tools/` should live in its own subpackage (for example `src/tools/bash/`), while `src/tools/policy.py` stays as the universal policy interface/router.
+- Gemini tool declarations must use `parameters_json_schema` instead of `parameters`; otherwise schemas with `additionalProperties: false` cause a 400 from the Gemini API.
+- OpenAI strict function schemas require every property to appear in `required`; optional fields must be represented as nullable in the outbound schema, and returned `null` values for omitted optionals should be normalized away before validating against the original tool schema.
+- Tool follow-up rounds now rebuild structured assistant tool calls and tool results into provider-native request shapes in `src/llm/`, so internal tool-call payloads no longer leak into user-facing Telegram replies.
+- Gemini tool-call history must preserve `thought_signature`; store it in provider metadata as base64 and restore it to bytes on the follow-up request.
+- `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.

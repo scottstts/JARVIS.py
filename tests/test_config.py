@@ -46,5 +46,6 @@ class CoreSettingsTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             settings = CoreSettings.from_env()
 
+        self.assertEqual(settings.workspace_dir, Path("/workspace"))
         self.assertEqual(settings.storage_dir, Path("/workspace/storage"))
         self.assertEqual(settings.identities_dir, Path("/workspace/identities"))
