@@ -47,4 +47,4 @@ class CoreSettingsTests(unittest.TestCase):
             settings = CoreSettings.from_env()
 
         self.assertEqual(settings.storage_dir, Path("/workspace/storage"))
-        self.assertEqual(settings.identities_dir, Path("src/identities"))
+        self.assertEqual(settings.identities_dir, Path("/workspace/identities"))

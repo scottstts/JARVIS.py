@@ -18,7 +18,7 @@ AGENT_WORKSPACE: Final[str | None] = "/workspace"
 JARVIS_STORAGE_DIR: Final[str | None] = (
     f"{AGENT_WORKSPACE}/storage" if AGENT_WORKSPACE is not None else None
 )
-JARVIS_IDENTITIES_DIR: Final = "src/identities"
+JARVIS_IDENTITIES_DIR: Final = "/workspace/identities"
 
 # Telegram UI runtime.
 TELEGRAM_API_BASE_URL: Final = "https://api.telegram.org"
