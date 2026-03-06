@@ -13,7 +13,7 @@ services:
 
       # Persistent agent workspace (memory/sessions/cache) on your Mac
       # Change the left side if you want a different host path.
-      - ${AGENT_ROOT:-${HOME}/.jarvis/labs}:/workspace
+      - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace
 
       # Persist uv cache between container rebuilds (fast installs)
       - uv_cache:/root/.cache/uv
