@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from ui.telegram.api import DraftMessage, TelegramAPIError
+from ui.telegram.api import DraftMessage, TelegramAPIError, TelegramRemoteFile
 from ui.telegram.bot import (
+    IncomingTelegramFile,
     IncomingTextMessage,
     TelegramGatewayBridge,
+    _clear_directory_contents,
+    parse_incoming_message,
     parse_incoming_text_message,
     route_id_for_chat,
     split_telegram_message,
 )
 from ui.telegram.config import UISettings
-from ui.telegram.gateway_client import GatewayBridgeError, GatewayDeltaEvent, GatewayDoneEvent
+from ui.telegram.gateway_client import (
+    GatewayBridgeError,
+    GatewayDeltaEvent,
+    GatewayDoneEvent,
+)
 
 
 @dataclass(slots=True)
@@ -33,19 +42,39 @@ class _SentDraft:
     parse_mode: str | None
 
 
+@dataclass(slots=True)
+class _DownloadedFile:
+    remote_file_path: str
+    destination_path: Path
+
+
+@dataclass(slots=True)
+class _SentDocument:
+    chat_id: int
+    file_path: Path
+    caption: str | None
+    filename: str | None
+
+
 class _FakeTelegramClient:
     def __init__(
         self,
         updates: list[dict[str, Any]] | None = None,
         *,
+        remote_files: dict[str, TelegramRemoteFile] | None = None,
+        download_payloads: dict[str, bytes] | None = None,
         draft_errors: list[TelegramAPIError] | None = None,
         message_errors: list[TelegramAPIError] | None = None,
     ) -> None:
         self._updates = updates or []
+        self._remote_files = remote_files or {}
+        self._download_payloads = download_payloads or {}
         self._draft_errors = draft_errors or []
         self._message_errors = message_errors or []
         self.sent_messages: list[_SentMessage] = []
         self.sent_drafts: list[_SentDraft] = []
+        self.downloaded_files: list[_DownloadedFile] = []
+        self.sent_documents: list[_SentDocument] = []
         self.message_attempts = 0
         self.draft_attempts = 0
         self.closed = False
@@ -64,6 +93,26 @@ class _FakeTelegramClient:
         updates = self._updates
         self._updates = []
         return updates
+
+    async def get_file(self, *, file_id: str) -> TelegramRemoteFile:
+        return self._remote_files[file_id]
+
+    async def download_file(
+        self,
+        *,
+        remote_file_path: str,
+        destination_path: str | Path,
+    ) -> Path:
+        destination = Path(destination_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(self._download_payloads.get(remote_file_path, b""))
+        self.downloaded_files.append(
+            _DownloadedFile(
+                remote_file_path=remote_file_path,
+                destination_path=destination,
+            )
+        )
+        return destination
 
     async def send_message(
         self,
@@ -95,6 +144,24 @@ class _FakeTelegramClient:
         )
         return True
 
+    async def send_document(
+        self,
+        *,
+        chat_id: int,
+        file_path: str | Path,
+        caption: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        self.sent_documents.append(
+            _SentDocument(
+                chat_id=chat_id,
+                file_path=Path(file_path),
+                caption=caption,
+                filename=filename,
+            )
+        )
+        return {"message_id": len(self.sent_documents)}
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -118,12 +185,14 @@ class _FakeGatewayClient:
             yield event
 
 
-def _settings() -> UISettings:
-    return UISettings(
-        telegram_token="test-token",
-        stream_draft_min_interval_seconds=0.0,
-        stream_draft_min_chars=1,
-    )
+def _settings(**overrides: object) -> UISettings:
+    values: dict[str, object] = {
+        "telegram_token": "test-token",
+        "stream_draft_min_interval_seconds": 0.0,
+        "stream_draft_min_chars": 1,
+    }
+    values.update(overrides)
+    return UISettings(**values)
 
 
 class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -155,6 +224,61 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.calls, [("tg_123", "hello")])
         self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
 
+    async def test_poll_once_downloads_file_and_forwards_metadata_text(self) -> None:
+        updates = [
+            {
+                "update_id": 10,
+                "message": {
+                    "message_id": 100,
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                    "caption": "please review",
+                    "document": {
+                        "file_id": "file-1",
+                        "file_unique_id": "unique-1",
+                        "file_name": "report.pdf",
+                        "mime_type": "application/pdf",
+                        "file_size": 42,
+                    },
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            telegram = _FakeTelegramClient(
+                updates=updates,
+                remote_files={
+                    "file-1": TelegramRemoteFile(
+                        file_id="file-1",
+                        file_unique_id="unique-1",
+                        file_path="documents/report.pdf",
+                        file_size=42,
+                    )
+                },
+                download_payloads={"documents/report.pdf": b"%PDF-1.4"},
+            )
+            gateway = _FakeGatewayClient(
+                events=[GatewayDoneEvent(session_id="s", text="pong")],
+            )
+            bridge = TelegramGatewayBridge(
+                settings=_settings(telegram_temp_dir=Path(tmp)),
+                telegram_client=telegram,
+                gateway_client=gateway,
+            )
+
+            await bridge.poll_once(offset=None)
+
+            self.assertEqual(len(telegram.downloaded_files), 1)
+            downloaded_path = telegram.downloaded_files[0].destination_path
+            self.assertTrue(downloaded_path.exists())
+            self.assertEqual(downloaded_path.read_bytes(), b"%PDF-1.4")
+            self.assertEqual(gateway.calls[0][0], "tg_123")
+            self.assertIn("filename: report.pdf", gateway.calls[0][1])
+            self.assertIn("telegram_media_type: document", gateway.calls[0][1])
+            self.assertIn("mime_type: application/pdf", gateway.calls[0][1])
+            self.assertIn("size_bytes: 42", gateway.calls[0][1])
+            self.assertIn(f"local_path: {downloaded_path}", gateway.calls[0][1])
+            self.assertIn("caption: please review", gateway.calls[0][1])
+
     async def test_poll_once_ignores_private_message_from_unauthorized_user(self) -> None:
         updates = [
             {
@@ -172,12 +296,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             events=[GatewayDoneEvent(session_id="s", text="pong")],
         )
         bridge = TelegramGatewayBridge(
-            settings=UISettings(
-                telegram_token="test-token",
-                telegram_allowed_user_id=999,
-                stream_draft_min_interval_seconds=0.0,
-                stream_draft_min_chars=1,
-            ),
+            settings=_settings(telegram_allowed_user_id=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -234,10 +353,22 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
-        self.assertEqual([draft.draft.text for draft in telegram.sent_drafts], ["stream-", "stream-reply"])
-        self.assertEqual([message.text for message in telegram.sent_messages], ["stream-reply"])
-        self.assertEqual([draft.parse_mode for draft in telegram.sent_drafts], ["HTML", "HTML"])
-        self.assertEqual([message.parse_mode for message in telegram.sent_messages], ["HTML"])
+        self.assertEqual(
+            [draft.draft.text for draft in telegram.sent_drafts],
+            ["stream-", "stream-reply"],
+        )
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["stream-reply"],
+        )
+        self.assertEqual(
+            [draft.parse_mode for draft in telegram.sent_drafts],
+            ["HTML", "HTML"],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.sent_messages],
+            ["HTML"],
+        )
 
     async def test_handle_message_ignores_non_private_chat(self) -> None:
         telegram = _FakeTelegramClient()
@@ -264,12 +395,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             events=[GatewayDoneEvent(session_id="session", text="should-not-send")],
         )
         bridge = TelegramGatewayBridge(
-            settings=UISettings(
-                telegram_token="test-token",
-                telegram_allowed_user_id=777,
-                stream_draft_min_interval_seconds=0.0,
-                stream_draft_min_chars=1,
-            ),
+            settings=_settings(telegram_allowed_user_id=777),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -287,6 +413,29 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.calls, [])
         self.assertEqual(telegram.sent_messages, [])
         self.assertEqual(telegram.sent_drafts, [])
+
+    async def test_send_file_to_owner_uses_allowed_user_id(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(telegram_allowed_user_id=777),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "note.txt"
+            file_path.write_text("hello", encoding="utf-8")
+
+            await bridge.send_file_to_owner(
+                file_path=file_path,
+                caption="attached",
+                filename="custom.txt",
+            )
+
+        self.assertEqual(len(telegram.sent_documents), 1)
+        self.assertEqual(telegram.sent_documents[0].chat_id, 777)
+        self.assertEqual(telegram.sent_documents[0].caption, "attached")
+        self.assertEqual(telegram.sent_documents[0].filename, "custom.txt")
 
     async def test_long_final_text_is_split(self) -> None:
         long_text = "a" * 5000
@@ -323,7 +472,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
         )
 
-        self.assertEqual([message.text for message in telegram.sent_messages], ["gateway failed"])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["gateway failed"],
+        )
 
     async def test_draft_rate_limit_disables_drafts_for_current_and_next_turn(self) -> None:
         telegram = _FakeTelegramClient(
@@ -356,7 +508,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(telegram.draft_attempts, 1)
         self.assertEqual(telegram.sent_drafts, [])
-        self.assertEqual([message.text for message in telegram.sent_messages], ["stream-reply", "stream-reply"])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["stream-reply", "stream-reply"],
+        )
 
     async def test_final_message_renders_markdown_as_html(self) -> None:
         telegram = _FakeTelegramClient()
@@ -432,6 +587,53 @@ class TelegramBotHelpersTests(unittest.TestCase):
         self.assertEqual(parsed.chat_id, 321)
         self.assertEqual(parsed.sender_user_id, 321)
         self.assertEqual(parsed.text, "hello")
+
+    def test_parse_incoming_message_extracts_document_metadata(self) -> None:
+        parsed = parse_incoming_message(
+            {
+                "update_id": 14,
+                "message": {
+                    "from": {"id": 321},
+                    "chat": {"id": 321, "type": "private"},
+                    "caption": "review this",
+                    "document": {
+                        "file_id": "file-1",
+                        "file_unique_id": "unique-1",
+                        "file_name": "report.pdf",
+                        "mime_type": "application/pdf",
+                        "file_size": 42,
+                    },
+                },
+            }
+        )
+        self.assertIsNotNone(parsed)
+        if parsed is None:
+            self.fail("Expected parsed incoming message.")
+        self.assertEqual(parsed.text, "review this")
+        self.assertEqual(
+            parsed.file_attachment,
+            IncomingTelegramFile(
+                telegram_media_type="document",
+                file_id="file-1",
+                file_unique_id="unique-1",
+                original_file_name="report.pdf",
+                mime_type="application/pdf",
+                size_bytes=42,
+                extra_metadata=(),
+            ),
+        )
+
+    def test_clear_directory_contents_removes_files_and_subdirectories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "child.txt").write_text("world", encoding="utf-8")
+
+            _clear_directory_contents(root)
+
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_route_id_for_negative_chat_id(self) -> None:
         self.assertEqual(route_id_for_chat(-123), "tg_n123")

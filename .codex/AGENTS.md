@@ -81,6 +81,7 @@ docker compose exec dev bash -lc "cd /repo && uv run <...>"
 - throughout the implementation, you will constantly ask me design choice questions like "option ABC, which do you want". This is because I'm not sure about some design choices yet, so constantly offer me options, alternatives, and challenge me when something doesn't seem to make obvious sense.
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
 - No need to delete __pycache__/
+- agent system runtime settings live in src/settings.py, and only secrets (api keys, bot tokens, etc.) and vars that needs to be in .env (like docker volume path for docker compose) will live in .env (and also .env.example--but use placeholders)
 
 # Notes & Lessons
 

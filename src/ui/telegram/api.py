@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -33,6 +34,14 @@ class DraftMessage:
     text: str
 
 
+@dataclass(slots=True, frozen=True)
+class TelegramRemoteFile:
+    file_id: str
+    file_path: str
+    file_unique_id: str | None = None
+    file_size: int | None = None
+
+
 class TelegramBotAPIClient:
     """Async client facade using requests under the hood."""
 
@@ -42,10 +51,15 @@ class TelegramBotAPIClient:
         token: str,
         api_base_url: str = "https://api.telegram.org",
         request_timeout_seconds: float = 20.0,
+        file_transfer_timeout_seconds: float = 120.0,
     ) -> None:
         self._token = token
         self._api_base_url = api_base_url.rstrip("/")
         self._request_timeout_seconds = request_timeout_seconds
+        self._file_transfer_timeout_seconds = max(
+            file_transfer_timeout_seconds,
+            request_timeout_seconds,
+        )
         self._session = requests.Session()
 
     async def aclose(self) -> None:
@@ -88,6 +102,48 @@ class TelegramBotAPIClient:
             )
         return [item for item in result if isinstance(item, dict)]
 
+    async def get_file(self, *, file_id: str) -> TelegramRemoteFile:
+        result = await self._call_method("getFile", payload={"file_id": file_id})
+        if not isinstance(result, dict):
+            raise TelegramAPIError(
+                code="invalid_telegram_response",
+                message="Telegram getFile returned an unexpected payload shape.",
+            )
+        file_path = result.get("file_path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise TelegramAPIError(
+                code="invalid_telegram_response",
+                message="Telegram getFile did not include a file_path.",
+            )
+        file_unique_id = result.get("file_unique_id")
+        file_size = result.get("file_size")
+        return TelegramRemoteFile(
+            file_id=(
+                str(result.get("file_id"))
+                if result.get("file_id") is not None
+                else file_id
+            ),
+            file_path=file_path,
+            file_unique_id=(
+                str(file_unique_id) if file_unique_id is not None else None
+            ),
+            file_size=file_size if isinstance(file_size, int) else None,
+        )
+
+    async def download_file(
+        self,
+        *,
+        remote_file_path: str,
+        destination_path: str | Path,
+    ) -> Path:
+        destination = Path(destination_path).expanduser()
+        await asyncio.to_thread(
+            self._download_file_blocking,
+            remote_file_path,
+            destination,
+        )
+        return destination
+
     async def send_message(
         self,
         *,
@@ -126,6 +182,28 @@ class TelegramBotAPIClient:
         result = await self._call_method("sendMessageDraft", payload=payload)
         return bool(result)
 
+    async def send_document(
+        self,
+        *,
+        chat_id: int,
+        file_path: str | Path,
+        caption: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        result = await asyncio.to_thread(
+            self._send_document_blocking,
+            chat_id,
+            Path(file_path).expanduser(),
+            caption,
+            filename,
+        )
+        if not isinstance(result, dict):
+            raise TelegramAPIError(
+                code="invalid_telegram_response",
+                message="Telegram sendDocument returned an unexpected payload shape.",
+            )
+        return result
+
     async def _call_method(
         self,
         method: str,
@@ -160,6 +238,75 @@ class TelegramBotAPIClient:
                 message=f"Telegram request failed for method '{method}'.",
             ) from exc
 
+        return self._parse_method_response(response, method=method)
+
+    def _send_document_blocking(
+        self,
+        chat_id: int,
+        file_path: Path,
+        caption: str | None,
+        filename: str | None,
+    ) -> Any:
+        url = f"{self._api_base_url}/bot{self._token}/sendDocument"
+        data: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption is not None:
+            data["caption"] = caption
+
+        with file_path.open("rb") as handle:
+            upload_name = filename or file_path.name
+            files = {"document": (upload_name, handle)}
+            try:
+                response = self._session.post(
+                    url,
+                    data=data,
+                    files=files,
+                    timeout=self._file_transfer_timeout_seconds,
+                )
+            except requests.RequestException as exc:
+                raise TelegramAPIError(
+                    code="telegram_http_error",
+                    message="Telegram request failed for method 'sendDocument'.",
+                ) from exc
+
+        return self._parse_method_response(response, method="sendDocument")
+
+    def _download_file_blocking(
+        self,
+        remote_file_path: str,
+        destination_path: Path,
+    ) -> None:
+        url = f"{self._api_base_url}/file/bot{self._token}/{remote_file_path.lstrip('/')}"
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            response = self._session.get(
+                url,
+                stream=True,
+                timeout=self._file_transfer_timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise TelegramAPIError(
+                code="telegram_http_error",
+                message=f"Telegram file download failed for path '{remote_file_path}'.",
+            ) from exc
+
+        if response.status_code >= 400:
+            raise TelegramAPIError(
+                code="telegram_http_error",
+                message=f"Telegram file download failed for path '{remote_file_path}'.",
+                status_code=response.status_code,
+            )
+
+        with destination_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+    def _parse_method_response(
+        self,
+        response: Any,
+        *,
+        method: str,
+    ) -> Any:
         try:
             parsed = response.json()
         except ValueError as exc:

@@ -13,9 +13,19 @@ JARVIS_GATEWAY_PORT: Final = 8080
 JARVIS_GATEWAY_WS_PATH: Final = "/ws"
 JARVIS_GATEWAY_MAX_MESSAGE_CHARS: Final = 32_000
 
+# Core workspace paths.
+AGENT_WORKSPACE: Final[str | None] = "/workspace"
+JARVIS_STORAGE_DIR: Final[str | None] = (
+    f"{AGENT_WORKSPACE}/storage" if AGENT_WORKSPACE is not None else None
+)
+JARVIS_IDENTITIES_DIR: Final = "src/identities"
+
 # Telegram UI runtime.
 TELEGRAM_API_BASE_URL: Final = "https://api.telegram.org"
 JARVIS_UI_TELEGRAM_ALLOWED_USER_ID: Final[int | None] = None
+JARVIS_UI_TELEGRAM_TEMP_DIR: Final[str | None] = (
+    f"{AGENT_WORKSPACE}/temp" if AGENT_WORKSPACE is not None else None
+)
 JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS: Final = 30
 JARVIS_UI_TELEGRAM_POLL_LIMIT: Final = 100
 JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS: Final = 2.0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from ui.telegram.config import UIConfigurationError, UISettings
@@ -64,6 +65,29 @@ class UISettingsTests(unittest.TestCase):
         ):
             with self.assertRaises(UIConfigurationError):
                 UISettings.from_env()
+
+    def test_defaults_telegram_temp_dir_from_settings(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+            },
+            clear=True,
+        ):
+            settings = UISettings.from_env()
+        self.assertEqual(settings.telegram_temp_dir, Path("/workspace/temp"))
+
+    def test_accepts_explicit_telegram_temp_dir(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_TEMP_DIR": "/tmp/jarvis-telegram",
+            },
+            clear=True,
+        ):
+            settings = UISettings.from_env()
+        self.assertEqual(settings.telegram_temp_dir, Path("/tmp/jarvis-telegram"))
 
     def test_rejects_invalid_poll_limit(self) -> None:
         with patch.dict(

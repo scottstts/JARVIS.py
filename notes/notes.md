@@ -22,3 +22,4 @@
 - Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.
 - Non-secret runtime defaults now live in `src/settings.py`; `.env` is reserved for secrets and machine-specific paths.
 - Telegram UI can be restricted to a single owner by setting `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; unauthorized private messages are ignored without a reply.
+- Telegram file messages now download the original attachment into `JARVIS_UI_TELEGRAM_TEMP_DIR` (default `/workspace/temp`), inject a metadata-only user message pointing at that local path, and expose an owner-file send interface for future agent tools. **important:** this file send telegram interface (for agent to send files to user's telegram) will be used later for agent's send_file tool implementation.

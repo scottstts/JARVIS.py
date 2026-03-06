@@ -99,7 +99,7 @@ class CoreSettings:
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
-        storage_root = _optional_env("JARVIS_STORAGE_DIR")
+        storage_root = _optional_env("JARVIS_STORAGE_DIR") or app_settings.JARVIS_STORAGE_DIR
         if storage_root is None:
             agent_workspace = _optional_env("AGENT_WORKSPACE")
             if agent_workspace is not None:
@@ -107,7 +107,7 @@ class CoreSettings:
             else:
                 storage_root = "~/.jarvis/storage"
 
-        identities_dir = _optional_env("JARVIS_IDENTITIES_DIR") or "src/identities"
+        identities_dir = _optional_env("JARVIS_IDENTITIES_DIR") or app_settings.JARVIS_IDENTITIES_DIR
 
         return cls(
             context_policy=ContextPolicySettings.from_env(),
