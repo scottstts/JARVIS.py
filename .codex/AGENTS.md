@@ -73,7 +73,7 @@ docker compose exec dev bash -lc "cd /repo && uv run <...>"
 
 ### Specific Doc for Agent Tools development
 
-During the development of agent tools (src/tools/), you need to follow a dedicated tool dev doc: /dev_docs/tool_dev_docs.md.
+During the development of agent tools (src/tools/), you need to follow a dedicated tool dev doc: /dev_docs/tool_dev_doc.md.
 
 Here you'll see the basic protocol and structure of how tools are built, what tools have been built, what yet to be built.
 
