@@ -20,3 +20,4 @@
 - Telegram draft streaming can hit Bot API 429 flood control; parse `retry_after`, pause drafts per chat for that interval, and still send the final assistant message.
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
 - Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.
+- Non-secret runtime defaults now live in `src/settings.py`; `.env` is reserved for secrets and machine-specific paths.

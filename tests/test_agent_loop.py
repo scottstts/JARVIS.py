@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import settings as app_settings
+
 from core import AgentLoop
 from llm import LLMService
 from storage import SessionStorage
@@ -17,7 +19,10 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         _load_dotenv_if_present()
-        provider = (os.getenv("JARVIS_LLM_DEFAULT_PROVIDER") or "").strip().lower()
+        provider = (
+            os.getenv("JARVIS_LLM_DEFAULT_PROVIDER")
+            or str(app_settings.JARVIS_LLM_DEFAULT_PROVIDER)
+        ).strip().lower()
         if provider == "openai" and not os.getenv("OPENAI_API_KEY"):
             raise unittest.SkipTest("OPENAI_API_KEY is not configured.")
         if provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):

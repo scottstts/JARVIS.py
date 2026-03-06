@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+import settings as app_settings
+
 
 class GatewayConfigurationError(ValueError):
     """Raised when gateway runtime settings are invalid."""
@@ -41,10 +43,10 @@ def _normalize_ws_path(path: str) -> str:
 
 @dataclass(slots=True, frozen=True)
 class GatewaySettings:
-    host: str = "0.0.0.0"
-    port: int = 8080
-    websocket_path: str = "/ws"
-    max_message_chars: int = 32_000
+    host: str = app_settings.JARVIS_GATEWAY_HOST
+    port: int = app_settings.JARVIS_GATEWAY_PORT
+    websocket_path: str = app_settings.JARVIS_GATEWAY_WS_PATH
+    max_message_chars: int = app_settings.JARVIS_GATEWAY_MAX_MESSAGE_CHARS
 
     def __post_init__(self) -> None:
         if not self.host.strip():
@@ -65,8 +67,13 @@ class GatewaySettings:
     @classmethod
     def from_env(cls) -> "GatewaySettings":
         return cls(
-            host=_optional_env("JARVIS_GATEWAY_HOST", "0.0.0.0"),
-            port=_parse_int_env("JARVIS_GATEWAY_PORT", 8080),
-            websocket_path=_normalize_ws_path(_optional_env("JARVIS_GATEWAY_WS_PATH", "/ws")),
-            max_message_chars=_parse_int_env("JARVIS_GATEWAY_MAX_MESSAGE_CHARS", 32_000),
+            host=_optional_env("JARVIS_GATEWAY_HOST", app_settings.JARVIS_GATEWAY_HOST),
+            port=_parse_int_env("JARVIS_GATEWAY_PORT", app_settings.JARVIS_GATEWAY_PORT),
+            websocket_path=_normalize_ws_path(
+                _optional_env("JARVIS_GATEWAY_WS_PATH", app_settings.JARVIS_GATEWAY_WS_PATH)
+            ),
+            max_message_chars=_parse_int_env(
+                "JARVIS_GATEWAY_MAX_MESSAGE_CHARS",
+                app_settings.JARVIS_GATEWAY_MAX_MESSAGE_CHARS,
+            ),
         )

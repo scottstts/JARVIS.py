@@ -6,13 +6,15 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import settings as app_settings
+
 from .errors import CoreConfigurationError
 
 
-def _required_int_env(name: str) -> int:
+def _parse_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        raise CoreConfigurationError(f"{name} must be explicitly set in the environment.")
+    if raw is None:
+        return default
     try:
         value = int(raw)
     except ValueError as exc:
@@ -66,13 +68,21 @@ class ContextPolicySettings:
     @classmethod
     def from_env(cls) -> "ContextPolicySettings":
         return cls(
-            context_window_tokens=_required_int_env("JARVIS_CONTEXT_WINDOW_TOKENS"),
-            compact_threshold_tokens=_required_int_env("JARVIS_COMPACT_THRESHOLD_TOKENS"),
-            compact_reserve_output_tokens=_required_int_env(
-                "JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS"
+            context_window_tokens=_parse_int_env(
+                "JARVIS_CONTEXT_WINDOW_TOKENS",
+                app_settings.JARVIS_CONTEXT_WINDOW_TOKENS,
             ),
-            compact_reserve_overhead_tokens=_required_int_env(
-                "JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS"
+            compact_threshold_tokens=_parse_int_env(
+                "JARVIS_COMPACT_THRESHOLD_TOKENS",
+                app_settings.JARVIS_COMPACT_THRESHOLD_TOKENS,
+            ),
+            compact_reserve_output_tokens=_parse_int_env(
+                "JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS",
+                app_settings.JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS,
+            ),
+            compact_reserve_overhead_tokens=_parse_int_env(
+                "JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS",
+                app_settings.JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS,
             ),
         )
 

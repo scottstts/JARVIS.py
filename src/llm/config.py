@@ -5,22 +5,39 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+import settings as app_settings
+
 from .errors import LLMConfigurationError
 
 
-def _required_env(name: str) -> str:
+def _normalize_optional_value(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _required_setting(name: str, default: object) -> str:
     raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        raise LLMConfigurationError(f"{name} must be explicitly set in the environment.")
-    return raw.strip()
+    if raw is None:
+        value = _normalize_optional_value(default)
+    else:
+        value = _normalize_optional_value(raw)
+    if value is None:
+        raise LLMConfigurationError(f"{name} must be configured.")
+    return value
 
 
 def _optional_env(name: str) -> str | None:
     raw = os.getenv(name)
+    return _normalize_optional_value(raw)
+
+
+def _optional_setting(name: str, default: object) -> str | None:
+    raw = os.getenv(name)
     if raw is None:
-        return None
-    value = raw.strip()
-    return value or None
+        return _normalize_optional_value(default)
+    return _normalize_optional_value(raw)
 
 
 def _optional_lower_env(name: str) -> str | None:
@@ -30,8 +47,15 @@ def _optional_lower_env(name: str) -> str | None:
     return value.lower()
 
 
-def _optional_choice_env(name: str, allowed: set[str]) -> str | None:
-    value = _optional_env(name)
+def _optional_lower_setting(name: str, default: object) -> str | None:
+    value = _optional_setting(name, default)
+    if value is None:
+        return None
+    return value.lower()
+
+
+def _optional_choice_setting(name: str, default: object, allowed: set[str]) -> str | None:
+    value = _optional_setting(name, default)
     if value is None:
         return None
     if value not in allowed:
@@ -60,8 +84,11 @@ def _parse_float_env(name: str, default: float) -> float:
         raise LLMConfigurationError(f"{name} must be a float, got: {raw}") from exc
 
 
-def _parse_optional_int_env(name: str) -> int | None:
-    value = _optional_env(name)
+def _parse_optional_int_env(name: str, default: int | None = None) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = _normalize_optional_value(raw)
     if value is None:
         return None
     try:
@@ -70,8 +97,11 @@ def _parse_optional_int_env(name: str) -> int | None:
         raise LLMConfigurationError(f"{name} must be an integer, got: {value}") from exc
 
 
-def _parse_optional_float_env(name: str) -> float | None:
-    value = _optional_env(name)
+def _parse_optional_float_env(name: str, default: float | None = None) -> float | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = _normalize_optional_value(raw)
     if value is None:
         return None
     try:
@@ -98,8 +128,11 @@ class EmbeddingSettings:
     @classmethod
     def from_env(cls) -> "EmbeddingSettings":
         return cls(
-            provider=_required_env("JARVIS_EMBEDDING_PROVIDER"),
-            model=_required_env("JARVIS_EMBEDDING_MODEL"),
+            provider=_required_setting(
+                "JARVIS_EMBEDDING_PROVIDER",
+                app_settings.JARVIS_EMBEDDING_PROVIDER,
+            ),
+            model=_required_setting("JARVIS_EMBEDDING_MODEL", app_settings.JARVIS_EMBEDDING_MODEL),
         )
 
 
@@ -127,19 +160,28 @@ class OpenAIProviderSettings:
             base_url=_optional_env("OPENAI_BASE_URL"),
             organization=_optional_env("OPENAI_ORG_ID"),
             project=_optional_env("OPENAI_PROJECT_ID"),
-            chat_model=_optional_env("JARVIS_OPENAI_CHAT_MODEL"),
-            temperature=_parse_optional_float_env("JARVIS_OPENAI_TEMPERATURE"),
-            max_output_tokens=_parse_optional_int_env("JARVIS_OPENAI_MAX_OUTPUT_TOKENS"),
-            reasoning_effort=_optional_choice_env(
+            chat_model=_optional_setting("JARVIS_OPENAI_CHAT_MODEL", app_settings.JARVIS_OPENAI_CHAT_MODEL),
+            temperature=_parse_optional_float_env(
+                "JARVIS_OPENAI_TEMPERATURE",
+                app_settings.JARVIS_OPENAI_TEMPERATURE,
+            ),
+            max_output_tokens=_parse_optional_int_env(
+                "JARVIS_OPENAI_MAX_OUTPUT_TOKENS",
+                app_settings.JARVIS_OPENAI_MAX_OUTPUT_TOKENS,
+            ),
+            reasoning_effort=_optional_choice_setting(
                 "JARVIS_OPENAI_REASONING_EFFORT",
+                app_settings.JARVIS_OPENAI_REASONING_EFFORT,
                 {"none", "minimal", "low", "medium", "high", "xhigh"},
             ),
-            reasoning_summary=_optional_choice_env(
+            reasoning_summary=_optional_choice_setting(
                 "JARVIS_OPENAI_REASONING_SUMMARY",
+                app_settings.JARVIS_OPENAI_REASONING_SUMMARY,
                 {"auto", "concise", "detailed"},
             ),
-            text_verbosity=_optional_choice_env(
+            text_verbosity=_optional_choice_setting(
                 "JARVIS_OPENAI_TEXT_VERBOSITY",
+                app_settings.JARVIS_OPENAI_TEXT_VERBOSITY,
                 {"low", "medium", "high"},
             ),
         )
@@ -167,17 +209,30 @@ class AnthropicProviderSettings:
         return cls(
             api_key=_optional_env("ANTHROPIC_API_KEY"),
             base_url=_optional_env("ANTHROPIC_BASE_URL"),
-            chat_model=_optional_env("JARVIS_ANTHROPIC_CHAT_MODEL"),
-            temperature=_parse_optional_float_env("JARVIS_ANTHROPIC_TEMPERATURE"),
-            max_output_tokens=_parse_optional_int_env("JARVIS_ANTHROPIC_MAX_OUTPUT_TOKENS"),
+            chat_model=_optional_setting(
+                "JARVIS_ANTHROPIC_CHAT_MODEL",
+                app_settings.JARVIS_ANTHROPIC_CHAT_MODEL,
+            ),
+            temperature=_parse_optional_float_env(
+                "JARVIS_ANTHROPIC_TEMPERATURE",
+                app_settings.JARVIS_ANTHROPIC_TEMPERATURE,
+            ),
+            max_output_tokens=_parse_optional_int_env(
+                "JARVIS_ANTHROPIC_MAX_OUTPUT_TOKENS",
+                app_settings.JARVIS_ANTHROPIC_MAX_OUTPUT_TOKENS,
+            ),
             thinking_mode=(
-                _optional_lower_env("JARVIS_ANTHROPIC_THINKING_MODE")
+                _optional_lower_setting(
+                    "JARVIS_ANTHROPIC_THINKING_MODE",
+                    app_settings.JARVIS_ANTHROPIC_THINKING_MODE,
+                )
                 or _optional_lower_env("JARVIS_ANTHROPIC_THINKING_TYPE")
             ),
             thinking_budget_tokens=_parse_optional_int_env(
-                "JARVIS_ANTHROPIC_THINKING_BUDGET_TOKENS"
+                "JARVIS_ANTHROPIC_THINKING_BUDGET_TOKENS",
+                app_settings.JARVIS_ANTHROPIC_THINKING_BUDGET_TOKENS,
             ),
-            effort=_optional_lower_env("JARVIS_ANTHROPIC_EFFORT"),
+            effort=_optional_lower_setting("JARVIS_ANTHROPIC_EFFORT", app_settings.JARVIS_ANTHROPIC_EFFORT),
         )
 
 
@@ -200,11 +255,23 @@ class GeminiProviderSettings:
     def from_env(cls) -> "GeminiProviderSettings":
         return cls(
             api_key=_optional_env("GOOGLE_API_KEY"),
-            chat_model=_optional_env("JARVIS_GEMINI_CHAT_MODEL"),
-            temperature=_parse_optional_float_env("JARVIS_GEMINI_TEMPERATURE"),
-            max_output_tokens=_parse_optional_int_env("JARVIS_GEMINI_MAX_OUTPUT_TOKENS"),
-            thinking_level=_optional_lower_env("JARVIS_GEMINI_THINKING_LEVEL"),
-            thinking_budget=_parse_optional_int_env("JARVIS_GEMINI_THINKING_BUDGET"),
+            chat_model=_optional_setting("JARVIS_GEMINI_CHAT_MODEL", app_settings.JARVIS_GEMINI_CHAT_MODEL),
+            temperature=_parse_optional_float_env(
+                "JARVIS_GEMINI_TEMPERATURE",
+                app_settings.JARVIS_GEMINI_TEMPERATURE,
+            ),
+            max_output_tokens=_parse_optional_int_env(
+                "JARVIS_GEMINI_MAX_OUTPUT_TOKENS",
+                app_settings.JARVIS_GEMINI_MAX_OUTPUT_TOKENS,
+            ),
+            thinking_level=_optional_lower_setting(
+                "JARVIS_GEMINI_THINKING_LEVEL",
+                app_settings.JARVIS_GEMINI_THINKING_LEVEL,
+            ),
+            thinking_budget=_parse_optional_int_env(
+                "JARVIS_GEMINI_THINKING_BUDGET",
+                app_settings.JARVIS_GEMINI_THINKING_BUDGET,
+            ),
         )
 
 
@@ -227,11 +294,20 @@ class OpenRouterProviderSettings:
         return cls(
             api_key=_optional_env("OPENROUTER_API_KEY"),
             base_url=_optional_env("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1",
-            chat_model=_optional_env("JARVIS_OPENROUTER_CHAT_MODEL"),
-            temperature=_parse_optional_float_env("JARVIS_OPENROUTER_TEMPERATURE"),
-            max_output_tokens=_parse_optional_int_env("JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS"),
+            chat_model=_optional_setting(
+                "JARVIS_OPENROUTER_CHAT_MODEL",
+                app_settings.JARVIS_OPENROUTER_CHAT_MODEL,
+            ),
+            temperature=_parse_optional_float_env(
+                "JARVIS_OPENROUTER_TEMPERATURE",
+                app_settings.JARVIS_OPENROUTER_TEMPERATURE,
+            ),
+            max_output_tokens=_parse_optional_int_env(
+                "JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS",
+                app_settings.JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS,
+            ),
             site_url=_optional_env("OPENROUTER_SITE_URL"),
-            app_name=_optional_env("OPENROUTER_APP_NAME"),
+            app_name=_optional_setting("OPENROUTER_APP_NAME", app_settings.OPENROUTER_APP_NAME),
         )
 
 
@@ -262,11 +338,23 @@ class LLMSettings:
     @classmethod
     def from_env(cls) -> "LLMSettings":
         return cls(
-            default_provider=_required_env("JARVIS_LLM_DEFAULT_PROVIDER"),
+            default_provider=_required_setting(
+                "JARVIS_LLM_DEFAULT_PROVIDER",
+                app_settings.JARVIS_LLM_DEFAULT_PROVIDER,
+            ),
             embedding=EmbeddingSettings.from_env(),
-            request_timeout_seconds=_parse_float_env("JARVIS_LLM_TIMEOUT_SECONDS", 60.0),
-            retry_attempts=_parse_int_env("JARVIS_LLM_RETRY_ATTEMPTS", 2),
-            retry_backoff_seconds=_parse_float_env("JARVIS_LLM_RETRY_BACKOFF_SECONDS", 0.5),
+            request_timeout_seconds=_parse_float_env(
+                "JARVIS_LLM_TIMEOUT_SECONDS",
+                app_settings.JARVIS_LLM_TIMEOUT_SECONDS,
+            ),
+            retry_attempts=_parse_int_env(
+                "JARVIS_LLM_RETRY_ATTEMPTS",
+                app_settings.JARVIS_LLM_RETRY_ATTEMPTS,
+            ),
+            retry_backoff_seconds=_parse_float_env(
+                "JARVIS_LLM_RETRY_BACKOFF_SECONDS",
+                app_settings.JARVIS_LLM_RETRY_BACKOFF_SECONDS,
+            ),
             openai=OpenAIProviderSettings.from_env(),
             anthropic=AnthropicProviderSettings.from_env(),
             gemini=GeminiProviderSettings.from_env(),
