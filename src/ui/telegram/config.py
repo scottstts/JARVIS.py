@@ -37,6 +37,19 @@ def _parse_int_env(name: str, default: int) -> int:
         raise UIConfigurationError(f"{name} must be an integer, got: {raw}") from exc
 
 
+def _parse_optional_int_env(name: str, default: int | None) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        raise UIConfigurationError(f"{name} must be an integer when set.")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise UIConfigurationError(f"{name} must be an integer, got: {raw}") from exc
+
+
 def _parse_float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -104,6 +117,7 @@ _DEFAULT_GATEWAY_WS_BASE_URL = (
 class UISettings:
     telegram_token: str
     telegram_api_base_url: str = app_settings.TELEGRAM_API_BASE_URL
+    telegram_allowed_user_id: int | None = app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID
     telegram_poll_timeout_seconds: int = app_settings.JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_poll_limit: int = app_settings.JARVIS_UI_TELEGRAM_POLL_LIMIT
     poll_error_backoff_seconds: float = app_settings.JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS
@@ -120,6 +134,8 @@ class UISettings:
             raise UIConfigurationError("TELEGRAM_TOKEN cannot be empty.")
         if not self.telegram_api_base_url.startswith("https://"):
             raise UIConfigurationError("TELEGRAM_API_BASE_URL must start with https://.")
+        if self.telegram_allowed_user_id is not None and self.telegram_allowed_user_id <= 0:
+            raise UIConfigurationError("JARVIS_UI_TELEGRAM_ALLOWED_USER_ID must be > 0.")
         if self.telegram_poll_timeout_seconds <= 0:
             raise UIConfigurationError("JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS must be > 0.")
         if self.telegram_poll_limit <= 0 or self.telegram_poll_limit > 100:
@@ -157,6 +173,10 @@ class UISettings:
                 "TELEGRAM_API_BASE_URL",
                 app_settings.TELEGRAM_API_BASE_URL,
             ).rstrip("/"),
+            telegram_allowed_user_id=_parse_optional_int_env(
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID",
+                app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID,
+            ),
             telegram_poll_timeout_seconds=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS",
                 app_settings.JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS,

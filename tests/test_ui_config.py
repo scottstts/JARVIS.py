@@ -41,6 +41,30 @@ class UISettingsTests(unittest.TestCase):
             settings = UISettings.from_env()
         self.assertEqual(settings.gateway_ws_base_url, "wss://example.com/ws")
 
+    def test_reads_allowed_telegram_user_id(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "8793811805",
+            },
+            clear=True,
+        ):
+            settings = UISettings.from_env()
+        self.assertEqual(settings.telegram_allowed_user_id, 8793811805)
+
+    def test_rejects_blank_allowed_telegram_user_id(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "  ",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(UIConfigurationError):
+                UISettings.from_env()
+
     def test_rejects_invalid_poll_limit(self) -> None:
         with patch.dict(
             os.environ,

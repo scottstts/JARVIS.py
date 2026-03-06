@@ -64,6 +64,7 @@ class IncomingTextMessage:
     chat_id: int
     chat_type: str
     text: str
+    sender_user_id: int | None = None
 
 
 class TelegramGatewayBridge:
@@ -94,6 +95,15 @@ class TelegramGatewayBridge:
             "Telegram bridge online for bot @%s",
             bot_profile.get("username", "unknown"),
         )
+        if self._settings.telegram_allowed_user_id is None:
+            LOGGER.warning(
+                "Telegram owner gate is disabled; any private chat can reach the bot."
+            )
+        else:
+            LOGGER.info(
+                "Telegram bridge restricted to user_id=%s",
+                self._settings.telegram_allowed_user_id,
+            )
 
         next_offset: int | None = None
         while True:
@@ -128,6 +138,16 @@ class TelegramGatewayBridge:
 
     async def handle_message(self, message: IncomingTextMessage) -> None:
         if message.chat_type != "private":
+            return
+        if not _is_authorized_private_message(
+            message=message,
+            allowed_user_id=self._settings.telegram_allowed_user_id,
+        ):
+            LOGGER.warning(
+                "Ignoring unauthorized Telegram message from user_id=%s chat_id=%s",
+                _effective_private_user_id(message),
+                message.chat_id,
+            )
             return
         route_id = route_id_for_chat(message.chat_id)
         draft_id = self._next_draft_id_for_chat(message.chat_id)
@@ -275,6 +295,13 @@ def parse_incoming_text_message(update: dict[str, Any]) -> IncomingTextMessage |
     if not text:
         return None
 
+    sender_user_id: int | None = None
+    from_user = message.get("from")
+    if isinstance(from_user, dict):
+        from_user_id = from_user.get("id")
+        if isinstance(from_user_id, int):
+            sender_user_id = from_user_id
+
     chat = message.get("chat")
     if not isinstance(chat, dict):
         return None
@@ -290,6 +317,7 @@ def parse_incoming_text_message(update: dict[str, Any]) -> IncomingTextMessage |
         chat_id=chat_id,
         chat_type=chat_type,
         text=text,
+        sender_user_id=sender_user_id,
     )
 
 
@@ -298,6 +326,25 @@ def route_id_for_chat(chat_id: int) -> str:
     if chat_segment.startswith("-"):
         chat_segment = f"n{chat_segment[1:]}"
     return f"tg_{chat_segment}"
+
+
+def _effective_private_user_id(message: IncomingTextMessage) -> int | None:
+    if message.sender_user_id is not None:
+        return message.sender_user_id
+    if message.chat_type == "private":
+        return message.chat_id
+    return None
+
+
+def _is_authorized_private_message(
+    *,
+    message: IncomingTextMessage,
+    allowed_user_id: int | None,
+) -> bool:
+    if allowed_user_id is None:
+        return True
+    effective_user_id = _effective_private_user_id(message)
+    return effective_user_id == allowed_user_id and message.chat_id == allowed_user_id
 
 
 def _should_flush_draft(

@@ -133,6 +133,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 "update_id": 10,
                 "message": {
                     "message_id": 100,
+                    "from": {"id": 123},
                     "chat": {"id": 123, "type": "private"},
                     "text": "hello",
                 },
@@ -153,6 +154,39 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next_offset, 11)
         self.assertEqual(gateway.calls, [("tg_123", "hello")])
         self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
+
+    async def test_poll_once_ignores_private_message_from_unauthorized_user(self) -> None:
+        updates = [
+            {
+                "update_id": 10,
+                "message": {
+                    "message_id": 100,
+                    "from": {"id": 123},
+                    "chat": {"id": 123, "type": "private"},
+                    "text": "hello",
+                },
+            }
+        ]
+        telegram = _FakeTelegramClient(updates=updates)
+        gateway = _FakeGatewayClient(
+            events=[GatewayDoneEvent(session_id="s", text="pong")],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=UISettings(
+                telegram_token="test-token",
+                telegram_allowed_user_id=999,
+                stream_draft_min_interval_seconds=0.0,
+                stream_draft_min_chars=1,
+            ),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        next_offset = await bridge.poll_once(offset=None)
+
+        self.assertEqual(next_offset, 11)
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(telegram.sent_messages, [])
 
     async def test_poll_once_advances_offset_for_ignored_update(self) -> None:
         telegram = _FakeTelegramClient(
@@ -218,6 +252,36 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         await bridge.handle_message(
             IncomingTextMessage(update_id=1, chat_id=-10, chat_type="group", text="hi"),
+        )
+
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.sent_drafts, [])
+
+    async def test_handle_message_ignores_private_chat_when_owner_gate_does_not_match(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[GatewayDoneEvent(session_id="session", text="should-not-send")],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=UISettings(
+                telegram_token="test-token",
+                telegram_allowed_user_id=777,
+                stream_draft_min_interval_seconds=0.0,
+                stream_draft_min_chars=1,
+            ),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=123,
+                chat_type="private",
+                text="hi",
+                sender_user_id=123,
+            ),
         )
 
         self.assertEqual(gateway.calls, [])
@@ -355,6 +419,7 @@ class TelegramBotHelpersTests(unittest.TestCase):
             {
                 "update_id": 12,
                 "message": {
+                    "from": {"id": 321},
                     "chat": {"id": 321, "type": "private"},
                     "text": "  hello ",
                 },
@@ -365,6 +430,7 @@ class TelegramBotHelpersTests(unittest.TestCase):
             self.fail("Expected parsed incoming message.")
         self.assertEqual(parsed.update_id, 12)
         self.assertEqual(parsed.chat_id, 321)
+        self.assertEqual(parsed.sender_user_id, 321)
         self.assertEqual(parsed.text, "hello")
 
     def test_route_id_for_negative_chat_id(self) -> None:

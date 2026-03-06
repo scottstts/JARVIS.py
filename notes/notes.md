@@ -21,3 +21,4 @@
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
 - Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.
 - Non-secret runtime defaults now live in `src/settings.py`; `.env` is reserved for secrets and machine-specific paths.
+- Telegram UI can be restricted to a single owner by setting `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; unauthorized private messages are ignored without a reply.
