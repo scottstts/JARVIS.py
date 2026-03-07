@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -10,6 +11,49 @@ from unittest.mock import patch
 
 from llm import ToolCall, ToolDefinition
 from tools import RegisteredTool, ToolExecutionContext, ToolPolicy, ToolRegistry, ToolRuntime, ToolSettings
+
+
+class _FakeWebSearchResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        payload: dict[str, object],
+        headers: dict[str, str] | None = None,
+        text: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+        self.text = text or ""
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+
+class ToolSettingsTests(unittest.TestCase):
+    def test_uses_default_web_search_count_from_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(settings.web_search_result_count, 10)
+
+    def test_allows_web_search_count_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {"JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT": "7"},
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(settings.web_search_result_count, 7)
 
 
 class ToolRegistryTests(unittest.TestCase):
@@ -21,11 +65,16 @@ class ToolRegistryTests(unittest.TestCase):
             registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
 
             basic_names = [tool.name for tool in registry.basic_definitions()]
-            self.assertEqual(basic_names, ["bash", "view_image", "send_file"])
+            self.assertEqual(basic_names, ["bash", "web_search", "view_image", "send_file"])
             self.assertEqual(registry.search("bash"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
                 ["bash"],
+            )
+            self.assertEqual(registry.search("web_search"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("web_search", include_basic=True)],
+                ["web_search"],
             )
             self.assertEqual(registry.search("view_image"), ())
             self.assertEqual(
@@ -180,6 +229,23 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn(".env", decision.reason or "")
+
+    def test_web_search_allows_non_empty_query(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="web_search",
+            arguments={"query": "best coffee grinders"},
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_web_search_denies_empty_query(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="web_search",
+            arguments={"query": "   "},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("non-empty", decision.reason or "")
 
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -367,6 +433,110 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result.metadata["image_attachment"]["path"],
             str(image_path),
         )
+
+    async def test_web_search_executes_and_normalizes_results(self) -> None:
+        def _fake_requests_get(url, *, params, headers, timeout):
+            self.assertEqual(url, "https://api.search.brave.com/res/v1/web/search")
+            self.assertEqual(params["q"], "brave browser")
+            self.assertEqual(params["count"], "10")
+            self.assertEqual(params["result_filter"], "web")
+            self.assertEqual(params["spellcheck"], "false")
+            self.assertEqual(headers["X-Subscription-Token"], "test-brave-key")
+            self.assertEqual(timeout, 15.0)
+            return _FakeWebSearchResponse(
+                status_code=200,
+                headers={
+                    "X-RateLimit-Limit": "1000",
+                    "X-RateLimit-Remaining": "999",
+                },
+                payload={
+                    "type": "search",
+                    "query": {
+                        "original": "brave browser",
+                        "cleaned": "brave browser",
+                        "more_results_available": True,
+                    },
+                    "web": {
+                        "type": "search",
+                        "family_friendly": True,
+                        "results": [
+                            {
+                                "title": "Brave Browser",
+                                "url": "https://brave.com/",
+                                "description": "Browse privately with Brave.",
+                                "language": "en",
+                                "page_age": "2026-02-01T00:00:00Z",
+                                "meta_url": {"hostname": "brave.com"},
+                            },
+                            {
+                                "title": "Brave Search",
+                                "url": "https://search.brave.com/",
+                                "description": "Private independent search.",
+                            },
+                        ],
+                    },
+                },
+            )
+
+        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-brave-key"}, clear=False):
+            with patch("tools.web_search.tool.requests.get", side_effect=_fake_requests_get):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_web_search",
+                        name="web_search",
+                        arguments={"query": "brave browser"},
+                        raw_arguments='{"query":"brave browser"}',
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertIn("Web search results", result.content)
+        self.assertIn("Brave Browser", result.content)
+        self.assertEqual(result.metadata["configured_result_count"], 10)
+        self.assertEqual(result.metadata["result_count"], 2)
+        self.assertEqual(result.metadata["query"]["original"], "brave browser")
+        self.assertTrue(result.metadata["query"]["more_results_available"])
+        self.assertEqual(result.metadata["results"][0]["source"], "brave.com")
+
+    async def test_web_search_returns_error_when_api_key_missing(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_web_search_missing_key",
+                    name="web_search",
+                    arguments={"query": "brave browser"},
+                    raw_arguments='{"query":"brave browser"}',
+                ),
+                context=self.context,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("BRAVE_SEARCH_API_KEY", result.content)
+
+    async def test_web_search_returns_api_error_details(self) -> None:
+        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-brave-key"}, clear=False):
+            with patch(
+                "tools.web_search.tool.requests.get",
+                return_value=_FakeWebSearchResponse(
+                    status_code=429,
+                    payload={"error": {"detail": "rate limit exceeded"}},
+                    text='{"error":{"detail":"rate limit exceeded"}}',
+                ),
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_web_search_rate_limit",
+                        name="web_search",
+                        arguments={"query": "brave browser"},
+                        raw_arguments='{"query":"brave browser"}',
+                    ),
+                    context=self.context,
+                )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.metadata["status_code"], 429)
+        self.assertIn("rate limit exceeded", result.content)
 
     async def test_view_image_rejects_non_universal_format(self) -> None:
         image_path = self.workspace_dir / "temp" / "sample.gif"

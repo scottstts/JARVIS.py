@@ -35,6 +35,7 @@
 - Gemini tool-call history must preserve `thought_signature`; store it in provider metadata as base64 and restore it to bytes on the follow-up request.
 - `view_image` is the single workspace-image path for multimodal turns: it prepares a transient local-file attachment that all four provider adapters consume without persisting image bytes into transcript storage.
 - `send_file` is now a basic tool: it only allows explicit non-`.env` files inside `/workspace`, and it routes Telegram delivery through the existing UI file-send path using the active `tg_<chat_id>` route when available.
+- `web_search` is now a basic Brave-backed tool with a query-only schema, web-only normalized results, and a settings-controlled result count (`JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT`, default `10`).
 - Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.

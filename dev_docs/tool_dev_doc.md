@@ -285,6 +285,39 @@ Command-specific restrictions:
 - depends on the Telegram UI runtime being configured with a valid bot token
 - if the current route is not a Telegram route, delivery falls back to `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID` when set
 
+### `web_search`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/web_search/`
+- Purpose: run a basic Brave web search query and return normalized web results for current information gathering
+
+#### Input Schema
+
+- `query: string` required
+
+#### Executor Behavior
+
+- reads `BRAVE_SEARCH_API_KEY` from runtime environment
+- calls Brave `GET /res/v1/web/search`
+- always forces `result_filter=web`
+- disables Brave spellcheck so the query stays deterministic
+- returns up to `JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT` results (default `10`)
+- normalizes each result to a concise structure centered on `title`, `url`, `snippet`, and source hostname
+- includes query metadata such as `original`, `cleaned`, and `more_results_available` when Brave returns it
+- converts request failures, missing API key errors, timeouts, and non-200 Brave responses into normalized tool-error results
+
+#### Policy
+
+- `query` must be non-empty
+- query length must stay within Brave-compatible limits (`<= 400` chars and `<= 50` words)
+
+#### Current Limitations
+
+- intentionally minimal; no news, videos, locations, goggles, summary generation, or other Brave advanced features are exposed
+- count is controlled by app settings, not by tool arguments
+- no response-body fetching; downstream page reading still belongs in a future `web_fetch` tool
+
 ## Tools To Be Implemented
 
 ### Basic Tools
@@ -294,10 +327,6 @@ These should be auto-exposed at session start once implemented.
 #### `tool_search`
 
 - Purpose: search the registry for discoverable tools and return concise usage docs so the agent can opt into additional capabilities
-
-#### `web_search`
-
-- Purpose: run web search queries and return structured search results for current information gathering
 
 #### `web_fetch`
 

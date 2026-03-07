@@ -41,6 +41,8 @@ class ToolSettings:
     bash_max_timeout_seconds: float
     bash_max_output_chars: int
     max_tool_rounds_per_turn: int
+    web_search_result_count: int
+    web_search_timeout_seconds: float
 
     def __post_init__(self) -> None:
         if not self.bash_executable:
@@ -57,6 +59,12 @@ class ToolSettings:
             raise ValueError("bash_max_output_chars must be > 0.")
         if self.max_tool_rounds_per_turn <= 0:
             raise ValueError("max_tool_rounds_per_turn must be > 0.")
+        if self.web_search_result_count <= 0:
+            raise ValueError("web_search_result_count must be > 0.")
+        if self.web_search_result_count > 20:
+            raise ValueError("web_search_result_count must be <= 20.")
+        if self.web_search_timeout_seconds <= 0:
+            raise ValueError("web_search_timeout_seconds must be > 0.")
 
     @classmethod
     def from_env(cls) -> "ToolSettings":
@@ -88,5 +96,13 @@ class ToolSettings:
             max_tool_rounds_per_turn=_parse_int_env(
                 "JARVIS_TOOL_MAX_ROUNDS_PER_TURN",
                 app_settings.JARVIS_TOOL_MAX_ROUNDS_PER_TURN,
+            ),
+            web_search_result_count=_parse_int_env(
+                "JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT",
+                app_settings.JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT,
+            ),
+            web_search_timeout_seconds=_parse_float_env(
+                "JARVIS_TOOL_WEB_SEARCH_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_WEB_SEARCH_TIMEOUT_SECONDS,
             ),
         )

@@ -13,6 +13,8 @@ from llm import DoneEvent, ImagePart, LLMRequest, LLMResponse, LLMUsage, TextPar
 from storage import SessionStorage
 from tests.helpers import build_core_settings
 
+_EXPECTED_BASIC_TOOL_NAMES = ["bash", "web_search", "view_image", "send_file"]
+
 
 def _build_response(
     text: str,
@@ -98,9 +100,9 @@ class _FakeToolLLMService:
 
     def _assert_bash_registered(self, request: LLMRequest) -> None:
         names = [tool.name for tool in request.tools]
-        if names != ["bash", "view_image", "send_file"]:
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
             raise AssertionError(
-                f"Expected bash, view_image, and send_file tools to be registered, got {names}."
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
             )
 
 
@@ -112,9 +114,9 @@ class _FakeViewImageLLMService:
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
-        if names != ["bash", "view_image", "send_file"]:
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
             raise AssertionError(
-                f"Expected bash, view_image, and send_file tools to be registered, got {names}."
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
             )
 
         if self.generate_calls == 1:
@@ -190,9 +192,9 @@ class _FakeSendFileLLMService:
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
-        if names != ["bash", "view_image", "send_file"]:
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
             raise AssertionError(
-                f"Expected bash, view_image, and send_file tools to be registered, got {names}."
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
             )
 
         if self.generate_calls == 1:
