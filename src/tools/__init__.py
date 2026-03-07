@@ -3,6 +3,7 @@
 from .bash import BashCommandPolicy
 from .config import ToolSettings
 from .policy import ToolPolicy
+from .python_interpreter import PythonInterpreterPolicy
 from .registry import ToolRegistry
 from .runtime import ToolRuntime
 from .send_file import SendFilePolicy
@@ -19,6 +20,7 @@ from .view_image import ViewImagePolicy
 
 __all__ = [
     "BashCommandPolicy",
+    "PythonInterpreterPolicy",
     "RegisteredTool",
     "SendFilePolicy",
     "ToolExecutionContext",

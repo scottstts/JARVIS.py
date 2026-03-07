@@ -13,6 +13,11 @@ from llm import ToolCall, ToolDefinition
 from tools import RegisteredTool, ToolExecutionContext, ToolPolicy, ToolRegistry, ToolRuntime, ToolSettings
 from tools.web_fetch.tool import BrowserRenderResult, HTTPFetchResult, MarkdownConversionResult
 
+_PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
+_PYTHON_INTERPRETER_RUNTIME_AVAILABLE = (
+    shutil.which("bwrap") is not None and _PYTHON_INTERPRETER_VENV.exists()
+)
+
 
 class _FakeWebSearchResponse:
     def __init__(
@@ -57,6 +62,30 @@ def _build_http_fetch_result(
 
 
 class ToolSettingsTests(unittest.TestCase):
+    def test_requires_agent_workspace_for_host_runs(self) -> None:
+        with patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ), patch("workspace_paths._running_in_container", return_value=False):
+            with self.assertRaisesRegex(
+                ValueError,
+                "AGENT_WORKSPACE must be explicitly set for host runs",
+            ):
+                ToolSettings.from_env()
+
+    def test_uses_explicit_agent_workspace_for_host_runs(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
+            },
+            clear=True,
+        ), patch("workspace_paths._running_in_container", return_value=False):
+            settings = ToolSettings.from_env()
+
+        self.assertEqual(settings.workspace_dir, Path("/tmp/jarvis-host-workspace"))
+
     def test_uses_default_web_search_count_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -92,6 +121,24 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertEqual(settings.web_fetch_max_response_bytes, 2_097_152)
         self.assertEqual(settings.web_fetch_max_markdown_chars, 20_000)
 
+    def test_uses_default_python_interpreter_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(
+            settings.python_interpreter_venv,
+            Path("/opt/jarvis-python-tool-venv"),
+        )
+        self.assertEqual(
+            settings.python_interpreter_allowed_packages,
+            ("python-dateutil", "pyyaml", "pypdf", "pandas", "pillow"),
+        )
+        self.assertEqual(settings.python_interpreter_default_timeout_seconds, 10.0)
+        self.assertEqual(settings.python_interpreter_max_timeout_seconds, 30.0)
+
 
 class ToolRegistryTests(unittest.TestCase):
     def test_default_registry_exposes_basic_tools(self) -> None:
@@ -104,12 +151,24 @@ class ToolRegistryTests(unittest.TestCase):
             basic_names = [tool.name for tool in registry.basic_definitions()]
             self.assertEqual(
                 basic_names,
-                ["bash", "web_search", "web_fetch", "view_image", "send_file"],
+                [
+                    "bash",
+                    "python_interpreter",
+                    "web_search",
+                    "web_fetch",
+                    "view_image",
+                    "send_file",
+                ],
             )
             self.assertEqual(registry.search("bash"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
                 ["bash"],
+            )
+            self.assertEqual(registry.search("python"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("python", include_basic=True)],
+                ["python_interpreter"],
             )
             self.assertEqual(registry.search("web_search"), ())
             self.assertEqual(
@@ -124,7 +183,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search("view_image"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("image", include_basic=True)],
-                ["view_image"],
+                ["python_interpreter", "view_image"],
             )
             self.assertEqual(registry.search("send"), ())
             self.assertEqual(
@@ -318,6 +377,52 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("private", decision.reason or "")
 
+    def test_python_interpreter_allows_inline_code_with_explicit_workspace_paths(self) -> None:
+        input_dir = self.workspace_dir / "inputs"
+        output_dir = self.workspace_dir / "outputs"
+        input_dir.mkdir()
+        output_dir.mkdir()
+        (input_dir / "data.txt").write_text("hello", encoding="utf-8")
+
+        decision = self.policy.authorize(
+            tool_name="python_interpreter",
+            arguments={
+                "code": "print('hello')",
+                "read_paths": ["inputs/data.txt"],
+                "write_paths": ["outputs"],
+            },
+            context=self.context,
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_python_interpreter_denies_scripts_from_temp(self) -> None:
+        script_path = self.workspace_dir / "temp" / "script.py"
+        script_path.parent.mkdir()
+        script_path.write_text("print('hello')", encoding="utf-8")
+
+        decision = self.policy.authorize(
+            tool_name="python_interpreter",
+            arguments={"script_path": "temp/script.py"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("protected", decision.reason or "")
+
+    def test_python_interpreter_denies_write_path_ancestor_of_protected_dir(self) -> None:
+        storage_dir = self.workspace_dir / "storage"
+        storage_dir.mkdir()
+
+        decision = self.policy.authorize(
+            tool_name="python_interpreter",
+            arguments={"code": "print('hello')", "write_paths": ["storage"]},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("ancestors of protected", decision.reason or "")
+
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -439,6 +544,114 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("Tool execution failed", result.content)
         self.assertEqual(result.metadata["error_type"], "RuntimeError")
+
+    @unittest.skipUnless(
+        _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
+        "python_interpreter runtime is only available in the dev container",
+    )
+    async def test_python_interpreter_executes_inline_code_with_staged_io(self) -> None:
+        input_dir = self.workspace_dir / "inputs"
+        output_dir = self.workspace_dir / "outputs"
+        input_dir.mkdir()
+        output_dir.mkdir()
+        (input_dir / "data.txt").write_text("hello", encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_python_inline",
+                name="python_interpreter",
+                arguments={
+                    "code": (
+                        "from pathlib import Path\n"
+                        "text = Path('/workspace/inputs/data.txt').read_text(encoding='utf-8')\n"
+                        "Path('/workspace/outputs/result.txt').write_text("
+                        "text.upper(), encoding='utf-8')\n"
+                        "print(text.upper())\n"
+                    ),
+                    "read_paths": ["inputs/data.txt"],
+                    "write_paths": ["outputs"],
+                },
+                raw_arguments=(
+                    '{"code":"from pathlib import Path\\ntext = '
+                    "Path('/workspace/inputs/data.txt').read_text(encoding='utf-8')\\n"
+                    "Path('/workspace/outputs/result.txt').write_text(text.upper(), "
+                    "encoding='utf-8')\\nprint(text.upper())\\n\","
+                    '"read_paths":["inputs/data.txt"],"write_paths":["outputs"]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("HELLO", result.content)
+        self.assertEqual(
+            (output_dir / "result.txt").read_text(encoding="utf-8"),
+            "HELLO",
+        )
+        self.assertIn("pyyaml", result.metadata["allowed_packages"])
+
+    @unittest.skipUnless(
+        _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
+        "python_interpreter runtime is only available in the dev container",
+    )
+    async def test_python_interpreter_executes_stored_script_with_curated_package(self) -> None:
+        scripts_dir = self.workspace_dir / "scripts"
+        exports_dir = self.workspace_dir / "exports"
+        scripts_dir.mkdir()
+        exports_dir.mkdir()
+        script_path = scripts_dir / "emit_yaml.py"
+        script_path.write_text(
+            (
+                "from pathlib import Path\n"
+                "import sys\n"
+                "import yaml\n"
+                "\n"
+                "payload = {'value': sys.argv[1]}\n"
+                "target = Path('/workspace/exports/payload.yml')\n"
+                "target.write_text(yaml.safe_dump(payload), encoding='utf-8')\n"
+                "print(payload['value'])\n"
+            ),
+            encoding="utf-8",
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_python_script",
+                name="python_interpreter",
+                arguments={
+                    "script_path": "scripts/emit_yaml.py",
+                    "args": ["example"],
+                    "write_paths": ["exports"],
+                },
+                raw_arguments=(
+                    '{"script_path":"scripts/emit_yaml.py","args":["example"],'
+                    '"write_paths":["exports"]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("example", result.content)
+        self.assertIn("value: example", (exports_dir / "payload.yml").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(
+        _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
+        "python_interpreter runtime is only available in the dev container",
+    )
+    async def test_python_interpreter_blocks_disallowed_imports(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_python_socket",
+                name="python_interpreter",
+                arguments={"code": "import socket\n"},
+                raw_arguments='{"code":"import socket\\n"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("blocked", result.content.lower())
 
     async def test_send_file_executes_for_workspace_file(self) -> None:
         report_path = self.workspace_dir / "exports" / "report.txt"

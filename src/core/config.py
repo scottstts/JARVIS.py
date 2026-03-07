@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import settings as app_settings
+from workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
 from .errors import CoreConfigurationError
 
@@ -100,19 +101,23 @@ class CoreSettings:
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
-        workspace_root = _optional_env("AGENT_WORKSPACE") or app_settings.AGENT_WORKSPACE
-        if workspace_root is None:
-            workspace_root = "/workspace"
-
-        storage_root = _optional_env("JARVIS_STORAGE_DIR") or app_settings.JARVIS_STORAGE_DIR
-        if storage_root is None:
-            storage_root = str(Path(workspace_root).expanduser() / "storage")
-
-        identities_dir = _optional_env("JARVIS_IDENTITIES_DIR") or app_settings.JARVIS_IDENTITIES_DIR
+        workspace_dir = resolve_workspace_dir(error_type=CoreConfigurationError)
+        storage_dir = resolve_workspace_child(
+            env_name="JARVIS_STORAGE_DIR",
+            configured_default=app_settings.JARVIS_STORAGE_DIR,
+            workspace_dir=workspace_dir,
+            child_name="storage",
+        )
+        identities_dir = resolve_workspace_child(
+            env_name="JARVIS_IDENTITIES_DIR",
+            configured_default=app_settings.JARVIS_IDENTITIES_DIR,
+            workspace_dir=workspace_dir,
+            child_name="identities",
+        )
 
         return cls(
             context_policy=ContextPolicySettings.from_env(),
-            workspace_dir=Path(workspace_root).expanduser(),
-            storage_dir=Path(storage_root).expanduser(),
-            identities_dir=Path(identities_dir).expanduser(),
+            workspace_dir=workspace_dir,
+            storage_dir=storage_dir,
+            identities_dir=identities_dir,
         )

@@ -4,7 +4,11 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: jarvis
+    cap_add:
+      - SYS_ADMIN
     shm_size: 8gb
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - ./:/repo
       - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace

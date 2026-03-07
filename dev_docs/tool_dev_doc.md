@@ -221,6 +221,52 @@ Command-specific restrictions:
 - no parallel shell tool calls yet
 - if more expressive editing is needed later, prefer a dedicated edit tool over relaxing shell policy too much
 
+### `python_interpreter`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/python_interpreter/`
+- Purpose: run constrained Python code or stored workspace scripts for parsing, tabular work, PDF/text extraction, image processing, and structured transformations that are awkward in shell
+
+#### Input Schema
+
+- `code: string | null` optional; exactly one of `code` or `script_path` is required
+- `script_path: string | null` optional; exactly one of `code` or `script_path` is required
+- `args: string[]` optional
+- `read_paths: string[]` optional
+- `write_paths: string[]` optional
+- `timeout_seconds: number` optional
+
+#### Executor Behavior
+
+- runs inside `bubblewrap` with a dedicated interpreter venv created at container build time
+- uses a staged `/workspace` copy instead of mounting the real workspace directly
+- mounts the staged workspace read-only, then re-binds only explicit `write_paths` as writable
+- disables network with `--unshare-net`
+- only mounts the minimal Python runtime roots needed for the interpreter plus the dedicated venv
+- executes through an internal runner that applies resource limits and blocks process-spawn APIs/imports
+- supports inline code and stored scripts under `/workspace`
+- captures both `stdout` and `stderr`
+- truncates large output to the configured cap
+- syncs explicit write targets back into the real workspace after execution, even if the script exits with an error
+
+#### Policy
+
+- exactly one of `code` or `script_path` must be provided
+- `script_path`, `read_paths`, and `write_paths` must stay inside `/workspace`
+- scripts may not execute from protected workspace paths
+- `read_paths` and `write_paths` must already exist and must be explicit files or directories
+- `write_paths` may not target or contain protected workspace paths
+- `.env` paths are denied
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
+
+#### Current Limitations
+
+- intentionally one-shot and stateless; no persistent kernel/session memory across tool calls
+- writable targets must already exist; to create new files, pass an existing writable directory
+- protected workspace paths are excluded from staged reads, so broad reads like `/workspace` are partial by design
+- third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the dedicated venv
+
 ### `view_image`
 
 - Status: implemented
@@ -362,10 +408,6 @@ These should be auto-exposed at session start once implemented.
 
 - Purpose: search the registry for discoverable tools and return concise usage docs so the agent can opt into additional capabilities
 
-#### `python_interpreter`
-
-- Purpose: run constrained Python code for data processing, parsing, small scripts, and structured transformations that are awkward in shell
-
 #### `file_patch`
 
 - Purpose: perform structured file edits with explicit patch operations instead of freeform shell editing
@@ -404,6 +446,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `web_search`, `web_fetch`, `view_image`, `send_file`
-- Implemented basic tools: `bash`, `web_search`, `web_fetch`, `view_image`, `send_file`
+- Implemented tools: `bash`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
+- Implemented basic tools: `bash`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
 - Implemented discoverable tools: none

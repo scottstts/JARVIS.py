@@ -4,6 +4,7 @@ FROM python:3.12-slim
 # Basic utilities + agent bash-tool command dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash git curl ca-certificates tini \
+    bubblewrap \
     file ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
@@ -18,17 +19,24 @@ RUN curl -LsSf https://astral.sh/ruff/install.sh | sh \
 # (Optional but handy) common python dev env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    JARVIS_TOOL_PYTHON_INTERPRETER_VENV=/opt/jarvis-python-tool-venv \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /tmp/jarvis-deps
 COPY pyproject.toml uv.lock ./
+COPY src/settings.py ./src/settings.py
 
 # Install locked Python dependencies into an image-level venv so the bind-mounted repo
-# does not hide them at runtime, then pre-download Chromium for Playwright fallback.
+# does not hide them at runtime, pre-download Chromium for Playwright fallback,
+# and prepare the dedicated sandboxed interpreter venv for the future tool.
 RUN uv sync --frozen --no-install-project \
-  && python -m playwright install --with-deps chromium
+  && python -m playwright install --with-deps chromium \
+  && python -m venv "${JARVIS_TOOL_PYTHON_INTERPRETER_VENV}" \
+  && export JARVIS_PYTHON_TOOL_PACKAGES="$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('jarvis_settings', 'src/settings.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(' '.join(module.JARVIS_TOOL_PYTHON_INTERPRETER_ALLOWED_PACKAGES))")" \
+  && uv pip install --python "${JARVIS_TOOL_PYTHON_INTERPRETER_VENV}/bin/python" \
+       ${JARVIS_PYTHON_TOOL_PACKAGES}
 
 # Work in the mounted repo by default
 WORKDIR /repo

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from .bash import BashCommandPolicy
+from .config import ToolSettings
+from .python_interpreter import PythonInterpreterPolicy
 from .send_file import SendFilePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
 from .web_fetch import WebFetchPolicy
@@ -31,6 +33,13 @@ class ToolPolicy:
             path = str(arguments.get("path", "")).strip()
             return ViewImagePolicy().authorize(path=path, context=context)
 
+        if tool_name == "python_interpreter":
+            settings = ToolSettings.from_workspace_dir(context.workspace_dir)
+            return PythonInterpreterPolicy(settings).authorize(
+                arguments=arguments,
+                context=context,
+            )
+
         if tool_name == "send_file":
             path = str(arguments.get("path", "")).strip()
             return SendFilePolicy().authorize(path=path, context=context)
@@ -43,7 +52,14 @@ class ToolPolicy:
             url = str(arguments.get("url", "")).strip()
             return WebFetchPolicy().authorize(url=url, context=context)
 
-        if tool_name not in {"bash", "web_search", "web_fetch", "view_image", "send_file"}:
+        if tool_name not in {
+            "bash",
+            "python_interpreter",
+            "web_search",
+            "web_fetch",
+            "view_image",
+            "send_file",
+        }:
             return ToolPolicyDecision(
                 allowed=False,
                 reason=f"Tool '{tool_name}' is not implemented in this runtime.",

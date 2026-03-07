@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import settings as app_settings
+from workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
 
 class UIConfigurationError(ValueError):
@@ -131,15 +132,12 @@ def _default_telegram_temp_dir() -> Path:
     return Path("/workspace/temp")
 
 
-_DEFAULT_TELEGRAM_TEMP_DIR = _default_telegram_temp_dir()
-
-
 @dataclass(slots=True, frozen=True)
 class UISettings:
     telegram_token: str
     telegram_api_base_url: str = app_settings.TELEGRAM_API_BASE_URL
     telegram_allowed_user_id: int | None = app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID
-    telegram_temp_dir: Path = _DEFAULT_TELEGRAM_TEMP_DIR
+    telegram_temp_dir: Path = _default_telegram_temp_dir()
     telegram_poll_timeout_seconds: int = app_settings.JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_poll_limit: int = app_settings.JARVIS_UI_TELEGRAM_POLL_LIMIT
     poll_error_backoff_seconds: float = app_settings.JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS
@@ -190,6 +188,13 @@ class UISettings:
             if gateway_raw is not None
             else _derive_gateway_ws_base_url()
         )
+        workspace_dir = resolve_workspace_dir(error_type=UIConfigurationError)
+        default_telegram_temp_dir = resolve_workspace_child(
+            env_name="JARVIS_UI_TELEGRAM_TEMP_DIR",
+            configured_default=app_settings.JARVIS_UI_TELEGRAM_TEMP_DIR,
+            workspace_dir=workspace_dir,
+            child_name="temp",
+        )
 
         return cls(
             telegram_token=_required_env("TELEGRAM_TOKEN"),
@@ -203,7 +208,7 @@ class UISettings:
             ),
             telegram_temp_dir=_parse_path_env(
                 "JARVIS_UI_TELEGRAM_TEMP_DIR",
-                _DEFAULT_TELEGRAM_TEMP_DIR,
+                default_telegram_temp_dir,
             ),
             telegram_poll_timeout_seconds=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS",

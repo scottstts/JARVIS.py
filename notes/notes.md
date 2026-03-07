@@ -17,6 +17,7 @@
 - Added repo-root `main.py` bootstrap so `uv run -m main` works with the current `src/` layout without extra `PYTHONPATH` setup.
 - Fixed OpenAI multi-turn chat history shaping: assistant transcript messages must be resent to the Responses API as `output_text`, not `input_text`, or turn two fails with a 400.
 - Renamed host/container workspace envs to avoid Docker confusion: `AGENT_ROOT` is the host bind-mount source for compose, while `AGENT_WORKSPACE` is the in-container app workspace path used to derive storage.
+- Host runtime config now fails fast unless `AGENT_WORKSPACE` is explicitly set; `/workspace` remains a container-only default, and host runs should point `AGENT_WORKSPACE` at the real host workspace path.
 - Telegram draft streaming can hit Bot API 429 flood control; parse `retry_after`, pause drafts per chat for that interval, and still send the final assistant message.
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
 - Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.
@@ -40,3 +41,5 @@
 - Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
+- `python_interpreter` is now a basic tool built around a build-time dedicated venv plus `bubblewrap`, using a staged `/workspace` copy and writable re-binds for explicit outputs instead of mounting the real workspace directly.
+- The interpreter package whitelist now lives in `src/settings.py`, and `Dockerfile.dev` reads that setting at build time to install the curated packages into `/opt/jarvis-python-tool-venv`.

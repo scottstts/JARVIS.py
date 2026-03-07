@@ -49,3 +49,32 @@ class CoreSettingsTests(unittest.TestCase):
         self.assertEqual(settings.workspace_dir, Path("/workspace"))
         self.assertEqual(settings.storage_dir, Path("/workspace/storage"))
         self.assertEqual(settings.identities_dir, Path("/workspace/identities"))
+
+    def test_requires_agent_workspace_for_host_runs(self) -> None:
+        with patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ), patch("workspace_paths._running_in_container", return_value=False):
+            with self.assertRaisesRegex(
+                CoreConfigurationError,
+                "AGENT_WORKSPACE must be explicitly set for host runs",
+            ):
+                CoreSettings.from_env()
+
+    def test_uses_explicit_agent_workspace_for_host_runs(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
+            },
+            clear=True,
+        ), patch("workspace_paths._running_in_container", return_value=False):
+            settings = CoreSettings.from_env()
+
+        self.assertEqual(settings.workspace_dir, Path("/tmp/jarvis-host-workspace"))
+        self.assertEqual(settings.storage_dir, Path("/tmp/jarvis-host-workspace/storage"))
+        self.assertEqual(
+            settings.identities_dir,
+            Path("/tmp/jarvis-host-workspace/identities"),
+        )

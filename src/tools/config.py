@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import settings as app_settings
+from workspace_paths import resolve_workspace_dir
 
 
 def _optional_env(name: str) -> str | None:
@@ -40,6 +41,16 @@ class ToolSettings:
     bash_default_timeout_seconds: float
     bash_max_timeout_seconds: float
     bash_max_output_chars: int
+    python_interpreter_venv: Path
+    python_interpreter_allowed_packages: tuple[str, ...]
+    python_interpreter_default_timeout_seconds: float
+    python_interpreter_max_timeout_seconds: float
+    python_interpreter_max_output_chars: int
+    python_interpreter_max_code_chars: int
+    python_interpreter_max_paths: int
+    python_interpreter_max_staged_bytes: int
+    python_interpreter_memory_limit_bytes: int
+    python_interpreter_file_size_limit_bytes: int
     max_tool_rounds_per_turn: int
     web_search_result_count: int
     web_search_timeout_seconds: float
@@ -61,6 +72,34 @@ class ToolSettings:
             )
         if self.bash_max_output_chars <= 0:
             raise ValueError("bash_max_output_chars must be > 0.")
+        if not str(self.python_interpreter_venv).strip():
+            raise ValueError("python_interpreter_venv cannot be empty.")
+        if not self.python_interpreter_allowed_packages:
+            raise ValueError("python_interpreter_allowed_packages cannot be empty.")
+        if self.python_interpreter_default_timeout_seconds <= 0:
+            raise ValueError("python_interpreter_default_timeout_seconds must be > 0.")
+        if self.python_interpreter_max_timeout_seconds <= 0:
+            raise ValueError("python_interpreter_max_timeout_seconds must be > 0.")
+        if (
+            self.python_interpreter_default_timeout_seconds
+            > self.python_interpreter_max_timeout_seconds
+        ):
+            raise ValueError(
+                "python_interpreter_default_timeout_seconds cannot exceed "
+                "python_interpreter_max_timeout_seconds."
+            )
+        if self.python_interpreter_max_output_chars <= 0:
+            raise ValueError("python_interpreter_max_output_chars must be > 0.")
+        if self.python_interpreter_max_code_chars <= 0:
+            raise ValueError("python_interpreter_max_code_chars must be > 0.")
+        if self.python_interpreter_max_paths <= 0:
+            raise ValueError("python_interpreter_max_paths must be > 0.")
+        if self.python_interpreter_max_staged_bytes <= 0:
+            raise ValueError("python_interpreter_max_staged_bytes must be > 0.")
+        if self.python_interpreter_memory_limit_bytes <= 0:
+            raise ValueError("python_interpreter_memory_limit_bytes must be > 0.")
+        if self.python_interpreter_file_size_limit_bytes <= 0:
+            raise ValueError("python_interpreter_file_size_limit_bytes must be > 0.")
         if self.max_tool_rounds_per_turn <= 0:
             raise ValueError("max_tool_rounds_per_turn must be > 0.")
         if self.web_search_result_count <= 0:
@@ -80,10 +119,7 @@ class ToolSettings:
 
     @classmethod
     def from_env(cls) -> "ToolSettings":
-        workspace_root = _optional_env("AGENT_WORKSPACE") or app_settings.AGENT_WORKSPACE
-        if workspace_root is None:
-            workspace_root = "/workspace"
-        return cls.from_workspace_dir(Path(workspace_root).expanduser())
+        return cls.from_workspace_dir(resolve_workspace_dir())
 
     @classmethod
     def from_workspace_dir(cls, workspace_dir: Path) -> "ToolSettings":
@@ -104,6 +140,45 @@ class ToolSettings:
             bash_max_output_chars=_parse_int_env(
                 "JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS",
                 app_settings.JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS,
+            ),
+            python_interpreter_venv=Path(
+                _optional_env("JARVIS_TOOL_PYTHON_INTERPRETER_VENV")
+                or app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_VENV
+            ).expanduser(),
+            python_interpreter_allowed_packages=tuple(
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_ALLOWED_PACKAGES
+            ),
+            python_interpreter_default_timeout_seconds=_parse_float_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_DEFAULT_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_DEFAULT_TIMEOUT_SECONDS,
+            ),
+            python_interpreter_max_timeout_seconds=_parse_float_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_MAX_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_MAX_TIMEOUT_SECONDS,
+            ),
+            python_interpreter_max_output_chars=_parse_int_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_MAX_OUTPUT_CHARS",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_MAX_OUTPUT_CHARS,
+            ),
+            python_interpreter_max_code_chars=_parse_int_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_MAX_CODE_CHARS",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_MAX_CODE_CHARS,
+            ),
+            python_interpreter_max_paths=_parse_int_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_MAX_PATHS",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_MAX_PATHS,
+            ),
+            python_interpreter_max_staged_bytes=_parse_int_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_MAX_STAGED_BYTES",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_MAX_STAGED_BYTES,
+            ),
+            python_interpreter_memory_limit_bytes=_parse_int_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_MEMORY_LIMIT_BYTES",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_MEMORY_LIMIT_BYTES,
+            ),
+            python_interpreter_file_size_limit_bytes=_parse_int_env(
+                "JARVIS_TOOL_PYTHON_INTERPRETER_FILE_SIZE_LIMIT_BYTES",
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_FILE_SIZE_LIMIT_BYTES,
             ),
             max_tool_rounds_per_turn=_parse_int_env(
                 "JARVIS_TOOL_MAX_ROUNDS_PER_TURN",

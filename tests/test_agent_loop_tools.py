@@ -14,7 +14,14 @@ from storage import SessionStorage
 from tests.helpers import build_core_settings
 from tools.web_fetch.tool import HTTPFetchResult
 
-_EXPECTED_BASIC_TOOL_NAMES = ["bash", "web_search", "web_fetch", "view_image", "send_file"]
+_EXPECTED_BASIC_TOOL_NAMES = [
+    "bash",
+    "python_interpreter",
+    "web_search",
+    "web_fetch",
+    "view_image",
+    "send_file",
+]
 
 
 def _build_response(
@@ -203,6 +210,68 @@ class _FakeViewImageLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FakePythonInterpreterLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="python_interpreter_1",
+                        name="python_interpreter",
+                        arguments={
+                            "code": (
+                                "from pathlib import Path\n"
+                                "Path('/workspace/exports/report.txt').write_text("
+                                "'hello', encoding='utf-8')\n"
+                                "print('done')\n"
+                            ),
+                            "write_paths": ["exports"],
+                        },
+                        raw_arguments=(
+                            '{"code":"from pathlib import Path\\nPath('
+                            "'/workspace/exports/report.txt').write_text('hello', "
+                            "encoding='utf-8')\\nprint('done')\\n\","
+                            '"write_paths":["exports"]}'
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "Python interpreter result" not in tool_result_parts[0].content:
+            raise AssertionError("Expected python_interpreter tool result content.")
+        if "synced_write_paths:" not in tool_result_parts[0].content:
+            raise AssertionError("Expected python_interpreter result to mention synced outputs.")
+
+        return _build_response("Python task finished.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _FakeSendFileLLMService:
     def __init__(self) -> None:
         self.generate_calls = 0
@@ -385,6 +454,39 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "view_image")
             self.assertIn("Image attachment prepared", message_records[-2].content)
             self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
+
+    async def test_handle_user_input_executes_python_interpreter_tool_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            exports_dir = settings.workspace_dir / "exports"
+            exports_dir.mkdir(parents=True, exist_ok=True)
+
+            storage = SessionStorage(settings.storage_dir)
+            loop = AgentLoop(
+                llm_service=_FakePythonInterpreterLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input("Use python to write hello into exports/report.txt.")
+
+            self.assertEqual(result.response_text, "Python task finished.")
+            self.assertEqual(
+                (exports_dir / "report.txt").read_text(encoding="utf-8"),
+                "hello",
+            )
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertEqual(
+                message_records[-3].metadata["tool_calls"][0]["name"],
+                "python_interpreter",
+            )
+            self.assertIn("Python interpreter result", message_records[-2].content)
 
     async def test_handle_user_input_executes_send_file_tool_with_route_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

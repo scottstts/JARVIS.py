@@ -77,6 +77,32 @@ class UISettingsTests(unittest.TestCase):
             settings = UISettings.from_env()
         self.assertEqual(settings.telegram_temp_dir, Path("/workspace/temp"))
 
+    def test_requires_agent_workspace_for_host_runs(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+            },
+            clear=True,
+        ), patch("workspace_paths._running_in_container", return_value=False):
+            with self.assertRaisesRegex(
+                UIConfigurationError,
+                "AGENT_WORKSPACE must be explicitly set for host runs",
+            ):
+                UISettings.from_env()
+
+    def test_uses_explicit_agent_workspace_for_telegram_temp_dir_default(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+                "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
+            },
+            clear=True,
+        ), patch("workspace_paths._running_in_container", return_value=False):
+            settings = UISettings.from_env()
+        self.assertEqual(settings.telegram_temp_dir, Path("/tmp/jarvis-host-workspace/temp"))
+
     def test_accepts_explicit_telegram_temp_dir(self) -> None:
         with patch.dict(
             os.environ,
