@@ -37,3 +37,4 @@
 - `send_file` is now a basic tool: it only allows explicit non-`.env` files inside `/workspace`, and it routes Telegram delivery through the existing UI file-send path using the active `tg_<chat_id>` route when available.
 - Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
+- OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
