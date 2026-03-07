@@ -2,8 +2,7 @@
 
 Name: Scott
 Timezone: Dublin/Europe
-
-Note: I am still developing you--Jarvis.
+My Website Markdown: https://scottsun.io/llm.txt
 
 ## Context
 

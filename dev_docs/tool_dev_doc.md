@@ -410,9 +410,9 @@ These should be auto-exposed at session start once implemented.
 
 These should stay hidden by default and only be surfaced through `tool_search`.
 
-#### `git_readonly`
+#### `view_youtube`
 
-- Purpose: inspect repository status, diff, and history through a safer read-only interface
+- Purpose: get a summary of a given youtube video.
 
 #### `archive`
 
