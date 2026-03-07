@@ -6,11 +6,7 @@ from typing import Any
 
 from ..config import ToolSettings
 from ..types import ToolExecutionContext, ToolPolicyDecision
-from .paths import (
-    contains_protected_relative_descendant,
-    is_protected_relative_path,
-    resolve_workspace_path,
-)
+from .paths import resolve_workspace_path
 
 _MAX_ARGS = 32
 _MAX_ARG_CHARS = 512
@@ -31,8 +27,6 @@ class PythonInterpreterPolicy:
         code = _normalize_nullable_string(arguments.get("code"))
         script_path = _normalize_nullable_string(arguments.get("script_path"))
         args = _normalize_string_list(arguments.get("args"))
-        read_paths = _normalize_string_list(arguments.get("read_paths"))
-        write_paths = _normalize_string_list(arguments.get("write_paths"))
 
         if bool(code) == bool(script_path):
             return ToolPolicyDecision(
@@ -64,37 +58,10 @@ class PythonInterpreterPolicy:
                     ),
                 )
 
-        if len(read_paths) > self._settings.python_interpreter_max_paths:
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=(
-                    "python_interpreter allows at most "
-                    f"{self._settings.python_interpreter_max_paths} read_paths."
-                ),
-            )
-        if len(write_paths) > self._settings.python_interpreter_max_paths:
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=(
-                    "python_interpreter allows at most "
-                    f"{self._settings.python_interpreter_max_paths} write_paths."
-                ),
-            )
-
         if script_path is not None:
             script_decision = self._authorize_script_path(script_path=script_path, context=context)
             if not script_decision.allowed:
                 return script_decision
-
-        for raw_path in read_paths:
-            decision = self._authorize_read_path(raw_path=raw_path, context=context)
-            if not decision.allowed:
-                return decision
-
-        for raw_path in write_paths:
-            decision = self._authorize_write_path(raw_path=raw_path, context=context)
-            if not decision.allowed:
-                return decision
 
         return ToolPolicyDecision(allowed=True)
 
@@ -105,7 +72,7 @@ class PythonInterpreterPolicy:
         context: ToolExecutionContext,
     ) -> ToolPolicyDecision:
         try:
-            resolved, relative = resolve_workspace_path(
+            resolved, _ = resolve_workspace_path(
                 script_path,
                 context=context,
                 require_exists=True,
@@ -117,82 +84,6 @@ class PythonInterpreterPolicy:
             return ToolPolicyDecision(
                 allowed=False,
                 reason="python_interpreter 'script_path' must point to a file.",
-            )
-        if is_protected_relative_path(relative):
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=(
-                    "python_interpreter does not allow scripts inside protected workspace "
-                    "paths or .env paths."
-                ),
-            )
-        return ToolPolicyDecision(allowed=True)
-
-    def _authorize_read_path(
-        self,
-        *,
-        raw_path: str,
-        context: ToolExecutionContext,
-    ) -> ToolPolicyDecision:
-        try:
-            resolved, relative = resolve_workspace_path(
-                raw_path,
-                context=context,
-                require_exists=True,
-            )
-        except ValueError as exc:
-            return ToolPolicyDecision(allowed=False, reason=str(exc))
-
-        if not resolved.is_file() and not resolved.is_dir():
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=f"python_interpreter read path '{raw_path}' must be a file or directory.",
-            )
-        if is_protected_relative_path(relative):
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=(
-                    "python_interpreter read paths may not target protected workspace "
-                    "paths or .env paths."
-                ),
-            )
-        return ToolPolicyDecision(allowed=True)
-
-    def _authorize_write_path(
-        self,
-        *,
-        raw_path: str,
-        context: ToolExecutionContext,
-    ) -> ToolPolicyDecision:
-        try:
-            resolved, relative = resolve_workspace_path(
-                raw_path,
-                context=context,
-                require_exists=True,
-            )
-        except ValueError as exc:
-            return ToolPolicyDecision(allowed=False, reason=str(exc))
-
-        if not resolved.is_file() and not resolved.is_dir():
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=f"python_interpreter write path '{raw_path}' must be a file or directory.",
-            )
-        if is_protected_relative_path(relative):
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=(
-                    "python_interpreter write paths may not target protected workspace "
-                    "paths or .env paths."
-                ),
-            )
-        if contains_protected_relative_descendant(relative):
-            return ToolPolicyDecision(
-                allowed=False,
-                reason=(
-                    "python_interpreter write paths may not be ancestors of protected "
-                    "workspace paths. Use a narrower writable directory."
-                ),
             )
         return ToolPolicyDecision(allowed=True)
 

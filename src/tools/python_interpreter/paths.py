@@ -8,11 +8,6 @@ from pathlib import Path
 from ..types import ToolExecutionContext
 
 _GLOB_PATTERN = re.compile(r"[*?\[]")
-_PROTECTED_WORKSPACE_RELATIVE_PATHS = (
-    Path("temp"),
-    Path("identities"),
-    Path("storage") / "routes",
-)
 
 
 class PythonInterpreterPathError(ValueError):
@@ -64,37 +59,3 @@ def resolve_workspace_path(
         ) from exc
 
     return resolved, relative if relative.parts else Path(".")
-
-
-def is_protected_relative_path(relative_path: Path) -> bool:
-    if _contains_dot_env_segment(relative_path):
-        return True
-    return any(
-        _is_same_or_descendant(relative_path, protected)
-        for protected in _PROTECTED_WORKSPACE_RELATIVE_PATHS
-    )
-
-
-def contains_protected_relative_descendant(relative_path: Path) -> bool:
-    if relative_path == Path("."):
-        return True
-    return any(
-        _is_same_or_descendant(protected, relative_path)
-        for protected in _PROTECTED_WORKSPACE_RELATIVE_PATHS
-    )
-
-
-def should_skip_relative_path(relative_path: Path) -> bool:
-    return is_protected_relative_path(relative_path)
-
-
-def protected_workspace_paths() -> tuple[Path, ...]:
-    return _PROTECTED_WORKSPACE_RELATIVE_PATHS
-
-
-def _contains_dot_env_segment(relative_path: Path) -> bool:
-    return any(part == ".env" for part in relative_path.parts)
-
-
-def _is_same_or_descendant(path: Path, ancestor: Path) -> bool:
-    return path == ancestor or ancestor in path.parents

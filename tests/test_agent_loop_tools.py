@@ -236,13 +236,11 @@ class _FakePythonInterpreterLLMService:
                                 "'hello', encoding='utf-8')\n"
                                 "print('done')\n"
                             ),
-                            "write_paths": ["exports"],
                         },
                         raw_arguments=(
                             '{"code":"from pathlib import Path\\nPath('
                             "'/workspace/exports/report.txt').write_text('hello', "
-                            "encoding='utf-8')\\nprint('done')\\n\","
-                            '"write_paths":["exports"]}'
+                            "encoding='utf-8')\\nprint('done')\\n\"}"
                         ),
                     )
                 ],
@@ -263,8 +261,8 @@ class _FakePythonInterpreterLLMService:
             raise AssertionError("Expected one tool result part before follow-up model call.")
         if "Python interpreter result" not in tool_result_parts[0].content:
             raise AssertionError("Expected python_interpreter tool result content.")
-        if "synced_write_paths:" not in tool_result_parts[0].content:
-            raise AssertionError("Expected python_interpreter result to mention synced outputs.")
+        if "workspace_mode: direct_bind" not in tool_result_parts[0].content:
+            raise AssertionError("Expected python_interpreter result to mention direct workspace mode.")
 
         return _build_response("Python task finished.")
 

@@ -12,6 +12,7 @@ import resource
 import runpy
 import sys
 import sysconfig
+from collections.abc import Callable
 from pathlib import Path
 
 _CANONICAL_NAME_PATTERN = re.compile(r"[-_.]+")
@@ -86,6 +87,46 @@ def _install_process_guards() -> None:
     for function_name in _BLOCKED_OS_FUNCTIONS:
         if hasattr(os, function_name):
             setattr(os, function_name, _deny_process_spawn)
+
+    _patch_low_level_process_modules(_deny_process_spawn)
+    _patch_subprocess_module(_deny_process_spawn)
+
+
+def _patch_low_level_process_modules(
+    deny_process_spawn: Callable[..., None],
+) -> None:
+    try:
+        import _posixsubprocess
+    except ImportError:
+        return
+
+    if hasattr(_posixsubprocess, "fork_exec"):
+        setattr(_posixsubprocess, "fork_exec", deny_process_spawn)
+
+
+def _patch_subprocess_module(
+    deny_process_spawn: Callable[..., None],
+) -> None:
+    try:
+        import subprocess
+    except ImportError:
+        return
+
+    class _DeniedPopen:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            deny_process_spawn(*args, **kwargs)
+
+    subprocess.Popen = _DeniedPopen
+    for attribute_name in (
+        "call",
+        "check_call",
+        "check_output",
+        "getoutput",
+        "getstatusoutput",
+        "run",
+    ):
+        if hasattr(subprocess, attribute_name):
+            setattr(subprocess, attribute_name, deny_process_spawn)
 
 
 def _install_import_guard(config: dict[str, object]) -> None:

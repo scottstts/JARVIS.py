@@ -240,31 +240,25 @@ Command-specific restrictions:
 #### Executor Behavior
 
 - runs inside `bubblewrap` with a dedicated interpreter venv created at container build time
-- uses a staged `/workspace` copy instead of mounting the real workspace directly
-- mounts the staged workspace read-only, then re-binds only explicit `write_paths` as writable
+- mounts the real workspace directly at `/workspace`
+- only `/workspace` is writable; writes outside `/workspace` are denied by the sandbox
 - disables network with `--unshare-net`
 - only mounts the minimal Python runtime roots needed for the interpreter plus the dedicated venv
 - executes through an internal runner that applies resource limits and blocks process-spawn APIs/imports
 - supports inline code and stored scripts under `/workspace`
 - captures both `stdout` and `stderr`
 - truncates large output to the configured cap
-- syncs explicit write targets back into the real workspace after execution, even if the script exits with an error
 
 #### Policy
 
 - exactly one of `code` or `script_path` must be provided
-- `script_path`, `read_paths`, and `write_paths` must stay inside `/workspace`
-- scripts may not execute from protected workspace paths
-- `read_paths` and `write_paths` must already exist and must be explicit files or directories
-- `write_paths` may not target or contain protected workspace paths
-- `.env` paths are denied
+- `script_path` must stay inside `/workspace`
 - shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
 
 #### Current Limitations
 
 - intentionally one-shot and stateless; no persistent kernel/session memory across tool calls
-- writable targets must already exist; to create new files, pass an existing writable directory
-- protected workspace paths are excluded from staged reads, so broad reads like `/workspace` are partial by design
+- `read_paths` and `write_paths` are deprecated compatibility fields and no longer control filesystem access
 - third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the dedicated venv
 
 ### `view_image`

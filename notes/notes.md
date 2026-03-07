@@ -41,5 +41,5 @@
 - Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
-- `python_interpreter` is now a basic tool built around a build-time dedicated venv plus `bubblewrap`, using a staged `/workspace` copy and writable re-binds for explicit outputs instead of mounting the real workspace directly.
+- `python_interpreter` is now a basic tool built around a build-time dedicated venv plus `bubblewrap`, mounting the real `/workspace` directly and allowing writes only inside that workspace boundary.
 - The interpreter package whitelist now lives in `src/settings.py`, and `Dockerfile.dev` reads that setting at build time to install the curated packages into `/opt/jarvis-python-tool-venv`.
