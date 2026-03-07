@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,51 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("may only write inside", decision.reason or "")
 
+    def test_denies_reading_dot_env_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "cat /tmp/.env"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn(".env", decision.reason or "")
+
+    def test_denies_writing_dot_env_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "printf 'secret' | tee .env"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn(".env", decision.reason or "")
+
+    def test_denies_recursive_grep(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "grep -R secret ."},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("Recursive grep", decision.reason or "")
+
+    def test_denies_rg_no_config_override(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "rg --no-config secret ."},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("--no-config", decision.reason or "")
+
+    def test_denies_rg_glob_that_targets_dot_env(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "rg -g .env secret ."},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn(".env", decision.reason or "")
+
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -139,6 +185,25 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("denied", result.content.lower())
         self.assertFalse((self.workspace_dir / "note.txt").exists())
+
+    @unittest.skipUnless(shutil.which("rg"), "rg is not installed")
+    async def test_rg_runtime_ignores_dot_env_files(self) -> None:
+        (self.workspace_dir / ".env").write_text("secret\n", encoding="utf-8")
+        (self.workspace_dir / "note.txt").write_text("secret\n", encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_rg_env",
+                name="bash",
+                arguments={"command": "rg secret ."},
+                raw_arguments='{"command":"rg secret ."}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("note.txt", result.content)
+        self.assertNotIn(".env", result.content)
 
     async def test_returns_tool_error_when_executor_raises(self) -> None:
         async def _failing_executor(*, call_id, arguments, context):

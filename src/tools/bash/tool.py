@@ -14,6 +14,8 @@ from llm import ToolDefinition
 from ..config import ToolSettings
 from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
+_RG_CONFIG_PATH = Path(__file__).with_name("rg_config")
+
 
 class BashToolExecutor:
     """Runs validated bash commands inside the agent workspace."""
@@ -31,12 +33,15 @@ class BashToolExecutor:
         command = str(arguments["command"])
         timeout_seconds = self._resolve_timeout_seconds(arguments)
         started_at = perf_counter()
+        env = os.environ.copy()
+        env["RIPGREP_CONFIG_PATH"] = str(_RG_CONFIG_PATH)
 
         process = await asyncio.create_subprocess_exec(
             self._settings.bash_executable,
             "-lc",
             f"set -o pipefail\n{command}",
             cwd=str(context.workspace_dir),
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -158,7 +163,7 @@ def _build_bash_tool_description(settings: ToolSettings) -> str:
         "Use this for reading files, searching content, and editing files inside the workspace. "
         "Allowed commands: pwd, ls, find, stat, file, du, cat, head, tail, grep, rg, wc, cut, "
         "sort, uniq, diff, printf, echo, mkdir, touch, cp, mv, rm, truncate, tee, sed. "
-        "Writes are allowed only inside the workspace path. "
+        "Writes are allowed only inside the workspace path, and any '.env' path is denied for both reads and writes. "
         "Use pipes when needed. Do not use shell control operators like ;, &&, ||, redirects, "
         "subshells, heredocs, or command substitution. "
         "Use printf piped to tee to create or overwrite file content."

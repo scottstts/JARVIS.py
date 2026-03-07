@@ -1,9 +1,10 @@
 # Dockerfile.dev
 FROM python:3.12-slim
 
-# Basic utilities + tini for proper signal handling
+# Basic utilities + agent bash-tool command dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash git curl ca-certificates tini \
+    file ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 # Install uv (Astral's installer)

@@ -77,8 +77,8 @@ Structure:
 
 Current active policy:
 
-- `bash` may read across the container filesystem
-- `bash` may only write inside `/workspace`
+- `bash` may read across the container filesystem except `.env` paths
+- `bash` may only write inside `/workspace`, and `.env` paths are denied even there
 
 ### Transcript And Follow-Up Tool Rounds
 
@@ -138,8 +138,8 @@ When adding a new tool below, keep the tool entry in this shape:
 
 Filesystem rule:
 
-- reads allowed anywhere in the container
-- writes allowed only inside `/workspace`
+- reads allowed anywhere in the container except `.env` paths
+- writes allowed only inside `/workspace`, except `.env` paths are denied there too
 
 Allowed read / inspect commands:
 
@@ -178,6 +178,7 @@ Write restrictions:
 - `cp` may read from anywhere, but its destination must be inside `/workspace`
 - `mv` may only move paths entirely inside `/workspace`
 - `rm`, `mkdir`, `touch`, `truncate`, `tee`, and `sed -i` may only target paths inside `/workspace`
+- any explicit `.env` path is denied for both reads and writes
 - relative write paths resolve from `/workspace`
 - write operands using `~`, `*`, `?`, or `[` are rejected
 
@@ -205,6 +206,9 @@ Rejected shell syntax:
 Command-specific restrictions:
 
 - `find` rejects `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`
+- `find` may not explicitly target `.env` via path/name/regex predicates
+- `grep` rejects recursive forms like `-r`, `-R`, and `--recursive`
+- `rg` always runs with a config that excludes `.env`, rejects `--no-config`, and rejects glob filters that would re-include `.env`
 - `sort` rejects `-o` and `--output`
 - `sed` only allows read-only `-n` line printing and limited `sed -i` substitution
 - `cp` / `mv` reject target-directory forms like `-t`, `--target-directory`, `-T`, `--no-target-directory`
@@ -287,4 +291,3 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 - Implemented tools: `bash`
 - Implemented basic tools: `bash`
 - Implemented discoverable tools: none
-
