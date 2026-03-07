@@ -33,4 +33,6 @@
 - OpenAI strict function schemas require every property to appear in `required`; optional fields must be represented as nullable in the outbound schema, and returned `null` values for omitted optionals should be normalized away before validating against the original tool schema.
 - Tool follow-up rounds now rebuild structured assistant tool calls and tool results into provider-native request shapes in `src/llm/`, so internal tool-call payloads no longer leak into user-facing Telegram replies.
 - Gemini tool-call history must preserve `thought_signature`; store it in provider metadata as base64 and restore it to bytes on the follow-up request.
+- `view_image` is the single workspace-image path for multimodal turns: it prepares a transient local-file attachment that all four provider adapters consume without persisting image bytes into transcript storage.
+- Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.

@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 from ..config import GeminiProviderSettings
 from ..errors import (
@@ -73,7 +74,7 @@ class GeminiProvider:
             streaming=True,
             tools=True,
             embeddings=True,
-            image_input=False,
+            image_input=True,
         )
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -278,8 +279,8 @@ class GeminiProvider:
             function_calling_config["allowed_function_names"] = allowed
         return {"function_calling_config": function_calling_config}
 
-    def _to_gemini_content_parts(self, message: Any) -> list[dict[str, Any]]:
-        parts: list[dict[str, Any]] = []
+    def _to_gemini_content_parts(self, message: Any) -> list[Any]:
+        parts: list[Any] = []
         for part in message.parts:
             if isinstance(part, TextPart):
                 parts.append({"text": part.text})
@@ -301,9 +302,7 @@ class GeminiProvider:
                     function_call_part["thought_signature"] = thought_signature
                 parts.append(function_call_part)
             elif isinstance(part, ImagePart):
-                raise LLMConfigurationError(
-                    "Gemini provider does not support image input in this layer yet."
-                )
+                parts.append(_to_gemini_image_part(part))
             else:
                 raise LLMConfigurationError(
                     f"Unsupported Gemini message part type: {type(part).__name__}."
@@ -491,6 +490,22 @@ def _decode_gemini_thought_signature(provider_metadata: dict[str, Any]) -> bytes
         return base64.b64decode(encoded)
     except (ValueError, TypeError):
         return None
+
+
+def _to_gemini_image_part(part: ImagePart) -> genai_types.Part:
+    data_url_payload = part.data_url_payload()
+    if data_url_payload is None:
+        raise LLMConfigurationError(
+            "Gemini image input in this layer requires a base64 data URL image."
+        )
+    media_type, data_base64 = data_url_payload
+    try:
+        data = base64.b64decode(data_base64, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise LLMConfigurationError(
+            "Gemini image input received invalid base64 image data."
+        ) from exc
+    return genai_types.Part.from_bytes(data=data, mime_type=media_type)
 
 
 def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:

@@ -12,7 +12,7 @@ from tools import RegisteredTool, ToolExecutionContext, ToolPolicy, ToolRegistry
 
 
 class ToolRegistryTests(unittest.TestCase):
-    def test_default_registry_exposes_basic_bash(self) -> None:
+    def test_default_registry_exposes_basic_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
@@ -20,11 +20,16 @@ class ToolRegistryTests(unittest.TestCase):
             registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
 
             basic_names = [tool.name for tool in registry.basic_definitions()]
-            self.assertEqual(basic_names, ["bash"])
+            self.assertEqual(basic_names, ["bash", "view_image"])
             self.assertEqual(registry.search("bash"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
                 ["bash"],
+            )
+            self.assertEqual(registry.search("view_image"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("image", include_basic=True)],
+                ["view_image"],
             )
 
 
@@ -124,6 +129,24 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn(".env", decision.reason or "")
+
+    def test_view_image_allows_workspace_relative_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="view_image",
+            arguments={"path": "temp/sample.png"},
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_view_image_denies_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "outside.png"
+        decision = self.policy.authorize(
+            tool_name="view_image",
+            arguments={"path": str(outside)},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
 
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -246,3 +269,45 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("Tool execution failed", result.content)
         self.assertEqual(result.metadata["error_type"], "RuntimeError")
+
+    async def test_view_image_prepares_image_attachment(self) -> None:
+        image_path = self.workspace_dir / "temp" / "sample.png"
+        image_path.parent.mkdir()
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake_png_payload")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_view_image",
+                name="view_image",
+                arguments={"path": "temp/sample.png", "detail": "high"},
+                raw_arguments='{"path":"temp/sample.png","detail":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("Image attachment prepared", result.content)
+        self.assertEqual(result.metadata["media_type"], "image/png")
+        self.assertEqual(result.metadata["detail"], "high")
+        self.assertEqual(
+            result.metadata["image_attachment"]["path"],
+            str(image_path),
+        )
+
+    async def test_view_image_rejects_non_universal_format(self) -> None:
+        image_path = self.workspace_dir / "temp" / "sample.gif"
+        image_path.parent.mkdir()
+        image_path.write_bytes(b"GIF89afake_gif_payload")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_view_image_gif",
+                name="view_image",
+                arguments={"path": "temp/sample.gif"},
+                raw_arguments='{"path":"temp/sample.gif"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("unsupported image type", result.content.lower())

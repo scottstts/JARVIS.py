@@ -370,6 +370,52 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["HTML"],
         )
 
+    async def test_handle_message_skips_whitespace_only_draft_payloads(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="\n\n"),
+                GatewayDoneEvent(session_id="session", text="pong"),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(telegram.draft_attempts, 0)
+        self.assertEqual(telegram.sent_drafts, [])
+        self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
+
+    async def test_handle_message_falls_back_to_plain_text_for_empty_html_drafts(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="# "),
+                GatewayDoneEvent(session_id="session", text="pong"),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(telegram.draft_attempts, 1)
+        self.assertEqual(len(telegram.sent_drafts), 1)
+        self.assertEqual(telegram.sent_drafts[0].draft.text, "#")
+        self.assertIsNone(telegram.sent_drafts[0].parse_mode)
+        self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
+
     async def test_handle_message_ignores_non_private_chat(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(

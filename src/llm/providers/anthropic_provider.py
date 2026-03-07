@@ -91,7 +91,7 @@ class AnthropicProvider:
             streaming=True,
             tools=True,
             embeddings=False,
-            image_input=False,
+            image_input=True,
         )
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -266,8 +266,11 @@ class AnthropicProvider:
                     }
                 )
             elif isinstance(part, ImagePart):
-                raise LLMConfigurationError(
-                    "Anthropic provider does not support image input in this layer yet."
+                content_blocks.append(
+                    {
+                        "type": "image",
+                        "source": _to_anthropic_image_source(part),
+                    }
                 )
             else:
                 raise LLMConfigurationError(
@@ -463,3 +466,17 @@ def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:
             continue
         raise LLMConfigurationError(unsupported_message)
     return "\n".join(text_parts).strip()
+
+
+def _to_anthropic_image_source(part: ImagePart) -> dict[str, Any]:
+    data_url_payload = part.data_url_payload()
+    if data_url_payload is None:
+        raise LLMConfigurationError(
+            "Anthropic image input in this layer requires a base64 data URL image."
+        )
+    media_type, data_base64 = data_url_payload
+    return {
+        "type": "base64",
+        "media_type": media_type,
+        "data": data_base64,
+    }

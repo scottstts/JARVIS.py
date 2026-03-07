@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Mapping, Sequence, TypeAlias
 
 LLMRole: TypeAlias = Literal["system", "developer", "user", "assistant", "tool"]
-ImageDetail: TypeAlias = Literal["low", "high", "auto"]
+ImageDetail: TypeAlias = Literal["low", "high", "auto", "original"]
 FinishReason: TypeAlias = Literal[
     "stop",
     "tool_calls",
@@ -49,6 +50,31 @@ class ImagePart:
             image_url=f"data:{media_type};base64,{data_base64}",
             detail=detail,
         )
+
+    @classmethod
+    def from_bytes(
+        cls,
+        *,
+        media_type: str,
+        data: bytes,
+        detail: ImageDetail = "auto",
+    ) -> "ImagePart":
+        return cls.from_base64(
+            media_type=media_type,
+            data_base64=base64.b64encode(data).decode("ascii"),
+            detail=detail,
+        )
+
+    def data_url_payload(self) -> tuple[str, str] | None:
+        if self.image_url is None or not self.image_url.startswith("data:"):
+            return None
+        header, separator, data = self.image_url.partition(",")
+        if separator != "," or not header.endswith(";base64"):
+            raise ValueError("ImagePart data URLs must use the 'data:<mime>;base64,<payload>' form.")
+        media_type = header[5:-7]
+        if not media_type or not data:
+            raise ValueError("ImagePart data URL is missing a media type or payload.")
+        return media_type, data
 
 
 @dataclass(slots=True, frozen=True)

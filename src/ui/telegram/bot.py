@@ -33,6 +33,7 @@ LOGGER = logging.getLogger(__name__)
 _GENERIC_ERROR_REPLY = "I hit an internal error while processing that message."
 _FILE_DOWNLOAD_ERROR_REPLY = "I couldn't download that file from Telegram."
 _FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
 class GatewayClientLike(Protocol):
@@ -383,24 +384,28 @@ class TelegramGatewayBridge:
         draft_text = text
         if len(draft_text) > max_chars:
             draft_text = f"{draft_text[: max_chars - 1]}…"
-        draft_text = draft_text or "."
-        draft = DraftMessage(
-            id=draft_id,
-            text=render_markdown_to_telegram_html(draft_text),
+        plain_draft_text = draft_text.strip()
+        if not plain_draft_text:
+            return
+
+        rendered_text = render_markdown_to_telegram_html(draft_text)
+        if _has_visible_telegram_text(rendered_text):
+            draft = DraftMessage(id=draft_id, text=rendered_text)
+            try:
+                await self._telegram.send_message_draft(
+                    chat_id=chat_id,
+                    draft=draft,
+                    parse_mode="HTML",
+                )
+                return
+            except TelegramAPIError as exc:
+                if not _is_formatting_error(exc):
+                    raise
+
+        await self._telegram.send_message_draft(
+            chat_id=chat_id,
+            draft=DraftMessage(id=draft_id, text=plain_draft_text),
         )
-        try:
-            await self._telegram.send_message_draft(
-                chat_id=chat_id,
-                draft=draft,
-                parse_mode="HTML",
-            )
-        except TelegramAPIError as exc:
-            if not _is_formatting_error(exc):
-                raise
-            await self._telegram.send_message_draft(
-                chat_id=chat_id,
-                draft=DraftMessage(id=draft_id, text=draft_text),
-            )
 
     async def _send_final_text(self, *, chat_id: int, text: str) -> None:
         chunks = split_telegram_message(
@@ -748,6 +753,12 @@ def _should_flush_draft(
 
     elapsed = now_monotonic - last_sent_monotonic
     return elapsed >= min_interval_seconds
+
+
+def _has_visible_telegram_text(text: str) -> bool:
+    if not text.strip():
+        return False
+    return bool(_HTML_TAG_PATTERN.sub("", text).strip())
 
 
 def split_telegram_message(text: str, *, max_chars: int = 4_096) -> list[str]:

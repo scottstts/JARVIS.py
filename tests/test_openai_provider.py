@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from llm.config import OpenAIProviderSettings
 from llm.errors import ToolCallValidationError
 from llm.providers.openai_provider import OpenAIProvider
-from llm.types import LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
+from llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
 
 
 class OpenAIProviderRequestShapeTests(unittest.TestCase):
@@ -174,6 +174,55 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
                 ],
                 request_tools=(tool,),
             )
+
+    def test_image_input_uses_input_image_items(self) -> None:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
+        request = LLMRequest(
+            model="gpt-5.4-2026-03-05",
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart(image_url=image_url, detail="original"),
+                    ),
+                ),
+            ),
+        )
+
+        kwargs = provider._build_response_create_kwargs(request, stream=False)
+        image_item = kwargs["input"][0]["content"][0]
+        self.assertEqual(image_item["type"], "input_image")
+        self.assertEqual(image_item["image_url"], image_url)
+        self.assertEqual(image_item["detail"], "original")
+
+    def test_original_detail_downgrades_for_models_without_original_support(self) -> None:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="gpt-5.2-2025-12-11",
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64=base64.b64encode(b"png-bytes").decode("ascii"),
+                            detail="original",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        kwargs = provider._build_response_create_kwargs(request, stream=False)
+        image_item = kwargs["input"][0]["content"][0]
+        self.assertEqual(image_item["detail"], "high")
 
 
 class GeminiNormalizationRegressionTests(unittest.TestCase):

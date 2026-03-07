@@ -13,7 +13,7 @@ from llm.config import (
 from llm.providers.anthropic_provider import AnthropicProvider
 from llm.providers.gemini_provider import GeminiProvider
 from llm.providers.openrouter_provider import OpenRouterProvider
-from llm.types import LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
+from llm.types import ImagePart, LLMMessage, LLMRequest, TextPart, ToolCall, ToolDefinition, ToolResultPart
 
 
 class AnthropicProviderRequestShapeTests(unittest.TestCase):
@@ -80,6 +80,38 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(kwargs["messages"][1]["role"], "user")
         self.assertEqual(kwargs["messages"][1]["content"][0]["type"], "tool_result")
         self.assertEqual(kwargs["messages"][1]["content"][0]["tool_use_id"], "bash_1")
+
+    def test_image_input_uses_base64_image_block(self) -> None:
+        provider = AnthropicProvider(
+            settings=AnthropicProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="claude-sonnet-4-6",
+            max_output_tokens=1024,
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64=base64.b64encode(b"png-bytes").decode("ascii"),
+                        ),
+                        TextPart(text="Describe this image."),
+                    ),
+                ),
+            ),
+        )
+
+        kwargs = provider._build_messages_create_kwargs(request)
+        image_block = kwargs["messages"][0]["content"][0]
+        self.assertEqual(image_block["type"], "image")
+        self.assertEqual(image_block["source"]["type"], "base64")
+        self.assertEqual(image_block["source"]["media_type"], "image/png")
+        self.assertEqual(
+            image_block["source"]["data"],
+            base64.b64encode(b"png-bytes").decode("ascii"),
+        )
 
 
 class GeminiProviderRequestShapeTests(unittest.TestCase):
@@ -185,6 +217,33 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
         self.assertIn("function_response", contents[1]["parts"][0])
         self.assertEqual(contents[1]["parts"][0]["function_response"]["name"], "bash")
 
+    def test_image_input_uses_inline_data_part(self) -> None:
+        provider = GeminiProvider(
+            settings=GeminiProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        image_bytes = b"png-bytes"
+        request = LLMRequest(
+            model="gemini-3-flash-preview",
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64=base64.b64encode(image_bytes).decode("ascii"),
+                        ),
+                        TextPart(text="Describe this image."),
+                    ),
+                ),
+            ),
+        )
+
+        contents, _config = provider._build_generate_payload(request)
+        image_part = contents[0]["parts"][0]
+        self.assertEqual(image_part.inline_data.mime_type, "image/png")
+        self.assertEqual(image_part.inline_data.data, image_bytes)
+
 
 class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
@@ -246,3 +305,27 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
         self.assertIsNone(payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][1]["role"], "tool")
         self.assertEqual(payload["messages"][1]["tool_call_id"], "bash_1")
+
+    def test_image_input_uses_image_url_content_item(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
+        request = LLMRequest(
+            model="minimax/minimax-m2.5",
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart(image_url=image_url),
+                        TextPart(text="Describe this image."),
+                    ),
+                ),
+            ),
+        )
+
+        payload = provider._build_chat_payload(request)
+        content = payload["messages"][0]["content"]
+        image_item = next(item for item in content if item["type"] == "image_url")
+        self.assertEqual(image_item["image_url"]["url"], image_url)

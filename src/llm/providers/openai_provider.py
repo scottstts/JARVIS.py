@@ -6,6 +6,7 @@ import asyncio
 import copy
 import inspect
 import os
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
@@ -250,7 +251,7 @@ class OpenAIProvider:
             "input": [
                 item
                 for message in request.messages
-                for item in self._to_openai_input_items(message)
+                for item in self._to_openai_input_items(message, model=request.model)
             ],
             "stream": stream,
             "parallel_tool_calls": request.parallel_tool_calls,
@@ -292,7 +293,12 @@ class OpenAIProvider:
 
         return kwargs
 
-    def _to_openai_input_items(self, message: LLMMessage) -> list[dict[str, Any]]:
+    def _to_openai_input_items(
+        self,
+        message: LLMMessage,
+        *,
+        model: str,
+    ) -> list[dict[str, Any]]:
         if message.role == "tool":
             return self._to_openai_tool_result_items(message)
 
@@ -315,7 +321,7 @@ class OpenAIProvider:
                     )
                 image_item: dict[str, Any] = {
                     "type": "input_image",
-                    "detail": part.detail,
+                    "detail": _normalize_openai_image_detail(part.detail, model=model),
                 }
                 if part.image_url is not None:
                     image_item["image_url"] = part.image_url
@@ -583,6 +589,29 @@ def _normalize_openai_schema_node(node: Any) -> Any:
         node.setdefault("additionalProperties", False)
 
     return node
+
+
+def _normalize_openai_image_detail(detail: str, *, model: str) -> str:
+    if detail != "original":
+        return detail
+    if _openai_model_supports_original_detail(model):
+        return detail
+    return "high"
+
+
+def _openai_model_supports_original_detail(model: str) -> bool:
+    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?", model.lower())
+    if match is None:
+        return False
+
+    major = int(match.group(1))
+    minor_group = match.group(2)
+    minor = int(minor_group) if minor_group is not None else None
+    if major > 5:
+        return True
+    if major < 5 or minor is None:
+        return False
+    return minor >= 4
 
 
 def _wrap_schema_as_nullable(schema: dict[str, Any]) -> dict[str, Any]:

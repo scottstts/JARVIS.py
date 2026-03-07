@@ -12,6 +12,7 @@ from .types import (
     ToolExposure,
     ToolPolicyDecision,
 )
+from .view_image import ViewImagePolicy
 
 __all__ = [
     "BashCommandPolicy",
@@ -24,4 +25,5 @@ __all__ = [
     "ToolRegistry",
     "ToolRuntime",
     "ToolSettings",
+    "ViewImagePolicy",
 ]

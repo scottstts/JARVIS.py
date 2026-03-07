@@ -1,12 +1,15 @@
 """Core agentic loop with sessioning and context compaction policies."""
 
 from __future__ import annotations
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Sequence
 from uuid import uuid4
 
 from llm import (
+    ImagePart,
     LLMMessage,
     LLMRequest,
     LLMResponse,
@@ -37,6 +40,8 @@ _OVERFLOW_ERROR_HINTS = (
     "context_length_exceeded",
     "exceeds the model",
 )
+_TRANSIENT_RECORD_METADATA_KEY = "transient"
+_IMAGE_INPUT_METADATA_KEY = "image_input"
 
 
 @dataclass(slots=True, frozen=True)
@@ -499,6 +504,8 @@ class AgentLoop:
         estimated_input_tokens: int,
     ) -> None:
         for record in records:
+            if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+                continue
             self._storage.append_record(session_id, record)
 
         usage = response.usage
@@ -545,6 +552,7 @@ class AgentLoop:
                     "Tool loop exceeded max rounds for a single turn."
                 )
 
+            transient_records: list[ConversationRecord] = []
             for tool_call in current_response.tool_calls:
                 tool_result = await self._tool_runtime.execute(
                     tool_call=tool_call,
@@ -553,6 +561,14 @@ class AgentLoop:
                 pending_records.append(
                     self._build_tool_record(session.session_id, tool_result)
                 )
+                transient_records.extend(
+                    self._build_transient_records_from_tool_result(
+                        session.session_id,
+                        tool_result,
+                    )
+                )
+
+            pending_records.extend(transient_records)
 
             request = self._build_request(list(base_records) + pending_records)
             current_estimated_input_tokens = estimate_request_input_tokens(request)
@@ -744,6 +760,43 @@ class AgentLoop:
             metadata=metadata,
         )
 
+    def _build_transient_records_from_tool_result(
+        self,
+        session_id: str,
+        result: ToolExecutionResult,
+    ) -> list[ConversationRecord]:
+        attachment = result.metadata.get("image_attachment")
+        if not isinstance(attachment, dict):
+            return []
+
+        path = str(attachment.get("path", "")).strip()
+        media_type = str(attachment.get("media_type", "")).strip()
+        detail = str(attachment.get("detail", "auto")).strip() or "auto"
+        if not path or not media_type:
+            return []
+
+        content = (
+            "Attached image from a local workspace file requested via view_image.\n"
+            f"path: {path}\n"
+            f"media_type: {media_type}"
+        )
+        return [
+            self._build_message_record(
+                session_id=session_id,
+                role="user",
+                content=content,
+                metadata={
+                    _TRANSIENT_RECORD_METADATA_KEY: True,
+                    _IMAGE_INPUT_METADATA_KEY: {
+                        "path": path,
+                        "media_type": media_type,
+                        "detail": detail,
+                    },
+                    "source_tool": result.name,
+                },
+            )
+        ]
+
     def _append_message(
         self,
         *,
@@ -772,9 +825,15 @@ def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:
 
 def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
     if record.role in {"system", "developer", "user"}:
-        if not record.content:
+        parts: list[ImagePart | TextPart] = []
+        image_part = _record_image_part(record)
+        if image_part is not None:
+            parts.append(image_part)
+        if record.content:
+            parts.append(TextPart(text=record.content))
+        if not parts:
             return None
-        return LLMMessage.text(record.role, record.content)
+        return LLMMessage(role=record.role, parts=tuple(parts))
 
     if record.role == "assistant":
         parts: list[TextPart | ToolCall] = []
@@ -823,3 +882,28 @@ def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
         )
 
     return None
+
+
+def _record_image_part(record: ConversationRecord) -> ImagePart | None:
+    attachment = record.metadata.get(_IMAGE_INPUT_METADATA_KEY)
+    if not isinstance(attachment, dict):
+        return None
+
+    raw_path = str(attachment.get("path", "")).strip()
+    media_type = str(attachment.get("media_type", "")).strip()
+    raw_detail = str(attachment.get("detail", "auto")).strip() or "auto"
+    if not raw_path or not media_type:
+        return None
+    if raw_detail not in {"low", "high", "auto", "original"}:
+        raw_detail = "auto"
+
+    try:
+        data = Path(raw_path).read_bytes()
+    except OSError:
+        return None
+
+    return ImagePart.from_base64(
+        media_type=media_type,
+        data_base64=base64.b64encode(data).decode("ascii"),
+        detail=raw_detail,  # type: ignore[arg-type]
+    )

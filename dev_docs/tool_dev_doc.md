@@ -79,6 +79,7 @@ Current active policy:
 
 - `bash` may read across the container filesystem except `.env` paths
 - `bash` may only write inside `/workspace`, and `.env` paths are denied even there
+- `view_image` may only read explicit image files inside `/workspace`
 
 ### Transcript And Follow-Up Tool Rounds
 
@@ -220,6 +221,37 @@ Command-specific restrictions:
 - no parallel shell tool calls yet
 - if more expressive editing is needed later, prefer a dedicated edit tool over relaxing shell policy too much
 
+### `view_image`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/view_image/`
+- Purpose: attach a local workspace image to the next model turn so multimodal providers can inspect it through a single tool path
+
+#### Input Schema
+
+- `path: string` required
+- `detail: string` optional enum `auto | low | high | original`
+
+#### Executor Behavior
+
+- resolves relative paths from `/workspace`
+- validates that the target exists and is a file
+- inspects file bytes and only accepts image types shared across all current provider adapters
+- returns a normalized tool result with `image_attachment` metadata so the agent loop can inject a transient multimodal follow-up message
+- the image attachment is only guaranteed for the immediate tool-follow-up request and is not persisted into stored transcript history
+
+#### Policy
+
+- only explicit paths are allowed
+- path must stay inside `/workspace`
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
+
+#### Current Limitations
+
+- currently limited to the common provider-safe MIME set: `image/png`, `image/jpeg`, and `image/webp`
+- the tool does not upload provider file handles; it re-reads the local file and injects inline image data for the next model call only
+
 ## Tools To Be Implemented
 
 ### Basic Tools
@@ -245,10 +277,6 @@ These should be auto-exposed at session start once implemented.
 #### `python_interpreter`
 
 - Purpose: run constrained Python code for data processing, parsing, small scripts, and structured transformations that are awkward in shell
-
-#### `image_inspect`
-
-- Purpose: inspect images for metadata, OCR, dimensions, and lightweight visual extraction tasks
 
 #### `file_patch`
 
@@ -288,6 +316,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`
-- Implemented basic tools: `bash`
+- Implemented tools: `bash`, `view_image`
+- Implemented basic tools: `bash`, `view_image`
 - Implemented discoverable tools: none

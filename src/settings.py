@@ -86,7 +86,7 @@ JARVIS_GEMINI_THINKING_LEVEL: Final = "medium"
 JARVIS_GEMINI_THINKING_BUDGET: Final[int | None] = None
 
 # OpenRouter provider defaults.
-JARVIS_OPENROUTER_CHAT_MODEL: Final = "minimax/minimax-m2.5"
+JARVIS_OPENROUTER_CHAT_MODEL: Final = "moonshotai/kimi-k2.5"
 OPENROUTER_APP_NAME: Final = "Jarvis"
 JARVIS_OPENROUTER_TEMPERATURE: Final = 0.8
 JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS: Final = 10_000
