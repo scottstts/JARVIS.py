@@ -500,6 +500,24 @@ def route_id_for_chat(chat_id: int) -> str:
     return f"tg_{chat_segment}"
 
 
+def chat_id_for_route_id(route_id: str) -> int | None:
+    normalized = route_id.strip()
+    if not normalized.startswith("tg_"):
+        return None
+
+    chat_segment = normalized.removeprefix("tg_")
+    if not chat_segment:
+        return None
+    if chat_segment.startswith("n"):
+        digits = chat_segment[1:]
+        if digits.isdigit():
+            return -int(digits)
+        return None
+    if chat_segment.isdigit():
+        return int(chat_segment)
+    return None
+
+
 def _extract_file_attachment(message: dict[str, Any]) -> IncomingTelegramFile | None:
     document = message.get("document")
     if isinstance(document, dict):
@@ -823,6 +841,46 @@ async def send_owner_telegram_file(
         await client.aclose()
 
 
+async def send_telegram_file(
+    *,
+    file_path: str | Path,
+    caption: str | None = None,
+    filename: str | None = None,
+    route_id: str | None = None,
+    chat_id: int | None = None,
+    settings: UISettings | None = None,
+) -> dict[str, Any]:
+    resolved_settings = settings or UISettings.from_env()
+    resolved_chat_id = _resolve_delivery_chat_id(
+        route_id=route_id,
+        chat_id=chat_id,
+        owner_chat_id=resolved_settings.telegram_allowed_user_id,
+    )
+
+    client = TelegramBotAPIClient(
+        token=resolved_settings.telegram_token,
+        api_base_url=resolved_settings.telegram_api_base_url,
+    )
+    try:
+        result = await client.send_document(
+            chat_id=resolved_chat_id,
+            file_path=file_path,
+            caption=caption,
+            filename=filename,
+        )
+    finally:
+        await client.aclose()
+
+    if isinstance(result, dict):
+        enriched_result = dict(result)
+        enriched_result.setdefault("chat_id", resolved_chat_id)
+        return enriched_result
+    return {
+        "chat_id": resolved_chat_id,
+        "result": result,
+    }
+
+
 async def run_telegram_ui(settings: UISettings | None = None) -> None:
     bridge = TelegramGatewayBridge(settings=settings)
     cleanup_task = asyncio.create_task(
@@ -836,3 +894,27 @@ async def run_telegram_ui(settings: UISettings | None = None) -> None:
         with suppress(asyncio.CancelledError):
             await cleanup_task
         await bridge.aclose()
+
+
+def _resolve_delivery_chat_id(
+    *,
+    route_id: str | None,
+    chat_id: int | None,
+    owner_chat_id: int | None,
+) -> int:
+    if chat_id is not None:
+        return chat_id
+    if route_id is not None:
+        resolved = chat_id_for_route_id(route_id)
+        if resolved is not None:
+            return resolved
+        if owner_chat_id is None:
+            raise UIConfigurationError(
+                "send_file could not map the active route to a Telegram chat and no owner fallback is configured."
+            )
+        return owner_chat_id
+    if owner_chat_id is None:
+        raise UIConfigurationError(
+            "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID must be set when send_file has no Telegram route context."
+        )
+    return owner_chat_id

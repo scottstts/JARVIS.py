@@ -16,6 +16,7 @@ class ToolExecutionContext:
     """Runtime context passed to tool executors and policy checks."""
 
     workspace_dir: Path
+    route_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

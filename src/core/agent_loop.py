@@ -90,6 +90,7 @@ class AgentLoop:
         storage: SessionStorage | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_runtime: ToolRuntime | None = None,
+        route_id: str | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
@@ -102,7 +103,10 @@ class AgentLoop:
         self._tool_settings = ToolSettings.from_workspace_dir(self._settings.workspace_dir)
         self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
-        self._tool_context = ToolExecutionContext(workspace_dir=self._tool_settings.workspace_dir)
+        self._tool_context = ToolExecutionContext(
+            workspace_dir=self._tool_settings.workspace_dir,
+            route_id=route_id,
+        )
 
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         command = parse_user_command(user_text)

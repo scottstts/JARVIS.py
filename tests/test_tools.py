@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from llm import ToolCall, ToolDefinition
 from tools import RegisteredTool, ToolExecutionContext, ToolPolicy, ToolRegistry, ToolRuntime, ToolSettings
@@ -20,7 +21,7 @@ class ToolRegistryTests(unittest.TestCase):
             registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
 
             basic_names = [tool.name for tool in registry.basic_definitions()]
-            self.assertEqual(basic_names, ["bash", "view_image"])
+            self.assertEqual(basic_names, ["bash", "view_image", "send_file"])
             self.assertEqual(registry.search("bash"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
@@ -30,6 +31,11 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [tool.name for tool in registry.search("image", include_basic=True)],
                 ["view_image"],
+            )
+            self.assertEqual(registry.search("send"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("send", include_basic=True)],
+                ["send_file"],
             )
 
 
@@ -147,6 +153,33 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("inside", decision.reason or "")
+
+    def test_send_file_allows_workspace_relative_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="send_file",
+            arguments={"path": "exports/report.pdf"},
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_send_file_denies_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "outside.pdf"
+        decision = self.policy.authorize(
+            tool_name="send_file",
+            arguments={"path": str(outside)},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
+
+    def test_send_file_denies_dot_env_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="send_file",
+            arguments={"path": ".env"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn(".env", decision.reason or "")
 
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -269,6 +302,47 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("Tool execution failed", result.content)
         self.assertEqual(result.metadata["error_type"], "RuntimeError")
+
+    async def test_send_file_executes_for_workspace_file(self) -> None:
+        report_path = self.workspace_dir / "exports" / "report.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("hello", encoding="utf-8")
+        context = ToolExecutionContext(
+            workspace_dir=self.workspace_dir,
+            route_id="tg_123",
+        )
+
+        async def _fake_send_telegram_file(**kwargs):
+            self.assertEqual(kwargs["route_id"], "tg_123")
+            self.assertEqual(kwargs["file_path"], report_path)
+            self.assertEqual(kwargs["caption"], "Attached report")
+            self.assertEqual(kwargs["filename"], "weekly.txt")
+            return {"message_id": 9, "chat_id": 123}
+
+        with patch(
+            "tools.send_file.tool.send_telegram_file",
+            side_effect=_fake_send_telegram_file,
+        ):
+            result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_send_file",
+                    name="send_file",
+                    arguments={
+                        "path": "exports/report.txt",
+                        "caption": "Attached report",
+                        "filename": "weekly.txt",
+                    },
+                    raw_arguments=(
+                        '{"path":"exports/report.txt","caption":"Attached report",'
+                        '"filename":"weekly.txt"}'
+                    ),
+                ),
+                context=context,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertIn("File sent to Telegram", result.content)
+        self.assertEqual(result.metadata["chat_id"], 123)
 
     async def test_view_image_prepares_image_attachment(self) -> None:
         image_path = self.workspace_dir / "temp" / "sample.png"

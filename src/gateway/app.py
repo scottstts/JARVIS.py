@@ -184,6 +184,7 @@ def _build_default_router(
         return AgentLoop(
             llm_service=resolved_llm_service,
             settings=route_core_settings,
+            route_id=route_id,
         )
 
     return SessionRouter(agent_loop_factory)

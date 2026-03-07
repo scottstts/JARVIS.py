@@ -8,6 +8,7 @@ from llm import ToolDefinition
 
 from .bash import build_bash_tool
 from .config import ToolSettings
+from .send_file import build_send_file_tool
 from .types import RegisteredTool
 from .view_image import build_view_image_tool
 
@@ -23,7 +24,13 @@ class ToolRegistry:
 
     @classmethod
     def default(cls, settings: ToolSettings) -> "ToolRegistry":
-        return cls(tools=(build_bash_tool(settings), build_view_image_tool(settings)))
+        return cls(
+            tools=(
+                build_bash_tool(settings),
+                build_view_image_tool(settings),
+                build_send_file_tool(settings),
+            )
+        )
 
     def register(self, tool: RegisteredTool) -> None:
         if tool.name in self._tools:

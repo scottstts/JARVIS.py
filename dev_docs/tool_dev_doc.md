@@ -252,6 +252,39 @@ Command-specific restrictions:
 - currently limited to the common provider-safe MIME set: `image/png`, `image/jpeg`, and `image/webp`
 - the tool does not upload provider file handles; it re-reads the local file and injects inline image data for the next model call only
 
+### `send_file`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/send_file/`
+- Purpose: send a local workspace file to the user through the Telegram file-send interface
+
+#### Input Schema
+
+- `path: string` required
+- `caption: string` optional
+- `filename: string` optional
+
+#### Executor Behavior
+
+- resolves relative paths from `/workspace`
+- validates that the target exists and is a file
+- uses the Telegram file-send interface already implemented under `src/ui/telegram/`
+- prefers the active Telegram route when available and falls back to the configured owner chat when route context is unavailable
+- returns a normalized tool result with delivery metadata including the resolved Telegram chat id when available
+
+#### Policy
+
+- only explicit paths are allowed
+- path must stay inside `/workspace`
+- `.env` files and paths inside `.env` directories are denied
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
+
+#### Current Limitations
+
+- depends on the Telegram UI runtime being configured with a valid bot token
+- if the current route is not a Telegram route, delivery falls back to `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID` when set
+
 ## Tools To Be Implemented
 
 ### Basic Tools
@@ -269,10 +302,6 @@ These should be auto-exposed at session start once implemented.
 #### `web_fetch`
 
 - Purpose: fetch and normalize the contents of a specific URL or page for reading and extraction
-
-#### `send_file`
-
-- Purpose: send a local file from the agent workspace to the user through the Telegram file-send interface (such interface has been implemented in src/ui/telegram/, use it)
 
 #### `python_interpreter`
 
@@ -316,6 +345,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `view_image`
-- Implemented basic tools: `bash`, `view_image`
+- Implemented tools: `bash`, `view_image`, `send_file`
+- Implemented basic tools: `bash`, `view_image`, `send_file`
 - Implemented discoverable tools: none

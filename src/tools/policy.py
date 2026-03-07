@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .bash import BashCommandPolicy
+from .send_file import SendFilePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
 from .view_image import ViewImagePolicy
 
@@ -28,7 +29,11 @@ class ToolPolicy:
             path = str(arguments.get("path", "")).strip()
             return ViewImagePolicy().authorize(path=path, context=context)
 
-        if tool_name not in {"bash", "view_image"}:
+        if tool_name == "send_file":
+            path = str(arguments.get("path", "")).strip()
+            return SendFilePolicy().authorize(path=path, context=context)
+
+        if tool_name not in {"bash", "view_image", "send_file"}:
             return ToolPolicyDecision(
                 allowed=False,
                 reason=f"Tool '{tool_name}' is not implemented in this runtime.",

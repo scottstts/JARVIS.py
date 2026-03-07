@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from base64 import b64decode
 from pathlib import Path
+from unittest.mock import patch
 
 from core import AgentLoop, AgentTurnDoneEvent
 from llm import DoneEvent, ImagePart, LLMRequest, LLMResponse, LLMUsage, TextPart, ToolCall, ToolResultPart
@@ -97,8 +98,10 @@ class _FakeToolLLMService:
 
     def _assert_bash_registered(self, request: LLMRequest) -> None:
         names = [tool.name for tool in request.tools]
-        if names != ["bash", "view_image"]:
-            raise AssertionError(f"Expected bash and view_image tools to be registered, got {names}.")
+        if names != ["bash", "view_image", "send_file"]:
+            raise AssertionError(
+                f"Expected bash, view_image, and send_file tools to be registered, got {names}."
+            )
 
 
 class _FakeViewImageLLMService:
@@ -109,8 +112,10 @@ class _FakeViewImageLLMService:
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
-        if names != ["bash", "view_image"]:
-            raise AssertionError(f"Expected bash and view_image tools to be registered, got {names}.")
+        if names != ["bash", "view_image", "send_file"]:
+            raise AssertionError(
+                f"Expected bash, view_image, and send_file tools to be registered, got {names}."
+            )
 
         if self.generate_calls == 1:
             return _build_response(
@@ -173,6 +178,62 @@ class _FakeViewImageLLMService:
             raise AssertionError("Attachment bytes did not match the workspace file.")
 
         return _build_response("Image inspected.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeSendFileLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != ["bash", "view_image", "send_file"]:
+            raise AssertionError(
+                f"Expected bash, view_image, and send_file tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="send_file_1",
+                        name="send_file",
+                        arguments={
+                            "path": "exports/report.txt",
+                            "caption": "Weekly report",
+                            "filename": "report.txt",
+                        },
+                        raw_arguments=(
+                            '{"path":"exports/report.txt","caption":"Weekly report",'
+                            '"filename":"report.txt"}'
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "File sent to Telegram" not in tool_result_parts[0].content:
+            raise AssertionError("Expected send_file tool result content.")
+        if "chat_id: 123" not in tool_result_parts[0].content:
+            raise AssertionError("Expected send_file result to include the resolved Telegram chat.")
+
+        return _build_response("Report delivered.")
 
     async def stream_generate(self, request: LLMRequest):
         raise AssertionError("Streaming is not expected in this test.")
@@ -255,3 +316,36 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "view_image")
             self.assertIn("Image attachment prepared", message_records[-2].content)
             self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
+
+    async def test_handle_user_input_executes_send_file_tool_with_route_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            report_path = settings.workspace_dir / "exports" / "report.txt"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text("weekly report", encoding="utf-8")
+
+            storage = SessionStorage(settings.storage_dir)
+            loop = AgentLoop(
+                llm_service=_FakeSendFileLLMService(),
+                settings=settings,
+                storage=storage,
+                route_id="tg_123",
+            )
+
+            async def _fake_send_telegram_file(**kwargs):
+                self.assertEqual(kwargs["route_id"], "tg_123")
+                self.assertEqual(kwargs["file_path"], report_path)
+                return {"message_id": 7, "chat_id": 123}
+
+            with patch(
+                "tools.send_file.tool.send_telegram_file",
+                side_effect=_fake_send_telegram_file,
+            ):
+                result = await loop.handle_user_input("Send me the report file.")
+
+            self.assertEqual(result.response_text, "Report delivered.")
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "send_file")
+            self.assertIn("File sent to Telegram", message_records[-2].content)

@@ -15,6 +15,7 @@ from ui.telegram.bot import (
     IncomingTextMessage,
     TelegramGatewayBridge,
     _clear_directory_contents,
+    chat_id_for_route_id,
     parse_incoming_message,
     parse_incoming_text_message,
     route_id_for_chat,
@@ -683,6 +684,12 @@ class TelegramBotHelpersTests(unittest.TestCase):
 
     def test_route_id_for_negative_chat_id(self) -> None:
         self.assertEqual(route_id_for_chat(-123), "tg_n123")
+
+    def test_chat_id_for_route_id(self) -> None:
+        self.assertEqual(chat_id_for_route_id("tg_123"), 123)
+        self.assertEqual(chat_id_for_route_id("tg_n123"), -123)
+        self.assertIsNone(chat_id_for_route_id("ws_123"))
+        self.assertIsNone(chat_id_for_route_id("tg_bad"))
 
     def test_split_telegram_message(self) -> None:
         chunks = split_telegram_message("abc", max_chars=2)
