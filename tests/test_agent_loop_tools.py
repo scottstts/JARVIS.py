@@ -12,8 +12,9 @@ from core import AgentLoop, AgentTurnDoneEvent
 from llm import DoneEvent, ImagePart, LLMRequest, LLMResponse, LLMUsage, TextPart, ToolCall, ToolResultPart
 from storage import SessionStorage
 from tests.helpers import build_core_settings
+from tools.web_fetch.tool import HTTPFetchResult
 
-_EXPECTED_BASIC_TOOL_NAMES = ["bash", "web_search", "view_image", "send_file"]
+_EXPECTED_BASIC_TOOL_NAMES = ["bash", "web_search", "web_fetch", "view_image", "send_file"]
 
 
 def _build_response(
@@ -30,6 +31,23 @@ def _build_response(
         finish_reason=finish_reason,  # type: ignore[arg-type]
         usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
         response_id="resp_fake",
+    )
+
+
+def _build_http_fetch_result(
+    *,
+    requested_url: str,
+    content_type: str,
+    body_text: str,
+) -> HTTPFetchResult:
+    return HTTPFetchResult(
+        requested_url=requested_url,
+        final_url=requested_url,
+        status_code=200,
+        headers={"Content-Type": content_type},
+        content_type=content_type,
+        body_text=body_text,
+        redirect_chain=(),
     )
 
 
@@ -241,6 +259,55 @@ class _FakeSendFileLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FakeWebFetchLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="web_fetch_1",
+                        name="web_fetch",
+                        arguments={"url": "https://example.com/docs"},
+                        raw_arguments='{"url":"https://example.com/docs"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "Web fetch result" not in tool_result_parts[0].content:
+            raise AssertionError("Expected web_fetch tool result content.")
+        if "strategy: tier1_markdown_accept" not in tool_result_parts[0].content:
+            raise AssertionError("Expected web_fetch result to record the tier 1 strategy.")
+
+        return _build_response("Fetched page.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_executes_bash_tool_round_and_persists_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,3 +418,37 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             message_records = [record for record in records if record.kind == "message"]
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "send_file")
             self.assertIn("File sent to Telegram", message_records[-2].content)
+
+    async def test_handle_user_input_executes_web_fetch_tool_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.storage_dir)
+            loop = AgentLoop(
+                llm_service=_FakeWebFetchLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            tier1_result = _build_http_fetch_result(
+                requested_url="https://example.com/docs",
+                content_type="text/markdown",
+                body_text="# Example Docs\n\nHello from the fetched page.",
+            )
+
+            with patch(
+                "tools.web_fetch.tool._fetch_http_text",
+                return_value=tier1_result,
+            ):
+                result = await loop.handle_user_input("Fetch https://example.com/docs for me.")
+
+            self.assertEqual(result.response_text, "Fetched page.")
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "web_fetch")
+            self.assertIn("Web fetch result", message_records[-2].content)
+            self.assertEqual(message_records[-2].metadata["strategy"], "tier1_markdown_accept")

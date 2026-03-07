@@ -7,10 +7,11 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from llm import ToolCall, ToolDefinition
 from tools import RegisteredTool, ToolExecutionContext, ToolPolicy, ToolRegistry, ToolRuntime, ToolSettings
+from tools.web_fetch.tool import BrowserRenderResult, HTTPFetchResult, MarkdownConversionResult
 
 
 class _FakeWebSearchResponse:
@@ -29,6 +30,30 @@ class _FakeWebSearchResponse:
 
     def json(self) -> dict[str, object]:
         return self._payload
+
+
+def _build_http_fetch_result(
+    *,
+    requested_url: str = "https://example.com/page",
+    final_url: str | None = None,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+    content_type: str | None = "text/html",
+    body_text: str = "",
+    redirect_chain: tuple[str, ...] = (),
+) -> HTTPFetchResult:
+    resolved_headers = dict(headers or {})
+    if content_type is not None and "Content-Type" not in resolved_headers:
+        resolved_headers["Content-Type"] = content_type
+    return HTTPFetchResult(
+        requested_url=requested_url,
+        final_url=final_url or requested_url,
+        status_code=status_code,
+        headers=resolved_headers,
+        content_type=content_type,
+        body_text=body_text,
+        redirect_chain=redirect_chain,
+    )
 
 
 class ToolSettingsTests(unittest.TestCase):
@@ -55,6 +80,18 @@ class ToolSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.web_search_result_count, 7)
 
+    def test_uses_default_web_fetch_limits_from_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(settings.web_fetch_timeout_seconds, 20.0)
+        self.assertEqual(settings.web_fetch_playwright_timeout_seconds, 20.0)
+        self.assertEqual(settings.web_fetch_max_response_bytes, 2_097_152)
+        self.assertEqual(settings.web_fetch_max_markdown_chars, 20_000)
+
 
 class ToolRegistryTests(unittest.TestCase):
     def test_default_registry_exposes_basic_tools(self) -> None:
@@ -65,7 +102,10 @@ class ToolRegistryTests(unittest.TestCase):
             registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
 
             basic_names = [tool.name for tool in registry.basic_definitions()]
-            self.assertEqual(basic_names, ["bash", "web_search", "view_image", "send_file"])
+            self.assertEqual(
+                basic_names,
+                ["bash", "web_search", "web_fetch", "view_image", "send_file"],
+            )
             self.assertEqual(registry.search("bash"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
@@ -75,6 +115,11 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [tool.name for tool in registry.search("web_search", include_basic=True)],
                 ["web_search"],
+            )
+            self.assertEqual(registry.search("web_fetch"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("web_fetch", include_basic=True)],
+                ["web_fetch"],
             )
             self.assertEqual(registry.search("view_image"), ())
             self.assertEqual(
@@ -246,6 +291,32 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("non-empty", decision.reason or "")
+
+    def test_web_fetch_allows_public_https_url(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="web_fetch",
+            arguments={"url": "https://example.com/docs"},
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_web_fetch_denies_localhost_target(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="web_fetch",
+            arguments={"url": "http://localhost:8080/debug"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("localhost", decision.reason or "")
+
+    def test_web_fetch_denies_private_ip_target(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="web_fetch",
+            arguments={"url": "http://127.0.0.1:8080/debug"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("private", decision.reason or "")
 
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -537,6 +608,180 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.metadata["status_code"], 429)
         self.assertIn("rate limit exceeded", result.content)
+
+    async def test_web_fetch_uses_tier1_markdown_when_available(self) -> None:
+        requested_url = "https://example.com/page"
+        tier1_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/markdown",
+            headers={
+                "Content-Type": "text/markdown",
+                "X-Markdown-Tokens": "41",
+                "Content-Signal": "search=yes",
+            },
+            body_text="# Example\n\nHello from Tier 1.",
+        )
+
+        with patch(
+            "tools.web_fetch.tool._fetch_http_text",
+            return_value=tier1_result,
+        ) as fetch_mock:
+            result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_web_fetch_tier1",
+                    name="web_fetch",
+                    arguments={"url": requested_url},
+                    raw_arguments='{"url":"https://example.com/page"}',
+                ),
+                context=self.context,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(fetch_mock.call_count, 1)
+        self.assertEqual(result.metadata["strategy"], "tier1_markdown_accept")
+        self.assertEqual(result.metadata["markdown_tokens"], 41)
+        self.assertIn("strategy: tier1_markdown_accept", result.content)
+
+    async def test_web_fetch_converts_html_when_markdown_fast_path_fails(self) -> None:
+        requested_url = "https://example.com/article"
+        tier1_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text="<html><body><div>Not markdown</div></body></html>",
+        )
+        tier2_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text=(
+                "<html><body><article><h1>Example</h1><p>Hello from HTML.</p>"
+                "</article></body></html>"
+            ),
+        )
+        converted_result = MarkdownConversionResult(
+            markdown="# Example\n\nHello from HTML.",
+            markdown_tokens=88,
+        )
+
+        with patch(
+            "tools.web_fetch.tool._fetch_http_text",
+            side_effect=[tier1_result, tier2_result],
+        ) as fetch_mock:
+            with patch(
+                "tools.web_fetch.tool._convert_html_to_markdown",
+                return_value=converted_result,
+            ) as convert_mock:
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_web_fetch_tier2",
+                        name="web_fetch",
+                        arguments={"url": requested_url},
+                        raw_arguments='{"url":"https://example.com/article"}',
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(fetch_mock.call_count, 2)
+        convert_mock.assert_called_once()
+        self.assertEqual(result.metadata["strategy"], "tier2_html_to_markdown")
+        self.assertIn("Hello from HTML.", result.content)
+
+    async def test_web_fetch_falls_back_to_playwright_for_js_heavy_page(self) -> None:
+        requested_url = "https://example.com/app"
+        app_shell_html = (
+            "<html><body><div id=\"__next\"></div><script>window.__APP__ = {};</script>"
+            "</body></html>"
+        )
+        tier1_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text=app_shell_html,
+        )
+        tier2_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text=app_shell_html,
+        )
+        low_signal_markdown = MarkdownConversionResult(
+            markdown="Loading...",
+            markdown_tokens=3,
+        )
+        rendered_result = BrowserRenderResult(
+            requested_url=requested_url,
+            final_url=requested_url,
+            html=(
+                "<html><body><main><h1>Rendered App</h1><p>The client content loaded."
+                "</p></main></body></html>"
+            ),
+        )
+        rendered_markdown = MarkdownConversionResult(
+            markdown="# Rendered App\n\nThe client content loaded.",
+            markdown_tokens=55,
+        )
+
+        with patch(
+            "tools.web_fetch.tool._fetch_http_text",
+            side_effect=[tier1_result, tier2_result],
+        ) as fetch_mock:
+            with patch(
+                "tools.web_fetch.tool._convert_html_to_markdown",
+                side_effect=[low_signal_markdown, rendered_markdown],
+            ) as convert_mock:
+                with patch(
+                    "tools.web_fetch.tool._render_page_html",
+                    new=AsyncMock(return_value=rendered_result),
+                ) as render_mock:
+                    result = await self.runtime.execute(
+                        tool_call=ToolCall(
+                            call_id="call_web_fetch_tier3",
+                            name="web_fetch",
+                            arguments={"url": requested_url},
+                            raw_arguments='{"url":"https://example.com/app"}',
+                        ),
+                        context=self.context,
+                    )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(convert_mock.call_count, 2)
+        render_mock.assert_awaited_once()
+        self.assertEqual(result.metadata["strategy"], "tier3_playwright_html_to_markdown")
+        self.assertTrue(result.metadata["browser_rendered"])
+
+    async def test_web_fetch_returns_configuration_error_when_account_id_missing(self) -> None:
+        requested_url = "https://example.com/docs"
+        tier1_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text="<html><body><div>fallback</div></body></html>",
+        )
+        tier2_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text="<html><body><article><h1>Docs</h1></article></body></html>",
+        )
+
+        with patch(
+            "tools.web_fetch.tool._fetch_http_text",
+            side_effect=[tier1_result, tier2_result],
+        ):
+            with patch.dict(
+                os.environ,
+                {"CLOUDFLARE_AI_WORKERS_REST_API_KEY": "test-key"},
+                clear=True,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_web_fetch_missing_account",
+                        name="web_fetch",
+                        arguments={"url": requested_url},
+                        raw_arguments='{"url":"https://example.com/docs"}',
+                    ),
+                    context=self.context,
+                )
+
+        self.assertFalse(result.ok)
+        self.assertIn("CLOUDFLARE_ACCOUNT_ID", result.content)
 
     async def test_view_image_rejects_non_universal_format(self) -> None:
         image_path = self.workspace_dir / "temp" / "sample.gif"

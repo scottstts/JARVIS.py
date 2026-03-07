@@ -10,6 +10,7 @@ from .bash import build_bash_tool
 from .config import ToolSettings
 from .send_file import build_send_file_tool
 from .types import RegisteredTool
+from .web_fetch import build_web_fetch_tool
 from .web_search import build_web_search_tool
 from .view_image import build_view_image_tool
 
@@ -29,6 +30,7 @@ class ToolRegistry:
             tools=(
                 build_bash_tool(settings),
                 build_web_search_tool(settings),
+                build_web_fetch_tool(settings),
                 build_view_image_tool(settings),
                 build_send_file_tool(settings),
             )

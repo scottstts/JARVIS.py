@@ -6,6 +6,7 @@ from .policy import ToolPolicy
 from .registry import ToolRegistry
 from .runtime import ToolRuntime
 from .send_file import SendFilePolicy
+from .web_fetch import WebFetchPolicy
 from .web_search import WebSearchPolicy
 from .types import (
     RegisteredTool,
@@ -28,6 +29,7 @@ __all__ = [
     "ToolRegistry",
     "ToolRuntime",
     "ToolSettings",
+    "WebFetchPolicy",
     "WebSearchPolicy",
     "ViewImagePolicy",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from .bash import BashCommandPolicy
 from .send_file import SendFilePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
+from .web_fetch import WebFetchPolicy
 from .web_search import WebSearchPolicy
 from .view_image import ViewImagePolicy
 
@@ -38,7 +39,11 @@ class ToolPolicy:
             query = str(arguments.get("query", "")).strip()
             return WebSearchPolicy().authorize(query=query, context=context)
 
-        if tool_name not in {"bash", "web_search", "view_image", "send_file"}:
+        if tool_name == "web_fetch":
+            url = str(arguments.get("url", "")).strip()
+            return WebFetchPolicy().authorize(url=url, context=context)
+
+        if tool_name not in {"bash", "web_search", "web_fetch", "view_image", "send_file"}:
             return ToolPolicyDecision(
                 allowed=False,
                 reason=f"Tool '{tool_name}' is not implemented in this runtime.",

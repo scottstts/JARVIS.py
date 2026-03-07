@@ -316,7 +316,41 @@ Command-specific restrictions:
 
 - intentionally minimal; no news, videos, locations, goggles, summary generation, or other Brave advanced features are exposed
 - count is controlled by app settings, not by tool arguments
-- no response-body fetching; downstream page reading still belongs in a future `web_fetch` tool
+- no response-body fetching; downstream page reading belongs in `web_fetch`
+
+### `web_fetch`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/web_fetch/`
+- Purpose: fetch a specific web page and return clean markdown through a markdown-first three-tier strategy
+
+#### Input Schema
+
+- `url: string` required
+
+#### Executor Behavior
+
+- reads `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_AI_WORKERS_REST_API_KEY` from runtime environment for HTML-to-markdown conversion
+- Tier 1 requests the target URL with `Accept: text/markdown` and returns the response directly when usable markdown is available
+- Tier 2 re-fetches the URL as normal HTML/text content and converts fetched HTML through Cloudflare `toMarkdown`
+- Tier 3 uses local Playwright only as a fallback for JavaScript-heavy or render-dependent pages, then sends the rendered HTML through the same Cloudflare `toMarkdown` path
+- manually validates redirect targets and rejects private / localhost / reserved destinations before following them
+- caps fetched response bodies at `JARVIS_TOOL_WEB_FETCH_MAX_RESPONSE_BYTES` and truncates oversized markdown output at `JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS`
+- stores strategy, redirect chain, content type, markdown token count, and attempt summaries in normalized tool-result metadata
+
+#### Policy
+
+- `url` must be non-empty
+- only absolute `http://` and `https://` URLs are allowed
+- embedded credentials are denied
+- localhost and literal private / loopback / reserved IP targets are denied
+
+#### Current Limitations
+
+- HTML conversion and browser-render fallback both depend on Cloudflare `toMarkdown`; if `CLOUDFLARE_ACCOUNT_ID` is missing, only the Tier 1 markdown-native path can succeed
+- v1 intentionally excludes image conversion and general binary/document conversion paths
+- browser rendering is fallback-only and does not expose multi-step browser automation
 
 ## Tools To Be Implemented
 
@@ -327,10 +361,6 @@ These should be auto-exposed at session start once implemented.
 #### `tool_search`
 
 - Purpose: search the registry for discoverable tools and return concise usage docs so the agent can opt into additional capabilities
-
-#### `web_fetch`
-
-- Purpose: fetch and normalize the contents of a specific URL or page for reading and extraction
 
 #### `python_interpreter`
 
@@ -374,6 +404,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `view_image`, `send_file`
-- Implemented basic tools: `bash`, `view_image`, `send_file`
+- Implemented tools: `bash`, `web_search`, `web_fetch`, `view_image`, `send_file`
+- Implemented basic tools: `bash`, `web_search`, `web_fetch`, `view_image`, `send_file`
 - Implemented discoverable tools: none
