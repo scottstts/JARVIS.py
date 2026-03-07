@@ -9,6 +9,7 @@ dependencies = [
     "google-genai>=1.66.0",
     "jsonschema>=4.25.1",
     "openai>=2.24.0",
+    "playwright>=1.58.0",
     "requests>=2.32.5",
     "starlette>=0.49.3",
     "uvicorn>=0.38.0",

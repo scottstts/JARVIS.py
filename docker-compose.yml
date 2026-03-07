@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: jarvis
+    shm_size: 8gb
     volumes:
       - ./:/repo
       - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace

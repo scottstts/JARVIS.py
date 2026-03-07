@@ -17,7 +17,18 @@ RUN curl -LsSf https://astral.sh/ruff/install.sh | sh \
 
 # (Optional but handy) common python dev env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /tmp/jarvis-deps
+COPY pyproject.toml uv.lock ./
+
+# Install locked Python dependencies into an image-level venv so the bind-mounted repo
+# does not hide them at runtime, then pre-download Chromium for Playwright fallback.
+RUN uv sync --frozen --no-install-project \
+  && python -m playwright install --with-deps chromium
 
 # Work in the mounted repo by default
 WORKDIR /repo
