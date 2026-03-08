@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from core import AgentTextDeltaEvent, AgentTurnDoneEvent, AgentTurnResult
+from core import AgentAssistantMessageEvent, AgentTextDeltaEvent, AgentTurnDoneEvent, AgentTurnResult
 from gateway.session_router import SessionRouter, validate_route_id
 
 
@@ -36,6 +36,10 @@ class _TrackingLoop:
         await asyncio.sleep(0.01)
         self.messages.append(user_text)
         yield AgentTextDeltaEvent(session_id=self._session_id, delta="echo:")
+        yield AgentAssistantMessageEvent(
+            session_id=self._session_id,
+            text=f"echo:{user_text}",
+        )
         yield AgentTurnDoneEvent(
             session_id=self._session_id,
             response_text=f"echo:{user_text}",
@@ -99,13 +103,14 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
         router = SessionRouter(lambda route_id: _TrackingLoop(session_id=f"{route_id}-session"))
         self.assertEqual(router.active_session_id("alpha"), "alpha-session")
 
-    async def test_stream_turn_yields_delta_and_done(self) -> None:
+    async def test_stream_turn_yields_delta_message_and_done(self) -> None:
         router = SessionRouter(lambda route_id: _TrackingLoop(session_id=f"{route_id}-session"))
         events = [event async for event in router.stream_turn("alpha", "hello")]
 
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 3)
         self.assertEqual(events[0].type, "text_delta")
-        self.assertEqual(events[1].type, "done")
+        self.assertEqual(events[1].type, "assistant_message")
+        self.assertEqual(events[2].type, "done")
 
 
 class ValidateRouteIDTests(unittest.TestCase):

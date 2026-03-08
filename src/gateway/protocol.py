@@ -66,15 +66,11 @@ def build_assistant_message_event(
     *,
     session_id: str,
     text: str,
-    command: str | None,
-    compaction_performed: bool,
 ) -> dict[str, Any]:
     return {
         "type": "assistant_message",
         "session_id": session_id,
         "text": text,
-        "command": command,
-        "compaction_performed": compaction_performed,
     }
 
 
@@ -83,6 +79,22 @@ def build_assistant_delta_event(*, session_id: str, delta: str) -> dict[str, Any
         "type": "assistant_delta",
         "session_id": session_id,
         "delta": delta,
+    }
+
+
+def build_turn_done_event(
+    *,
+    session_id: str,
+    response_text: str,
+    command: str | None,
+    compaction_performed: bool,
+) -> dict[str, Any]:
+    return {
+        "type": "turn_done",
+        "session_id": session_id,
+        "response_text": response_text,
+        "command": command,
+        "compaction_performed": compaction_performed,
     }
 
 

@@ -8,8 +8,18 @@ from base64 import b64decode
 from pathlib import Path
 from unittest.mock import patch
 
-from core import AgentLoop, AgentTurnDoneEvent
-from llm import DoneEvent, ImagePart, LLMRequest, LLMResponse, LLMUsage, TextPart, ToolCall, ToolResultPart
+from core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
+from llm import (
+    DoneEvent,
+    ImagePart,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    TextDeltaEvent,
+    TextPart,
+    ToolCall,
+    ToolResultPart,
+)
 from storage import SessionStorage
 from tests.helpers import build_core_settings
 from tools.web_fetch.tool import HTTPFetchResult
@@ -109,20 +119,41 @@ class _FakeToolLLMService:
     async def stream_generate(self, request: LLMRequest):
         self.stream_calls += 1
         self._assert_bash_registered(request)
-        yield DoneEvent(
-            response=_build_response(
-                "",
-                tool_calls=[
-                    ToolCall(
-                        call_id="bash_stream_1",
-                        name="bash",
-                        arguments={"command": "printf 'hello' | tee note.txt"},
-                        raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
-                    )
-                ],
-                finish_reason="tool_calls",
+        if self.stream_calls == 1:
+            yield TextDeltaEvent(delta="Working on it.")
+            yield DoneEvent(
+                response=_build_response(
+                    "Working on it.",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="bash_stream_1",
+                            name="bash",
+                            arguments={"command": "printf 'hello' | tee note.txt"},
+                            raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
             )
-        )
+            return
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "note.txt" not in tool_result_parts[0].content:
+            raise AssertionError("Expected streamed tool result content to mention written file.")
+
+        yield TextDeltaEvent(delta="File written.")
+        yield DoneEvent(response=_build_response("File written."))
 
     def _assert_bash_registered(self, request: LLMRequest) -> None:
         names = [tool.name for tool in request.tools]
@@ -477,7 +508,18 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             events = [event async for event in loop.stream_user_input("Write hello into note.txt.")]
 
-            self.assertEqual([event.type for event in events], ["text_delta", "done"])
+            self.assertEqual(
+                [event.type for event in events],
+                [
+                    "text_delta",
+                    "assistant_message",
+                    "text_delta",
+                    "assistant_message",
+                    "done",
+                ],
+            )
+            self.assertIsInstance(events[1], AgentAssistantMessageEvent)
+            self.assertIsInstance(events[3], AgentAssistantMessageEvent)
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")

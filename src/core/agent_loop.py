@@ -60,6 +60,13 @@ class AgentTextDeltaEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class AgentAssistantMessageEvent:
+    session_id: str
+    text: str
+    type: Literal["assistant_message"] = "assistant_message"
+
+
+@dataclass(slots=True, frozen=True)
 class AgentTurnDoneEvent:
     session_id: str
     response_text: str
@@ -76,7 +83,11 @@ class AgentTurnDoneEvent:
         )
 
 
-AgentTurnStreamEvent = AgentTextDeltaEvent | AgentTurnDoneEvent
+AgentTurnStreamEvent = (
+    AgentTextDeltaEvent
+    | AgentAssistantMessageEvent
+    | AgentTurnDoneEvent
+)
 
 
 class AgentLoop:
@@ -177,6 +188,10 @@ class AgentLoop:
                 yield event
             return
 
+        yield AgentAssistantMessageEvent(
+            session_id=session.session_id,
+            text="Started a new session.",
+        )
         yield AgentTurnDoneEvent(
             session_id=session.session_id,
             response_text="Started a new session.",
@@ -189,6 +204,10 @@ class AgentLoop:
         command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         result = await self._handle_compact_command(command)
+        yield AgentAssistantMessageEvent(
+            session_id=result.session_id,
+            text=result.response_text,
+        )
         yield AgentTurnDoneEvent(
             session_id=result.session_id,
             response_text=result.response_text,
@@ -273,6 +292,41 @@ class AgentLoop:
             response_text=final_response.text,
             compaction_performed=did_compaction,
         )
+
+    async def _execute_tool_calls_and_build_request(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        current_response: LLMResponse,
+    ) -> tuple[LLMRequest, int]:
+        transient_records: list[ConversationRecord] = []
+        for tool_call in current_response.tool_calls:
+            tool_result = await self._tool_runtime.execute(
+                tool_call=tool_call,
+                context=self._tool_context,
+            )
+            pending_records.append(
+                self._build_tool_record(session_id, tool_result)
+            )
+            transient_records.extend(
+                self._build_transient_records_from_tool_result(
+                    session_id,
+                    tool_result,
+                )
+            )
+
+        pending_records.extend(transient_records)
+
+        request = self._build_request(list(base_records) + pending_records)
+        estimated_input_tokens = estimate_request_input_tokens(request)
+        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+            raise ContextBudgetError(
+                "Tool output exceeded the context budget during the current turn."
+            )
+
+        return request, estimated_input_tokens
 
     async def _stream_message_turn(
         self,
@@ -362,20 +416,55 @@ class AgentLoop:
             ),
             self._build_assistant_record(session.session_id, initial_response),
         ]
-        final_response, final_estimated_input_tokens, used_tool_rounds = (
-            await self._execute_followup_tool_rounds(
-                session=session,
+        if initial_response.text:
+            yield AgentAssistantMessageEvent(
+                session_id=session.session_id,
+                text=initial_response.text,
+            )
+
+        current_response = initial_response
+        tool_rounds = 0
+        while current_response.tool_calls:
+            tool_rounds += 1
+            if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
+                raise RuntimeError(
+                    "Tool loop exceeded max rounds for a single turn."
+                )
+
+            request, final_estimated_input_tokens = await self._execute_tool_calls_and_build_request(
+                session_id=session.session_id,
                 base_records=base_records,
                 pending_records=pending_records,
-                current_response=initial_response,
-                current_estimated_input_tokens=final_estimated_input_tokens,
+                current_response=current_response,
             )
-        )
-        if used_tool_rounds and final_response.text:
-            yield AgentTextDeltaEvent(
-                session_id=session.session_id,
-                delta=final_response.text,
+
+            streamed_response: LLMResponse | None = None
+            async for event in self._llm_service.stream_generate(request):
+                if event.type == "text_delta":
+                    if event.delta:
+                        yield AgentTextDeltaEvent(
+                            session_id=session.session_id,
+                            delta=event.delta,
+                        )
+                elif event.type == "done":
+                    streamed_response = event.response
+
+            if streamed_response is None:
+                raise RuntimeError(
+                    "Streaming follow-up generation completed without a final done event."
+                )
+
+            current_response = streamed_response
+            pending_records.append(
+                self._build_assistant_record(session.session_id, current_response)
             )
+            if current_response.text:
+                yield AgentAssistantMessageEvent(
+                    session_id=session.session_id,
+                    text=current_response.text,
+                )
+
+        final_response = current_response
 
         self._persist_successful_turn(
             session_id=session.session_id,
@@ -556,30 +645,12 @@ class AgentLoop:
                     "Tool loop exceeded max rounds for a single turn."
                 )
 
-            transient_records: list[ConversationRecord] = []
-            for tool_call in current_response.tool_calls:
-                tool_result = await self._tool_runtime.execute(
-                    tool_call=tool_call,
-                    context=self._tool_context,
-                )
-                pending_records.append(
-                    self._build_tool_record(session.session_id, tool_result)
-                )
-                transient_records.extend(
-                    self._build_transient_records_from_tool_result(
-                        session.session_id,
-                        tool_result,
-                    )
-                )
-
-            pending_records.extend(transient_records)
-
-            request = self._build_request(list(base_records) + pending_records)
-            current_estimated_input_tokens = estimate_request_input_tokens(request)
-            if current_estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
-                raise ContextBudgetError(
-                    "Tool output exceeded the context budget during the current turn."
-                )
+            request, current_estimated_input_tokens = await self._execute_tool_calls_and_build_request(
+                session_id=session.session_id,
+                base_records=base_records,
+                pending_records=pending_records,
+                current_response=current_response,
+            )
 
             current_response = await self._llm_service.generate(request)
             pending_records.append(

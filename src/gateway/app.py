@@ -8,7 +8,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 
-from core import AgentLoop, AgentTextDeltaEvent, AgentTurnDoneEvent, ContextBudgetError, CoreSettings
+from core import (
+    AgentAssistantMessageEvent,
+    AgentLoop,
+    AgentTextDeltaEvent,
+    AgentTurnDoneEvent,
+    ContextBudgetError,
+    CoreSettings,
+)
 from llm import LLMService, ProviderTimeoutError
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -23,6 +30,7 @@ from .protocol import (
     build_assistant_message_event,
     build_error_event,
     build_ready_event,
+    build_turn_done_event,
     parse_client_event,
 )
 from .session_router import InvalidRouteIDError, SessionRouter, validate_route_id
@@ -123,11 +131,20 @@ def create_app(
                         )
                         continue
 
-                    if isinstance(turn_event, AgentTurnDoneEvent):
+                    if isinstance(turn_event, AgentAssistantMessageEvent):
                         await websocket.send_json(
                             build_assistant_message_event(
                                 session_id=turn_event.session_id,
-                                text=turn_event.response_text,
+                                text=turn_event.text,
+                            )
+                        )
+                        continue
+
+                    if isinstance(turn_event, AgentTurnDoneEvent):
+                        await websocket.send_json(
+                            build_turn_done_event(
+                                session_id=turn_event.session_id,
+                                response_text=turn_event.response_text,
                                 command=turn_event.command,
                                 compaction_performed=turn_event.compaction_performed,
                             )

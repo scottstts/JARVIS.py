@@ -9,7 +9,8 @@ from unittest.mock import patch
 from ui.telegram.gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
-    GatewayDoneEvent,
+    GatewayMessageEvent,
+    GatewayTurnDoneEvent,
     GatewayWebSocketClient,
 )
 
@@ -47,6 +48,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
                 json.dumps({"type": "assistant_delta", "session_id": "s1", "delta": "hel"}),
                 json.dumps({"type": "assistant_message", "session_id": "s1", "text": "hello"}),
+                json.dumps({"type": "turn_done", "session_id": "s1", "response_text": "hello"}),
             ]
         )
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
@@ -57,10 +59,12 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
 
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 3)
         self.assertIsInstance(events[0], GatewayDeltaEvent)
-        self.assertIsInstance(events[1], GatewayDoneEvent)
+        self.assertIsInstance(events[1], GatewayMessageEvent)
+        self.assertIsInstance(events[2], GatewayTurnDoneEvent)
         self.assertEqual(events[1].text, "hello")
+        self.assertEqual(events[2].response_text, "hello")
         outbound = json.loads(socket.sent[0])
         self.assertEqual(outbound, {"type": "user_message", "text": "hi"})
 

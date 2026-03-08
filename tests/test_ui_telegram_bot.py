@@ -25,7 +25,8 @@ from ui.telegram.config import UISettings
 from ui.telegram.gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
-    GatewayDoneEvent,
+    GatewayMessageEvent,
+    GatewayTurnDoneEvent,
 )
 
 
@@ -171,7 +172,7 @@ class _FakeGatewayClient:
     def __init__(
         self,
         *,
-        events: list[GatewayDeltaEvent | GatewayDoneEvent] | None = None,
+        events: list[GatewayDeltaEvent | GatewayMessageEvent | GatewayTurnDoneEvent] | None = None,
         error: GatewayBridgeError | None = None,
     ) -> None:
         self._events = events or []
@@ -211,7 +212,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         ]
         telegram = _FakeTelegramClient(updates=updates)
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="s", text="pong")],
+            events=[
+                GatewayMessageEvent(session_id="s", text="pong"),
+                GatewayTurnDoneEvent(session_id="s", response_text="pong"),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(),
@@ -258,7 +262,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 download_payloads={"documents/report.pdf": b"%PDF-1.4"},
             )
             gateway = _FakeGatewayClient(
-                events=[GatewayDoneEvent(session_id="s", text="pong")],
+                events=[
+                    GatewayMessageEvent(session_id="s", text="pong"),
+                    GatewayTurnDoneEvent(session_id="s", response_text="pong"),
+                ],
             )
             bridge = TelegramGatewayBridge(
                 settings=_settings(telegram_temp_dir=Path(tmp)),
@@ -294,7 +301,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         ]
         telegram = _FakeTelegramClient(updates=updates)
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="s", text="pong")],
+            events=[
+                GatewayMessageEvent(session_id="s", text="pong"),
+                GatewayTurnDoneEvent(session_id="s", response_text="pong"),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(telegram_allowed_user_id=999),
@@ -321,7 +331,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="s", text="pong")],
+            events=[
+                GatewayMessageEvent(session_id="s", text="pong"),
+                GatewayTurnDoneEvent(session_id="s", response_text="pong"),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(),
@@ -341,7 +354,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             events=[
                 GatewayDeltaEvent(session_id="session", delta="stream-"),
                 GatewayDeltaEvent(session_id="session", delta="reply"),
-                GatewayDoneEvent(session_id="session", text="stream-reply"),
+                GatewayMessageEvent(session_id="session", text="stream-reply"),
+                GatewayTurnDoneEvent(session_id="session", response_text="stream-reply"),
             ],
         )
         bridge = TelegramGatewayBridge(
@@ -371,12 +385,47 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["HTML"],
         )
 
+    async def test_handle_message_preserves_multiple_assistant_segments(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="Working on it."),
+                GatewayMessageEvent(session_id="session", text="Working on it."),
+                GatewayDeltaEvent(session_id="session", delta="Done."),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [draft.draft.id for draft in telegram.sent_drafts],
+            [1, 2],
+        )
+        self.assertEqual(
+            [draft.draft.text for draft in telegram.sent_drafts],
+            ["Working on it.", "Done."],
+        )
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["Working on it.", "Done."],
+        )
+
     async def test_handle_message_skips_whitespace_only_draft_payloads(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             events=[
                 GatewayDeltaEvent(session_id="session", delta="\n\n"),
-                GatewayDoneEvent(session_id="session", text="pong"),
+                GatewayMessageEvent(session_id="session", text="pong"),
+                GatewayTurnDoneEvent(session_id="session", response_text="pong"),
             ],
         )
         bridge = TelegramGatewayBridge(
@@ -398,7 +447,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         gateway = _FakeGatewayClient(
             events=[
                 GatewayDeltaEvent(session_id="session", delta="# "),
-                GatewayDoneEvent(session_id="session", text="pong"),
+                GatewayMessageEvent(session_id="session", text="pong"),
+                GatewayTurnDoneEvent(session_id="session", response_text="pong"),
             ],
         )
         bridge = TelegramGatewayBridge(
@@ -420,7 +470,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_message_ignores_non_private_chat(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="session", text="should-not-send")],
+            events=[
+                GatewayMessageEvent(session_id="session", text="should-not-send"),
+                GatewayTurnDoneEvent(session_id="session", response_text="should-not-send"),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(),
@@ -439,7 +492,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_message_ignores_private_chat_when_owner_gate_does_not_match(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="session", text="should-not-send")],
+            events=[
+                GatewayMessageEvent(session_id="session", text="should-not-send"),
+                GatewayTurnDoneEvent(session_id="session", response_text="should-not-send"),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(telegram_allowed_user_id=777),
@@ -488,7 +544,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         long_text = "a" * 5000
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="session", text=long_text)],
+            events=[
+                GatewayMessageEvent(session_id="session", text=long_text),
+                GatewayTurnDoneEvent(session_id="session", response_text=long_text),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(),
@@ -537,7 +596,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         gateway = _FakeGatewayClient(
             events=[
                 GatewayDeltaEvent(session_id="session", delta="stream-"),
-                GatewayDoneEvent(session_id="session", text="stream-reply"),
+                GatewayMessageEvent(session_id="session", text="stream-reply"),
+                GatewayTurnDoneEvent(session_id="session", response_text="stream-reply"),
             ],
         )
         bridge = TelegramGatewayBridge(
@@ -564,10 +624,14 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             events=[
-                GatewayDoneEvent(
+                GatewayMessageEvent(
                     session_id="session",
                     text="**bold** and `code` with [link](https://example.com)",
-                )
+                ),
+                GatewayTurnDoneEvent(
+                    session_id="session",
+                    response_text="**bold** and `code` with [link](https://example.com)",
+                ),
             ],
         )
         bridge = TelegramGatewayBridge(
@@ -597,7 +661,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         gateway = _FakeGatewayClient(
-            events=[GatewayDoneEvent(session_id="session", text="**bold**")],
+            events=[
+                GatewayMessageEvent(session_id="session", text="**bold**"),
+                GatewayTurnDoneEvent(session_id="session", response_text="**bold**"),
+            ],
         )
         bridge = TelegramGatewayBridge(
             settings=_settings(),

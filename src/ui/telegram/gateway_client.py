@@ -26,15 +26,22 @@ class GatewayDeltaEvent:
 
 
 @dataclass(slots=True, frozen=True)
-class GatewayDoneEvent:
+class GatewayMessageEvent:
     session_id: str
     text: str
-    command: str | None = None
-    compaction_performed: bool = False
     type: str = "assistant_message"
 
 
-GatewayTurnEvent = GatewayDeltaEvent | GatewayDoneEvent
+@dataclass(slots=True, frozen=True)
+class GatewayTurnDoneEvent:
+    session_id: str
+    response_text: str
+    command: str | None = None
+    compaction_performed: bool = False
+    type: str = "turn_done"
+
+
+GatewayTurnEvent = GatewayDeltaEvent | GatewayMessageEvent | GatewayTurnDoneEvent
 
 
 class GatewayWebSocketClient:
@@ -91,9 +98,15 @@ class GatewayWebSocketClient:
                         )
                         continue
                     if event_type == "assistant_message":
-                        yield GatewayDoneEvent(
+                        yield GatewayMessageEvent(
                             session_id=str(payload.get("session_id", "")),
                             text=str(payload.get("text", "")),
+                        )
+                        continue
+                    if event_type == "turn_done":
+                        yield GatewayTurnDoneEvent(
+                            session_id=str(payload.get("session_id", "")),
+                            response_text=str(payload.get("response_text", "")),
                             command=(
                                 str(payload["command"])
                                 if payload.get("command") is not None

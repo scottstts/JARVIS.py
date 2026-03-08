@@ -25,7 +25,8 @@ from .formatting import render_markdown_to_telegram_html
 from .gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
-    GatewayDoneEvent,
+    GatewayMessageEvent,
+    GatewayTurnDoneEvent,
     GatewayWebSocketClient,
 )
 
@@ -229,11 +230,12 @@ class TelegramGatewayBridge:
             return
 
         route_id = route_id_for_chat(message.chat_id)
-        draft_id = self._next_draft_id_for_chat(message.chat_id)
+        current_draft_id = self._next_draft_id_for_chat(message.chat_id)
 
         accumulated_text = ""
         last_draft_text = ""
         last_draft_at = 0.0
+        delivered_any_segment = False
         drafts_enabled = (
             time.monotonic()
             >= self._draft_retry_until_by_chat.get(message.chat_id, 0.0)
@@ -262,7 +264,7 @@ class TelegramGatewayBridge:
                         try:
                             await self._send_draft(
                                 chat_id=message.chat_id,
-                                draft_id=draft_id,
+                                draft_id=current_draft_id,
                                 text=accumulated_text,
                             )
                             last_draft_text = accumulated_text
@@ -285,9 +287,27 @@ class TelegramGatewayBridge:
                                 )
                     continue
 
-                if isinstance(event, GatewayDoneEvent):
-                    final_text = event.text or "(No response text.)"
+                if isinstance(event, GatewayMessageEvent):
+                    final_text = event.text or accumulated_text or "(No response text.)"
                     await self._send_final_text(chat_id=message.chat_id, text=final_text)
+                    delivered_any_segment = True
+                    accumulated_text = ""
+                    last_draft_text = ""
+                    last_draft_at = 0.0
+                    current_draft_id = self._next_draft_id_for_chat(message.chat_id)
+                    continue
+
+                if isinstance(event, GatewayTurnDoneEvent):
+                    if not delivered_any_segment:
+                        final_text = (
+                            event.response_text
+                            or accumulated_text
+                            or "(No response text.)"
+                        )
+                        await self._send_final_text(
+                            chat_id=message.chat_id,
+                            text=final_text,
+                        )
                     return
 
             await self._send_final_text(

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from core import AgentTextDeltaEvent, AgentTurnDoneEvent, ContextBudgetError
+from core import (
+    AgentAssistantMessageEvent,
+    AgentTextDeltaEvent,
+    AgentTurnDoneEvent,
+    ContextBudgetError,
+)
 from gateway import GatewaySettings, create_app
 from llm import ProviderTimeoutError
 from starlette.testclient import TestClient
@@ -29,6 +34,10 @@ class _FakeRouter:
         yield AgentTextDeltaEvent(
             session_id=f"{route_id}-session",
             delta="echo:",
+        )
+        yield AgentAssistantMessageEvent(
+            session_id=f"{route_id}-session",
+            text=f"echo:{user_text}",
         )
         yield AgentTurnDoneEvent(
             session_id=f"{route_id}-session",
@@ -62,6 +71,11 @@ class GatewayAppTests(unittest.TestCase):
                 self.assertEqual(reply["type"], "assistant_message")
                 self.assertEqual(reply["session_id"], "dm_1-session")
                 self.assertEqual(reply["text"], "echo:hello")
+
+                done = socket.receive_json()
+                self.assertEqual(done["type"], "turn_done")
+                self.assertEqual(done["session_id"], "dm_1-session")
+                self.assertEqual(done["response_text"], "echo:hello")
                 self.assertEqual(router.calls, [("dm_1", "hello")])
 
     def test_invalid_json_emits_error_event(self) -> None:

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import AgentLoop, AgentTurnDoneEvent
+from core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
 from llm import DoneEvent, LLMResponse, LLMUsage, TextDeltaEvent
 from storage import SessionStorage
 from tests.helpers import build_core_settings
@@ -46,7 +46,11 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             events = [event async for event in loop.stream_user_input("hello")]
-            self.assertEqual([event.type for event in events], ["text_delta", "text_delta", "done"])
+            self.assertEqual(
+                [event.type for event in events],
+                ["text_delta", "text_delta", "assistant_message", "done"],
+            )
+            self.assertIsInstance(events[-2], AgentAssistantMessageEvent)
             self.assertIsInstance(events[-1], AgentTurnDoneEvent)
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
@@ -71,6 +75,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             events = [event async for event in loop.stream_user_input("/new continue")]
+            self.assertEqual(events[-2].type, "assistant_message")
             self.assertIsInstance(events[-1], AgentTurnDoneEvent)
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
