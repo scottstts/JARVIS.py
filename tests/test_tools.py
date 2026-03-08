@@ -167,6 +167,7 @@ class ToolRegistryTests(unittest.TestCase):
                 basic_names,
                 [
                     "bash",
+                    "file_patch",
                     "python_interpreter",
                     "web_search",
                     "web_fetch",
@@ -178,6 +179,11 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
                 ["bash"],
+            )
+            self.assertEqual(registry.search("patch"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("patch", include_basic=True)],
+                ["file_patch"],
             )
             self.assertEqual(registry.search("python"), ())
             self.assertEqual(
@@ -310,6 +316,42 @@ class ToolPolicyTests(unittest.TestCase):
             context=self.context,
         )
         self.assertTrue(decision.allowed)
+
+    def test_file_patch_allows_workspace_relative_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="file_patch",
+            arguments={
+                "path": "src/example.py",
+                "operations": [{"type": "write", "content": "print('hello')\n"}],
+            },
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_file_patch_denies_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "outside.py"
+        decision = self.policy.authorize(
+            tool_name="file_patch",
+            arguments={
+                "path": str(outside),
+                "operations": [{"type": "write", "content": "print('hello')\n"}],
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
+
+    def test_file_patch_denies_dot_env_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="file_patch",
+            arguments={
+                "path": ".env",
+                "operations": [{"type": "write", "content": "SECRET=1\n"}],
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn(".env", decision.reason or "")
 
     def test_view_image_denies_path_escape(self) -> None:
         outside = self.workspace_dir.parent / "outside.png"
@@ -460,6 +502,146 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (self.workspace_dir / "note.txt").read_text(encoding="utf-8"),
             "hello",
         )
+
+    async def test_file_patch_creates_new_file_with_write_operation(self) -> None:
+        scripts_dir = self.workspace_dir / "scripts"
+        scripts_dir.mkdir()
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_patch_create",
+                name="file_patch",
+                arguments={
+                    "path": "scripts/example.py",
+                    "operations": [
+                        {
+                            "type": "write",
+                            "content": "print('hello')\n",
+                        }
+                    ],
+                },
+                raw_arguments=(
+                    '{"path":"scripts/example.py","operations":[{"type":"write",'
+                    '"content":"print(\'hello\')\\n"}]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("status: created", result.content)
+        self.assertEqual(
+            (scripts_dir / "example.py").read_text(encoding="utf-8"),
+            "print('hello')\n",
+        )
+        self.assertEqual(result.metadata["status"], "created")
+        self.assertTrue(result.metadata["file_created"])
+
+    async def test_file_patch_applies_ordered_literal_edits(self) -> None:
+        target_path = self.workspace_dir / "note.txt"
+        target_path.write_text("alpha\nbeta\n", encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_patch_update",
+                name="file_patch",
+                arguments={
+                    "path": "note.txt",
+                    "operations": [
+                        {
+                            "type": "replace",
+                            "old": "beta",
+                            "new": "gamma",
+                        },
+                        {
+                            "type": "insert_after",
+                            "anchor": "gamma\n",
+                            "text": "delta\n",
+                        },
+                    ],
+                },
+                raw_arguments=(
+                    '{"path":"note.txt","operations":[{"type":"replace","old":"beta",'
+                    '"new":"gamma"},{"type":"insert_after","anchor":"gamma\\n",'
+                    '"text":"delta\\n"}]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            target_path.read_text(encoding="utf-8"),
+            "alpha\ngamma\ndelta\n",
+        )
+        self.assertEqual(result.metadata["status"], "updated")
+        self.assertEqual(result.metadata["operation_types"], ["replace", "insert_after"])
+
+    async def test_file_patch_fails_when_anchor_is_missing(self) -> None:
+        target_path = self.workspace_dir / "note.txt"
+        target_path.write_text("alpha\n", encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_patch_missing_anchor",
+                name="file_patch",
+                arguments={
+                    "path": "note.txt",
+                    "operations": [
+                        {
+                            "type": "insert_before",
+                            "anchor": "beta\n",
+                            "text": "delta\n",
+                        }
+                    ],
+                },
+                raw_arguments=(
+                    '{"path":"note.txt","operations":[{"type":"insert_before",'
+                    '"anchor":"beta\\n","text":"delta\\n"}]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("could not find a unique anchor match", result.content)
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "alpha\n")
+
+    async def test_file_patch_does_not_partially_write_on_failed_later_operation(self) -> None:
+        target_path = self.workspace_dir / "note.txt"
+        target_path.write_text("alpha\nbeta\n", encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_patch_atomic",
+                name="file_patch",
+                arguments={
+                    "path": "note.txt",
+                    "operations": [
+                        {
+                            "type": "replace",
+                            "old": "beta",
+                            "new": "gamma",
+                        },
+                        {
+                            "type": "insert_after",
+                            "anchor": "missing\n",
+                            "text": "delta\n",
+                        },
+                    ],
+                },
+                raw_arguments=(
+                    '{"path":"note.txt","operations":[{"type":"replace","old":"beta",'
+                    '"new":"gamma"},{"type":"insert_after","anchor":"missing\\n",'
+                    '"text":"delta\\n"}]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("operation 2", result.content)
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "alpha\nbeta\n")
 
     async def test_returns_policy_error_for_denied_command(self) -> None:
         result = await self.runtime.execute(

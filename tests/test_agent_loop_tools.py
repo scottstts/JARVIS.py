@@ -16,6 +16,7 @@ from tools.web_fetch.tool import HTTPFetchResult
 
 _EXPECTED_BASIC_TOOL_NAMES = [
     "bash",
+    "file_patch",
     "python_interpreter",
     "web_search",
     "web_fetch",
@@ -205,6 +206,66 @@ class _FakeViewImageLLMService:
             raise AssertionError("Attachment bytes did not match the workspace file.")
 
         return _build_response("Image inspected.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeFilePatchLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="file_patch_1",
+                        name="file_patch",
+                        arguments={
+                            "path": "notes/todo.txt",
+                            "operations": [
+                                {
+                                    "type": "write",
+                                    "content": "hello\n",
+                                }
+                            ],
+                        },
+                        raw_arguments=(
+                            '{"path":"notes/todo.txt","operations":[{"type":"write",'
+                            '"content":"hello\\n"}]}'
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "File patch applied" not in tool_result_parts[0].content:
+            raise AssertionError("Expected file_patch tool result content.")
+        if "notes/todo.txt" not in tool_result_parts[0].content:
+            raise AssertionError("Expected file_patch result to mention the target file.")
+
+        return _build_response("Patched file.")
 
     async def stream_generate(self, request: LLMRequest):
         raise AssertionError("Streaming is not expected in this test.")
@@ -452,6 +513,36 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "view_image")
             self.assertIn("Image attachment prepared", message_records[-2].content)
             self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
+
+    async def test_handle_user_input_executes_file_patch_tool_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            notes_dir = settings.workspace_dir / "notes"
+            notes_dir.mkdir(parents=True, exist_ok=True)
+
+            storage = SessionStorage(settings.storage_dir)
+            loop = AgentLoop(
+                llm_service=_FakeFilePatchLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input("Create notes/todo.txt with hello.")
+
+            self.assertEqual(result.response_text, "Patched file.")
+            self.assertEqual(
+                (notes_dir / "todo.txt").read_text(encoding="utf-8"),
+                "hello\n",
+            )
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "file_patch")
+            self.assertIn("File patch applied", message_records[-2].content)
 
     async def test_handle_user_input_executes_python_interpreter_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -261,6 +261,50 @@ Command-specific restrictions:
 - `read_paths` and `write_paths` are deprecated compatibility fields and no longer control filesystem access
 - third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the dedicated venv
 
+### `file_patch`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/file_patch/`
+- Purpose: perform structured one-file text edits through explicit patch operations instead of shell editing
+
+#### Input Schema
+
+- `path: string` required
+- `operations: array` required
+- supported operation objects:
+  - `{"type":"write","content":string}`
+  - `{"type":"replace","old":string,"new":string}`
+  - `{"type":"insert_before","anchor":string,"text":string}`
+  - `{"type":"insert_after","anchor":string,"text":string}`
+  - `{"type":"delete","text":string}`
+
+#### Executor Behavior
+
+- resolves exactly one workspace file path per call
+- allows creating a new file or fully overwriting an existing file through a single `write` operation
+- applies non-`write` operations sequentially in memory, using exact literal text matching only
+- for broad holistic rewrites, the agent should usually prefer one `write` operation over many granular patch operations
+- for small-to-medium targeted edits, the agent should usually prefer one `file_patch` call with a modest set of operations
+- multiple `file_patch` calls in the same turn should be a fallback only when one patch payload would otherwise become too large or unreliable
+- requires edit targets to match exactly once; missing or ambiguous matches fail the full call
+- writes the final content atomically to avoid partial-file corruption on later-operation failure
+- reads and writes UTF-8 text only
+
+#### Policy
+
+- `path` must be non-empty
+- only explicit file paths inside `/workspace` are allowed
+- `.env` files and paths inside `.env` directories are denied
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
+
+#### Current Limitations
+
+- v1 is text-only and UTF-8-only; it does not support binary patching
+- `write` must be the only operation in the call
+- parent directories must already exist; the tool does not create directories
+- no regex, fuzzy matching, unified diff parsing, or multi-file patch sets
+
 ### `view_image`
 
 - Status: implemented
@@ -402,10 +446,6 @@ These should be auto-exposed at session start once implemented.
 
 - Purpose: search the registry for discoverable tools and return concise usage docs so the agent can opt into additional capabilities
 
-#### `file_patch`
-
-- Purpose: perform structured file edits with explicit patch operations instead of freeform shell editing
-
 ### Discoverable Tools
 
 These should stay hidden by default and only be surfaced through `tool_search`.
@@ -440,6 +480,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
-- Implemented basic tools: `bash`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
+- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
+- Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
 - Implemented discoverable tools: none

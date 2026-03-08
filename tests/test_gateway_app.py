@@ -6,6 +6,7 @@ import unittest
 
 from core import AgentTextDeltaEvent, AgentTurnDoneEvent, ContextBudgetError
 from gateway import GatewaySettings, create_app
+from llm import ProviderTimeoutError
 from starlette.testclient import TestClient
 
 
@@ -21,6 +22,8 @@ class _FakeRouter:
         self.calls.append((route_id, user_text))
         if user_text == "budget":
             raise ContextBudgetError("budget exceeded")
+        if user_text == "timeout":
+            raise ProviderTimeoutError("Request timed out.")
         if user_text == "boom":
             raise RuntimeError("unexpected")
         yield AgentTextDeltaEvent(
@@ -123,3 +126,16 @@ class GatewayAppTests(unittest.TestCase):
                 error = socket.receive_json()
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "internal_error")
+
+    def test_provider_timeout_is_mapped(self) -> None:
+        app = create_app(
+            gateway_settings=GatewaySettings(websocket_path="/ws", max_message_chars=50),
+            router=_FakeRouter(),
+        )
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/dm_6") as socket:
+                _ = socket.receive_json()  # ready
+                socket.send_json({"type": "user_message", "text": "timeout"})
+                error = socket.receive_json()
+                self.assertEqual(error["type"], "error")
+                self.assertEqual(error["code"], "provider_timeout")

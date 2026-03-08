@@ -8,6 +8,7 @@ from llm import ToolDefinition
 
 from .bash import build_bash_tool
 from .config import ToolSettings
+from .file_patch import build_file_patch_tool
 from .python_interpreter import build_python_interpreter_tool
 from .send_file import build_send_file_tool
 from .types import RegisteredTool
@@ -30,6 +31,7 @@ class ToolRegistry:
         return cls(
             tools=(
                 build_bash_tool(settings),
+                build_file_patch_tool(settings),
                 build_python_interpreter_tool(settings),
                 build_web_search_tool(settings),
                 build_web_fetch_tool(settings),

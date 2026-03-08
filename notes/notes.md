@@ -43,3 +43,6 @@
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
 - `python_interpreter` is now a basic tool built around a build-time dedicated venv plus `bubblewrap`, mounting the real `/workspace` directly and allowing writes only inside that workspace boundary.
 - The interpreter package whitelist now lives in `src/settings.py`, and `Dockerfile.dev` reads that setting at build time to install the curated packages into `/opt/jarvis-python-tool-venv`.
+- `file_patch` is a basic single-file UTF-8 text editing tool with structured operations (`write`, `replace`, `insert_before`, `insert_after`, `delete`), exact-once literal matching, workspace-only paths, and atomic final writes.
+- Prompting guidance for `file_patch`: prefer one `write` for broad rewrites, one patch call for modest targeted edits, and only split across multiple patch calls when a single payload would become too large or unreliable.
+- The bash output cap is now `40_000` chars by default so long single-file reads, such as prose/document patching flows, usually fit in one tool round instead of forcing multiple chunked reads.

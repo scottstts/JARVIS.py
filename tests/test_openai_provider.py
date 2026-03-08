@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from llm.config import OpenAIProviderSettings
 from llm.errors import ToolCallValidationError
 from llm.providers.openai_provider import OpenAIProvider
 from llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
+from tools.file_patch.tool import build_file_patch_tool
+from tools.config import ToolSettings
 
 
 class OpenAIProviderRequestShapeTests(unittest.TestCase):
@@ -174,6 +177,25 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
                 ],
                 request_tools=(tool,),
             )
+
+    def test_file_patch_tool_schema_avoids_openai_unsupported_one_of(self) -> None:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        settings = ToolSettings.from_workspace_dir(Path("/workspace"))
+        tool = build_file_patch_tool(settings).definition
+
+        payload = provider._to_openai_tool(tool)
+        parameters = payload["parameters"]
+        operation_items = parameters["properties"]["operations"]["items"]
+
+        self.assertNotIn("oneOf", operation_items)
+        self.assertEqual(operation_items["type"], "object")
+        self.assertEqual(
+            operation_items["properties"]["type"]["enum"],
+            ["write", "replace", "insert_before", "insert_after", "delete"],
+        )
 
     def test_image_input_uses_input_image_items(self) -> None:
         provider = OpenAIProvider(

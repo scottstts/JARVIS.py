@@ -2,6 +2,7 @@
 
 from .bash import BashCommandPolicy
 from .config import ToolSettings
+from .file_patch import FilePatchPolicy
 from .policy import ToolPolicy
 from .python_interpreter import PythonInterpreterPolicy
 from .registry import ToolRegistry
@@ -20,6 +21,7 @@ from .view_image import ViewImagePolicy
 
 __all__ = [
     "BashCommandPolicy",
+    "FilePatchPolicy",
     "PythonInterpreterPolicy",
     "RegisteredTool",
     "SendFilePolicy",

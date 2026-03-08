@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 
 from core import AgentLoop, AgentTextDeltaEvent, AgentTurnDoneEvent, ContextBudgetError, CoreSettings
-from llm import LLMService
+from llm import LLMService, ProviderTimeoutError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -28,6 +28,7 @@ from .protocol import (
 from .session_router import InvalidRouteIDError, SessionRouter, validate_route_id
 
 _INTERNAL_ERROR_MESSAGE = "Internal error while processing message."
+_PROVIDER_TIMEOUT_MESSAGE = "The model timed out while processing that message."
 LOGGER = logging.getLogger(__name__)
 
 
@@ -136,6 +137,14 @@ def create_app(
                     build_error_event(
                         code="context_budget_exceeded",
                         message=str(exc),
+                    )
+                )
+                continue
+            except ProviderTimeoutError:
+                await websocket.send_json(
+                    build_error_event(
+                        code="provider_timeout",
+                        message=_PROVIDER_TIMEOUT_MESSAGE,
                     )
                 )
                 continue

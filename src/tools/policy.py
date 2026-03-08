@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .bash import BashCommandPolicy
 from .config import ToolSettings
+from .file_patch import FilePatchPolicy
 from .python_interpreter import PythonInterpreterPolicy
 from .send_file import SendFilePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
@@ -33,6 +34,10 @@ class ToolPolicy:
             path = str(arguments.get("path", "")).strip()
             return ViewImagePolicy().authorize(path=path, context=context)
 
+        if tool_name == "file_patch":
+            path = str(arguments.get("path", "")).strip()
+            return FilePatchPolicy().authorize(path=path, context=context)
+
         if tool_name == "python_interpreter":
             settings = ToolSettings.from_workspace_dir(context.workspace_dir)
             return PythonInterpreterPolicy(settings).authorize(
@@ -54,6 +59,7 @@ class ToolPolicy:
 
         if tool_name not in {
             "bash",
+            "file_patch",
             "python_interpreter",
             "web_search",
             "web_fetch",
