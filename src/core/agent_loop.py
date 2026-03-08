@@ -19,6 +19,7 @@ from llm import (
     TextPart,
     ToolCall,
     ToolChoice,
+    ToolDefinition,
     ToolResultPart,
 )
 from storage import ConversationRecord, SessionMetadata, SessionStorage
@@ -326,8 +327,14 @@ class AgentLoop:
             )
 
         pending_records.extend(transient_records)
+        activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
+            pending_records
+        )
 
-        request = self._build_request(list(base_records) + pending_records)
+        request = self._build_request(
+            list(base_records) + pending_records,
+            activated_discoverable_tool_names=activated_discoverable_tool_names,
+        )
         estimated_input_tokens = estimate_request_input_tokens(request)
         if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
             raise ContextBudgetError(
@@ -619,6 +626,8 @@ class AgentLoop:
     def _build_request(
         self,
         records: Sequence[ConversationRecord],
+        *,
+        activated_discoverable_tool_names: Sequence[str] = (),
     ) -> LLMRequest:
         messages: list[LLMMessage] = []
         for record in records:
@@ -629,9 +638,24 @@ class AgentLoop:
                 messages.append(llm_message)
         return LLMRequest(
             messages=tuple(messages),
-            tools=self._tool_registry.basic_definitions(),
+            tools=self._compose_request_tools(activated_discoverable_tool_names),
             tool_choice=ToolChoice.auto(),
         )
+
+    def _compose_request_tools(
+        self,
+        activated_discoverable_tool_names: Sequence[str],
+    ) -> tuple[ToolDefinition, ...]:
+        tools = list(self._tool_registry.basic_definitions())
+        seen_names = {tool.name for tool in tools}
+        for tool in self._tool_registry.resolve_discoverable_tool_definitions(
+            activated_discoverable_tool_names
+        ):
+            if tool.name in seen_names:
+                continue
+            tools.append(tool)
+            seen_names.add(tool.name)
+        return tuple(tools)
 
     def _build_turn_request(
         self,
@@ -1013,6 +1037,26 @@ def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
         )
 
     return None
+
+
+def _collect_activated_discoverable_tool_names(
+    records: Sequence[ConversationRecord],
+) -> tuple[str, ...]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if record.role != "tool":
+            continue
+        raw_names = record.metadata.get("activated_discoverable_tool_names")
+        if not isinstance(raw_names, list):
+            continue
+        for raw_name in raw_names:
+            name = str(raw_name).strip()
+            if not name or name in seen:
+                continue
+            names.append(name)
+            seen.add(name)
+    return tuple(names)
 
 
 def _record_image_part(record: ConversationRecord) -> ImagePart | None:

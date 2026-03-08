@@ -31,10 +31,11 @@ Keep this doc structured and status-oriented. It is meant to be updated througho
 
 Responsibilities:
 
-- register tools
-- define exposure class
-- expose tool definitions to the LLM
-- support future tool discovery
+- register executable tools
+- define exposure class for executable tools
+- expose executable tool definitions to the LLM
+- register discoverable catalog entries for `tool_search`
+- resolve discoverable executable tools when `tool_search` activates them for the current turn
 
 Exposure classes:
 
@@ -43,8 +44,141 @@ Exposure classes:
 
 Current rule:
 
-- only `basic` tools are injected into every `LLMRequest`
-- discoverable tools are hidden until explicitly surfaced later
+- only `basic` tools are injected into the initial `LLMRequest`
+- discoverable entries live in a separate catalog inside `ToolRegistry`
+- discoverable entries may be docs-only or may link to a backing executable tool
+- low-verbosity `tool_search` stays informational only
+- high-verbosity `tool_search` may transiently surface matched backed discoverable tools for the rest of the current turn
+
+### Discoverable Catalog
+
+Each discoverable catalog entry is separate from `ToolDefinition`.
+
+Purpose:
+
+- let `tool_search` return richer discovery docs than normal tool schemas can express
+- avoid forcing basic tools to carry search-only metadata they do not use
+- support future discoverables that are not just normal JSON-schema LLM tools
+
+Current discoverable entry shape:
+
+- `name`
+- `purpose`
+- `aliases` optional
+- `detailed_description` optional
+- `usage` flexible
+- `metadata` optional
+- `backing_tool_name` optional
+
+Current catalog rules:
+
+- discoverable entries are what `tool_search` searches and formats
+- discoverable entries are not automatically callable just because they exist in the catalog
+- if `backing_tool_name` is set, it must point at a separately registered executable tool
+- `usage` is intentionally flexible and does not need to mirror `ToolDefinition.input_schema`
+- `usage` and `metadata` are returned by `tool_search`, but current search indexing only uses `name`, `aliases`, `purpose`, and `detailed_description`
+
+### How To Add A Discoverable Tool
+
+There are two valid patterns. Pick the smallest one that matches the capability.
+
+#### Pattern A: Backed Executable Discoverable Tool
+
+Use this when the discoverable capability should eventually become an actual callable tool after the agent finds it through `tool_search`.
+
+Required wiring:
+
+1. Create the normal tool package under `src/tools/<tool_name>/`.
+2. Implement the executor and `build_<tool_name>_tool(...)` exactly like any other tool.
+3. Set `exposure="discoverable"` on the returned `RegisteredTool`.
+4. Register that executable tool in `ToolRegistry.default(...)` with `registry.register(...)`.
+5. Register a separate discoverable catalog entry with `registry.register_discoverable(DiscoverableTool(...))`.
+6. Set `backing_tool_name` on the discoverable entry to the executable tool name.
+7. Add the policy branch in `src/tools/policy.py`.
+
+Important:
+
+- the executable tool registration and the discoverable catalog registration are separate steps by design
+- if you forget step 7, the tool may appear in the follow-up request after `tool_search`, but runtime execution will still be denied by policy
+- the recommended convention is for discoverable `name` and executable tool name to match unless there is a strong reason not to
+
+Minimal mental model:
+
+- `RegisteredTool` makes a tool executable
+- `DiscoverableTool` makes a capability searchable through `tool_search`
+- `backing_tool_name` is the bridge between those two worlds
+
+#### Pattern B: Docs-Only / Skill-Backed Discoverable Entry
+
+Use this when the capability should be discoverable but should not be surfaced as a callable tool.
+
+Typical examples:
+
+- a workflow that should be carried out through an agent skill
+- a capability that is not implemented yet, but should still be discoverable as a roadmap hint
+- a non-tool integration where `usage` should explain what the agent should do next
+- any tool that does not use the backend execution style (i.e. fixed and pre-defined schema tool call)
+
+Required wiring:
+
+1. Register only a `DiscoverableTool` entry.
+2. Leave `backing_tool_name=None`.
+3. Put the real operator instructions in `usage`.
+
+Behavior:
+
+- `tool_search` can find and explain it
+- high verbosity will return richer docs
+- it will never be activated as a callable tool because there is no backing executable tool
+
+### Discoverable Search Behavior
+
+Current search intentionally stays simple and deterministic.
+
+Behavior:
+
+- empty query returns all discoverable entries sorted by name
+- non-empty query is normalized to lowercase with collapsed whitespace
+- search ranking favors exact `name` and `aliases` matches first
+- substring hits in `name` / `aliases` rank above `purpose`
+- `purpose` ranks above `detailed_description`
+- token overlap gives additional score so multi-word queries can still match even when the words are separated
+
+Non-goals for the current implementation:
+
+- no embeddings
+- no fuzzy package dependency
+- no indexing of arbitrary nested `usage` / `metadata` payloads
+
+### Discoverable Activation Flow
+
+This is the current end-to-end flow for backed discoverable tools:
+
+1. The initial turn request contains only `basic` tools.
+2. The model calls `tool_search`.
+3. If `tool_search` is used with `verbosity="low"`, the result is informational only.
+4. If `tool_search` is used with `verbosity="high"`, matched discoverable entries with a `backing_tool_name` are written into tool-result metadata.
+5. The agent loop scans current-turn pending tool results for that activation metadata.
+6. The agent loop merges the resolved discoverable executable `ToolDefinition`s into the next follow-up `LLMRequest`.
+7. Those discoverable tools are available for the rest of the current turn only.
+
+Important:
+
+- activation is transient by design and does not carry into future user turns
+- this keeps initial tool lists small and avoids turning every discoverable capability into permanent context noise
+- low verbosity is intentionally non-activating so the agent can scout first and expand later
+
+### Recommended Test Coverage For New Discoverable Tools
+
+When you add the first real discoverable executable tool, add tests for all of the following:
+
+- the tool is registered with `exposure="discoverable"`
+- the discoverable catalog entry is registered and searchable
+- low-verbosity `tool_search` finds it without activating it
+- high-verbosity `tool_search` returns richer docs and activation metadata
+- the agent loop follow-up request includes the discoverable tool after the high-verbosity search
+- the tool executes successfully once surfaced
+- policy denies malformed inputs and allows valid ones
 
 ### Executor Runtime
 
@@ -80,6 +214,7 @@ Current active policy:
 - `bash` may read across the container filesystem except `.env` paths
 - `bash` may only write inside `/workspace`, and `.env` paths are denied even there
 - `view_image` may only read explicit image files inside `/workspace`
+- `tool_search` allows an optional short query and `low` / `high` verbosity only
 
 ### Transcript And Follow-Up Tool Rounds
 
@@ -89,6 +224,8 @@ Current standard:
 - tool results are stored as structured records plus metadata
 - internal tool-call payloads are not sent to user-facing Telegram output
 - follow-up tool rounds are rebuilt into provider-native request shapes inside `src/llm/`
+- `tool_search` may attach discoverable-activation metadata to its tool result
+- only current-turn pending tool results can activate discoverable tools; activations do not persist across turns
 
 Current provider-native follow-up handling:
 
@@ -109,6 +246,18 @@ When adding a new tool below, keep the tool entry in this shape:
 - `Executor Behavior`
 - `Policy`
 - `Current Limitations`
+
+### Standard Discoverable Entry Format
+
+When documenting a discoverable entry or a discoverable-capable tool below, keep the discoverable shape in mind:
+
+- `Name`
+- `Aliases`
+- `Purpose`
+- `Detailed Description`
+- `Usage`
+- `Metadata`
+- `Backing Tool`
 
 ## Tools Implemented
 
@@ -436,15 +585,43 @@ Command-specific restrictions:
 - v1 intentionally excludes image conversion and general binary/document conversion paths
 - browser rendering is fallback-only and does not expose multi-step browser automation
 
+### `tool_search`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/tool_search/`
+- Purpose: search the discoverable catalog at low or high verbosity and optionally surface backed discoverable tools for the current turn
+
+#### Input Schema
+
+- `query: string` optional; omit or pass empty string to list all discoverable tools
+- `verbosity: string` optional; accepts `low` or `high`, defaults to `low`
+
+#### Executor Behavior
+
+- low verbosity returns only discoverable tool name and one-line purpose
+- high verbosity returns richer discovery docs including aliases, detailed description, flexible usage payload, metadata, and backing tool name when present
+- search is simple deterministic text matching across discoverable `name`, `aliases`, `purpose`, and `detailed_description`
+- high-verbosity results add activation metadata so matched backed discoverable tools can be included in follow-up requests for the rest of the current turn
+- low-verbosity results do not activate discoverable tools, to avoid inflating the tool list too early
+
+#### Policy
+
+- `query` is optional
+- query length must stay within the configured hard caps
+- `verbosity` must be `low` or `high`
+
+#### Current Limitations
+
+- there are currently no discoverable catalog entries registered in the default runtime
+- activation only applies to discoverable entries that link to a real executable tool
+- search does not currently index arbitrary `usage` or `metadata` payload contents
+
 ## Tools To Be Implemented
 
 ### Basic Tools
 
-These should be auto-exposed at session start once implemented.
-
-#### `tool_search`
-
-- Purpose: search the registry for discoverable tools and return concise usage docs so the agent can opt into additional capabilities
+None currently planned.
 
 ### Discoverable Tools
 
@@ -480,6 +657,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
-- Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`
+- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
+- Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
 - Implemented discoverable tools: none

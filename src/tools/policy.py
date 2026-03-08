@@ -7,6 +7,7 @@ from .config import ToolSettings
 from .file_patch import FilePatchPolicy
 from .python_interpreter import PythonInterpreterPolicy
 from .send_file import SendFilePolicy
+from .tool_search import ToolSearchPolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
 from .web_fetch import WebFetchPolicy
 from .web_search import WebSearchPolicy
@@ -57,6 +58,17 @@ class ToolPolicy:
             url = str(arguments.get("url", "")).strip()
             return WebFetchPolicy().authorize(url=url, context=context)
 
+        if tool_name == "tool_search":
+            raw_query = arguments.get("query")
+            query = None if raw_query is None else str(raw_query)
+            raw_verbosity = arguments.get("verbosity")
+            verbosity = None if raw_verbosity is None else str(raw_verbosity)
+            return ToolSearchPolicy().authorize(
+                query=query,
+                verbosity=verbosity,
+                context=context,
+            )
+
         if tool_name not in {
             "bash",
             "file_patch",
@@ -65,6 +77,7 @@ class ToolPolicy:
             "web_fetch",
             "view_image",
             "send_file",
+            "tool_search",
         }:
             return ToolPolicyDecision(
                 allowed=False,

@@ -11,7 +11,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from llm import ToolCall, ToolDefinition
-from tools import RegisteredTool, ToolExecutionContext, ToolPolicy, ToolRegistry, ToolRuntime, ToolSettings
+from tools import (
+    DiscoverableTool,
+    RegisteredTool,
+    ToolExecutionContext,
+    ToolPolicy,
+    ToolRegistry,
+    ToolRuntime,
+    ToolSettings,
+)
 from tools.web_fetch.tool import BrowserRenderResult, HTTPFetchResult, MarkdownConversionResult
 
 _PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
@@ -173,6 +181,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "web_fetch",
                     "view_image",
                     "send_file",
+                    "tool_search",
                 ],
             )
             self.assertEqual(registry.search("bash"), ())
@@ -210,6 +219,58 @@ class ToolRegistryTests(unittest.TestCase):
                 [tool.name for tool in registry.search("send", include_basic=True)],
                 ["send_file"],
             )
+            self.assertEqual(registry.search_discoverable("archive"), ())
+            self.assertEqual(registry.search_discoverable(""), ())
+
+    def test_search_discoverable_matches_name_alias_and_description(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            RegisteredTool(
+                name="archive",
+                exposure="discoverable",
+                definition=ToolDefinition(
+                    name="archive",
+                    description="Archive file helper.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                ),
+                executor=AsyncMock(),
+            )
+        )
+        registry.register_discoverable(
+            DiscoverableTool(
+                name="archive",
+                aliases=("zip_tools", "tar_tools"),
+                purpose="List, extract, and create archive formats inside the workspace.",
+                detailed_description="Handles zip and tar style archive workflows.",
+                usage={"arguments": ["path"]},
+                metadata={"family": "filesystem"},
+                backing_tool_name="archive",
+            )
+        )
+
+        self.assertEqual(
+            [tool.name for tool in registry.search_discoverable("zip")],
+            ["archive"],
+        )
+        self.assertEqual(
+            [tool.name for tool in registry.search_discoverable("tar style")],
+            ["archive"],
+        )
+        self.assertEqual(
+            [tool.name for tool in registry.search_discoverable("")],
+            ["archive"],
+        )
+        self.assertEqual(
+            [tool.name for tool in registry.resolve_discoverable_tool_definitions(["archive"])],
+            ["archive"],
+        )
 
 
 class ToolPolicyTests(unittest.TestCase):
@@ -432,6 +493,23 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("private", decision.reason or "")
+
+    def test_tool_search_allows_empty_query_and_defaults(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="tool_search",
+            arguments={},
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_tool_search_denies_invalid_verbosity(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="tool_search",
+            arguments={"query": "archive", "verbosity": "verbose"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("verbosity", decision.reason or "")
 
     def test_python_interpreter_allows_inline_code_without_declared_io_paths(self) -> None:
         decision = self.policy.authorize(
@@ -1077,6 +1155,81 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.metadata["status_code"], 429)
         self.assertIn("rate limit exceeded", result.content)
+
+    async def test_tool_search_returns_empty_low_verbosity_listing_when_no_discoverables_exist(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_empty",
+                name="tool_search",
+                arguments={},
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("Tool search result", result.content)
+        self.assertIn("verbosity: low", result.content)
+        self.assertEqual(result.metadata["match_count"], 0)
+        self.assertEqual(result.metadata["activated_discoverable_tool_names"], [])
+
+    async def test_tool_search_returns_high_verbosity_details_and_activation_metadata(self) -> None:
+        archive_tool = RegisteredTool(
+            name="archive",
+            exposure="discoverable",
+            definition=ToolDefinition(
+                name="archive",
+                description="Archive workspace files.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            ),
+            executor=AsyncMock(),
+        )
+        self.registry.register(archive_tool)
+        self.registry.register_discoverable(
+            DiscoverableTool(
+                name="archive",
+                aliases=("zip_tools",),
+                purpose="List, extract, and create archive formats inside the workspace.",
+                detailed_description="Use this for zip or tar workflows in the workspace.",
+                usage={
+                    "arguments": [
+                        {
+                            "name": "path",
+                            "type": "string",
+                        }
+                    ]
+                },
+                metadata={"family": "filesystem"},
+                backing_tool_name="archive",
+            )
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_archive",
+                name="tool_search",
+                arguments={"query": "zip", "verbosity": "high"},
+                raw_arguments='{"query":"zip","verbosity":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("aliases: zip_tools", result.content)
+        self.assertIn("usage:", result.content)
+        self.assertIn("metadata:", result.content)
+        self.assertEqual(result.metadata["match_count"], 1)
+        self.assertEqual(
+            result.metadata["activated_discoverable_tool_names"],
+            ["archive"],
+        )
 
     async def test_web_fetch_uses_tier1_markdown_when_available(self) -> None:
         requested_url = "https://example.com/page"

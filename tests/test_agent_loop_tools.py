@@ -16,6 +16,7 @@ from llm import (
     ImagePart,
     LLMRequest,
     LLMResponse,
+    ToolDefinition,
     LLMUsage,
     TextDeltaEvent,
     TextPart,
@@ -24,6 +25,7 @@ from llm import (
 )
 from storage import SessionStorage
 from tests.helpers import build_core_settings
+from tools import DiscoverableTool, RegisteredTool, ToolRegistry, ToolSettings
 from tools.web_fetch.tool import HTTPFetchResult
 
 _EXPECTED_BASIC_TOOL_NAMES = [
@@ -34,6 +36,7 @@ _EXPECTED_BASIC_TOOL_NAMES = [
     "web_fetch",
     "view_image",
     "send_file",
+    "tool_search",
 ]
 
 
@@ -496,6 +499,54 @@ class _FakeWebFetchLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FakeToolSearchActivationLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+
+        if self.generate_calls == 1:
+            names = [tool.name for tool in request.tools]
+            if names != _EXPECTED_BASIC_TOOL_NAMES:
+                raise AssertionError(
+                    f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+                )
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="tool_search_1",
+                        name="tool_search",
+                        arguments={"query": "archive", "verbosity": "high"},
+                        raw_arguments='{"query":"archive","verbosity":"high"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        names = [tool.name for tool in request.tools]
+        expected = _EXPECTED_BASIC_TOOL_NAMES + ["archive"]
+        if names != expected:
+            raise AssertionError(f"Expected {expected} tools to be registered, got {names}.")
+
+        tool_message = request.messages[-1]
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool_search tool result before follow-up.")
+        tool_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_parts) != 1:
+            raise AssertionError("Expected one tool result part after tool_search.")
+        if "backing_tool_name: archive" not in tool_parts[0].content:
+            raise AssertionError("Expected high-verbosity tool_search content for archive.")
+
+        return _build_response("Archive tool surfaced.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_executes_bash_tool_round_and_persists_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -714,3 +765,70 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "web_fetch")
             self.assertIn("Web fetch result", message_records[-2].content)
             self.assertEqual(message_records[-2].metadata["strategy"], "tier1_markdown_accept")
+
+    async def test_handle_user_input_surfaces_discoverable_tools_after_high_verbosity_tool_search(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.storage_dir)
+            registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(settings.workspace_dir)
+            )
+
+            async def _archive_executor(**kwargs):
+                raise AssertionError("archive should not be executed in this test.")
+
+            registry.register(
+                RegisteredTool(
+                    name="archive",
+                    exposure="discoverable",
+                    definition=ToolDefinition(
+                        name="archive",
+                        description="Archive workspace files.",
+                        input_schema={
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                            },
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    ),
+                    executor=_archive_executor,
+                )
+            )
+            registry.register_discoverable(
+                DiscoverableTool(
+                    name="archive",
+                    aliases=("zip_tools",),
+                    purpose="List, extract, and create archive formats inside the workspace.",
+                    detailed_description="Use this to inspect or manipulate zip and tar archives.",
+                    usage={"arguments": [{"name": "path", "type": "string"}]},
+                    metadata={"family": "filesystem"},
+                    backing_tool_name="archive",
+                )
+            )
+
+            loop = AgentLoop(
+                llm_service=_FakeToolSearchActivationLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+            )
+
+            result = await loop.handle_user_input("Find an archive tool.")
+
+            self.assertEqual(result.response_text, "Archive tool surfaced.")
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "tool_search")
+            self.assertEqual(
+                message_records[-2].metadata["activated_discoverable_tool_names"],
+                ["archive"],
+            )

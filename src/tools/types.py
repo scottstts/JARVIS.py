@@ -57,3 +57,22 @@ class RegisteredTool:
     exposure: ToolExposure
     definition: ToolDefinition
     executor: ToolExecutor
+
+
+@dataclass(slots=True, frozen=True)
+class DiscoverableTool:
+    """Catalog entry exposed through tool_search."""
+
+    name: str
+    purpose: str
+    aliases: tuple[str, ...] = ()
+    detailed_description: str | None = None
+    usage: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    backing_tool_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("DiscoverableTool.name cannot be empty.")
+        if not self.purpose.strip():
+            raise ValueError("DiscoverableTool.purpose cannot be empty.")
