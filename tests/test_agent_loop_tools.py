@@ -8,6 +8,8 @@ from base64 import b64decode
 from pathlib import Path
 from unittest.mock import patch
 
+import settings as app_settings
+
 from core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
 from llm import (
     DoneEvent,
@@ -73,10 +75,12 @@ class _FakeToolLLMService:
     def __init__(self) -> None:
         self.generate_calls = 0
         self.stream_calls = 0
+        self._turn_context_text: str | None = None
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_calls += 1
         self._assert_bash_registered(request)
+        self._assert_turn_context_present(request)
 
         if self.generate_calls == 1 and self.stream_calls == 0:
             return _build_response(
@@ -119,6 +123,7 @@ class _FakeToolLLMService:
     async def stream_generate(self, request: LLMRequest):
         self.stream_calls += 1
         self._assert_bash_registered(request)
+        self._assert_turn_context_present(request)
         if self.stream_calls == 1:
             yield TextDeltaEvent(delta="Working on it.")
             yield DoneEvent(
@@ -160,6 +165,30 @@ class _FakeToolLLMService:
         if names != _EXPECTED_BASIC_TOOL_NAMES:
             raise AssertionError(
                 f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+    def _assert_turn_context_present(self, request: LLMRequest) -> None:
+        matching_contexts: list[str] = []
+        for message in request.messages:
+            if message.role != "system":
+                continue
+            for part in message.parts:
+                if not isinstance(part, TextPart):
+                    continue
+                if "System context auto-appended for this turn only." in part.text:
+                    matching_contexts.append(part.text)
+
+        if len(matching_contexts) != 1:
+            raise AssertionError(
+                "Expected exactly one transient turn datetime context message in the request."
+            )
+        if f"| {app_settings.JARVIS_CORE_TIMEZONE} time" not in matching_contexts[0]:
+            raise AssertionError("Expected turn datetime context to include the configured timezone.")
+        if self._turn_context_text is None:
+            self._turn_context_text = matching_contexts[0]
+        elif matching_contexts[0] != self._turn_context_text:
+            raise AssertionError(
+                "Expected the same transient turn datetime context across tool follow-up rounds."
             )
 
 

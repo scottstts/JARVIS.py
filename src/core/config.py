@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import settings as app_settings
 from workspace_paths import resolve_workspace_child, resolve_workspace_dir
@@ -96,8 +97,21 @@ class CoreSettings:
     workspace_dir: Path
     storage_dir: Path
     identities_dir: Path
+    turn_timezone: str = app_settings.JARVIS_CORE_TIMEZONE
     program_file_name: str = "PROGRAM.md"
     reactor_file_name: str = "REACTOR.md"
+
+    def __post_init__(self) -> None:
+        timezone_name = self.turn_timezone.strip()
+        if not timezone_name:
+            raise CoreConfigurationError("JARVIS_CORE_TIMEZONE must not be blank.")
+        try:
+            ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise CoreConfigurationError(
+                f"JARVIS_CORE_TIMEZONE must be a valid IANA timezone, got: {timezone_name}"
+            ) from exc
+        object.__setattr__(self, "turn_timezone", timezone_name)
 
     @classmethod
     def from_env(cls) -> "CoreSettings":
@@ -120,4 +134,6 @@ class CoreSettings:
             workspace_dir=workspace_dir,
             storage_dir=storage_dir,
             identities_dir=identities_dir,
+            turn_timezone=_optional_env("JARVIS_CORE_TIMEZONE")
+            or app_settings.JARVIS_CORE_TIMEZONE,
         )

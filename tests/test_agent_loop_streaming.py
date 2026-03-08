@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
-from llm import DoneEvent, LLMResponse, LLMUsage, TextDeltaEvent
+from llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent, TextPart
 from storage import SessionStorage
 from tests.helpers import build_core_settings
 
@@ -32,6 +32,18 @@ class _FakeStreamingLLMService:
         yield TextDeltaEvent(delta="stream-")
         yield TextDeltaEvent(delta="reply")
         yield DoneEvent(response=_build_response("stream-reply"))
+
+
+class _FakeTurnContextLLMService:
+    def __init__(self) -> None:
+        self.requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest):
+        self.requests.append(request)
+        return _build_response("ok")
+
+    async def stream_generate(self, _request):
+        raise AssertionError("Streaming is not expected in this test.")
 
 
 class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
@@ -81,3 +93,52 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
             self.assertEqual(done.command, "/new")
+
+    async def test_handle_user_input_injects_transient_turn_datetime_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.storage_dir)
+            llm_service = _FakeTurnContextLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input("hello")
+
+            self.assertEqual(result.response_text, "ok")
+            self.assertEqual(len(llm_service.requests), 1)
+            request = llm_service.requests[0]
+            turn_context_entries: list[tuple[int, str]] = []
+            for index, message in enumerate(request.messages):
+                if message.role != "system":
+                    continue
+                for part in message.parts:
+                    if not isinstance(part, TextPart):
+                        continue
+                    if "System context auto-appended for this turn only." in part.text:
+                        turn_context_entries.append((index, part.text))
+            self.assertEqual(len(turn_context_entries), 1)
+            context_index, context_text = turn_context_entries[0]
+            self.assertIn("Current date/time:", context_text)
+            self.assertIn(f"| {settings.turn_timezone} time", context_text)
+
+            user_index = next(
+                index
+                for index, message in enumerate(request.messages)
+                if message.role == "user"
+                and any(
+                    isinstance(part, TextPart) and part.text == "hello"
+                    for part in message.parts
+                )
+            )
+            self.assertLess(context_index, user_index)
+
+            persisted_records = storage.load_records(result.session_id)
+            self.assertFalse(
+                any(
+                    "System context auto-appended for this turn only." in record.content
+                    for record in persisted_records
+                )
+            )

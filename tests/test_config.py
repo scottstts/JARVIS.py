@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import settings as app_settings
+
 from core.config import ContextPolicySettings, CoreSettings
 from core.errors import CoreConfigurationError
 
@@ -49,6 +51,7 @@ class CoreSettingsTests(unittest.TestCase):
         self.assertEqual(settings.workspace_dir, Path("/workspace"))
         self.assertEqual(settings.storage_dir, Path("/workspace/storage"))
         self.assertEqual(settings.identities_dir, Path("/workspace/identities"))
+        self.assertEqual(settings.turn_timezone, app_settings.JARVIS_CORE_TIMEZONE)
 
     def test_requires_agent_workspace_for_host_runs(self) -> None:
         with patch.dict(
@@ -78,3 +81,29 @@ class CoreSettingsTests(unittest.TestCase):
             settings.identities_dir,
             Path("/tmp/jarvis-host-workspace/identities"),
         )
+
+    def test_reads_explicit_turn_timezone(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "JARVIS_CORE_TIMEZONE": "America/New_York",
+            },
+            clear=True,
+        ):
+            settings = CoreSettings.from_env()
+
+        self.assertEqual(settings.turn_timezone, "America/New_York")
+
+    def test_rejects_invalid_turn_timezone(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "JARVIS_CORE_TIMEZONE": "Mars/OlympusMons",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                CoreConfigurationError,
+                "JARVIS_CORE_TIMEZONE must be a valid IANA timezone",
+            ):
+                CoreSettings.from_env()

@@ -71,6 +71,7 @@ JARVIS_CONTEXT_WINDOW_TOKENS: Final = 400_000
 JARVIS_COMPACT_THRESHOLD_TOKENS: Final = 350_000
 JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS: Final = 16_000
 JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS: Final = 10_000
+JARVIS_CORE_TIMEZONE: Final = "Europe/Dublin"
 
 # Core LLM routing/runtime.
 # The provider chosen here will determine which API key is needed below

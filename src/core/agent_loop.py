@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Sequence
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from llm import (
     ImagePart,
@@ -42,6 +43,7 @@ _OVERFLOW_ERROR_HINTS = (
 )
 _TRANSIENT_RECORD_METADATA_KEY = "transient"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
+_TURN_CONTEXT_METADATA_KEY = "turn_context"
 
 
 @dataclass(slots=True, frozen=True)
@@ -224,6 +226,7 @@ class AgentLoop:
         (
             session,
             base_records,
+            turn_context_text,
             request,
             estimated_input_tokens,
             did_compaction,
@@ -240,6 +243,7 @@ class AgentLoop:
         ) = await self._generate_with_overflow_retry(
             session=session,
             user_text=user_text,
+            turn_context_text=turn_context_text,
             request=request,
             estimated_input_tokens=estimated_input_tokens,
         )
@@ -248,6 +252,10 @@ class AgentLoop:
 
         base_records = self._storage.load_records(session.session_id)
         pending_records = [
+            self._build_turn_context_record(
+                session_id=session.session_id,
+                turn_context_text=turn_context_text,
+            ),
             self._build_message_record(
                 session_id=session.session_id,
                 role="user",
@@ -338,6 +346,7 @@ class AgentLoop:
         (
             session,
             _base_records,
+            turn_context_text,
             request,
             estimated_input_tokens,
             did_compaction,
@@ -381,15 +390,11 @@ class AgentLoop:
                 raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
 
             records = self._storage.load_records(compacted.session_id)
-            request = self._build_request(
-                records
-                + [
-                    self._build_message_record(
-                        session_id=compacted.session_id,
-                        role="user",
-                        content=user_text,
-                    )
-                ]
+            request = self._build_turn_request(
+                session_id=compacted.session_id,
+                records=records,
+                user_text=user_text,
+                turn_context_text=turn_context_text,
             )
             retry_estimate = estimate_request_input_tokens(request)
             if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
@@ -409,6 +414,10 @@ class AgentLoop:
 
         base_records = self._storage.load_records(session.session_id)
         pending_records = [
+            self._build_turn_context_record(
+                session_id=session.session_id,
+                turn_context_text=turn_context_text,
+            ),
             self._build_message_record(
                 session_id=session.session_id,
                 role="user",
@@ -500,7 +509,8 @@ class AgentLoop:
         *,
         user_text: str,
         force_session_id: str | None = None,
-    ) -> tuple[SessionMetadata, list[ConversationRecord], LLMRequest, int, bool]:
+    ) -> tuple[SessionMetadata, list[ConversationRecord], str, LLMRequest, int, bool]:
+        turn_context_text = self._build_turn_context_text()
         session = self._storage.get_session(force_session_id) if force_session_id else None
         if session is None:
             session = self._ensure_active_session()
@@ -513,15 +523,11 @@ class AgentLoop:
                 did_compaction = True
 
         records = self._storage.load_records(session.session_id)
-        request = self._build_request(
-            records
-            + [
-                self._build_message_record(
-                    session_id=session.session_id,
-                    role="user",
-                    content=user_text,
-                )
-            ]
+        request = self._build_turn_request(
+            session_id=session.session_id,
+            records=records,
+            user_text=user_text,
+            turn_context_text=turn_context_text,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -531,15 +537,11 @@ class AgentLoop:
                 session = compacted
                 did_compaction = True
                 records = self._storage.load_records(session.session_id)
-                request = self._build_request(
-                    records
-                    + [
-                        self._build_message_record(
-                            session_id=session.session_id,
-                            role="user",
-                            content=user_text,
-                        )
-                    ]
+                request = self._build_turn_request(
+                    session_id=session.session_id,
+                    records=records,
+                    user_text=user_text,
+                    turn_context_text=turn_context_text,
                 )
                 estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -548,13 +550,21 @@ class AgentLoop:
                 "Request is still over the preflight context budget after compaction."
             )
 
-        return session, records, request, estimated_input_tokens, did_compaction
+        return (
+            session,
+            records,
+            turn_context_text,
+            request,
+            estimated_input_tokens,
+            did_compaction,
+        )
 
     async def _generate_with_overflow_retry(
         self,
         *,
         session: SessionMetadata,
         user_text: str,
+        turn_context_text: str,
         request: LLMRequest,
         estimated_input_tokens: int,
     ) -> tuple[SessionMetadata, LLMResponse, bool, int]:
@@ -570,15 +580,11 @@ class AgentLoop:
             raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
 
         records = self._storage.load_records(compacted.session_id)
-        retry_request = self._build_request(
-            records
-            + [
-                self._build_message_record(
-                    session_id=compacted.session_id,
-                    role="user",
-                    content=user_text,
-                )
-            ]
+        retry_request = self._build_turn_request(
+            session_id=compacted.session_id,
+            records=records,
+            user_text=user_text,
+            turn_context_text=turn_context_text,
         )
         retry_estimate = estimate_request_input_tokens(retry_request)
         if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
@@ -625,6 +631,29 @@ class AgentLoop:
             messages=tuple(messages),
             tools=self._tool_registry.basic_definitions(),
             tool_choice=ToolChoice.auto(),
+        )
+
+    def _build_turn_request(
+        self,
+        *,
+        session_id: str,
+        records: Sequence[ConversationRecord],
+        user_text: str,
+        turn_context_text: str,
+    ) -> LLMRequest:
+        return self._build_request(
+            list(records)
+            + [
+                self._build_turn_context_record(
+                    session_id=session_id,
+                    turn_context_text=turn_context_text,
+                ),
+                self._build_message_record(
+                    session_id=session_id,
+                    role="user",
+                    content=user_text,
+                ),
+            ]
         )
 
     async def _execute_followup_tool_rounds(
@@ -835,6 +864,22 @@ class AgentLoop:
             metadata=metadata,
         )
 
+    def _build_turn_context_record(
+        self,
+        *,
+        session_id: str,
+        turn_context_text: str,
+    ) -> ConversationRecord:
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=turn_context_text,
+            metadata={
+                _TRANSIENT_RECORD_METADATA_KEY: True,
+                _TURN_CONTEXT_METADATA_KEY: "datetime",
+            },
+        )
+
     def _build_transient_records_from_tool_result(
         self,
         session_id: str,
@@ -887,6 +932,17 @@ class AgentLoop:
             metadata=metadata,
         )
         self._storage.append_record(session_id, record)
+
+    def _build_turn_context_text(self) -> str:
+        current_time = datetime.now(ZoneInfo(self._settings.turn_timezone))
+        date_text = f"{current_time.strftime('%B')} {current_time.day}, {current_time.year}"
+        time_text = current_time.strftime("%H:%M")
+        timezone_text = self._settings.turn_timezone
+        return (
+            "System context auto-appended for this turn only. "
+            "This is not part of the user's message.\n"
+            f"Current date/time: {date_text} | {time_text} | {timezone_text} time"
+        )
 
 
 def _utc_now_iso() -> str:
