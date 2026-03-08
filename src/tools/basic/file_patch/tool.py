@@ -9,8 +9,8 @@ from typing import Any
 
 from llm import ToolDefinition
 
-from ..config import ToolSettings
-from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...config import ToolSettings
+from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 _MAX_OPERATIONS = 32
 _MAX_PATH_CHARS = 1_024

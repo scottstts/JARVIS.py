@@ -14,8 +14,8 @@ from typing import Any
 
 from llm import ToolDefinition
 
-from ..config import ToolSettings
-from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...config import ToolSettings
+from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 from .paths import resolve_workspace_path
 
 _RUNNER_PATH = Path(__file__).with_name("sandbox_runner.py")

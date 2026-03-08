@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from .bash import BashCommandPolicy
+from .basic.bash import BashCommandPolicy
+from .basic.file_patch import FilePatchPolicy
+from .basic.python_interpreter import PythonInterpreterPolicy
+from .basic.send_file import SendFilePolicy
+from .basic.tool_search import ToolSearchPolicy
+from .basic.web_fetch import WebFetchPolicy
+from .basic.web_search import WebSearchPolicy
+from .basic.view_image import ViewImagePolicy
 from .config import ToolSettings
-from .file_patch import FilePatchPolicy
-from .python_interpreter import PythonInterpreterPolicy
-from .send_file import SendFilePolicy
-from .tool_search import ToolSearchPolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
-from .web_fetch import WebFetchPolicy
-from .web_search import WebSearchPolicy
-from .view_image import ViewImagePolicy
 
 
 class ToolPolicy:

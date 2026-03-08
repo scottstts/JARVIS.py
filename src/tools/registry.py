@@ -7,16 +7,16 @@ import re
 
 from llm import ToolDefinition
 
-from .bash import build_bash_tool
+from .basic.bash import build_bash_tool
+from .basic.file_patch import build_file_patch_tool
+from .basic.python_interpreter import build_python_interpreter_tool
+from .basic.send_file import build_send_file_tool
+from .basic.tool_search import build_tool_search_tool
+from .basic.web_fetch import build_web_fetch_tool
+from .basic.web_search import build_web_search_tool
+from .basic.view_image import build_view_image_tool
 from .config import ToolSettings
-from .file_patch import build_file_patch_tool
-from .python_interpreter import build_python_interpreter_tool
-from .send_file import build_send_file_tool
-from .tool_search import build_tool_search_tool
 from .types import DiscoverableTool, RegisteredTool
-from .web_fetch import build_web_fetch_tool
-from .web_search import build_web_search_tool
-from .view_image import build_view_image_tool
 
 _SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 

@@ -7,7 +7,12 @@ from typing import Any, Protocol
 
 from llm import ToolDefinition
 
-from ..types import DiscoverableTool, RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...types import (
+    DiscoverableTool,
+    RegisteredTool,
+    ToolExecutionContext,
+    ToolExecutionResult,
+)
 
 
 class ToolSearchCatalog(Protocol):

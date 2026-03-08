@@ -7,7 +7,7 @@ import re
 import shlex
 from pathlib import Path
 
-from ..types import ToolExecutionContext, ToolPolicyDecision
+from ...types import ToolExecutionContext, ToolPolicyDecision
 
 _FORBIDDEN_SHELL_SNIPPETS = ("&&", "||", ";", ">", "<", "`", "$", "\n", "\r", "(", ")")
 _PROTECTED_ENV_BASENAME = ".env"

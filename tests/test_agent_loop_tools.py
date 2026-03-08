@@ -26,7 +26,7 @@ from llm import (
 from storage import SessionStorage
 from tests.helpers import build_core_settings
 from tools import DiscoverableTool, RegisteredTool, ToolRegistry, ToolSettings
-from tools.web_fetch.tool import HTTPFetchResult
+from tools.basic.web_fetch.tool import HTTPFetchResult
 
 _EXPECTED_BASIC_TOOL_NAMES = [
     "bash",
@@ -720,7 +720,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 return {"message_id": 7, "chat_id": 123}
 
             with patch(
-                "tools.send_file.tool.send_telegram_file",
+                "tools.basic.send_file.tool.send_telegram_file",
                 side_effect=_fake_send_telegram_file,
             ):
                 result = await loop.handle_user_input("Send me the report file.")
@@ -749,7 +749,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with patch(
-                "tools.web_fetch.tool._fetch_http_text",
+                "tools.basic.web_fetch.tool._fetch_http_text",
                 return_value=tier1_result,
             ):
                 result = await loop.handle_user_input("Fetch https://example.com/docs for me.")

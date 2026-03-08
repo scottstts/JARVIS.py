@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..config import ToolSettings
-from ..types import ToolExecutionContext, ToolPolicyDecision
+from ...config import ToolSettings
+from ...types import ToolExecutionContext, ToolPolicyDecision
 from .paths import resolve_workspace_path
 
 _MAX_ARGS = 32

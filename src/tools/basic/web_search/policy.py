@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..types import ToolExecutionContext, ToolPolicyDecision
+from ...types import ToolExecutionContext, ToolPolicyDecision
 
 _MAX_QUERY_CHARS = 400
 _MAX_QUERY_WORDS = 50

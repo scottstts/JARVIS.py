@@ -11,8 +11,8 @@ import requests
 
 from llm import ToolDefinition
 
-from ..config import ToolSettings
-from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...config import ToolSettings
+from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 _BRAVE_WEB_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ..types import ToolExecutionContext
+from ...types import ToolExecutionContext
 
 _GLOB_PATTERN = re.compile(r"[*?\[]")
 

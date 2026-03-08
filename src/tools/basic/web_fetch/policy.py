@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 from urllib.parse import urlparse
 
-from ..types import ToolExecutionContext, ToolPolicyDecision
+from ...types import ToolExecutionContext, ToolPolicyDecision
 
 _MAX_URL_CHARS = 2_000
 _LOCAL_HOSTS = {"localhost", "localhost.localdomain"}

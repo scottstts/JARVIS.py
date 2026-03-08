@@ -18,8 +18,8 @@ from playwright.async_api import async_playwright
 
 from llm import ToolDefinition
 
-from ..config import ToolSettings
-from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...config import ToolSettings
+from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 _CLOUDFLARE_TOMARKDOWN_URL_TEMPLATE = (
     "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/tomarkdown"

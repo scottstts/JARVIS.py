@@ -7,8 +7,8 @@ from typing import Any
 
 from llm import ToolDefinition
 
-from ..config import ToolSettings
-from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...config import ToolSettings
+from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 _SUPPORTED_IMAGE_MEDIA_TYPES = {
     "image/jpeg",

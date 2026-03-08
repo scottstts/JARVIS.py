@@ -29,7 +29,7 @@
 - Bash tool v1 is intentionally restrictive: sequential tool rounds, workspace-only writes, conservative shell syntax allowlist, and executor failures are converted into structured tool-error results instead of crashing the turn.
 - Bash tool now denies explicit `.env` paths for both reads and writes, blocks recursive `grep`, and forces `rg` to ignore `.env` without allowing `--no-config` or re-include globs.
 - `Dockerfile.dev` now explicitly installs `file` and `ripgrep` so the dev container matches the bash tool's full command allowlist.
-- Tool-specific code under `src/tools/` should live in its own subpackage (for example `src/tools/bash/`), while `src/tools/policy.py` stays as the universal policy interface/router.
+- Tool-specific code now lives under `src/tools/basic/<tool_name>/` for basic tools and will live under `src/tools/discoverable/<tool_name>/` for discoverable executable tools, while `src/tools/policy.py` stays as the universal policy interface/router.
 - Gemini tool declarations must use `parameters_json_schema` instead of `parameters`; otherwise schemas with `additionalProperties: false` cause a 400 from the Gemini API.
 - OpenAI strict function schemas require every property to appear in `required`; optional fields must be represented as nullable in the outbound schema, and returned `null` values for omitted optionals should be normalized away before validating against the original tool schema.
 - Tool follow-up rounds now rebuild structured assistant tool calls and tool results into provider-native request shapes in `src/llm/`, so internal tool-call payloads no longer leak into user-facing Telegram replies.

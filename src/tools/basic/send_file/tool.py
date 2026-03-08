@@ -9,8 +9,8 @@ from llm import ToolDefinition
 from ui.telegram import UIConfigurationError, send_telegram_file
 from ui.telegram.api import TelegramAPIError
 
-from ..config import ToolSettings
-from ..types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
+from ...config import ToolSettings
+from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 
 class SendFileToolExecutor:

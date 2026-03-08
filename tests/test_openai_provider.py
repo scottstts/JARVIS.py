@@ -11,7 +11,7 @@ from llm.config import OpenAIProviderSettings
 from llm.errors import ToolCallValidationError
 from llm.providers.openai_provider import OpenAIProvider
 from llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
-from tools.file_patch.tool import build_file_patch_tool
+from tools.basic.file_patch.tool import build_file_patch_tool
 from tools.config import ToolSettings
 
 

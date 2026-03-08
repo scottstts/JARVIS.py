@@ -20,7 +20,11 @@ from tools import (
     ToolRuntime,
     ToolSettings,
 )
-from tools.web_fetch.tool import BrowserRenderResult, HTTPFetchResult, MarkdownConversionResult
+from tools.basic.web_fetch.tool import (
+    BrowserRenderResult,
+    HTTPFetchResult,
+    MarkdownConversionResult,
+)
 
 _PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
 _PYTHON_INTERPRETER_RUNTIME_AVAILABLE = (
@@ -1004,7 +1008,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return {"message_id": 9, "chat_id": 123}
 
         with patch(
-            "tools.send_file.tool.send_telegram_file",
+            "tools.basic.send_file.tool.send_telegram_file",
             side_effect=_fake_send_telegram_file,
         ):
             result = await self.runtime.execute(
@@ -1097,7 +1101,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-brave-key"}, clear=False):
-            with patch("tools.web_search.tool.requests.get", side_effect=_fake_requests_get):
+            with patch("tools.basic.web_search.tool.requests.get", side_effect=_fake_requests_get):
                 result = await self.runtime.execute(
                     tool_call=ToolCall(
                         call_id="call_web_search",
@@ -1135,7 +1139,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_web_search_returns_api_error_details(self) -> None:
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-brave-key"}, clear=False):
             with patch(
-                "tools.web_search.tool.requests.get",
+                "tools.basic.web_search.tool.requests.get",
                 return_value=_FakeWebSearchResponse(
                     status_code=429,
                     payload={"error": {"detail": "rate limit exceeded"}},
@@ -1245,7 +1249,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.web_fetch.tool._fetch_http_text",
+            "tools.basic.web_fetch.tool._fetch_http_text",
             return_value=tier1_result,
         ) as fetch_mock:
             result = await self.runtime.execute(
@@ -1285,11 +1289,11 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.web_fetch.tool._fetch_http_text",
+            "tools.basic.web_fetch.tool._fetch_http_text",
             side_effect=[tier1_result, tier2_result],
         ) as fetch_mock:
             with patch(
-                "tools.web_fetch.tool._convert_html_to_markdown",
+                "tools.basic.web_fetch.tool._convert_html_to_markdown",
                 return_value=converted_result,
             ) as convert_mock:
                 result = await self.runtime.execute(
@@ -1342,15 +1346,15 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.web_fetch.tool._fetch_http_text",
+            "tools.basic.web_fetch.tool._fetch_http_text",
             side_effect=[tier1_result, tier2_result],
         ) as fetch_mock:
             with patch(
-                "tools.web_fetch.tool._convert_html_to_markdown",
+                "tools.basic.web_fetch.tool._convert_html_to_markdown",
                 side_effect=[low_signal_markdown, rendered_markdown],
             ) as convert_mock:
                 with patch(
-                    "tools.web_fetch.tool._render_page_html",
+                    "tools.basic.web_fetch.tool._render_page_html",
                     new=AsyncMock(return_value=rendered_result),
                 ) as render_mock:
                     result = await self.runtime.execute(
@@ -1384,7 +1388,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.web_fetch.tool._fetch_http_text",
+            "tools.basic.web_fetch.tool._fetch_http_text",
             side_effect=[tier1_result, tier2_result],
         ):
             with patch.dict(

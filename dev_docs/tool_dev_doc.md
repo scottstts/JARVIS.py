@@ -18,7 +18,8 @@ Keep this doc structured and status-oriented. It is meant to be updated througho
 
 ### Tool Packages
 
-- Each tool lives in its own package under `src/tools/<tool_name>/`
+- Basic tools live in `src/tools/basic/<tool_name>/`
+- Discoverable executable tools live in `src/tools/discoverable/<tool_name>/`
 - Shared cross-tool interfaces stay at the top level of `src/tools/`
 - Current shared top-level modules:
   - `registry.py`
@@ -88,7 +89,7 @@ Use this when the discoverable capability should eventually become an actual cal
 
 Required wiring:
 
-1. Create the normal tool package under `src/tools/<tool_name>/`.
+1. Create the discoverable executable tool package under `src/tools/discoverable/<tool_name>/`.
 2. Implement the executor and `build_<tool_name>_tool(...)` exactly like any other tool.
 3. Set `exposure="discoverable"` on the returned `RegisteredTool`.
 4. Register that executable tool in `ToolRegistry.default(...)` with `registry.register(...)`.
@@ -207,7 +208,8 @@ Important runtime behavior:
 Structure:
 
 - `src/tools/policy.py` is the universal policy interface/router
-- each tool owns its own policy logic under `src/tools/<tool_name>/policy.py`
+- each basic tool owns its own policy logic under `src/tools/basic/<tool_name>/policy.py`
+- each discoverable executable tool owns its own policy logic under `src/tools/discoverable/<tool_name>/policy.py`
 
 Current active policy:
 
@@ -265,7 +267,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/bash/`
+- Package: `src/tools/basic/bash/`
 - Purpose: run validated shell commands inside the container for file inspection and workspace-limited file manipulation
 
 #### Input Schema
@@ -374,7 +376,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/python_interpreter/`
+- Package: `src/tools/basic/python_interpreter/`
 - Purpose: run constrained Python code or stored workspace scripts for parsing, tabular work, PDF/text extraction, image processing, and structured transformations that are awkward in shell
 
 #### Input Schema
@@ -414,7 +416,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/file_patch/`
+- Package: `src/tools/basic/file_patch/`
 - Purpose: perform structured one-file text edits through explicit patch operations instead of shell editing
 
 #### Input Schema
@@ -458,7 +460,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/view_image/`
+- Package: `src/tools/basic/view_image/`
 - Purpose: attach a local workspace image to the next model turn so multimodal providers can inspect it through a single tool path
 
 #### Input Schema
@@ -489,7 +491,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/send_file/`
+- Package: `src/tools/basic/send_file/`
 - Purpose: send a local workspace file to the user through the Telegram file-send interface
 
 #### Input Schema
@@ -522,7 +524,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/web_search/`
+- Package: `src/tools/basic/web_search/`
 - Purpose: run a basic Brave web search query and return normalized web results for current information gathering
 
 #### Input Schema
@@ -555,7 +557,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/web_fetch/`
+- Package: `src/tools/basic/web_fetch/`
 - Purpose: fetch a specific web page and return clean markdown through a markdown-first three-tier strategy
 
 #### Input Schema
@@ -589,7 +591,7 @@ Command-specific restrictions:
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/tool_search/`
+- Package: `src/tools/basic/tool_search/`
 - Purpose: search the discoverable catalog at low or high verbosity and optionally surface backed discoverable tools for the current turn
 
 #### Input Schema
