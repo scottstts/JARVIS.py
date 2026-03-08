@@ -445,8 +445,16 @@ class OpenRouterProvider:
 
     def _iter_sse_payloads(self, response: requests.Response) -> Iterator[str]:
         data_lines: list[str] = []
-        for raw_line in response.iter_lines(decode_unicode=True):
-            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+        for raw_line in response.iter_lines(decode_unicode=False):
+            if isinstance(raw_line, bytes):
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ProviderResponseError(
+                        "OpenRouter returned a non-UTF-8 streaming payload."
+                    ) from exc
+            else:
+                line = raw_line
             line = line.rstrip("\r")
             if not line:
                 if data_lines:

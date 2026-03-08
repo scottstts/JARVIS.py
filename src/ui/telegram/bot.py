@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import time
+import unicodedata
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
@@ -288,9 +289,10 @@ class TelegramGatewayBridge:
                     continue
 
                 if isinstance(event, GatewayMessageEvent):
-                    final_text = event.text or accumulated_text or "(No response text.)"
-                    await self._send_final_text(chat_id=message.chat_id, text=final_text)
-                    delivered_any_segment = True
+                    final_text = _coalesce_visible_text(event.text, accumulated_text)
+                    if final_text is not None:
+                        await self._send_final_text(chat_id=message.chat_id, text=final_text)
+                        delivered_any_segment = True
                     accumulated_text = ""
                     last_draft_text = ""
                     last_draft_at = 0.0
@@ -300,8 +302,10 @@ class TelegramGatewayBridge:
                 if isinstance(event, GatewayTurnDoneEvent):
                     if not delivered_any_segment:
                         final_text = (
-                            event.response_text
-                            or accumulated_text
+                            _coalesce_visible_text(
+                                event.response_text,
+                                accumulated_text,
+                            )
                             or "(No response text.)"
                         )
                         await self._send_final_text(
@@ -404,11 +408,11 @@ class TelegramGatewayBridge:
         draft_text = text
         if len(draft_text) > max_chars:
             draft_text = f"{draft_text[: max_chars - 1]}…"
-        plain_draft_text = draft_text.strip()
-        if not plain_draft_text:
+        plain_draft_text = _coalesce_visible_text(draft_text)
+        if plain_draft_text is None:
             return
 
-        rendered_text = render_markdown_to_telegram_html(draft_text)
+        rendered_text = render_markdown_to_telegram_html(plain_draft_text)
         if _has_visible_telegram_text(rendered_text):
             draft = DraftMessage(id=draft_id, text=rendered_text)
             try:
@@ -428,25 +432,33 @@ class TelegramGatewayBridge:
         )
 
     async def _send_final_text(self, *, chat_id: int, text: str) -> None:
+        normalized_text = _coalesce_visible_text(text) or "(No response text.)"
         chunks = split_telegram_message(
-            text,
+            normalized_text,
             max_chars=self._settings.telegram_max_message_chars,
         )
         for chunk in chunks:
             await self._send_formatted_message(chat_id=chat_id, text=chunk)
 
     async def _send_formatted_message(self, *, chat_id: int, text: str) -> None:
-        formatted_text = render_markdown_to_telegram_html(text)
-        try:
-            await self._telegram.send_message(
-                chat_id=chat_id,
-                text=formatted_text,
-                parse_mode="HTML",
-            )
-        except TelegramAPIError as exc:
-            if not _is_formatting_error(exc):
-                raise
-            await self._telegram.send_message(chat_id=chat_id, text=text)
+        plain_text = text.strip()
+        if not plain_text:
+            return
+
+        formatted_text = render_markdown_to_telegram_html(plain_text)
+        if _has_visible_telegram_text(formatted_text):
+            try:
+                await self._telegram.send_message(
+                    chat_id=chat_id,
+                    text=formatted_text,
+                    parse_mode="HTML",
+                )
+                return
+            except TelegramAPIError as exc:
+                if not _is_formatting_error(exc):
+                    raise
+
+        await self._telegram.send_message(chat_id=chat_id, text=plain_text)
 
     def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
         if exc.retry_after_seconds is None:
@@ -794,13 +806,19 @@ def _should_flush_draft(
 
 
 def _has_visible_telegram_text(text: str) -> bool:
-    if not text.strip():
-        return False
-    return bool(_HTML_TAG_PATTERN.sub("", text).strip())
+    return _has_effective_text(_HTML_TAG_PATTERN.sub("", text))
+
+
+def _coalesce_visible_text(*candidates: str) -> str | None:
+    for candidate in candidates:
+        normalized = _strip_invisible_edges(candidate)
+        if _has_effective_text(normalized):
+            return normalized
+    return None
 
 
 def split_telegram_message(text: str, *, max_chars: int = 4_096) -> list[str]:
-    if not text:
+    if not _has_effective_text(text):
         return ["(No response text.)"]
     if len(text) <= max_chars:
         return [text]
@@ -814,9 +832,31 @@ def split_telegram_message(text: str, *, max_chars: int = 4_096) -> list[str]:
             newline_break = text.rfind("\n", start, end)
             if newline_break > start:
                 end = newline_break + 1
-        chunks.append(text[start:end])
+        chunk = text[start:end]
+        if _has_effective_text(chunk):
+            chunks.append(chunk)
         start = end
-    return chunks
+    return chunks or ["(No response text.)"]
+
+
+def _has_effective_text(text: str) -> bool:
+    return any(_is_effectively_visible_character(char) for char in text)
+
+
+def _strip_invisible_edges(text: str) -> str:
+    start = 0
+    end = len(text)
+    while start < end and not _is_effectively_visible_character(text[start]):
+        start += 1
+    while end > start and not _is_effectively_visible_character(text[end - 1]):
+        end -= 1
+    return text[start:end]
+
+
+def _is_effectively_visible_character(char: str) -> bool:
+    if char.isspace():
+        return False
+    return unicodedata.category(char)[0] not in {"C", "M"}
 
 
 def _is_formatting_error(exc: TelegramAPIError) -> bool:

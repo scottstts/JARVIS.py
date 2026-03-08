@@ -124,6 +124,11 @@ class _FakeTelegramClient:
         parse_mode: str | None = None,
     ) -> dict[str, Any]:
         self.message_attempts += 1
+        if not text.strip():
+            raise TelegramAPIError(
+                code="telegram_api_error_400",
+                message="Bad Request: text must be non-empty",
+            )
         if self._message_errors:
             raise self._message_errors.pop(0)
         self.sent_messages.append(
@@ -442,11 +447,60 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_drafts, [])
         self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
 
+    async def test_handle_message_skips_whitespace_only_assistant_segment(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="  "),
+                GatewayMessageEvent(session_id="session", text="  "),
+                GatewayDeltaEvent(session_id="session", delta="done"),
+                GatewayMessageEvent(session_id="session", text="done"),
+                GatewayTurnDoneEvent(session_id="session", response_text="done"),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual([message.text for message in telegram.sent_messages], ["done"])
+        self.assertEqual([draft.draft.text for draft in telegram.sent_drafts], ["done"])
+
+    async def test_handle_message_skips_invisible_unicode_only_assistant_segment(self) -> None:
+        telegram = _FakeTelegramClient()
+        invisible_text = "\u200b\u200d\ufeff"
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta=invisible_text),
+                GatewayMessageEvent(session_id="session", text=invisible_text),
+                GatewayDeltaEvent(session_id="session", delta="done"),
+                GatewayMessageEvent(session_id="session", text="done"),
+                GatewayTurnDoneEvent(session_id="session", response_text="done"),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual([message.text for message in telegram.sent_messages], ["done"])
+        self.assertEqual([draft.draft.text for draft in telegram.sent_drafts], ["done"])
+
     async def test_handle_message_falls_back_to_plain_text_for_empty_html_drafts(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             events=[
-                GatewayDeltaEvent(session_id="session", delta="# "),
+                GatewayDeltaEvent(session_id="session", delta="> "),
                 GatewayMessageEvent(session_id="session", text="pong"),
                 GatewayTurnDoneEvent(session_id="session", response_text="pong"),
             ],
@@ -463,7 +517,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(telegram.draft_attempts, 1)
         self.assertEqual(len(telegram.sent_drafts), 1)
-        self.assertEqual(telegram.sent_drafts[0].draft.text, "#")
+        self.assertEqual(telegram.sent_drafts[0].draft.text, ">")
         self.assertIsNone(telegram.sent_drafts[0].parse_mode)
         self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
 
@@ -761,3 +815,9 @@ class TelegramBotHelpersTests(unittest.TestCase):
     def test_split_telegram_message(self) -> None:
         chunks = split_telegram_message("abc", max_chars=2)
         self.assertEqual(chunks, ["ab", "c"])
+
+    def test_split_telegram_message_returns_placeholder_for_blank_text(self) -> None:
+        self.assertEqual(split_telegram_message(" \n\t "), ["(No response text.)"])
+
+    def test_split_telegram_message_returns_placeholder_for_invisible_unicode(self) -> None:
+        self.assertEqual(split_telegram_message("\u200b\u200d\ufeff"), ["(No response text.)"])

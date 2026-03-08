@@ -256,6 +256,66 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(done.response.tool_calls[0].name, "bash")
         self.assertEqual(done.response.tool_calls[0].arguments, {"command": "pwd"})
 
+    def test_stream_generate_preserves_utf8_text(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="openai/gpt-4o-mini",
+            messages=(LLMMessage.text("user", "list tools"),),
+        )
+
+        response = _FakeStreamingResponse(
+            lines=[
+                self._sse_chunk(
+                    {
+                        "id": "gen_utf8",
+                        "model": "openai/gpt-4o-mini",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "bash — run commands"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ),
+                "",
+                self._sse_chunk(
+                    {
+                        "id": "gen_utf8",
+                        "model": "openai/gpt-4o-mini",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "llm.providers.openrouter_provider.requests.post",
+                return_value=response,
+            ):
+                events = asyncio.run(self._collect_events(provider, request))
+
+        self.assertEqual(
+            [event.delta for event in events if isinstance(event, TextDeltaEvent)],
+            ["bash — run commands"],
+        )
+        self.assertIsInstance(events[-1], DoneEvent)
+        done = events[-1]
+        self.assertEqual(done.response.text, "bash — run commands")
+
     def test_stream_generate_raises_on_stream_error_chunk(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),

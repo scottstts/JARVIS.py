@@ -7,6 +7,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from typing import Any
 
 from core import (
     AgentAssistantMessageEvent,
@@ -38,6 +39,19 @@ from .session_router import InvalidRouteIDError, SessionRouter, validate_route_i
 _INTERNAL_ERROR_MESSAGE = "Internal error while processing message."
 _PROVIDER_TIMEOUT_MESSAGE = "The model timed out while processing that message."
 LOGGER = logging.getLogger(__name__)
+_WEBSOCKET_CLOSED_SEND_ERROR = 'Cannot call "send" once a close message has been sent.'
+
+
+async def _send_json_if_open(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    try:
+        await websocket.send_json(payload)
+    except WebSocketDisconnect:
+        return False
+    except RuntimeError as exc:
+        if _WEBSOCKET_CLOSED_SEND_ERROR in str(exc):
+            return False
+        raise
+    return True
 
 
 def create_app(
@@ -79,18 +93,22 @@ def create_app(
         try:
             route_id = validate_route_id(route_id_raw)
         except InvalidRouteIDError as exc:
-            await websocket.send_json(
+            if not await _send_json_if_open(
+                websocket,
                 build_error_event(code="invalid_route_id", message=str(exc))
-            )
+            ):
+                return
             await websocket.close(code=1008)
             return
 
-        await websocket.send_json(
+        if not await _send_json_if_open(
+            websocket,
             build_ready_event(
                 route_id=route_id,
                 session_id=resolved_router.active_session_id(route_id),
             )
-        )
+        ):
+            return
 
         while True:
             try:
@@ -101,12 +119,14 @@ def create_app(
             try:
                 payload = json.loads(raw_message)
             except json.JSONDecodeError:
-                await websocket.send_json(
+                if not await _send_json_if_open(
+                    websocket,
                     build_error_event(
                         code="invalid_json",
                         message="Message must be valid JSON.",
                     )
-                )
+                ):
+                    return
                 continue
 
             try:
@@ -115,64 +135,78 @@ def create_app(
                     max_message_chars=resolved_gateway_settings.max_message_chars,
                 )
             except ProtocolError as exc:
-                await websocket.send_json(
+                if not await _send_json_if_open(
+                    websocket,
                     build_error_event(code=exc.code, message=exc.message)
-                )
+                ):
+                    return
                 continue
 
             try:
                 async for turn_event in resolved_router.stream_turn(route_id, event.text):
                     if isinstance(turn_event, AgentTextDeltaEvent):
-                        await websocket.send_json(
+                        if not await _send_json_if_open(
+                            websocket,
                             build_assistant_delta_event(
                                 session_id=turn_event.session_id,
                                 delta=turn_event.delta,
                             )
-                        )
+                        ):
+                            return
                         continue
 
                     if isinstance(turn_event, AgentAssistantMessageEvent):
-                        await websocket.send_json(
+                        if not await _send_json_if_open(
+                            websocket,
                             build_assistant_message_event(
                                 session_id=turn_event.session_id,
                                 text=turn_event.text,
                             )
-                        )
+                        ):
+                            return
                         continue
 
                     if isinstance(turn_event, AgentTurnDoneEvent):
-                        await websocket.send_json(
+                        if not await _send_json_if_open(
+                            websocket,
                             build_turn_done_event(
                                 session_id=turn_event.session_id,
                                 response_text=turn_event.response_text,
                                 command=turn_event.command,
                                 compaction_performed=turn_event.compaction_performed,
                             )
-                        )
+                        ):
+                            return
             except ContextBudgetError as exc:
-                await websocket.send_json(
+                if not await _send_json_if_open(
+                    websocket,
                     build_error_event(
                         code="context_budget_exceeded",
                         message=str(exc),
                     )
-                )
+                ):
+                    return
                 continue
             except ProviderTimeoutError:
-                await websocket.send_json(
+                if not await _send_json_if_open(
+                    websocket,
                     build_error_event(
                         code="provider_timeout",
                         message=_PROVIDER_TIMEOUT_MESSAGE,
                     )
-                )
+                ):
+                    return
                 continue
             except Exception:
                 LOGGER.exception("Unhandled gateway turn error for route_id=%s", route_id)
-                await websocket.send_json(
+                if not await _send_json_if_open(
+                    websocket,
                     build_error_event(
                         code="internal_error",
                         message=_INTERNAL_ERROR_MESSAGE,
                     )
-                )
+                ):
+                    return
                 continue
 
     return Starlette(

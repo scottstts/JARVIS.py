@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from core import (
@@ -11,8 +12,10 @@ from core import (
     ContextBudgetError,
 )
 from gateway import GatewaySettings, create_app
+from gateway.app import _send_json_if_open
 from llm import ProviderTimeoutError
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 class _FakeRouter:
@@ -153,3 +156,31 @@ class GatewayAppTests(unittest.TestCase):
                 error = socket.receive_json()
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "provider_timeout")
+
+    def test_send_json_if_open_returns_false_on_disconnect(self) -> None:
+        class _DisconnectingWebSocket:
+            async def send_json(self, payload):
+                raise WebSocketDisconnect(code=1006)
+
+        result = asyncio.run(
+            _send_json_if_open(
+                _DisconnectingWebSocket(),
+                {"type": "error", "code": "internal_error"},
+            )
+        )
+
+        self.assertFalse(result)
+
+    def test_send_json_if_open_returns_false_after_close(self) -> None:
+        class _ClosedWebSocket:
+            async def send_json(self, payload):
+                raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+        result = asyncio.run(
+            _send_json_if_open(
+                _ClosedWebSocket(),
+                {"type": "error", "code": "internal_error"},
+            )
+        )
+
+        self.assertFalse(result)
