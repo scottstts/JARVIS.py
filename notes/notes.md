@@ -53,5 +53,6 @@
 - Telegram final sends should ignore whitespace-only assistant segments because some OpenRouter/Kimi tool-call rounds emit only spaces before `finish_reason="tool_calls"`.
 - Runtime secret bootstrap now loads non-empty files from Docker secrets at `/run/secrets` into process env, and repo-root `.env` is no longer used at startup.
 - `docker-compose.yml` now sources secrets from repo-local ignored files under `secrets/`, so fill those files before rebuilding/running the dev container.
+- Telegram owner gating now comes from the Docker secret file `secrets/JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`, not from `.env`.
 - Identities bootstrap is now a single-container flow: the `dev` service copies `/repo/src/identities/.` into `/workspace/identities/` during startup, and there is no separate `init-identities` compose service.
 - The dev container `shm_size` is intentionally `12gb`; Docker Desktop disk-image size remains a host-level setting outside repo control.
