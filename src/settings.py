@@ -15,8 +15,8 @@ JARVIS_GATEWAY_MAX_MESSAGE_CHARS: Final = 32_000
 
 # Core workspace paths.
 AGENT_WORKSPACE: Final[str | None] = "/workspace" # container path
-JARVIS_STORAGE_DIR: Final[str | None] = (
-    f"{AGENT_WORKSPACE}/storage" if AGENT_WORKSPACE is not None else None
+JARVIS_TRANSCRIPT_ARCHIVE_DIR: Final[str | None] = (
+    f"{AGENT_WORKSPACE}/archive/transcripts" if AGENT_WORKSPACE is not None else None
 )
 JARVIS_IDENTITIES_DIR: Final = "/workspace/identities"
 

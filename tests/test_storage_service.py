@@ -12,7 +12,7 @@ from storage import ConversationRecord, SessionStorage
 class SessionStorageTests(unittest.TestCase):
     def test_create_append_load_and_update_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = SessionStorage(Path(tmp) / "storage")
+            storage = SessionStorage(Path(tmp) / "archive" / "transcripts")
             session = storage.create_session(start_reason="initial")
             self.assertEqual(storage.get_active_session().session_id, session.session_id)  # type: ignore[union-attr]
 
@@ -40,7 +40,7 @@ class SessionStorageTests(unittest.TestCase):
 
     def test_archive_marks_status_archived(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            storage = SessionStorage(Path(tmp) / "storage")
+            storage = SessionStorage(Path(tmp) / "archive" / "transcripts")
             session = storage.create_session(start_reason="initial")
             storage.archive_session(session.session_id)
             archived = storage.get_session(session.session_id)

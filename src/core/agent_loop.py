@@ -108,7 +108,7 @@ class AgentLoop:
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
-        self._storage = storage or SessionStorage(self._settings.storage_dir)
+        self._storage = storage or SessionStorage(self._settings.transcript_archive_dir)
         self._identity_loader = IdentityBootstrapLoader(self._settings)
         self._compactor = ContextCompactor(
             llm_service=self._llm_service,

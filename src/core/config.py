@@ -95,7 +95,7 @@ class CoreSettings:
 
     context_policy: ContextPolicySettings
     workspace_dir: Path
-    storage_dir: Path
+    transcript_archive_dir: Path
     identities_dir: Path
     turn_timezone: str = app_settings.JARVIS_CORE_TIMEZONE
     program_file_name: str = "PROGRAM.md"
@@ -118,11 +118,11 @@ class CoreSettings:
     @classmethod
     def from_env(cls) -> "CoreSettings":
         workspace_dir = resolve_workspace_dir(error_type=CoreConfigurationError)
-        storage_dir = resolve_workspace_child(
-            env_name="JARVIS_STORAGE_DIR",
-            configured_default=app_settings.JARVIS_STORAGE_DIR,
+        transcript_archive_dir = resolve_workspace_child(
+            env_name="JARVIS_TRANSCRIPT_ARCHIVE_DIR",
+            configured_default=app_settings.JARVIS_TRANSCRIPT_ARCHIVE_DIR,
             workspace_dir=workspace_dir,
-            child_name="storage",
+            child_name="archive/transcripts",
         )
         identities_dir = resolve_workspace_child(
             env_name="JARVIS_IDENTITIES_DIR",
@@ -134,7 +134,7 @@ class CoreSettings:
         return cls(
             context_policy=ContextPolicySettings.from_env(),
             workspace_dir=workspace_dir,
-            storage_dir=storage_dir,
+            transcript_archive_dir=transcript_archive_dir,
             identities_dir=identities_dir,
             turn_timezone=_optional_env("JARVIS_CORE_TIMEZONE")
             or app_settings.JARVIS_CORE_TIMEZONE,

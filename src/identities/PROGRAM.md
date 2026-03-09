@@ -17,15 +17,15 @@ You will have full read/write access to only this `workspace/` dir, and read onl
 
 In side your workspace/ dir:
 
-- `temp/` dir. This is where the files I send you will show up. This dir is cleared everyday at mid night so as to not clutter. If there are files in it that you deem needed to persist, copy or move it to a dedicated dir of your own choosing (or creation) like `/workspace/storage/xxx/`
+- `temp/` dir. This is where the files I send you will show up. This dir is cleared everyday at mid night so as to not clutter. If there are files in it that you deem needed to persist, copy or move it to a dedicated dir of your own choosing (or creation) like `/workspace/images/`
 - `identities/` dir. This is where identity files such as REACTOR.md and USER.md are stored.
-- `storage/` dir. This is where persistent data is stored. Inside, `routes/` contains all the transcripts of past conversations. Treat this as **immutable** and **read only**
+- `archive/` dir. This is where past conversation transcripts are stored. Treat this as **immutable** and **read only**
 
 **Important:** Do not write to some of the default dirs in your workspace **unless explicitly permitted**, they are:
 
 - `workspace/temp/`
 - `workspace/identities/`
-- `workspace/storage/routes/`
+- `workspace/archive/`
 
 Other than these, you may freely create files, delete them, edit them, do what you see fit and what will be helpful.
 

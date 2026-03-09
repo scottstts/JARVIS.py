@@ -233,13 +233,13 @@ def _build_default_router(
 ) -> SessionRouter:
     resolved_core_settings = core_settings or CoreSettings.from_env()
     resolved_llm_service = llm_service
-    base_storage_dir = resolved_core_settings.storage_dir
+    base_transcript_archive_dir = resolved_core_settings.transcript_archive_dir
 
     def agent_loop_factory(route_id: str) -> AgentLoop:
-        route_storage_dir = base_storage_dir / "routes" / route_id
+        route_transcript_archive_dir = base_transcript_archive_dir / route_id
         route_core_settings = replace(
             resolved_core_settings,
-            storage_dir=route_storage_dir,
+            transcript_archive_dir=route_transcript_archive_dir,
         )
         return AgentLoop(
             llm_service=resolved_llm_service,

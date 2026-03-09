@@ -32,6 +32,6 @@ def build_core_settings(
             compact_reserve_overhead_tokens=compact_reserve_overhead_tokens,
         ),
         workspace_dir=workspace_dir,
-        storage_dir=root_dir / "storage",
+        transcript_archive_dir=root_dir / "archive" / "transcripts",
         identities_dir=identities_dir,
     )

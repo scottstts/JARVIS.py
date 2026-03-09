@@ -20,7 +20,7 @@ The agent should have below components, some of which can be straightforward, so
 
 - storage/ . This is a utility service that stores all past conversation transcripts, metadata like prompt hash, tool calls, durations, token usage, etc. stored in JSONL.
 
-**NOTE:** I need to clarify this otherwise it could be potentially confusing. EVERYTHING I mentioned here is part of the repo, they're code (mostly, unless they're prompts). for example, `storage/` is the service that grabs the conversation and stores it, while there most likely will also be a `storage/` dir in the agent workspace in the docker container, which will be the dir where the conversation transcripts are actually stored. same goes for e.g. `memory/`. An **exception** is the `identities/`. this contains the core prompts that the agent will need. So they are a part of the code repo where they are created, but the same files will also be copied to the agent workspace as `identities/` too, which are the actual files that agent will use during runtime
+**NOTE:** I need to clarify this otherwise it could be potentially confusing. EVERYTHING I mentioned here is part of the repo, they're code (mostly, unless they're prompts). for example, `storage/` is the service that grabs the conversation and stores it, while the actual runtime transcripts live under `archive/transcripts/` in the agent workspace in the docker container. same goes for e.g. `memory/`. An **exception** is the `identities/`. this contains the core prompts that the agent will need. So they are a part of the code repo where they are created, but the same files will also be copied to the agent workspace as `identities/` too, which are the actual files that agent will use during runtime
 
 ## Scattered Design Choices
 

@@ -70,7 +70,7 @@ class ContextCompactor:
                 "Stable context: compaction model returned empty output.\n"
                 "Decisions made: none extracted.\n"
                 "Open items: continue from latest user request.\n"
-                "Important artifacts: session transcript retained in storage."
+                "Important artifacts: session transcript retained in the archive."
             )
 
         usage = response.usage

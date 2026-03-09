@@ -50,7 +50,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_user_input_emits_delta_and_done_and_persists_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeStreamingLLMService(),
                 settings=settings,
@@ -79,7 +79,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_new_with_body_marks_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeStreamingLLMService(),
                 settings=settings,
@@ -97,7 +97,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_injects_transient_turn_datetime_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = _FakeTurnContextLLMService()
             loop = AgentLoop(
                 llm_service=llm_service,

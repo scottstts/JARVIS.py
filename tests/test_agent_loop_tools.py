@@ -551,7 +551,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_executes_bash_tool_round_and_persists_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeToolLLMService(),
                 settings=settings,
@@ -579,7 +579,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_user_input_completes_tool_round_and_emits_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeToolLLMService(),
                 settings=settings,
@@ -613,7 +613,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             image_bytes = b"\x89PNG\r\n\x1a\nfake_png_payload"
             image_path.write_bytes(image_bytes)
 
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeViewImageLLMService(image_bytes),
                 settings=settings,
@@ -642,7 +642,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             notes_dir = settings.workspace_dir / "notes"
             notes_dir.mkdir(parents=True, exist_ok=True)
 
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeFilePatchLLMService(),
                 settings=settings,
@@ -672,7 +672,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             exports_dir = settings.workspace_dir / "exports"
             exports_dir.mkdir(parents=True, exist_ok=True)
 
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakePythonInterpreterLLMService(),
                 settings=settings,
@@ -706,7 +706,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text("weekly report", encoding="utf-8")
 
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeSendFileLLMService(),
                 settings=settings,
@@ -735,7 +735,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_executes_web_fetch_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             loop = AgentLoop(
                 llm_service=_FakeWebFetchLLMService(),
                 settings=settings,
@@ -771,7 +771,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             registry = ToolRegistry.default(
                 ToolSettings.from_workspace_dir(settings.workspace_dir)
             )

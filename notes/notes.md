@@ -16,8 +16,9 @@
 - Added `src/main.py` as the combined runtime entrypoint: it starts the gateway in-process, binds the Telegram UI to that local gateway, and shuts both down together.
 - Added repo-root `main.py` bootstrap so `uv run -m main` works with the current `src/` layout without extra `PYTHONPATH` setup.
 - Fixed OpenAI multi-turn chat history shaping: assistant transcript messages must be resent to the Responses API as `output_text`, not `input_text`, or turn two fails with a 400.
-- Renamed host/container workspace envs to avoid Docker confusion: `AGENT_ROOT` is the host bind-mount source for compose, while `AGENT_WORKSPACE` is the in-container app workspace path used to derive storage.
+- Renamed host/container workspace envs to avoid Docker confusion: `AGENT_ROOT` is the host bind-mount source for compose, while `AGENT_WORKSPACE` is the in-container app workspace path used to derive workspace child paths.
 - Host runtime config now fails fast unless `AGENT_WORKSPACE` is explicitly set; `/workspace` remains a container-only default, and host runs should point `AGENT_WORKSPACE` at the real host workspace path.
+- Route transcript archives now live under `/workspace/archive/transcripts/<route_id>/`; the old `/workspace/storage/routes/` runtime path is retired.
 - Telegram draft streaming can hit Bot API 429 flood control; parse `retry_after`, pause drafts per chat for that interval, and still send the final assistant message.
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
 - Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.

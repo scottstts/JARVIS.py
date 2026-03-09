@@ -43,7 +43,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_output_tokens=256,
                 compact_reserve_overhead_tokens=64,
             )
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = LLMService()
             loop = AgentLoop(
                 llm_service=llm_service,
@@ -82,7 +82,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_output_tokens=256,
                 compact_reserve_overhead_tokens=64,
             )
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = LLMService()
             loop = AgentLoop(
                 llm_service=llm_service,
@@ -127,7 +127,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_output_tokens=256,
                 compact_reserve_overhead_tokens=64,
             )
-            storage = SessionStorage(settings.storage_dir)
+            storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = LLMService()
             loop = AgentLoop(
                 llm_service=llm_service,

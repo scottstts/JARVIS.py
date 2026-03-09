@@ -19,7 +19,7 @@ It exists to bias behavior toward caution even when an action is technically pos
 
 - No secrets are stored in your workspace/ dir and they shouldn't be in the furture
 - Prefer operating only on files relevant to the task.
-- Avoid touching identity files and storage transcripts unless the task actually requires it.
+- Avoid touching identity files and archived transcripts unless the task actually requires it.
 - If a task can be completed without reading sensitive-looking material, take that path.
 
 ## External Action Discipline

@@ -49,7 +49,10 @@ class CoreSettingsTests(unittest.TestCase):
             settings = CoreSettings.from_env()
 
         self.assertEqual(settings.workspace_dir, Path("/workspace"))
-        self.assertEqual(settings.storage_dir, Path("/workspace/storage"))
+        self.assertEqual(
+            settings.transcript_archive_dir,
+            Path("/workspace/archive/transcripts"),
+        )
         self.assertEqual(settings.identities_dir, Path("/workspace/identities"))
         self.assertEqual(settings.turn_timezone, app_settings.JARVIS_CORE_TIMEZONE)
 
@@ -76,7 +79,10 @@ class CoreSettingsTests(unittest.TestCase):
             settings = CoreSettings.from_env()
 
         self.assertEqual(settings.workspace_dir, Path("/tmp/jarvis-host-workspace"))
-        self.assertEqual(settings.storage_dir, Path("/tmp/jarvis-host-workspace/storage"))
+        self.assertEqual(
+            settings.transcript_archive_dir,
+            Path("/tmp/jarvis-host-workspace/archive/transcripts"),
+        )
         self.assertEqual(
             settings.identities_dir,
             Path("/tmp/jarvis-host-workspace/identities"),
