@@ -10,7 +10,7 @@ from dataclasses import replace
 import uvicorn
 
 from gateway import GatewaySettings, create_app
-from runtime_env import load_dotenv_if_present
+from runtime_env import load_docker_secrets_if_present
 from ui.telegram import UISettings, run_telegram_ui
 
 LOGGER = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ async def run_system(
 
 
 def main() -> None:
-    load_dotenv_if_present()
+    load_docker_secrets_if_present()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

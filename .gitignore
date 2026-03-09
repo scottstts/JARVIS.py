@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 .env
+secrets/*
+!secrets/.gitignore
+!secrets/README.md
 .ruff_cache/
 
 # Virtual environments

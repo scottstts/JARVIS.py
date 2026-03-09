@@ -13,7 +13,7 @@ import main
 from gateway import GatewaySettings
 from ui.telegram import UISettings
 
-from runtime_env import load_dotenv_if_present
+from runtime_env import load_docker_secrets_if_present
 
 
 class _FakeServer:
@@ -37,26 +37,30 @@ class _FakeServer:
 
 
 class RuntimeEnvTests(unittest.TestCase):
-    def test_load_dotenv_if_present_sets_values_without_overriding_by_default(self) -> None:
+    def test_load_docker_secrets_if_present_sets_values_without_overriding_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / ".env"
-            env_path.write_text(
-                "\n".join(
-                    [
-                        "FIRST=value-one",
-                        "export SECOND=\"value two\"",
-                        "THIRD=from-dotenv",
-                    ]
-                ),
-                encoding="utf-8",
-            )
+            secrets_dir = Path(tmp) / "secrets"
+            secrets_dir.mkdir()
+            (secrets_dir / "FIRST").write_text("value-one\n", encoding="utf-8")
+            (secrets_dir / "SECOND").write_text("value two\n", encoding="utf-8")
+            (secrets_dir / "THIRD").write_text("from-docker-secret\n", encoding="utf-8")
+            (secrets_dir / "EMPTY").write_text("\n", encoding="utf-8")
+            (secrets_dir / "invalid-name").write_text("ignored\n", encoding="utf-8")
 
             with patch.dict(os.environ, {"THIRD": "from-env"}, clear=True):
-                loaded = load_dotenv_if_present(env_path)
-                self.assertEqual(loaded, env_path)
+                loaded = load_docker_secrets_if_present(secrets_dir)
+                self.assertEqual(
+                    loaded,
+                    (
+                        secrets_dir / "FIRST",
+                        secrets_dir / "SECOND",
+                    ),
+                )
                 self.assertEqual(os.environ["FIRST"], "value-one")
                 self.assertEqual(os.environ["SECOND"], "value two")
                 self.assertEqual(os.environ["THIRD"], "from-env")
+                self.assertNotIn("EMPTY", os.environ)
+                self.assertNotIn("invalid-name", os.environ)
 
 
 class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):

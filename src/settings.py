@@ -1,6 +1,6 @@
 """Non-secret project runtime settings.
 
-Secrets and machine-specific paths stay in `.env`.
+Secrets are loaded separately from Docker secret files.
 """
 
 from __future__ import annotations

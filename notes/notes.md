@@ -6,14 +6,14 @@
 - Added a custom `src/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
 - Implemented file-backed `src/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
 - Session bootstrap now injects only `src/identities/PROGRAM.md` and `src/identities/REACTOR.md`, and compacted sessions additionally inject the generated summary seed.
-- Compaction policy is now provider-agnostic and driven by global `.env` knobs: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
+- Compaction policy is now provider-agnostic and driven by global environment settings: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
 - Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
 - Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
 - Added Starlette websocket gateway under src/gateway with route-scoped SessionRouter, one AgentLoop per route, and JSON events (ready, assistant_message, error).
 - Added real token streaming path in core AgentLoop and gateway websocket (`assistant_delta` events + final `assistant_message` done event), including overflow-compaction retry support for streaming turns.
 - Added explicit provider/client lifecycle cleanup (`aclose`) across LLMService and providers, and wired real integration tests to close services to avoid event-loop-closed teardown warnings.
 - Added `src/ui/` Telegram bridge that long-polls Bot API, forwards messages to gateway websocket per-chat route (`tg_<chat_id>`), and streams assistant deltas via `sendMessageDraft` before final `sendMessage`.
-- Added `src/main.py` as the combined runtime entrypoint: it loads `.env`, starts the gateway in-process, binds the Telegram UI to that local gateway, and shuts both down together.
+- Added `src/main.py` as the combined runtime entrypoint: it starts the gateway in-process, binds the Telegram UI to that local gateway, and shuts both down together.
 - Added repo-root `main.py` bootstrap so `uv run -m main` works with the current `src/` layout without extra `PYTHONPATH` setup.
 - Fixed OpenAI multi-turn chat history shaping: assistant transcript messages must be resent to the Responses API as `output_text`, not `input_text`, or turn two fails with a 400.
 - Renamed host/container workspace envs to avoid Docker confusion: `AGENT_ROOT` is the host bind-mount source for compose, while `AGENT_WORKSPACE` is the in-container app workspace path used to derive storage.
@@ -21,7 +21,7 @@
 - Telegram draft streaming can hit Bot API 429 flood control; parse `retry_after`, pause drafts per chat for that interval, and still send the final assistant message.
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
 - Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.
-- Non-secret runtime defaults now live in `src/settings.py`; `.env` is reserved for secrets and machine-specific paths.
+- Non-secret runtime defaults now live in `src/settings.py`; runtime secrets are now loaded separately from Docker secret files.
 - Telegram UI can be restricted to a single owner by setting `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; unauthorized private messages are ignored without a reply.
 - Telegram file messages now download the original attachment into `JARVIS_UI_TELEGRAM_TEMP_DIR` (default `/workspace/temp`), inject a metadata-only user message pointing at that local path, and expose an owner-file send interface for future agent tools. **important:** this file send telegram interface (for agent to send files to user's telegram) will be used later for agent's send_file tool implementation.
 - In docker compose added command to copy src/identities/. to /workspace/identities/, and wire the agent runtime to use /workspace/identities/ for starter files instead
@@ -51,3 +51,5 @@
 - `ToolRegistry` now has an executable tool registry plus a separate discoverable catalog; `tool_search` searches that catalog with low/high verbosity, and high-verbosity results can transiently activate backed discoverable tools for the current turn.
 - OpenRouter SSE should be decoded from raw bytes as UTF-8 rather than relying on `requests` text decoding, or Kimi responses can arrive with mojibake like `â` instead of `—`.
 - Telegram final sends should ignore whitespace-only assistant segments because some OpenRouter/Kimi tool-call rounds emit only spaces before `finish_reason="tool_calls"`.
+- Runtime secret bootstrap now loads non-empty files from Docker secrets at `/run/secrets` into process env, and repo-root `.env` is no longer used at startup.
+- `docker-compose.yml` now sources secrets from repo-local ignored files under `secrets/`, so fill those files before rebuilding/running the dev container.

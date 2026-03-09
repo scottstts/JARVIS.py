@@ -11,6 +11,7 @@ import settings as app_settings
 
 from core import AgentLoop
 from llm import LLMService
+from runtime_env import load_docker_secrets_if_present
 from storage import SessionStorage
 from tests.helpers import build_core_settings
 
@@ -18,7 +19,7 @@ from tests.helpers import build_core_settings
 class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _load_dotenv_if_present()
+        _load_docker_secrets_if_present()
         provider = (
             os.getenv("JARVIS_LLM_DEFAULT_PROVIDER")
             or str(app_settings.JARVIS_LLM_DEFAULT_PROVIDER)
@@ -148,22 +149,5 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 await llm_service.aclose()
 
 
-def _load_dotenv_if_present() -> None:
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            continue
-        key, raw_value = stripped.split("=", 1)
-        key = key.strip()
-        value = raw_value.strip()
-        if not key or key in os.environ:
-            continue
-        if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
-            value = value[1:-1]
-        os.environ[key] = value
+def _load_docker_secrets_if_present() -> None:
+    load_docker_secrets_if_present(Path(__file__).resolve().parents[1] / "secrets")

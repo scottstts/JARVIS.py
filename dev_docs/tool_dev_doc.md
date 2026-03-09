@@ -633,25 +633,13 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 - Purpose: get a summary of a given youtube video.
 
-#### `archive`
-
-- Purpose: list, extract, and create common archive formats like `zip` and `tar` inside the workspace
-
 #### `tabular_query`
 
 - Purpose: query and transform CSV, JSON, and SQLite-style tabular data through a higher-level interface
 
-#### `document_convert`
-
-- Purpose: convert between common document formats or extract clean text from them for downstream reasoning
-
 #### `browser_automation`
 
 - Purpose: handle multi-step web tasks that simple search or fetch cannot cover, such as navigation, clicks, or form interaction
-
-#### `http_api`
-
-- Purpose: make structured API requests with controlled auth/header handling for tool-like external integrations
 
 #### `workspace_index`
 

@@ -1,42 +1,42 @@
-"""Small runtime helpers for loading local .env files."""
+"""Runtime helpers for loading Docker secrets into process environment."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
+
+_DEFAULT_DOCKER_SECRETS_DIR = Path("/run/secrets")
+_ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
-def load_dotenv_if_present(
-    env_path: Path | None = None,
+def load_docker_secrets_if_present(
+    secrets_dir: Path | None = None,
     *,
     override: bool = False,
-) -> Path | None:
-    resolved_path = env_path or default_dotenv_path()
-    if not resolved_path.exists():
-        return None
+) -> tuple[Path, ...]:
+    resolved_dir = secrets_dir or default_docker_secrets_dir()
+    if not resolved_dir.exists() or not resolved_dir.is_dir():
+        return ()
 
-    for line in resolved_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    loaded_paths: list[Path] = []
+    for candidate in sorted(resolved_dir.iterdir()):
+        if not candidate.is_file():
             continue
-        if stripped.startswith("export "):
-            stripped = stripped[7:].strip()
-        if "=" not in stripped:
-            continue
-
-        key, raw_value = stripped.split("=", 1)
-        key = key.strip()
-        value = raw_value.strip()
-        if not key:
+        key = candidate.name.strip()
+        if not _ENV_VAR_NAME_PATTERN.fullmatch(key):
             continue
         if not override and key in os.environ:
             continue
-        if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
-            value = value[1:-1]
+        value = candidate.read_text(encoding="utf-8").rstrip("\r\n")
+        if not value.strip():
+            continue
+
         os.environ[key] = value
+        loaded_paths.append(candidate)
 
-    return resolved_path
+    return tuple(loaded_paths)
 
 
-def default_dotenv_path() -> Path:
-    return Path(__file__).resolve().parents[1] / ".env"
+def default_docker_secrets_dir() -> Path:
+    return _DEFAULT_DOCKER_SECRETS_DIR

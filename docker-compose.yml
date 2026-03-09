@@ -13,6 +13,15 @@ services:
       - ./:/repo
       - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace
       - uv_cache:/root/.cache/uv
+    secrets:
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      - GOOGLE_API_KEY
+      - OPENROUTER_API_KEY
+      - TELEGRAM_TOKEN
+      - BRAVE_SEARCH_API_KEY
+      - CLOUDFLARE_ACCOUNT_ID
+      - CLOUDFLARE_AI_WORKERS_REST_API_KEY
     working_dir: /repo
     tty: true
     stdin_open: true
@@ -33,3 +42,21 @@ services:
 
 volumes:
   uv_cache:
+
+secrets:
+  OPENAI_API_KEY:
+    file: ./secrets/OPENAI_API_KEY
+  ANTHROPIC_API_KEY:
+    file: ./secrets/ANTHROPIC_API_KEY
+  GOOGLE_API_KEY:
+    file: ./secrets/GOOGLE_API_KEY
+  OPENROUTER_API_KEY:
+    file: ./secrets/OPENROUTER_API_KEY
+  TELEGRAM_TOKEN:
+    file: ./secrets/TELEGRAM_TOKEN
+  BRAVE_SEARCH_API_KEY:
+    file: ./secrets/BRAVE_SEARCH_API_KEY
+  CLOUDFLARE_ACCOUNT_ID:
+    file: ./secrets/CLOUDFLARE_ACCOUNT_ID
+  CLOUDFLARE_AI_WORKERS_REST_API_KEY:
+    file: ./secrets/CLOUDFLARE_AI_WORKERS_REST_API_KEY
