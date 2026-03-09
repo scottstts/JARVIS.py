@@ -6,7 +6,7 @@ services:
     container_name: jarvis
     cap_add:
       - SYS_ADMIN
-    shm_size: 8gb
+    shm_size: 12gb
     security_opt:
       - seccomp:unconfined
     volumes:
@@ -23,22 +23,15 @@ services:
       - CLOUDFLARE_ACCOUNT_ID
       - CLOUDFLARE_AI_WORKERS_REST_API_KEY
     working_dir: /repo
+    command:
+      - bash
+      - -lc
+      - |
+        mkdir -p /workspace/identities
+        cp -a /repo/src/identities/. /workspace/identities/
+        exec bash
     tty: true
     stdin_open: true
-
-  init-identities:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    volumes:
-      - ./:/repo
-      - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace
-    working_dir: /repo
-    command: >
-      bash -lc '
-        mkdir -p /workspace/identities &&
-        cp -a /repo/src/identities/. /workspace/identities/
-      '
 
 volumes:
   uv_cache:
