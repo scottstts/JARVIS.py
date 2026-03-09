@@ -21,6 +21,8 @@ def build_core_settings(
     workspace_dir.mkdir(parents=True, exist_ok=True)
     (identities_dir / "PROGRAM.md").write_text("PROGRAM PROMPT", encoding="utf-8")
     (identities_dir / "REACTOR.md").write_text("REACTOR PROMPT", encoding="utf-8")
+    (identities_dir / "USER.md").write_text("USER PROMPT", encoding="utf-8")
+    (identities_dir / "ARMOR.md").write_text("ARMOR PROMPT", encoding="utf-8")
 
     return CoreSettings(
         context_policy=ContextPolicySettings(

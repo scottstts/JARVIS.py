@@ -5,7 +5,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash git curl ca-certificates tini \
     bubblewrap \
-    file ripgrep \
+    file ripgrep zip unzip \
   && rm -rf /var/lib/apt/lists/*
 
 # Install uv (Astral's installer)
@@ -38,8 +38,8 @@ RUN uv sync --frozen --no-install-project \
   && uv pip install --python "${JARVIS_TOOL_PYTHON_INTERPRETER_VENV}/bin/python" \
        ${JARVIS_PYTHON_TOOL_PACKAGES}
 
-# Work in the mounted repo by default
-WORKDIR /repo
+# Work in the mounted workspace by default
+WORKDIR /workspace
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]

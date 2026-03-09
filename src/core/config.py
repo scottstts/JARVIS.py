@@ -100,6 +100,8 @@ class CoreSettings:
     turn_timezone: str = app_settings.JARVIS_CORE_TIMEZONE
     program_file_name: str = "PROGRAM.md"
     reactor_file_name: str = "REACTOR.md"
+    user_file_name: str = "USER.md"
+    armor_file_name: str = "ARMOR.md"
 
     def __post_init__(self) -> None:
         timezone_name = self.turn_timezone.strip()

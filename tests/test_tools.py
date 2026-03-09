@@ -27,6 +27,7 @@ from tools.basic.web_fetch.tool import (
 )
 
 _PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
+_BASH_SANDBOX_RUNTIME_AVAILABLE = shutil.which("bwrap") is not None
 _PYTHON_INTERPRETER_RUNTIME_AVAILABLE = (
     shutil.which("bwrap") is not None and _PYTHON_INTERPRETER_VENV.exists()
 )
@@ -286,7 +287,7 @@ class ToolPolicyTests(unittest.TestCase):
         self.context = ToolExecutionContext(workspace_dir=self.workspace_dir)
         self.policy = ToolPolicy()
 
-    def test_allows_reads_outside_workspace(self) -> None:
+    def test_bash_policy_allows_absolute_paths_for_runtime_to_handle(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "cat /etc/hosts"},
@@ -294,16 +295,15 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
-    def test_denies_redirect_syntax(self) -> None:
+    def test_bash_policy_allows_normal_shell_syntax(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
-            arguments={"command": "printf 'hello' > note.txt"},
+            arguments={"command": "printf 'hello' > note.txt && cat $(pwd)/note.txt"},
             context=self.context,
         )
-        self.assertFalse(decision.allowed)
-        self.assertIn("not allowed", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
-    def test_allows_copy_into_workspace(self) -> None:
+    def test_bash_policy_allows_workspace_write_commands(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "cp /etc/hosts notes.txt"},
@@ -311,68 +311,22 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
-    def test_denies_move_from_outside_workspace(self) -> None:
+    def test_bash_policy_allows_path_escape_attempts_for_runtime_to_handle(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
-            arguments={"command": "mv /etc/hosts notes.txt"},
+            arguments={"command": "cat /repo/private.txt"},
             context=self.context,
         )
-        self.assertFalse(decision.allowed)
-        self.assertIn("may only write inside", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
-    def test_denies_write_path_escape(self) -> None:
+    def test_bash_policy_denies_null_byte_commands(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
-            arguments={"command": "printf 'hello' | tee ../note.txt"},
+            arguments={"command": "printf 'hello'\x00"},
             context=self.context,
         )
         self.assertFalse(decision.allowed)
-        self.assertIn("may only write inside", decision.reason or "")
-
-    def test_denies_reading_dot_env_path(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="bash",
-            arguments={"command": "cat /tmp/.env"},
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn(".env", decision.reason or "")
-
-    def test_denies_writing_dot_env_path(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="bash",
-            arguments={"command": "printf 'secret' | tee .env"},
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn(".env", decision.reason or "")
-
-    def test_denies_recursive_grep(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="bash",
-            arguments={"command": "grep -R secret ."},
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn("Recursive grep", decision.reason or "")
-
-    def test_denies_rg_no_config_override(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="bash",
-            arguments={"command": "rg --no-config secret ."},
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn("--no-config", decision.reason or "")
-
-    def test_denies_rg_glob_that_targets_dot_env(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="bash",
-            arguments={"command": "rg -g .env secret ."},
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn(".env", decision.reason or "")
+        self.assertIn("null bytes", decision.reason or "")
 
     def test_view_image_allows_workspace_relative_path(self) -> None:
         decision = self.policy.authorize(
@@ -554,6 +508,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def _cleanup_tmpdir(self) -> None:
         self._tmp.cleanup()
 
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
     async def test_executes_pwd_inside_workspace(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
@@ -566,15 +524,21 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertIn(str(self.workspace_dir), result.content)
+        self.assertIn("cwd: /workspace", result.content)
+        self.assertEqual(result.metadata["cwd"], "/workspace")
+        self.assertEqual(result.metadata["workspace_source_dir"], str(self.workspace_dir))
 
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
     async def test_writes_file_inside_workspace(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_write",
                 name="bash",
-                arguments={"command": "printf 'hello' | tee note.txt"},
-                raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                arguments={"command": "printf 'hello' > note.txt"},
+                raw_arguments='{"command":"printf \\"hello\\" > note.txt"}',
             ),
             context=self.context,
         )
@@ -725,13 +689,17 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("operation 2", result.content)
         self.assertEqual(target_path.read_text(encoding="utf-8"), "alpha\nbeta\n")
 
-    async def test_returns_policy_error_for_denied_command(self) -> None:
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
+    async def test_returns_policy_error_for_null_byte_command(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_denied",
                 name="bash",
-                arguments={"command": "printf 'hello' > note.txt"},
-                raw_arguments='{"command":"printf \\"hello\\" > note.txt"}',
+                arguments={"command": "printf 'hello'\x00"},
+                raw_arguments='{"command":"printf \\"hello\\"\\u0000"}',
             ),
             context=self.context,
         )
@@ -740,24 +708,71 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("denied", result.content.lower())
         self.assertFalse((self.workspace_dir / "note.txt").exists())
 
-    @unittest.skipUnless(shutil.which("rg"), "rg is not installed")
-    async def test_rg_runtime_ignores_dot_env_files(self) -> None:
-        (self.workspace_dir / ".env").write_text("secret\n", encoding="utf-8")
-        (self.workspace_dir / "note.txt").write_text("secret\n", encoding="utf-8")
-
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
+    async def test_bash_cannot_read_repo(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
-                call_id="call_rg_env",
+                call_id="call_repo_blocked",
                 name="bash",
-                arguments={"command": "rg secret ."},
-                raw_arguments='{"command":"rg secret ."}',
+                arguments={"command": "ls /repo"},
+                raw_arguments='{"command":"ls /repo"}',
             ),
             context=self.context,
         )
 
+        self.assertFalse(result.ok)
+        self.assertIn("/repo", result.content)
+        self.assertIn("No such file", result.content)
+
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
+    async def test_bash_cannot_read_run_secrets(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_secrets_blocked",
+                name="bash",
+                arguments={"command": "ls /run/secrets"},
+                raw_arguments='{"command":"ls /run/secrets"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("/run/secrets", result.content)
+        self.assertIn("No such file", result.content)
+
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
+    async def test_bash_scrubs_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "secret-key-marker",
+                "CUSTOM_SECRET_FOR_TEST": "custom-secret-marker",
+            },
+            clear=False,
+        ):
+            result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_env_scrubbed",
+                    name="bash",
+                    arguments={"command": "env | sort"},
+                    raw_arguments='{"command":"env | sort"}',
+                ),
+                context=self.context,
+            )
+
         self.assertTrue(result.ok)
-        self.assertIn("note.txt", result.content)
-        self.assertNotIn(".env", result.content)
+        self.assertNotIn("OPENAI_API_KEY", result.content)
+        self.assertNotIn("CUSTOM_SECRET_FOR_TEST", result.content)
+        self.assertIn("HOME=/workspace", result.content)
 
     async def test_returns_tool_error_when_executor_raises(self) -> None:
         async def _failing_executor(*, call_id, arguments, context):

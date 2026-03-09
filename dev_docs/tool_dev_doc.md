@@ -213,8 +213,7 @@ Structure:
 
 Current active policy:
 
-- `bash` may read across the container filesystem except `.env` paths
-- `bash` may only write inside `/workspace`, and `.env` paths are denied even there
+- `bash` only does thin validation up front; actual access control is enforced by a `bubblewrap` sandbox that mounts the workspace at `/workspace`, scrubs the environment, and omits `/repo` and `/run/secrets`
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
 
@@ -268,7 +267,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - Status: implemented
 - Exposure: `basic`
 - Package: `src/tools/basic/bash/`
-- Purpose: run validated shell commands inside the container for file inspection and workspace-limited file manipulation
+- Purpose: run bash commands inside a real sandbox with workspace-only user data access
 
 #### Input Schema
 
@@ -277,8 +276,14 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 #### Executor Behavior
 
-- runs with `/bin/bash -lc`
-- default working directory is `/workspace`
+- runs inside `bubblewrap`
+- mounts the real workspace at `/workspace`
+- binds `/tmp` to a workspace-owned internal temp directory
+- mounts only the minimal read-only system runtime paths needed to execute installed commands
+- does not mount `/repo` or `/run/secrets`
+- runs bash with `--noprofile --norc`
+- clears the environment and sets only a minimal runtime env (`PATH`, `HOME`, `PWD`, `TMPDIR`, `LANG`, `LC_ALL`)
+- keeps the container network available so tools like `curl` can still work
 - `set -o pipefail` is enabled
 - default timeout is `10s`
 - max timeout is `30s`
@@ -288,89 +293,16 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 #### Policy
 
-Filesystem rule:
-
-- reads allowed anywhere in the container except `.env` paths
-- writes allowed only inside `/workspace`, except `.env` paths are denied there too
-
-Allowed read / inspect commands:
-
-- `pwd`
-- `ls`
-- `find`
-- `stat`
-- `file`
-- `du`
-- `cat`
-- `head`
-- `tail`
-- `grep`
-- `rg`
-- `wc`
-- `cut`
-- `sort`
-- `uniq`
-- `diff`
-- `printf`
-- `echo`
-
-Allowed write / mutate commands:
-
-- `mkdir`
-- `touch`
-- `cp`
-- `mv`
-- `rm`
-- `truncate`
-- `tee`
-- `sed`
-
-Write restrictions:
-
-- `cp` may read from anywhere, but its destination must be inside `/workspace`
-- `mv` may only move paths entirely inside `/workspace`
-- `rm`, `mkdir`, `touch`, `truncate`, `tee`, and `sed -i` may only target paths inside `/workspace`
-- any explicit `.env` path is denied for both reads and writes
-- relative write paths resolve from `/workspace`
-- write operands using `~`, `*`, `?`, or `[` are rejected
-
-Allowed shell syntax:
-
-- plain command invocation
-- quoted arguments
-- pipelines with `|`
-
-Rejected shell syntax:
-
-- `;`
-- `&&`
-- `||`
-- `>`
-- `>>`
-- `<`
-- heredocs
-- command substitution
-- subshells
-- environment-variable expansion
-- background execution
-- multiline command strings
-
-Command-specific restrictions:
-
-- `find` rejects `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`
-- `find` may not explicitly target `.env` via path/name/regex predicates
-- `grep` rejects recursive forms like `-r`, `-R`, and `--recursive`
-- `rg` always runs with a config that excludes `.env`, rejects `--no-config`, and rejects glob filters that would re-include `.env`
-- `sort` rejects `-o` and `--output`
-- `sed` only allows read-only `-n` line printing and limited `sed -i` substitution
-- `cp` / `mv` reject target-directory forms like `-t`, `--target-directory`, `-T`, `--no-target-directory`
+- rejects empty commands
+- rejects commands containing null bytes
+- all filesystem boundary enforcement is delegated to the `bubblewrap` sandbox rather than command parsing
 
 #### Current Limitations
 
-- intentionally conservative; many harmless shell patterns are blocked
-- sequential tool execution only
-- no parallel shell tool calls yet
-- if more expressive editing is needed later, prefer a dedicated edit tool over relaxing shell policy too much
+- not a full general-purpose container shell: user-controlled data access is limited to `/workspace`
+- runtime support mounts such as `/usr`, selected `/etc` entries, and `/dev` are present so installed commands can run
+- command availability depends on what is installed in the runtime image
+- requires `bubblewrap` to be installed in the runtime environment
 
 ### `python_interpreter`
 

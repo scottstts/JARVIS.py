@@ -5,6 +5,7 @@
 1. Read PROGRAM.md. This is this file, containing how you operate.
 2. Read REACTOR.md. This is who you are.
 3. Read USER.md. This is who you are helping.
+4. Read ARMOR.md. This is your security-practice overlay.
 
 All of them are auto loaded to your context at the beginning of every conversation. But you can read them again any time you need to.
 

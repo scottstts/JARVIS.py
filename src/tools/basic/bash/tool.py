@@ -1,9 +1,10 @@
-"""Bash tool definition and execution runtime."""
+"""Bash tool definition and sandboxed execution runtime."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 from pathlib import Path
 from time import perf_counter
@@ -14,11 +15,26 @@ from llm import ToolDefinition
 from ...config import ToolSettings
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
-_RG_CONFIG_PATH = Path(__file__).with_name("rg_config")
+_BWRAP_EXECUTABLE = "bwrap"
+_SANDBOX_WORKSPACE = "/workspace"
+_SANDBOX_TMPDIR = "/tmp"
+_SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin"
+_RUNTIME_ETC_FILES = (
+    Path("/etc/hosts"),
+    Path("/etc/nsswitch.conf"),
+    Path("/etc/resolv.conf"),
+)
+_RUNTIME_ETC_DIRS = (
+    Path("/etc/ssl"),
+)
+
+
+class BashToolSetupError(RuntimeError):
+    """Raised when the bash sandbox cannot be prepared safely."""
 
 
 class BashToolExecutor:
-    """Runs validated bash commands inside the agent workspace."""
+    """Runs bash commands inside a dedicated bubblewrap sandbox."""
 
     def __init__(self, settings: ToolSettings) -> None:
         self._settings = settings
@@ -33,19 +49,36 @@ class BashToolExecutor:
         command = str(arguments["command"])
         timeout_seconds = self._resolve_timeout_seconds(arguments)
         started_at = perf_counter()
-        env = os.environ.copy()
-        env["RIPGREP_CONFIG_PATH"] = str(_RG_CONFIG_PATH)
 
-        process = await asyncio.create_subprocess_exec(
-            self._settings.bash_executable,
-            "-lc",
-            f"set -o pipefail\n{command}",
-            cwd=str(context.workspace_dir),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        try:
+            runtime_tmp_dir = context.workspace_dir / ".jarvis_internal" / "bash_tmp"
+            runtime_tmp_dir.mkdir(parents=True, exist_ok=True)
+            process = await asyncio.create_subprocess_exec(
+                *self._build_bwrap_command(
+                    workspace_source_dir=context.workspace_dir,
+                    runtime_tmp_dir=runtime_tmp_dir,
+                    command=command,
+                ),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except BashToolSetupError as exc:
+            duration_seconds = perf_counter() - started_at
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=(
+                    "Bash sandbox setup failed\n"
+                    f"error: {exc}"
+                ),
+                metadata={
+                    "setup_failed": True,
+                    "error": str(exc),
+                    "duration_seconds": round(duration_seconds, 3),
+                },
+            )
 
         timed_out = False
         try:
@@ -75,7 +108,7 @@ class BashToolExecutor:
         ok = not timed_out and exit_code == 0
         content = _format_bash_result(
             command=command,
-            cwd=context.workspace_dir,
+            cwd=Path(_SANDBOX_WORKSPACE),
             exit_code=exit_code,
             timed_out=timed_out,
             timeout_seconds=timeout_seconds,
@@ -88,7 +121,11 @@ class BashToolExecutor:
 
         metadata = {
             "command": command,
-            "cwd": str(context.workspace_dir),
+            "cwd": _SANDBOX_WORKSPACE,
+            "workspace_source_dir": str(context.workspace_dir),
+            "sandbox": "bubblewrap",
+            "filesystem_scope": "workspace_only",
+            "environment_scrubbed": True,
             "exit_code": exit_code,
             "timed_out": timed_out,
             "timeout_seconds": timeout_seconds,
@@ -105,6 +142,122 @@ class BashToolExecutor:
             content=content,
             metadata=metadata,
         )
+
+    def _build_bwrap_command(
+        self,
+        *,
+        workspace_source_dir: Path,
+        runtime_tmp_dir: Path,
+        command: str,
+    ) -> list[str]:
+        bwrap_path = shutil.which(_BWRAP_EXECUTABLE)
+        if bwrap_path is None:
+            raise BashToolSetupError("bubblewrap is not installed.")
+
+        resolved_workspace = workspace_source_dir.resolve(strict=True)
+        resolved_runtime_tmp = runtime_tmp_dir.resolve(strict=True)
+        bash_path = Path(self._settings.bash_executable).resolve(strict=True)
+
+        command_parts = [
+            bwrap_path,
+            "--die-with-parent",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup-try",
+            "--uid",
+            str(os.getuid()),
+            "--gid",
+            str(os.getgid()),
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            _SANDBOX_PATH,
+            "--setenv",
+            "HOME",
+            _SANDBOX_WORKSPACE,
+            "--setenv",
+            "PWD",
+            _SANDBOX_WORKSPACE,
+            "--setenv",
+            "TMPDIR",
+            _SANDBOX_TMPDIR,
+            "--setenv",
+            "TMP",
+            _SANDBOX_TMPDIR,
+            "--setenv",
+            "TEMP",
+            _SANDBOX_TMPDIR,
+            "--setenv",
+            "LANG",
+            "C",
+            "--setenv",
+            "LC_ALL",
+            "C",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+        ]
+
+        lib64_path = Path("/lib64")
+        if lib64_path.exists():
+            command_parts.extend(
+                [
+                    "--ro-bind",
+                    str(lib64_path),
+                    str(lib64_path),
+                ]
+            )
+
+        command_parts.extend(["--dir", "/etc"])
+        for etc_dir in _RUNTIME_ETC_DIRS:
+            if etc_dir.exists():
+                command_parts.extend(
+                    [
+                        "--ro-bind",
+                        str(etc_dir),
+                        str(etc_dir),
+                    ]
+                )
+        for etc_file in _RUNTIME_ETC_FILES:
+            if etc_file.exists():
+                command_parts.extend(
+                    [
+                        "--ro-bind",
+                        str(etc_file),
+                        str(etc_file),
+                    ]
+                )
+
+        command_parts.extend(
+            [
+                "--dev",
+                "/dev",
+                "--bind",
+                str(resolved_workspace),
+                _SANDBOX_WORKSPACE,
+                "--bind",
+                str(resolved_runtime_tmp),
+                _SANDBOX_TMPDIR,
+                "--chdir",
+                _SANDBOX_WORKSPACE,
+                str(bash_path),
+                "--noprofile",
+                "--norc",
+                "-lc",
+                f"set -o pipefail\n{command}",
+            ]
+        )
+        return command_parts
 
     def _resolve_timeout_seconds(self, arguments: dict[str, Any]) -> float:
         raw_timeout = arguments.get("timeout_seconds")
@@ -133,9 +286,9 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                     "command": {
                         "type": "string",
                         "description": (
-                            "Validated bash command to run inside the container. "
-                            "Use standard Linux commands for file inspection and "
-                            "workspace-limited file edits."
+                            "Bash command to run inside a bubblewrap sandbox. "
+                            "The workspace is mounted at /workspace and is the only "
+                            "user-controlled filesystem tree available."
                         ),
                     },
                     "timeout_seconds": {
@@ -158,15 +311,14 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
 
 def _build_bash_tool_description(settings: ToolSettings) -> str:
     return (
-        "Run a validated bash command inside the agent container. "
-        f"Default working directory is {settings.workspace_dir}. "
-        "Use this for reading files, searching content, and editing files inside the workspace. "
-        "Allowed commands: pwd, ls, find, stat, file, du, cat, head, tail, grep, rg, wc, cut, "
-        "sort, uniq, diff, printf, echo, mkdir, touch, cp, mv, rm, truncate, tee, sed. "
-        "Writes are allowed only inside the workspace path, and any '.env' path is denied for both reads and writes. "
-        "Use pipes when needed. Do not use shell control operators like ;, &&, ||, redirects, "
-        "subshells, heredocs, or command substitution. "
-        "Use printf piped to tee to create or overwrite file content."
+        "Run a bash command inside a bubblewrap sandbox. "
+        "The sandbox mounts the real workspace at /workspace, scrubs the environment, "
+        "skips shell startup files, and does not expose /repo or /run/secrets. "
+        f"Default working directory is /workspace; the real workspace source is {settings.workspace_dir}. "
+        "Examples of available command-line tools in the current runtime include rg, grep, find, file, curl, zip, and unzip. "
+        "Use normal shell syntax, including pipes, redirects, command substitution, subshells, "
+        "&&, ||, and multiline scripts. "
+        "Installed command availability depends on what exists in the runtime."
     )
 
 

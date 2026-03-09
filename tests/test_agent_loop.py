@@ -33,7 +33,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
         if provider == "openrouter" and not os.getenv("OPENROUTER_API_KEY"):
             raise unittest.SkipTest("OPENROUTER_API_KEY is not configured.")
 
-    async def test_initial_session_bootstraps_program_and_reactor(self) -> None:
+    async def test_initial_session_bootstraps_all_identity_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "README.md").write_text("README SHOULD NOT BE INJECTED", encoding="utf-8")
@@ -56,14 +56,18 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
 
                 records = storage.load_records(result.session_id)
                 message_records = [record for record in records if record.kind == "message"]
-                self.assertGreaterEqual(len(message_records), 4)
+                self.assertGreaterEqual(len(message_records), 6)
                 self.assertEqual(message_records[0].role, "system")
                 self.assertEqual(message_records[0].content, "PROGRAM PROMPT")
                 self.assertEqual(message_records[1].role, "system")
                 self.assertEqual(message_records[1].content, "REACTOR PROMPT")
-                self.assertEqual(message_records[2].role, "user")
-                self.assertEqual(message_records[2].content, "Reply with ACK only.")
-                self.assertEqual(message_records[3].role, "assistant")
+                self.assertEqual(message_records[2].role, "system")
+                self.assertEqual(message_records[2].content, "USER PROMPT")
+                self.assertEqual(message_records[3].role, "system")
+                self.assertEqual(message_records[3].content, "ARMOR PROMPT")
+                self.assertEqual(message_records[4].role, "user")
+                self.assertEqual(message_records[4].content, "Reply with ACK only.")
+                self.assertEqual(message_records[5].role, "assistant")
                 self.assertNotIn(
                     "README SHOULD NOT BE INJECTED",
                     "\n".join(record.content for record in message_records),
@@ -139,7 +143,10 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
 
                 new_records = storage.load_records(reset.session_id)
                 message_records = [record for record in new_records if record.kind == "message"]
-                self.assertEqual([record.role for record in message_records], ["system", "system"])
+                self.assertEqual(
+                    [record.role for record in message_records],
+                    ["system", "system", "system", "system"],
+                )
                 self.assertFalse(any(record.metadata.get("summary_seed") for record in message_records))
 
                 continued = await loop.handle_user_input("Confirm reset session is active.")

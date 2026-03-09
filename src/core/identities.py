@@ -20,10 +20,14 @@ class IdentityBootstrapLoader:
         identities_dir = self._settings.identities_dir
         program = self._read_identity_file(identities_dir / self._settings.program_file_name)
         reactor = self._read_identity_file(identities_dir / self._settings.reactor_file_name)
+        user = self._read_identity_file(identities_dir / self._settings.user_file_name)
+        armor = self._read_identity_file(identities_dir / self._settings.armor_file_name)
 
         messages = [
             LLMMessage.text("system", program),
             LLMMessage.text("system", reactor),
+            LLMMessage.text("system", user),
+            LLMMessage.text("system", armor),
         ]
         if summary_text:
             messages.append(

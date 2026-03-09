@@ -5,7 +5,7 @@
 - Embeddings are now globally configured via `JARVIS_EMBEDDING_PROVIDER` and `JARVIS_EMBEDDING_MODEL`, decoupled from chat provider selection.
 - Added a custom `src/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
 - Implemented file-backed `src/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
-- Session bootstrap now injects only `src/identities/PROGRAM.md` and `src/identities/REACTOR.md`, and compacted sessions additionally inject the generated summary seed.
+- Session bootstrap now injects `src/identities/PROGRAM.md`, `src/identities/REACTOR.md`, `src/identities/USER.md`, and `src/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
 - Compaction policy is now provider-agnostic and driven by global environment settings: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
 - Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
 - Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
@@ -26,9 +26,8 @@
 - Telegram file messages now download the original attachment into `JARVIS_UI_TELEGRAM_TEMP_DIR` (default `/workspace/temp`), inject a metadata-only user message pointing at that local path, and expose an owner-file send interface for future agent tools. **important:** this file send telegram interface (for agent to send files to user's telegram) will be used later for agent's send_file tool implementation.
 - In docker compose added command to copy src/identities/. to /workspace/identities/, and wire the agent runtime to use /workspace/identities/ for starter files instead
 - Added `src/tools/` with a registry/runtime/policy split and exposure classes (`basic` vs `discoverable`); only the `bash` tool is actually registered and auto-exposed right now.
-- Bash tool v1 is intentionally restrictive: sequential tool rounds, workspace-only writes, conservative shell syntax allowlist, and executor failures are converted into structured tool-error results instead of crashing the turn.
-- Bash tool now denies explicit `.env` paths for both reads and writes, blocks recursive `grep`, and forces `rg` to ignore `.env` without allowing `--no-config` or re-include globs.
-- `Dockerfile.dev` now explicitly installs `file` and `ripgrep` so the dev container matches the bash tool's full command allowlist.
+- Bash tool now runs inside `bubblewrap` with `/workspace` as the only user-controlled data mount, a scrubbed minimal environment, and no `/repo` or `/run/secrets` access; command parsing is reduced to thin validation only.
+- `Dockerfile.dev` now explicitly installs `file`, `ripgrep`, `zip`, and `unzip` so the sandboxed bash tool can cover common inspection and archive workflows without separate tools.
 - Tool-specific code now lives under `src/tools/basic/<tool_name>/` for basic tools and will live under `src/tools/discoverable/<tool_name>/` for discoverable executable tools, while `src/tools/policy.py` stays as the universal policy interface/router.
 - Gemini tool declarations must use `parameters_json_schema` instead of `parameters`; otherwise schemas with `additionalProperties: false` cause a 400 from the Gemini API.
 - OpenAI strict function schemas require every property to appear in `required`; optional fields must be represented as nullable in the outbound schema, and returned `null` values for omitted optionals should be normalized away before validating against the original tool schema.
