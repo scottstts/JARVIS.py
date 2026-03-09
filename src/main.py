@@ -89,7 +89,10 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    asyncio.run(run_system())
+    try:
+        asyncio.run(run_system())
+    except KeyboardInterrupt:
+        LOGGER.info("Shutdown requested via Ctrl+C; exiting cleanly.")
 
 
 async def _wait_for_gateway_start(

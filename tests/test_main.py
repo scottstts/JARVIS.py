@@ -144,3 +144,20 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
                                 ui_settings=UISettings(telegram_token="token"),
                             )
         self.assertEqual(str(context.exception), "gateway boom")
+
+
+class MainFunctionTests(unittest.TestCase):
+    def test_main_exits_cleanly_on_keyboard_interrupt(self) -> None:
+        async def fake_run_system() -> None:
+            raise KeyboardInterrupt
+
+        with patch("main.load_docker_secrets_if_present"):
+            with patch("main.logging.basicConfig"):
+                with patch("main.run_system", side_effect=fake_run_system):
+                    with self.assertLogs("main", level="INFO") as captured_logs:
+                        main.main()
+
+        self.assertIn(
+            "Shutdown requested via Ctrl+C; exiting cleanly.",
+            captured_logs.output[0],
+        )
