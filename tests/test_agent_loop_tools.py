@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import settings as app_settings
 
-from core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
+from core import AgentAssistantMessageEvent, AgentLoop, AgentToolCallEvent, AgentTurnDoneEvent
 from llm import (
     DoneEvent,
     ImagePart,
@@ -592,14 +592,18 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 [event.type for event in events],
                 [
                     "text_delta",
-                    "assistant_message",
+                    "tool_call",
                     "text_delta",
                     "assistant_message",
                     "done",
                 ],
             )
-            self.assertIsInstance(events[1], AgentAssistantMessageEvent)
+            self.assertIsInstance(events[1], AgentToolCallEvent)
             self.assertIsInstance(events[3], AgentAssistantMessageEvent)
+            tool_event = events[1]
+            if not isinstance(tool_event, AgentToolCallEvent):
+                self.fail("Expected tool-call stream event before tool execution.")
+            self.assertEqual(tool_event.tool_names, ("bash",))
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")

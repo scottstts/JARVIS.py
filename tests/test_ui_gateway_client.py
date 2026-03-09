@@ -10,6 +10,7 @@ from ui.telegram.gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
+    GatewayToolCallEvent,
     GatewayTurnDoneEvent,
     GatewayWebSocketClient,
 )
@@ -47,6 +48,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
             incoming=[
                 json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
                 json.dumps({"type": "assistant_delta", "session_id": "s1", "delta": "hel"}),
+                json.dumps({"type": "tool_call", "session_id": "s1", "tool_names": ["bash"]}),
                 json.dumps({"type": "assistant_message", "session_id": "s1", "text": "hello"}),
                 json.dumps({"type": "turn_done", "session_id": "s1", "response_text": "hello"}),
             ]
@@ -59,12 +61,14 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
 
-        self.assertEqual(len(events), 3)
+        self.assertEqual(len(events), 4)
         self.assertIsInstance(events[0], GatewayDeltaEvent)
-        self.assertIsInstance(events[1], GatewayMessageEvent)
-        self.assertIsInstance(events[2], GatewayTurnDoneEvent)
-        self.assertEqual(events[1].text, "hello")
-        self.assertEqual(events[2].response_text, "hello")
+        self.assertIsInstance(events[1], GatewayToolCallEvent)
+        self.assertIsInstance(events[2], GatewayMessageEvent)
+        self.assertIsInstance(events[3], GatewayTurnDoneEvent)
+        self.assertEqual(events[1].tool_names, ("bash",))
+        self.assertEqual(events[2].text, "hello")
+        self.assertEqual(events[3].response_text, "hello")
         outbound = json.loads(socket.sent[0])
         self.assertEqual(outbound, {"type": "user_message", "text": "hi"})
 

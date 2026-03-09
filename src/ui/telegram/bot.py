@@ -27,6 +27,7 @@ from .gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
+    GatewayToolCallEvent,
     GatewayTurnDoneEvent,
     GatewayWebSocketClient,
 )
@@ -293,6 +294,18 @@ class TelegramGatewayBridge:
                     if final_text is not None:
                         await self._send_final_text(chat_id=message.chat_id, text=final_text)
                         delivered_any_segment = True
+                    accumulated_text = ""
+                    last_draft_text = ""
+                    last_draft_at = 0.0
+                    current_draft_id = self._next_draft_id_for_chat(message.chat_id)
+                    continue
+
+                if isinstance(event, GatewayToolCallEvent):
+                    for tool_name in event.tool_names:
+                        await self._send_final_text(
+                            chat_id=message.chat_id,
+                            text=_format_tool_usage_notice(tool_name),
+                        )
                     accumulated_text = ""
                     last_draft_text = ""
                     last_draft_at = 0.0
@@ -807,6 +820,11 @@ def _should_flush_draft(
 
 def _has_visible_telegram_text(text: str) -> bool:
     return _has_effective_text(_HTML_TAG_PATTERN.sub("", text))
+
+
+def _format_tool_usage_notice(tool_name: str) -> str:
+    normalized_name = tool_name.strip() or "unknown"
+    return f"🔧 Used **{normalized_name}** tool."
 
 
 def _coalesce_visible_text(*candidates: str) -> str | None:

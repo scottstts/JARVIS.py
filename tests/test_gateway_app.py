@@ -8,6 +8,7 @@ import unittest
 from core import (
     AgentAssistantMessageEvent,
     AgentTextDeltaEvent,
+    AgentToolCallEvent,
     AgentTurnDoneEvent,
     ContextBudgetError,
 )
@@ -34,6 +35,16 @@ class _FakeRouter:
             raise ProviderTimeoutError("Request timed out.")
         if user_text == "boom":
             raise RuntimeError("unexpected")
+        if user_text == "tool":
+            yield AgentToolCallEvent(
+                session_id=f"{route_id}-session",
+                tool_names=("bash",),
+            )
+            yield AgentTurnDoneEvent(
+                session_id=f"{route_id}-session",
+                response_text="",
+            )
+            return
         yield AgentTextDeltaEvent(
             session_id=f"{route_id}-session",
             delta="echo:",
@@ -80,6 +91,25 @@ class GatewayAppTests(unittest.TestCase):
                 self.assertEqual(done["session_id"], "dm_1-session")
                 self.assertEqual(done["response_text"], "echo:hello")
                 self.assertEqual(router.calls, [("dm_1", "hello")])
+
+    def test_tool_call_event_is_forwarded(self) -> None:
+        app = create_app(
+            gateway_settings=GatewaySettings(websocket_path="/ws", max_message_chars=50),
+            router=_FakeRouter(),
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/dm_tool") as socket:
+                _ = socket.receive_json()  # ready
+                socket.send_json({"type": "user_message", "text": "tool"})
+
+                tool_event = socket.receive_json()
+                self.assertEqual(tool_event["type"], "tool_call")
+                self.assertEqual(tool_event["session_id"], "dm_tool-session")
+                self.assertEqual(tool_event["tool_names"], ["bash"])
+
+                done = socket.receive_json()
+                self.assertEqual(done["type"], "turn_done")
 
     def test_invalid_json_emits_error_event(self) -> None:
         app = create_app(

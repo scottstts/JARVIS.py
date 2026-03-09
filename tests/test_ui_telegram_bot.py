@@ -26,6 +26,7 @@ from ui.telegram.gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
+    GatewayToolCallEvent,
     GatewayTurnDoneEvent,
 )
 
@@ -177,7 +178,9 @@ class _FakeGatewayClient:
     def __init__(
         self,
         *,
-        events: list[GatewayDeltaEvent | GatewayMessageEvent | GatewayTurnDoneEvent] | None = None,
+        events: list[
+            GatewayDeltaEvent | GatewayMessageEvent | GatewayToolCallEvent | GatewayTurnDoneEvent
+        ] | None = None,
         error: GatewayBridgeError | None = None,
     ) -> None:
         self._events = events or []
@@ -422,6 +425,31 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             ["Working on it.", "Done."],
+        )
+
+    async def test_handle_message_emits_normalized_tool_notice(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="Working on it."),
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["🔧 Used <b>bash</b> tool.", "Done."],
         )
 
     async def test_handle_message_skips_whitespace_only_draft_payloads(self) -> None:

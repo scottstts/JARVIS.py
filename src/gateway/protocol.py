@@ -74,6 +74,18 @@ def build_assistant_message_event(
     }
 
 
+def build_tool_call_event(
+    *,
+    session_id: str,
+    tool_names: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "type": "tool_call",
+        "session_id": session_id,
+        "tool_names": list(tool_names),
+    }
+
+
 def build_assistant_delta_event(*, session_id: str, delta: str) -> dict[str, Any]:
     return {
         "type": "assistant_delta",

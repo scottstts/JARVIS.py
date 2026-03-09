@@ -13,6 +13,7 @@ from core import (
     AgentAssistantMessageEvent,
     AgentLoop,
     AgentTextDeltaEvent,
+    AgentToolCallEvent,
     AgentTurnDoneEvent,
     ContextBudgetError,
     CoreSettings,
@@ -31,6 +32,7 @@ from .protocol import (
     build_assistant_message_event,
     build_error_event,
     build_ready_event,
+    build_tool_call_event,
     build_turn_done_event,
     parse_client_event,
 )
@@ -161,6 +163,17 @@ def create_app(
                             build_assistant_message_event(
                                 session_id=turn_event.session_id,
                                 text=turn_event.text,
+                            )
+                        ):
+                            return
+                        continue
+
+                    if isinstance(turn_event, AgentToolCallEvent):
+                        if not await _send_json_if_open(
+                            websocket,
+                            build_tool_call_event(
+                                session_id=turn_event.session_id,
+                                tool_names=turn_event.tool_names,
                             )
                         ):
                             return

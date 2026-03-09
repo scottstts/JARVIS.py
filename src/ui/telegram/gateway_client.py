@@ -33,6 +33,13 @@ class GatewayMessageEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class GatewayToolCallEvent:
+    session_id: str
+    tool_names: tuple[str, ...]
+    type: str = "tool_call"
+
+
+@dataclass(slots=True, frozen=True)
 class GatewayTurnDoneEvent:
     session_id: str
     response_text: str
@@ -41,7 +48,12 @@ class GatewayTurnDoneEvent:
     type: str = "turn_done"
 
 
-GatewayTurnEvent = GatewayDeltaEvent | GatewayMessageEvent | GatewayTurnDoneEvent
+GatewayTurnEvent = (
+    GatewayDeltaEvent
+    | GatewayMessageEvent
+    | GatewayToolCallEvent
+    | GatewayTurnDoneEvent
+)
 
 
 class GatewayWebSocketClient:
@@ -101,6 +113,19 @@ class GatewayWebSocketClient:
                         yield GatewayMessageEvent(
                             session_id=str(payload.get("session_id", "")),
                             text=str(payload.get("text", "")),
+                        )
+                        continue
+                    if event_type == "tool_call":
+                        raw_tool_names = payload.get("tool_names", [])
+                        tool_names: list[str] = []
+                        if isinstance(raw_tool_names, list):
+                            for raw_name in raw_tool_names:
+                                name = str(raw_name).strip()
+                                if name:
+                                    tool_names.append(name)
+                        yield GatewayToolCallEvent(
+                            session_id=str(payload.get("session_id", "")),
+                            tool_names=tuple(tool_names),
                         )
                         continue
                     if event_type == "turn_done":

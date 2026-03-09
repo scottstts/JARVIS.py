@@ -70,6 +70,13 @@ class AgentAssistantMessageEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class AgentToolCallEvent:
+    session_id: str
+    tool_names: tuple[str, ...]
+    type: Literal["tool_call"] = "tool_call"
+
+
+@dataclass(slots=True, frozen=True)
 class AgentTurnDoneEvent:
     session_id: str
     response_text: str
@@ -89,6 +96,7 @@ class AgentTurnDoneEvent:
 AgentTurnStreamEvent = (
     AgentTextDeltaEvent
     | AgentAssistantMessageEvent
+    | AgentToolCallEvent
     | AgentTurnDoneEvent
 )
 
@@ -432,7 +440,14 @@ class AgentLoop:
             ),
             self._build_assistant_record(session.session_id, initial_response),
         ]
-        if initial_response.text:
+        if initial_response.tool_calls:
+            tool_names = _tool_notice_names(initial_response.tool_calls)
+            if tool_names:
+                yield AgentToolCallEvent(
+                    session_id=session.session_id,
+                    tool_names=tool_names,
+                )
+        elif initial_response.text:
             yield AgentAssistantMessageEvent(
                 session_id=session.session_id,
                 text=initial_response.text,
@@ -474,7 +489,14 @@ class AgentLoop:
             pending_records.append(
                 self._build_assistant_record(session.session_id, current_response)
             )
-            if current_response.text:
+            if current_response.tool_calls:
+                tool_names = _tool_notice_names(current_response.tool_calls)
+                if tool_names:
+                    yield AgentToolCallEvent(
+                        session_id=session.session_id,
+                        tool_names=tool_names,
+                    )
+            elif current_response.text:
                 yield AgentAssistantMessageEvent(
                     session_id=session.session_id,
                     text=current_response.text,
@@ -1056,6 +1078,18 @@ def _collect_activated_discoverable_tool_names(
                 continue
             names.append(name)
             seen.add(name)
+    return tuple(names)
+
+
+def _tool_notice_names(tool_calls: Sequence[ToolCall]) -> tuple[str, ...]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for tool_call in tool_calls:
+        name = tool_call.name.strip()
+        if not name or name in seen:
+            continue
+        names.append(name)
+        seen.add(name)
     return tuple(names)
 
 
