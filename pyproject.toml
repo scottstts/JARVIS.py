@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.84.0",
     "google-genai>=1.66.0",
+    "httpx>=0.28.1",
     "jsonschema>=4.25.1",
     "openai>=2.24.0",
     "playwright>=1.58.0",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,9 +33,27 @@ class _FakeResponse:
             raise ValueError("No JSON payload configured.")
         return self._payload
 
-    def iter_content(self, chunk_size: int) -> list[bytes]:
+    async def aiter_bytes(self, chunk_size: int) -> Any:
         _ = chunk_size
-        return [self._body]
+        if self._body:
+            yield self._body
+
+
+class _FakeStream:
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self._response
+
+    async def __aexit__(
+        self,
+        exc_type: object,
+        exc: object,
+        tb: object,
+    ) -> bool:
+        _ = (exc_type, exc, tb)
+        return False
 
 
 class _FakeSession:
@@ -48,7 +67,7 @@ class _FakeSession:
         self._get_responses = get_responses or []
         self.calls: list[dict[str, Any]] = []
 
-    def post(
+    async def post(
         self,
         url: str,
         *,
@@ -71,21 +90,50 @@ class _FakeSession:
             raise AssertionError("No fake POST response available.")
         return self._post_responses.pop(0)
 
-    def get(self, url: str, *, stream: bool, timeout: float) -> _FakeResponse:
+    def stream(self, method: str, url: str, *, timeout: float) -> _FakeStream:
         self.calls.append(
             {
-                "method": "GET",
+                "method": method,
                 "url": url,
-                "stream": stream,
                 "timeout": timeout,
             }
         )
         if not self._get_responses:
-            raise AssertionError("No fake GET response available.")
-        return self._get_responses.pop(0)
+            raise AssertionError("No fake stream response available.")
+        return _FakeStream(self._get_responses.pop(0))
 
-    def close(self) -> None:
+    async def aclose(self) -> None:
         return None
+
+
+class _BlockingSession(_FakeSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,
+        data: dict[str, object] | None = None,
+        files: dict[str, object] | None = None,
+        timeout: float,
+    ) -> _FakeResponse:
+        self.calls.append(
+            {
+                "method": "POST",
+                "url": url,
+                "json": json,
+                "data": data,
+                "files": files,
+                "timeout": timeout,
+            }
+        )
+        self.started.set()
+        await self._release.wait()
+        raise AssertionError("Blocking session should be cancelled before completing.")
 
 
 class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
@@ -228,3 +276,18 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.exception.code, "telegram_api_error_429")
         self.assertEqual(context.exception.retry_after_seconds, 5)
         self.assertEqual(context.exception.status_code, 429)
+
+    async def test_get_updates_cancellation_propagates(self) -> None:
+        session = _BlockingSession()
+        client = TelegramBotAPIClient(token="token")
+        client._session = session
+
+        task = asyncio.create_task(
+            client.get_updates(offset=None, timeout_seconds=30, limit=100)
+        )
+        await session.started.wait()
+
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task

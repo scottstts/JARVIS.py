@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import requests
+import httpx
 
 
 class TelegramAPIError(RuntimeError):
@@ -43,7 +42,7 @@ class TelegramRemoteFile:
 
 
 class TelegramBotAPIClient:
-    """Async client facade using requests under the hood."""
+    """Async client facade using httpx under the hood."""
 
     def __init__(
         self,
@@ -60,10 +59,10 @@ class TelegramBotAPIClient:
             file_transfer_timeout_seconds,
             request_timeout_seconds,
         )
-        self._session = requests.Session()
+        self._session = httpx.AsyncClient()
 
     async def aclose(self) -> None:
-        await asyncio.to_thread(self._session.close)
+        await self._session.aclose()
 
     async def get_me(self) -> dict[str, Any]:
         result = await self._call_method("getMe", payload={})
@@ -137,11 +136,29 @@ class TelegramBotAPIClient:
         destination_path: str | Path,
     ) -> Path:
         destination = Path(destination_path).expanduser()
-        await asyncio.to_thread(
-            self._download_file_blocking,
-            remote_file_path,
-            destination,
-        )
+        url = f"{self._api_base_url}/file/bot{self._token}/{remote_file_path.lstrip('/')}"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            async with self._session.stream(
+                "GET",
+                url,
+                timeout=self._file_transfer_timeout_seconds,
+            ) as response:
+                if response.status_code >= 400:
+                    raise TelegramAPIError(
+                        code="telegram_http_error",
+                        message=f"Telegram file download failed for path '{remote_file_path}'.",
+                        status_code=response.status_code,
+                    )
+                with destination.open("wb") as handle:
+                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+        except httpx.RequestError as exc:
+            raise TelegramAPIError(
+                code="telegram_http_error",
+                message=f"Telegram file download failed for path '{remote_file_path}'.",
+            ) from exc
         return destination
 
     async def send_message(
@@ -190,13 +207,29 @@ class TelegramBotAPIClient:
         caption: str | None = None,
         filename: str | None = None,
     ) -> dict[str, Any]:
-        result = await asyncio.to_thread(
-            self._send_document_blocking,
-            chat_id,
-            Path(file_path).expanduser(),
-            caption,
-            filename,
-        )
+        url = f"{self._api_base_url}/bot{self._token}/sendDocument"
+        data: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption is not None:
+            data["caption"] = caption
+
+        resolved_file_path = Path(file_path).expanduser()
+        with resolved_file_path.open("rb") as handle:
+            upload_name = filename or resolved_file_path.name
+            files = {"document": (upload_name, handle)}
+            try:
+                response = await self._session.post(
+                    url,
+                    data=data,
+                    files=files,
+                    timeout=self._file_transfer_timeout_seconds,
+                )
+            except httpx.RequestError as exc:
+                raise TelegramAPIError(
+                    code="telegram_http_error",
+                    message="Telegram request failed for method 'sendDocument'.",
+                ) from exc
+
+        result = self._parse_method_response(response, method="sendDocument")
         if not isinstance(result, dict):
             raise TelegramAPIError(
                 code="invalid_telegram_response",
@@ -216,90 +249,16 @@ class TelegramBotAPIClient:
             if request_timeout_seconds is not None
             else self._request_timeout_seconds
         )
-        return await asyncio.to_thread(
-            self._call_method_blocking,
-            method,
-            payload,
-            timeout,
-        )
-
-    def _call_method_blocking(
-        self,
-        method: str,
-        payload: dict[str, Any],
-        timeout: float,
-    ) -> Any:
         url = f"{self._api_base_url}/bot{self._token}/{method}"
         try:
-            response = self._session.post(url, json=payload, timeout=timeout)
-        except requests.RequestException as exc:
+            response = await self._session.post(url, json=payload, timeout=timeout)
+        except httpx.RequestError as exc:
             raise TelegramAPIError(
                 code="telegram_http_error",
                 message=f"Telegram request failed for method '{method}'.",
             ) from exc
 
         return self._parse_method_response(response, method=method)
-
-    def _send_document_blocking(
-        self,
-        chat_id: int,
-        file_path: Path,
-        caption: str | None,
-        filename: str | None,
-    ) -> Any:
-        url = f"{self._api_base_url}/bot{self._token}/sendDocument"
-        data: dict[str, str] = {"chat_id": str(chat_id)}
-        if caption is not None:
-            data["caption"] = caption
-
-        with file_path.open("rb") as handle:
-            upload_name = filename or file_path.name
-            files = {"document": (upload_name, handle)}
-            try:
-                response = self._session.post(
-                    url,
-                    data=data,
-                    files=files,
-                    timeout=self._file_transfer_timeout_seconds,
-                )
-            except requests.RequestException as exc:
-                raise TelegramAPIError(
-                    code="telegram_http_error",
-                    message="Telegram request failed for method 'sendDocument'.",
-                ) from exc
-
-        return self._parse_method_response(response, method="sendDocument")
-
-    def _download_file_blocking(
-        self,
-        remote_file_path: str,
-        destination_path: Path,
-    ) -> None:
-        url = f"{self._api_base_url}/file/bot{self._token}/{remote_file_path.lstrip('/')}"
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            response = self._session.get(
-                url,
-                stream=True,
-                timeout=self._file_transfer_timeout_seconds,
-            )
-        except requests.RequestException as exc:
-            raise TelegramAPIError(
-                code="telegram_http_error",
-                message=f"Telegram file download failed for path '{remote_file_path}'.",
-            ) from exc
-
-        if response.status_code >= 400:
-            raise TelegramAPIError(
-                code="telegram_http_error",
-                message=f"Telegram file download failed for path '{remote_file_path}'.",
-                status_code=response.status_code,
-            )
-
-        with destination_path.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    handle.write(chunk)
 
     def _parse_method_response(
         self,

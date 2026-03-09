@@ -55,5 +55,6 @@
 - `docker-compose.yml` now sources secrets from repo-local ignored files under `secrets/`, so fill those files before rebuilding/running the dev container.
 - Telegram owner gating now comes from the Docker secret file `secrets/JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`, not from `.env`.
 - The combined `src/main.py` entrypoint now swallows `KeyboardInterrupt` and logs a clean Ctrl+C shutdown message instead of printing a traceback.
+- Telegram Bot API calls now use `httpx.AsyncClient` instead of `requests` in worker threads, so long-poll shutdown is cancellation-friendly and Ctrl+C should stop much faster.
 - Identities bootstrap is now a single-container flow: the `dev` service copies `/repo/src/identities/.` into `/workspace/identities/` during startup, and there is no separate `init-identities` compose service.
 - The dev container `shm_size` is intentionally `12gb`; Docker Desktop disk-image size remains a host-level setting outside repo control.
