@@ -266,7 +266,21 @@ class ToolSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             settings.python_interpreter_allowed_packages,
-            ("python-dateutil", "pyyaml", "pypdf", "pandas", "pillow"),
+            (
+                "python-dateutil",
+                "pyyaml",
+                "pymupdf",
+                "pandas",
+                "pillow",
+                "pydantic",
+                "jinja2",
+                "rapidfuzz",
+                "markdown-it-py",
+                "feedparser",
+                "openpyxl",
+                "python-docx",
+                "icalendar",
+            ),
         )
         self.assertEqual(settings.python_interpreter_default_timeout_seconds, 10.0)
         self.assertEqual(settings.python_interpreter_max_timeout_seconds, 30.0)
@@ -1013,6 +1027,69 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
         "python_interpreter runtime is only available in the dev container",
     )
+    async def test_python_interpreter_allows_workspace_local_helper_imports(self) -> None:
+        scripts_dir = self.workspace_dir / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "helper.py").write_text(
+            "def message() -> str:\n"
+            "    return 'local helper ok'\n",
+            encoding="utf-8",
+        )
+        (scripts_dir / "main.py").write_text(
+            "import helper\n"
+            "print(helper.message())\n",
+            encoding="utf-8",
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_python_local_import",
+                name="python_interpreter",
+                arguments={
+                    "script_path": "scripts/main.py",
+                },
+                raw_arguments='{"script_path":"scripts/main.py"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("local helper ok", result.content)
+
+    @unittest.skipUnless(
+        _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
+        "python_interpreter runtime is only available in the dev container",
+    )
+    async def test_python_interpreter_supports_pymupdf_text_round_trip(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_python_pymupdf_round_trip",
+                name="python_interpreter",
+                arguments={
+                    "code": (
+                        "import fitz\n"
+                        "doc = fitz.open()\n"
+                        "page = doc.new_page()\n"
+                        "page.insert_text((72, 72), 'hello from pymupdf')\n"
+                        "pdf_bytes = doc.tobytes()\n"
+                        "reopened = fitz.open(stream=pdf_bytes, filetype='pdf')\n"
+                        "print(reopened[0].cropbox)\n"
+                        "print(reopened[0].get_text('text').strip())\n"
+                    ),
+                },
+                raw_arguments='{"code":"pymupdf round trip"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("hello from pymupdf", result.content)
+        self.assertIn("Rect(0.0, 0.0, 595.0, 842.0)", result.content)
+
+    @unittest.skipUnless(
+        _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
+        "python_interpreter runtime is only available in the dev container",
+    )
     async def test_python_interpreter_can_edit_workspace_jpeg_with_pillow(self) -> None:
         input_path = self.workspace_dir / "cat_input.jpg"
         output_path = self.workspace_dir / "cat_output.jpg"
@@ -1078,16 +1155,42 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_python_interpreter_blocks_disallowed_imports(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
-                call_id="call_python_socket",
+                call_id="call_python_ctypes",
                 name="python_interpreter",
-                arguments={"code": "import socket\n"},
-                raw_arguments='{"code":"import socket\\n"}',
+                arguments={"code": "import ctypes\n"},
+                raw_arguments='{"code":"import ctypes\\n"}',
             ),
             context=self.context,
         )
 
         self.assertFalse(result.ok)
         self.assertIn("blocked", result.content.lower())
+
+    @unittest.skipUnless(
+        _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
+        "python_interpreter runtime is only available in the dev container",
+    )
+    async def test_python_interpreter_allows_socket_import_but_network_use_still_fails(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_python_socket_runtime",
+                name="python_interpreter",
+                arguments={
+                    "code": (
+                        "import socket\n"
+                        "sock = socket.socket()\n"
+                        "sock.settimeout(1)\n"
+                        "sock.connect(('1.1.1.1', 80))\n"
+                    ),
+                },
+                raw_arguments='{"code":"socket runtime"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertNotIn("blocked", result.content.lower())
+        self.assertIn("OSError", result.content)
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,

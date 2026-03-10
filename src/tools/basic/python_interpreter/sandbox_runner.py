@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 import importlib.metadata
-import importlib.util
 import json
 import os
 import re
@@ -16,7 +15,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 _CANONICAL_NAME_PATTERN = re.compile(r"[-_.]+")
-_REQUIREMENT_NAME_PATTERN = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
 _BLOCKED_OS_FUNCTIONS = (
     "execl",
     "execle",
@@ -150,17 +148,13 @@ def _install_import_guard(config: dict[str, object]) -> None:
             + ", ".join(missing_distributions)
         )
 
-    allowed_distributions = _resolve_allowed_distribution_closure(
-        root_distributions=allowed_root_distributions,
-        installed_distributions=installed_distributions,
+    workspace_root = Path("/workspace").resolve(strict=False)
+    trusted_roots = (
+        workspace_root,
+        *_stdlib_roots(),
+        *_site_package_roots(),
     )
-    root_to_distributions = {
-        root: [_canonicalize_name(dist_name) for dist_name in distribution_names]
-        for root, distribution_names in importlib.metadata.packages_distributions().items()
-    }
-    stdlib_roots = _stdlib_roots()
-    site_package_roots = _site_package_roots()
-    checked_roots: dict[str, bool] = {}
+    validated_modules: set[str] = set()
     original_import = builtins.__import__
 
     def guarded_import(
@@ -170,89 +164,117 @@ def _install_import_guard(config: dict[str, object]) -> None:
         fromlist: tuple[str, ...] | list[str] = (),
         level: int = 0,
     ) -> object:
-        if level > 0 or not name:
-            return original_import(name, globals, locals, fromlist, level)
-        root_name = name.split(".", 1)[0]
-        is_allowed = checked_roots.get(root_name)
-        if is_allowed is None:
-            _raise_if_disallowed_import(
-                root_name=root_name,
-                blocked_roots=blocked_roots,
-                allowed_distributions=allowed_distributions,
-                root_to_distributions=root_to_distributions,
-                stdlib_roots=stdlib_roots,
-                site_package_roots=site_package_roots,
+        if level == 0 and name:
+            root_name = name.split(".", 1)[0]
+            if root_name in blocked_roots:
+                raise ImportError(f"Import of '{root_name}' is blocked in python_interpreter.")
+
+        before_modules = set(sys.modules)
+        module = original_import(name, globals, locals, fromlist, level)
+        _validate_loaded_modules(
+            before_modules=before_modules,
+            validated_modules=validated_modules,
+            trusted_roots=trusted_roots,
+            workspace_root=workspace_root,
+        )
+        if level == 0 and name:
+            _validate_module_name(
+                name.split(".", 1)[0],
+                validated_modules=validated_modules,
+                trusted_roots=trusted_roots,
+                workspace_root=workspace_root,
             )
-            checked_roots[root_name] = True
-        return original_import(name, globals, locals, fromlist, level)
+        return module
 
     builtins.__import__ = guarded_import
 
 
-def _raise_if_disallowed_import(
+def _validate_loaded_modules(
     *,
-    root_name: str,
-    blocked_roots: set[str],
-    allowed_distributions: set[str],
-    root_to_distributions: dict[str, list[str]],
-    stdlib_roots: tuple[Path, ...],
-    site_package_roots: tuple[Path, ...],
+    before_modules: set[str],
+    validated_modules: set[str],
+    trusted_roots: tuple[Path, ...],
+    workspace_root: Path,
 ) -> None:
-    if root_name in blocked_roots:
-        raise ImportError(f"Import of '{root_name}' is blocked in python_interpreter.")
+    for module_name in sorted(set(sys.modules) - before_modules):
+        if module_name in validated_modules:
+            continue
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        _raise_if_untrusted_module(
+            module_name=module_name,
+            module=module,
+            trusted_roots=trusted_roots,
+            workspace_root=workspace_root,
+        )
+        validated_modules.add(module_name)
 
-    if root_name in sys.builtin_module_names:
-        return
 
-    spec = importlib.util.find_spec(root_name)
-    if spec is None:
+def _validate_module_name(
+    module_name: str,
+    *,
+    validated_modules: set[str],
+    trusted_roots: tuple[Path, ...],
+    workspace_root: Path,
+) -> None:
+    if module_name in validated_modules:
         return
-    if spec.origin in {None, "built-in", "frozen"}:
+    module = sys.modules.get(module_name)
+    if module is None:
         return
+    _raise_if_untrusted_module(
+        module_name=module_name,
+        module=module,
+        trusted_roots=trusted_roots,
+        workspace_root=workspace_root,
+    )
+    validated_modules.add(module_name)
 
-    origin_path = Path(spec.origin).resolve(strict=False)
-    if any(origin_path.is_relative_to(site_root) for site_root in site_package_roots):
-        distributions = root_to_distributions.get(root_name, [])
-        if any(distribution in allowed_distributions for distribution in distributions):
+
+def _raise_if_untrusted_module(
+    *,
+    module_name: str,
+    module: object,
+    trusted_roots: tuple[Path, ...],
+    workspace_root: Path,
+) -> None:
+    spec = getattr(module, "__spec__", None)
+    origin = getattr(spec, "origin", None)
+    if origin in {None, "built-in", "frozen"}:
+        search_locations = getattr(spec, "submodule_search_locations", None)
+        if not search_locations:
+            return
+    else:
+        origin_path = Path(str(origin)).resolve(strict=False)
+        if _is_under_trusted_root(origin_path, trusted_roots):
+            if origin_path == workspace_root or origin_path.is_relative_to(workspace_root):
+                if not _is_safe_workspace_module_origin(origin_path):
+                    raise ImportError(
+                        f"Native extension import '{module_name}' is not allowed from /workspace.",
+                    )
             return
         raise ImportError(
-            f"Third-party import '{root_name}' is not available in python_interpreter.",
+            f"Import of '{module_name}' is not allowed in python_interpreter.",
         )
 
-    if any(origin_path.is_relative_to(stdlib_root) for stdlib_root in stdlib_roots):
+    search_locations = getattr(spec, "submodule_search_locations", None)
+    if search_locations is None:
+        return
+
+    resolved_locations = [
+        Path(str(location)).resolve(strict=False)
+        for location in search_locations
+    ]
+    if resolved_locations and all(
+        _is_under_trusted_root(location, trusted_roots)
+        for location in resolved_locations
+    ):
         return
 
     raise ImportError(
-        f"Import of '{root_name}' is not allowed in python_interpreter.",
+        f"Import of '{module_name}' is not allowed in python_interpreter.",
     )
-
-
-def _resolve_allowed_distribution_closure(
-    *,
-    root_distributions: set[str],
-    installed_distributions: dict[str, importlib.metadata.Distribution],
-) -> set[str]:
-    allowed_distributions: set[str] = set()
-    pending = list(root_distributions)
-
-    while pending:
-        distribution_name = pending.pop()
-        if distribution_name in allowed_distributions:
-            continue
-
-        distribution = installed_distributions.get(distribution_name)
-        if distribution is None:
-            continue
-
-        allowed_distributions.add(distribution_name)
-        for requirement in distribution.requires or ():
-            dependency_name = _extract_requirement_name(requirement)
-            if dependency_name is None:
-                continue
-            if dependency_name in installed_distributions and dependency_name not in allowed_distributions:
-                pending.append(dependency_name)
-
-    return allowed_distributions
 
 
 def _installed_distributions() -> dict[str, importlib.metadata.Distribution]:
@@ -263,13 +285,6 @@ def _installed_distributions() -> dict[str, importlib.metadata.Distribution]:
             continue
         distributions[_canonicalize_name(name)] = distribution
     return distributions
-
-
-def _extract_requirement_name(requirement: str) -> str | None:
-    match = _REQUIREMENT_NAME_PATTERN.match(requirement)
-    if match is None:
-        return None
-    return _canonicalize_name(match.group(1))
 
 
 def _canonicalize_name(name: str) -> str:
@@ -298,6 +313,20 @@ def _site_package_roots() -> tuple[Path, ...]:
         if path
     }
     return tuple(sorted(roots, key=str))
+
+
+def _is_under_trusted_root(path: Path, trusted_roots: tuple[Path, ...]) -> bool:
+    for trusted_root in trusted_roots:
+        try:
+            path.relative_to(trusted_root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_safe_workspace_module_origin(path: Path) -> bool:
+    return path.suffix in {"", ".py", ".pyc", ".pyi"}
 
 
 if __name__ == "__main__":

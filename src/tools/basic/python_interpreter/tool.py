@@ -90,14 +90,9 @@ class PythonInterpreterToolExecutor:
                             ),
                             "blocked_import_roots": [
                                 "_ctypes",
-                                "_socket",
+                                "_cffi_backend",
+                                "cffi",
                                 "ctypes",
-                                "ensurepip",
-                                "multiprocessing",
-                                "pip",
-                                "pty",
-                                "socket",
-                                "venv",
                             ],
                             "memory_limit_bytes": (
                                 self._settings.python_interpreter_memory_limit_bytes
@@ -395,10 +390,16 @@ def _build_python_interpreter_tool_description(settings: ToolSettings) -> str:
     return (
         "Run constrained Python inside a bubblewrap sandbox backed by a dedicated venv. "
         "Use this for parsing, transformations, tabular processing, PDF/text extraction, "
-        "image work, and small scripts that are awkward in shell. "
+        "image work, and more, that are awkward in shell. "
         "Exactly one of 'code' or 'script_path' is required. "
+        "If you anticipate long script, write the Python code as a file first, "
+        "and then call this tool to execute the script as a .py file. "
+        "When you run into snags with using the libraries and it is necessary to use them for the task, "
+        "try using web search for docs or example uses to get the correct usage. "
         "The real workspace is mounted at /workspace and is the only writable filesystem "
         "location available to the script. Writes outside /workspace are denied by the sandbox. "
+        "Workspace helper modules and curated venv packages import normally; direct native FFI "
+        "imports such as ctypes/cffi are blocked. "
         f"Curated third-party packages available: {packages}. "
         "No network access is available."
     )

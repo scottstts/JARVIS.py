@@ -327,10 +327,27 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - only `/workspace` is writable; writes outside `/workspace` are denied by the sandbox
 - disables network with `--unshare-net`
 - only mounts the minimal Python runtime roots needed for the interpreter plus the dedicated venv
-- executes through an internal runner that applies resource limits and blocks process-spawn APIs/imports
+- executes through an internal runner that applies resource limits, blocks process-spawn APIs, and enforces a low-interference import trust model
 - supports inline code and stored scripts under `/workspace`
 - captures both `stdout` and `stderr`
 - truncates large output to the configured cap
+
+#### Security / Capability Ethos
+
+- The python tool is capability-constrained, not package-by-package micromanaged.
+- Hard security lives at the sandbox boundary first:
+  - no network namespace
+  - writable filesystem limited to `/workspace`
+  - scrubbed environment
+  - process spawning blocked
+  - resource and output limits enforced
+- Python-level guarding should be minimal and low-friction because invasive import hooks can break legitimate native and SWIG-backed libraries.
+- Imports are therefore judged mainly by trust root, not by an ever-growing library exception list:
+  - stdlib modules are allowed
+  - packages installed in the dedicated curated venv are allowed
+  - workspace-local helper modules are allowed so stored scripts can be composed normally
+- The small hard import denylist is reserved for true escape hatches such as direct native FFI (`ctypes`, `_ctypes`, `cffi`, `_cffi_backend`).
+- This means adding ordinary curated packages should usually require no policy changes; policy should only move when a new capability class is intentionally granted.
 
 #### Policy
 
@@ -343,6 +360,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - intentionally one-shot and stateless; no persistent kernel/session memory across tool calls
 - `read_paths` and `write_paths` are deprecated compatibility fields and no longer control filesystem access
 - third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the dedicated venv
+- workspace imports are intended for normal pure-Python helper modules; importing arbitrary native extensions from `/workspace` is intentionally disallowed
 
 ### `file_patch`
 

@@ -595,7 +595,117 @@ class _FakeToolSearchActivationLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FakeToolRoundLimitLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        if request.tool_choice.mode.value == "none":
+            names = [tool.name for tool in request.tools]
+            if names:
+                raise AssertionError("Recovery request should disable all tools.")
+            system_message = request.messages[-1]
+            if system_message.role != "system":
+                raise AssertionError("Expected tool-round-limit system recovery message.")
+            return _build_response("Final answer without more tools.")
+
+        if self.generate_calls > 3:
+            raise AssertionError("Expected recovery request before another tool round executes.")
+
+        return _build_response(
+            "",
+            tool_calls=[
+                ToolCall(
+                    call_id=f"bash_{self.generate_calls}",
+                    name="bash",
+                    arguments={"command": "printf 'hello' | tee note.txt"},
+                    raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                )
+            ],
+            finish_reason="tool_calls",
+        )
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        if request.tool_choice.mode.value == "none":
+            names = [tool.name for tool in request.tools]
+            if names:
+                raise AssertionError("Recovery request should disable all tools.")
+            yield TextDeltaEvent(delta="Final ")
+            yield TextDeltaEvent(delta="answer without more tools.")
+            yield DoneEvent(response=_build_response("Final answer without more tools."))
+            return
+
+        if self.stream_calls > 3:
+            raise AssertionError("Expected recovery request before another streamed tool round.")
+
+        yield DoneEvent(
+            response=_build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id=f"bash_stream_{self.stream_calls}",
+                        name="bash",
+                        arguments={"command": "printf 'hello' | tee note.txt"},
+                        raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+
+
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handle_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+
+            with patch.dict("os.environ", {"JARVIS_TOOL_MAX_ROUNDS_PER_TURN": "2"}):
+                loop = AgentLoop(
+                    llm_service=_FakeToolRoundLimitLLMService(),
+                    settings=settings,
+                    storage=storage,
+                )
+
+            result = await loop.handle_user_input("Keep working until done.")
+
+            self.assertEqual(result.response_text, "Final answer without more tools.")
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            assistant_records = [record for record in message_records if record.role == "assistant"]
+            self.assertEqual(len(assistant_records), 4)
+            self.assertEqual(assistant_records[-1].content, "Final answer without more tools.")
+            self.assertFalse(any(record.metadata.get("tool_round_limit") for record in message_records))
+
+    async def test_stream_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+
+            with patch.dict("os.environ", {"JARVIS_TOOL_MAX_ROUNDS_PER_TURN": "2"}):
+                loop = AgentLoop(
+                    llm_service=_FakeToolRoundLimitLLMService(),
+                    settings=settings,
+                    storage=storage,
+                )
+
+            events = [event async for event in loop.stream_user_input("Keep working until done.")]
+
+            self.assertEqual(events[-1].type, "done")
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertEqual(done.response_text, "Final answer without more tools.")
+            assistant_messages = [
+                event.text
+                for event in events
+                if isinstance(event, AgentAssistantMessageEvent)
+            ]
+            self.assertEqual(assistant_messages[-1], "Final answer without more tools.")
+
     async def test_handle_user_input_executes_bash_tool_round_and_persists_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))

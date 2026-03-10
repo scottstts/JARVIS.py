@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Sequence
@@ -45,6 +45,11 @@ _OVERFLOW_ERROR_HINTS = (
 _TRANSIENT_RECORD_METADATA_KEY = "transient"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
 _TURN_CONTEXT_METADATA_KEY = "turn_context"
+_TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
+_TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
+    "I reached the per-turn tool round limit before finishing. "
+    "Continue in a new turn if you want me to keep using tools."
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -351,6 +356,157 @@ class AgentLoop:
 
         return request, estimated_input_tokens
 
+    def _build_tool_round_limit_record(
+        self,
+        *,
+        session_id: str,
+        attempted_round: int,
+    ) -> ConversationRecord:
+        max_rounds = self._tool_settings.max_tool_rounds_per_turn
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=(
+                f"Tool round limit reached for this turn at round {attempted_round} "
+                f"(max {max_rounds}). Do not call more tools. "
+                "End this turn with a short status update, summarize what was completed, "
+                "state what remains, and ask the user to continue if more tool work is needed."
+            ),
+            metadata={
+                _TRANSIENT_RECORD_METADATA_KEY: True,
+                _TOOL_ROUND_LIMIT_METADATA_KEY: True,
+                "attempted_round": attempted_round,
+                "max_rounds": max_rounds,
+            },
+        )
+
+    def _build_request(
+        self,
+        records: Sequence[ConversationRecord],
+        *,
+        activated_discoverable_tool_names: Sequence[str] = (),
+        allow_tools: bool = True,
+    ) -> LLMRequest:
+        messages: list[LLMMessage] = []
+        for record in records:
+            if record.kind != "message":
+                continue
+            llm_message = _record_to_llm_message(record)
+            if llm_message is not None:
+                messages.append(llm_message)
+        return LLMRequest(
+            messages=tuple(messages),
+            tools=(
+                self._compose_request_tools(activated_discoverable_tool_names)
+                if allow_tools
+                else ()
+            ),
+            tool_choice=ToolChoice.auto() if allow_tools else ToolChoice.none(),
+        )
+
+    def _build_tool_round_limit_recovery_request(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        attempted_round: int,
+    ) -> tuple[LLMRequest, int]:
+        pending_records.append(
+            self._build_tool_round_limit_record(
+                session_id=session_id,
+                attempted_round=attempted_round,
+            )
+        )
+        request = self._build_request(
+            list(base_records) + pending_records,
+            allow_tools=False,
+        )
+        estimated_input_tokens = estimate_request_input_tokens(request)
+        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+            raise ContextBudgetError(
+                "Tool round limit recovery request exceeded the context budget."
+            )
+        return request, estimated_input_tokens
+
+    def _normalize_tool_round_limit_recovery_response(
+        self,
+        response: LLMResponse,
+    ) -> LLMResponse:
+        text = response.text if response.text.strip() else _TOOL_ROUND_LIMIT_RECOVERY_TEXT
+        if text == response.text and not response.tool_calls:
+            return response
+        finish_reason = "stop" if response.tool_calls else response.finish_reason
+        return replace(
+            response,
+            text=text,
+            tool_calls=[],
+            finish_reason=finish_reason,
+        )
+
+    async def _recover_from_tool_round_limit(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        attempted_round: int,
+    ) -> tuple[LLMResponse, int]:
+        request, estimated_input_tokens = self._build_tool_round_limit_recovery_request(
+            session_id=session_id,
+            base_records=base_records,
+            pending_records=pending_records,
+            attempted_round=attempted_round,
+        )
+        response = await self._llm_service.generate(request)
+        normalized = self._normalize_tool_round_limit_recovery_response(response)
+        pending_records.append(self._build_assistant_record(session_id, normalized))
+        return normalized, estimated_input_tokens
+
+    async def _stream_recover_from_tool_round_limit(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        attempted_round: int,
+    ) -> tuple[list[AgentTurnStreamEvent], LLMResponse, int]:
+        request, estimated_input_tokens = self._build_tool_round_limit_recovery_request(
+            session_id=session_id,
+            base_records=base_records,
+            pending_records=pending_records,
+            attempted_round=attempted_round,
+        )
+        streamed_response: LLMResponse | None = None
+        recovery_events: list[AgentTurnStreamEvent] = []
+        async for event in self._llm_service.stream_generate(request):
+            if event.type == "text_delta":
+                if event.delta:
+                    recovery_events.append(
+                        AgentTextDeltaEvent(
+                            session_id=session_id,
+                            delta=event.delta,
+                        )
+                    )
+            elif event.type == "done":
+                streamed_response = event.response
+
+        if streamed_response is None:
+            raise RuntimeError(
+                "Streaming tool round limit recovery completed without a final done event."
+            )
+
+        normalized = self._normalize_tool_round_limit_recovery_response(streamed_response)
+        pending_records.append(self._build_assistant_record(session_id, normalized))
+        if normalized.text:
+            recovery_events.append(
+                AgentAssistantMessageEvent(
+                    session_id=session_id,
+                    text=normalized.text,
+                )
+            )
+        return recovery_events, normalized, estimated_input_tokens
+
     async def _stream_message_turn(
         self,
         user_text: str,
@@ -472,9 +628,20 @@ class AgentLoop:
         while current_response.tool_calls:
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
-                raise RuntimeError(
-                    "Tool loop exceeded max rounds for a single turn."
+                (
+                    recovery_events,
+                    final_response,
+                    final_estimated_input_tokens,
+                ) = await self._stream_recover_from_tool_round_limit(
+                    session_id=session.session_id,
+                    base_records=base_records,
+                    pending_records=pending_records,
+                    attempted_round=tool_rounds,
                 )
+                for recovery_event in recovery_events:
+                    yield recovery_event
+                current_response = final_response
+                break
 
             request, final_estimated_input_tokens = await self._execute_tool_calls_and_build_request(
                 session_id=session.session_id,
@@ -672,25 +839,6 @@ class AgentLoop:
             last_estimated_input_tokens=estimated_input_tokens,
         )
 
-    def _build_request(
-        self,
-        records: Sequence[ConversationRecord],
-        *,
-        activated_discoverable_tool_names: Sequence[str] = (),
-    ) -> LLMRequest:
-        messages: list[LLMMessage] = []
-        for record in records:
-            if record.kind != "message":
-                continue
-            llm_message = _record_to_llm_message(record)
-            if llm_message is not None:
-                messages.append(llm_message)
-        return LLMRequest(
-            messages=tuple(messages),
-            tools=self._compose_request_tools(activated_discoverable_tool_names),
-            tool_choice=ToolChoice.auto(),
-        )
-
     def _compose_request_tools(
         self,
         activated_discoverable_tool_names: Sequence[str],
@@ -743,9 +891,15 @@ class AgentLoop:
         while current_response.tool_calls:
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
-                raise RuntimeError(
-                    "Tool loop exceeded max rounds for a single turn."
+                current_response, current_estimated_input_tokens = (
+                    await self._recover_from_tool_round_limit(
+                        session_id=session.session_id,
+                        base_records=base_records,
+                        pending_records=pending_records,
+                        attempted_round=tool_rounds,
+                    )
                 )
+                break
 
             request, current_estimated_input_tokens = await self._execute_tool_calls_and_build_request(
                 session_id=session.session_id,
