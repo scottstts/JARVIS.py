@@ -378,6 +378,7 @@ class AgentLoop:
         while True:
             streamed_response: LLMResponse | None = None
             emitted_any = False
+            noticed_initial_tool_call_ids: set[str] = set()
             try:
                 async for event in self._llm_service.stream_generate(request):
                     if event.type == "text_delta":
@@ -386,6 +387,16 @@ class AgentLoop:
                             yield AgentTextDeltaEvent(
                                 session_id=session.session_id,
                                 delta=event.delta,
+                            )
+                    elif event.type == "tool_call_delta":
+                        emitted_any = True
+                        tool_name = str(event.tool_name or "").strip()
+                        call_id = event.call_id.strip()
+                        if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
+                            noticed_initial_tool_call_ids.add(call_id)
+                            yield AgentToolCallEvent(
+                                session_id=session.session_id,
+                                tool_names=(tool_name,),
                             )
                     elif event.type == "done":
                         streamed_response = event.response
@@ -440,18 +451,21 @@ class AgentLoop:
             ),
             self._build_assistant_record(session.session_id, initial_response),
         ]
+        if initial_response.text:
+            yield AgentAssistantMessageEvent(
+                session_id=session.session_id,
+                text=initial_response.text,
+            )
         if initial_response.tool_calls:
-            tool_names = _tool_notice_names(initial_response.tool_calls)
+            tool_names = _pending_tool_notice_names(
+                initial_response.tool_calls,
+                noticed_initial_tool_call_ids,
+            )
             if tool_names:
                 yield AgentToolCallEvent(
                     session_id=session.session_id,
                     tool_names=tool_names,
                 )
-        elif initial_response.text:
-            yield AgentAssistantMessageEvent(
-                session_id=session.session_id,
-                text=initial_response.text,
-            )
 
         current_response = initial_response
         tool_rounds = 0
@@ -470,12 +484,22 @@ class AgentLoop:
             )
 
             streamed_response: LLMResponse | None = None
+            noticed_followup_tool_call_ids: set[str] = set()
             async for event in self._llm_service.stream_generate(request):
                 if event.type == "text_delta":
                     if event.delta:
                         yield AgentTextDeltaEvent(
                             session_id=session.session_id,
                             delta=event.delta,
+                        )
+                elif event.type == "tool_call_delta":
+                    tool_name = str(event.tool_name or "").strip()
+                    call_id = event.call_id.strip()
+                    if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
+                        noticed_followup_tool_call_ids.add(call_id)
+                        yield AgentToolCallEvent(
+                            session_id=session.session_id,
+                            tool_names=(tool_name,),
                         )
                 elif event.type == "done":
                     streamed_response = event.response
@@ -489,18 +513,21 @@ class AgentLoop:
             pending_records.append(
                 self._build_assistant_record(session.session_id, current_response)
             )
+            if current_response.text:
+                yield AgentAssistantMessageEvent(
+                    session_id=session.session_id,
+                    text=current_response.text,
+                )
             if current_response.tool_calls:
-                tool_names = _tool_notice_names(current_response.tool_calls)
+                tool_names = _pending_tool_notice_names(
+                    current_response.tool_calls,
+                    noticed_followup_tool_call_ids,
+                )
                 if tool_names:
                     yield AgentToolCallEvent(
                         session_id=session.session_id,
                         tool_names=tool_names,
                     )
-            elif current_response.text:
-                yield AgentAssistantMessageEvent(
-                    session_id=session.session_id,
-                    text=current_response.text,
-                )
 
         final_response = current_response
 
@@ -1081,15 +1108,19 @@ def _collect_activated_discoverable_tool_names(
     return tuple(names)
 
 
-def _tool_notice_names(tool_calls: Sequence[ToolCall]) -> tuple[str, ...]:
+def _pending_tool_notice_names(
+    tool_calls: Sequence[ToolCall],
+    noticed_call_ids: set[str],
+) -> tuple[str, ...]:
     names: list[str] = []
-    seen: set[str] = set()
     for tool_call in tool_calls:
+        call_id = tool_call.call_id.strip()
         name = tool_call.name.strip()
-        if not name or name in seen:
+        if not name:
+            continue
+        if call_id and call_id in noticed_call_ids:
             continue
         names.append(name)
-        seen.add(name)
     return tuple(names)
 
 

@@ -147,6 +147,7 @@ class TelegramGatewayBridge:
         )
         self._next_draft_ids: dict[int, int] = {}
         self._draft_retry_until_by_chat: dict[int, float] = {}
+        self._draft_min_interval_by_chat: dict[int, float] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -226,7 +227,9 @@ class TelegramGatewayBridge:
         accumulated_text = ""
         last_draft_text = ""
         last_draft_at = 0.0
+        segment_started_at = time.monotonic()
         delivered_any_segment = False
+        pending_finalized_text_for_dedup: str | None = None
         drafts_enabled = (
             time.monotonic()
             >= self._draft_retry_until_by_chat.get(message.chat_id, 0.0)
@@ -248,8 +251,11 @@ class TelegramGatewayBridge:
                         current_text=accumulated_text,
                         last_sent_text=last_draft_text,
                         last_sent_monotonic=last_draft_at,
+                        segment_started_monotonic=segment_started_at,
                         min_chars=self._settings.stream_draft_min_chars,
-                        min_interval_seconds=self._settings.stream_draft_min_interval_seconds,
+                        min_interval_seconds=self._draft_min_interval_for_chat(
+                            message.chat_id
+                        ),
                         now_monotonic=now,
                     ):
                         try:
@@ -260,6 +266,7 @@ class TelegramGatewayBridge:
                             )
                             last_draft_text = accumulated_text
                             last_draft_at = now
+                            self._record_draft_success(chat_id=message.chat_id)
                         except TelegramAPIError as exc:
                             drafts_enabled = False
                             self._record_draft_backoff(
@@ -279,24 +286,39 @@ class TelegramGatewayBridge:
 
                 if isinstance(event, GatewayMessageEvent):
                     final_text = _coalesce_visible_text(event.text, accumulated_text)
-                    if final_text is not None:
+                    if (
+                        final_text is not None
+                        and final_text != pending_finalized_text_for_dedup
+                    ):
                         await self._send_final_text(chat_id=message.chat_id, text=final_text)
                         delivered_any_segment = True
+                    pending_finalized_text_for_dedup = None
                     accumulated_text = ""
                     last_draft_text = ""
                     last_draft_at = 0.0
+                    segment_started_at = time.monotonic()
                     current_draft_id = self._next_draft_id_for_chat(message.chat_id)
                     continue
 
                 if isinstance(event, GatewayToolCallEvent):
+                    flushed_text = _coalesce_visible_text(accumulated_text)
+                    if flushed_text is not None:
+                        await self._send_final_text(
+                            chat_id=message.chat_id,
+                            text=flushed_text,
+                        )
+                        delivered_any_segment = True
+                        pending_finalized_text_for_dedup = flushed_text
                     for tool_name in event.tool_names:
                         await self._send_final_text(
                             chat_id=message.chat_id,
                             text=_format_tool_usage_notice(tool_name),
                         )
+                        delivered_any_segment = True
                     accumulated_text = ""
                     last_draft_text = ""
                     last_draft_at = 0.0
+                    segment_started_at = time.monotonic()
                     current_draft_id = self._next_draft_id_for_chat(message.chat_id)
                     continue
 
@@ -461,8 +483,34 @@ class TelegramGatewayBridge:
     def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
         if exc.retry_after_seconds is None:
             return
+        base_interval = self._settings.stream_draft_min_interval_seconds
+        current_interval = self._draft_min_interval_by_chat.get(chat_id, base_interval)
+        backed_off_interval = max(
+            base_interval,
+            current_interval * 1.5,
+            min(2.5, max(base_interval, exc.retry_after_seconds / 2)),
+        )
+        self._draft_min_interval_by_chat[chat_id] = backed_off_interval
         self._draft_retry_until_by_chat[chat_id] = (
             time.monotonic() + max(1, exc.retry_after_seconds)
+        )
+
+    def _record_draft_success(self, *, chat_id: int) -> None:
+        base_interval = self._settings.stream_draft_min_interval_seconds
+        current_interval = self._draft_min_interval_by_chat.get(chat_id)
+        if current_interval is None or current_interval <= base_interval:
+            self._draft_min_interval_by_chat.pop(chat_id, None)
+            return
+        next_interval = max(base_interval, current_interval * 0.9)
+        if next_interval <= base_interval + 0.05:
+            self._draft_min_interval_by_chat.pop(chat_id, None)
+            return
+        self._draft_min_interval_by_chat[chat_id] = next_interval
+
+    def _draft_min_interval_for_chat(self, chat_id: int) -> float:
+        return self._draft_min_interval_by_chat.get(
+            chat_id,
+            self._settings.stream_draft_min_interval_seconds,
         )
 
     def _next_draft_id_for_chat(self, chat_id: int) -> int:
@@ -800,6 +848,7 @@ def _should_flush_draft(
     current_text: str,
     last_sent_text: str,
     last_sent_monotonic: float,
+    segment_started_monotonic: float,
     min_chars: int,
     min_interval_seconds: float,
     now_monotonic: float,
@@ -808,14 +857,18 @@ def _should_flush_draft(
         return False
 
     unsent_chars = len(current_text) - len(last_sent_text)
-    if unsent_chars >= min_chars:
-        return True
+    if unsent_chars <= 0:
+        return False
 
     if last_sent_monotonic == 0.0:
-        return True
+        if unsent_chars < min_chars:
+            return False
+        return (now_monotonic - segment_started_monotonic) >= min_interval_seconds
 
-    elapsed = now_monotonic - last_sent_monotonic
-    return elapsed >= min_interval_seconds
+    if (now_monotonic - last_sent_monotonic) < min_interval_seconds:
+        return False
+
+    return True
 
 
 def _has_visible_telegram_text(text: str) -> bool:

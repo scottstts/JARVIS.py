@@ -21,6 +21,7 @@ from llm import (
     TextDeltaEvent,
     TextPart,
     ToolCall,
+    ToolCallDeltaEvent,
     ToolResultPart,
 )
 from storage import SessionStorage
@@ -193,6 +194,53 @@ class _FakeToolLLMService:
             raise AssertionError(
                 "Expected the same transient turn datetime context across tool follow-up rounds."
             )
+
+
+class _FakeToolFirstLLMService(_FakeToolLLMService):
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        self._assert_bash_registered(request)
+        self._assert_turn_context_present(request)
+        if self.stream_calls == 1:
+            yield ToolCallDeltaEvent(
+                call_id="bash_stream_1",
+                tool_name="bash",
+                arguments_delta='{"command":"printf \\"hello\\" | tee note.txt"}',
+            )
+            yield TextDeltaEvent(delta="Working on it.")
+            yield DoneEvent(
+                response=_build_response(
+                    "Working on it.",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="bash_stream_1",
+                            name="bash",
+                            arguments={"command": "printf 'hello' | tee note.txt"},
+                            raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "note.txt" not in tool_result_parts[0].content:
+            raise AssertionError("Expected streamed tool result content to mention written file.")
+
+        yield TextDeltaEvent(delta="File written.")
+        yield DoneEvent(response=_build_response("File written."))
 
 
 class _FakeViewImageLLMService:
@@ -592,15 +640,21 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 [event.type for event in events],
                 [
                     "text_delta",
+                    "assistant_message",
                     "tool_call",
                     "text_delta",
                     "assistant_message",
                     "done",
                 ],
             )
-            self.assertIsInstance(events[1], AgentToolCallEvent)
-            self.assertIsInstance(events[3], AgentAssistantMessageEvent)
-            tool_event = events[1]
+            self.assertIsInstance(events[1], AgentAssistantMessageEvent)
+            self.assertIsInstance(events[2], AgentToolCallEvent)
+            self.assertIsInstance(events[4], AgentAssistantMessageEvent)
+            first_message = events[1]
+            if not isinstance(first_message, AgentAssistantMessageEvent):
+                self.fail("Expected assistant message stream event before tool execution.")
+            self.assertEqual(first_message.text, "Working on it.")
+            tool_event = events[2]
             if not isinstance(tool_event, AgentToolCallEvent):
                 self.fail("Expected tool-call stream event before tool execution.")
             self.assertEqual(tool_event.tool_names, ("bash",))
@@ -608,6 +662,40 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
             self.assertEqual(done.response_text, "File written.")
+
+    async def test_stream_user_input_preserves_tool_first_order_when_tool_delta_arrives_first(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeToolFirstLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            events = [event async for event in loop.stream_user_input("Write hello into note.txt.")]
+
+            self.assertEqual(
+                [event.type for event in events],
+                [
+                    "tool_call",
+                    "text_delta",
+                    "assistant_message",
+                    "text_delta",
+                    "assistant_message",
+                    "done",
+                ],
+            )
+            tool_event = events[0]
+            if not isinstance(tool_event, AgentToolCallEvent):
+                self.fail("Expected first stream event to be a tool-call notice.")
+            self.assertEqual(tool_event.tool_names, ("bash",))
+            first_message = events[2]
+            if not isinstance(first_message, AgentAssistantMessageEvent):
+                self.fail("Expected the mixed response text to still be finalized.")
+            self.assertEqual(first_message.text, "Working on it.")
 
     async def test_handle_user_input_executes_view_image_tool_and_keeps_attachment_transient(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

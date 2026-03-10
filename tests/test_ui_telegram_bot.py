@@ -14,6 +14,7 @@ from ui.telegram.bot import (
     IncomingTelegramFile,
     IncomingTextMessage,
     TelegramGatewayBridge,
+    _should_flush_draft,
     _clear_directory_contents,
     chat_id_for_route_id,
     parse_incoming_message,
@@ -441,6 +442,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         gateway = _FakeGatewayClient(
             events=[
                 GatewayDeltaEvent(session_id="session", delta="Working on it."),
+                GatewayMessageEvent(session_id="session", text="Working on it."),
                 GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
                 GatewayMessageEvent(session_id="session", text="Done."),
                 GatewayTurnDoneEvent(session_id="session", response_text="Done."),
@@ -458,7 +460,58 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["🔧 Used <b>bash</b> tool.", "Done."],
+            ["Working on it.", "🔧 Used <b>bash</b> tool.", "Done."],
+        )
+
+    async def test_handle_message_flushes_pending_stream_text_before_tool_notice(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="Working on it."),
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayMessageEvent(session_id="session", text="Working on it."),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["Working on it.", "🔧 Used <b>bash</b> tool.", "Done."],
+        )
+
+    async def test_handle_message_preserves_tool_notice_when_tool_event_arrives_first(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayDeltaEvent(session_id="session", delta="Working on it."),
+                GatewayMessageEvent(session_id="session", text="Working on it."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Working on it."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["🔧 Used <b>bash</b> tool.", "Working on it."],
         )
 
     async def test_handle_message_skips_whitespace_only_draft_payloads(self) -> None:
@@ -774,6 +827,76 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramBotHelpersTests(unittest.TestCase):
+    def test_should_flush_draft_waits_for_initial_interval(self) -> None:
+        self.assertFalse(
+            _should_flush_draft(
+                current_text="hello world, this is enough text",
+                last_sent_text="",
+                last_sent_monotonic=0.0,
+                segment_started_monotonic=10.0,
+                min_chars=10,
+                min_interval_seconds=1.0,
+                now_monotonic=10.5,
+            )
+        )
+        self.assertTrue(
+            _should_flush_draft(
+                current_text="hello world, this is enough text",
+                last_sent_text="",
+                last_sent_monotonic=0.0,
+                segment_started_monotonic=10.0,
+                min_chars=10,
+                min_interval_seconds=1.0,
+                now_monotonic=11.0,
+            )
+        )
+
+    def test_should_flush_draft_respects_interval_after_first_send(self) -> None:
+        self.assertFalse(
+            _should_flush_draft(
+                current_text="hello world with more text",
+                last_sent_text="hello world",
+                last_sent_monotonic=20.0,
+                segment_started_monotonic=19.0,
+                min_chars=5,
+                min_interval_seconds=1.0,
+                now_monotonic=20.5,
+            )
+        )
+        self.assertTrue(
+            _should_flush_draft(
+                current_text="hello world with more text",
+                last_sent_text="hello world",
+                last_sent_monotonic=20.0,
+                segment_started_monotonic=19.0,
+                min_chars=5,
+                min_interval_seconds=1.0,
+                now_monotonic=21.1,
+            )
+        )
+
+    def test_draft_backoff_increases_interval_and_success_decays_it(self) -> None:
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_interval_seconds=1.0),
+            telegram_client=_FakeTelegramClient(),
+            gateway_client=_FakeGatewayClient(),
+        )
+
+        bridge._record_draft_backoff(
+            chat_id=777,
+            exc=TelegramAPIError(
+                code="telegram_api_error_429",
+                message="Too Many Requests",
+                retry_after_seconds=3,
+            ),
+        )
+        backed_off = bridge._draft_min_interval_for_chat(777)
+        self.assertGreater(backed_off, 1.0)
+
+        bridge._record_draft_success(chat_id=777)
+        self.assertLess(bridge._draft_min_interval_for_chat(777), backed_off)
+        self.assertGreaterEqual(bridge._draft_min_interval_for_chat(777), 1.0)
+
     def test_parse_incoming_text_message(self) -> None:
         parsed = parse_incoming_text_message(
             {
