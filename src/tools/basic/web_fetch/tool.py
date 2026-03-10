@@ -74,6 +74,7 @@ _LOW_SIGNAL_MARKDOWN_PATTERNS = (
     "please wait",
 )
 _LOCAL_HOSTS = {"localhost", "localhost.localdomain"}
+_PLAYWRIGHT_NON_NETWORK_SCHEMES = {"data"}
 
 
 class WebFetchConfigurationError(RuntimeError):
@@ -647,6 +648,9 @@ async def _render_page_html(
 
     timeout_ms = int(settings.web_fetch_playwright_timeout_seconds * 1000)
     network_idle_timeout_ms = min(timeout_ms, 5_000)
+    validated_request_urls = {url}
+    blocked_request_url: str | None = None
+    blocked_request_reason: str | None = None
 
     try:
         async with async_playwright() as playwright:
@@ -654,8 +658,25 @@ async def _render_page_html(
                 headless=True,
                 args=["--disable-dev-shm-usage"],
             )
-            context = await browser.new_context()
+            context = await browser.new_context(service_workers="block")
             page = await context.new_page()
+
+            async def route_request(route: Any) -> None:
+                nonlocal blocked_request_reason, blocked_request_url
+                request_url = route.request.url
+                if request_url not in validated_request_urls:
+                    try:
+                        await asyncio.to_thread(_validate_browser_request_url, request_url)
+                    except WebFetchRequestError as exc:
+                        if blocked_request_url is None:
+                            blocked_request_url = request_url
+                            blocked_request_reason = str(exc)
+                        await route.abort("blockedbyclient")
+                        return
+                    validated_request_urls.add(request_url)
+                await route.continue_()
+
+            await page.route("**/*", route_request)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 try:
@@ -667,18 +688,41 @@ async def _render_page_html(
                     pass
                 html = await page.content()
                 final_url = page.url
+                await asyncio.to_thread(_validate_public_url, final_url)
             finally:
                 await context.close()
                 await browser.close()
     except PlaywrightTimeoutError as exc:
         raise RuntimeError("Playwright page render timed out.") from exc
+    except WebFetchRequestError as exc:
+        raise RuntimeError(
+            f"Playwright resolved to a blocked final URL: {exc}"
+        ) from exc
     except Exception as exc:
+        if blocked_request_url is not None and blocked_request_reason is not None:
+            raise RuntimeError(
+                "Playwright blocked a non-public browser request "
+                f"({blocked_request_url}): {blocked_request_reason}"
+            ) from exc
         raise RuntimeError(f"Playwright page render failed: {exc}") from exc
 
     return BrowserRenderResult(
         requested_url=url,
         final_url=final_url,
         html=_normalize_text(html),
+    )
+
+
+def _validate_browser_request_url(url: str) -> None:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        _validate_public_url(url)
+        return
+    if scheme in _PLAYWRIGHT_NON_NETWORK_SCHEMES:
+        return
+    raise WebFetchRequestError(
+        f"web_fetch Playwright does not allow browser requests with scheme '{scheme or 'unknown'}'."
     )
 
 

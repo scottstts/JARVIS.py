@@ -21,6 +21,7 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
                 "JARVIS_GATEWAY_HOST": "0.0.0.0",
                 "JARVIS_GATEWAY_PORT": "8181",
                 "JARVIS_GATEWAY_WS_PATH": "/socket",
@@ -35,12 +36,24 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
                 "JARVIS_UI_GATEWAY_WS_BASE_URL": "wss://example.com/ws",
             },
             clear=True,
         ):
             settings = UISettings.from_env()
         self.assertEqual(settings.gateway_ws_base_url, "wss://example.com/ws")
+
+    def test_requires_allowed_telegram_user_id(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_TOKEN": "token",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(UIConfigurationError):
+                UISettings.from_env()
 
     def test_reads_allowed_telegram_user_id(self) -> None:
         with patch.dict(
@@ -71,6 +84,7 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
             },
             clear=True,
         ):
@@ -82,6 +96,7 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
             },
             clear=True,
         ), patch("workspace_paths._running_in_container", return_value=False):
@@ -96,6 +111,7 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
                 "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
             },
             clear=True,
@@ -108,6 +124,7 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
                 "JARVIS_UI_TELEGRAM_TEMP_DIR": "/tmp/jarvis-telegram",
             },
             clear=True,
@@ -120,9 +137,21 @@ class UISettingsTests(unittest.TestCase):
             os.environ,
             {
                 "TELEGRAM_TOKEN": "token",
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
                 "JARVIS_UI_TELEGRAM_POLL_LIMIT": "200",
             },
             clear=True,
         ):
             with self.assertRaises(UIConfigurationError):
                 UISettings.from_env()
+
+    def test_repr_hides_telegram_token_and_user_id(self) -> None:
+        settings = UISettings(
+            telegram_token="123456:abcdef-secret",
+            telegram_allowed_user_id=8793811805,
+        )
+
+        rendered = repr(settings)
+
+        self.assertNotIn("123456:abcdef-secret", rendered)
+        self.assertNotIn("8793811805", rendered)

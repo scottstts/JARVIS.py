@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from base64 import b64decode
+from dataclasses import dataclass
 import os
 import shutil
 import tempfile
@@ -24,6 +25,9 @@ from tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     HTTPFetchResult,
     MarkdownConversionResult,
+    WebFetchRequestError,
+    _render_page_html,
+    _validate_browser_request_url,
 )
 
 _PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
@@ -62,6 +66,107 @@ class _FakeWebSearchResponse:
 
     def json(self) -> dict[str, object]:
         return self._payload
+
+
+@dataclass(slots=True)
+class _FakeBrowserRequest:
+    url: str
+
+
+class _FakeBrowserRoute:
+    def __init__(self, url: str) -> None:
+        self.request = _FakeBrowserRequest(url=url)
+        self.aborted = False
+        self.abort_error_code: str | None = None
+        self.continued = False
+
+    async def abort(self, error_code: str | None = None) -> None:
+        self.aborted = True
+        self.abort_error_code = error_code
+
+    async def continue_(self) -> None:
+        self.continued = True
+
+
+class _FakeBrowserPage:
+    def __init__(
+        self,
+        *,
+        final_url: str,
+        html: str,
+        request_urls: tuple[str, ...] = (),
+    ) -> None:
+        self.url = final_url
+        self._html = html
+        self._request_urls = request_urls
+        self._route_handler = None
+        self.handled_routes: list[_FakeBrowserRoute] = []
+
+    async def route(self, pattern: str, handler) -> None:
+        _ = pattern
+        self._route_handler = handler
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+        _ = url, wait_until, timeout
+        if self._route_handler is None:
+            return
+        for request_url in self._request_urls:
+            route = _FakeBrowserRoute(request_url)
+            self.handled_routes.append(route)
+            await self._route_handler(route)
+
+    async def wait_for_load_state(self, state: str, *, timeout: int) -> None:
+        _ = state, timeout
+
+    async def content(self) -> str:
+        return self._html
+
+
+class _FakeBrowserContext:
+    def __init__(self, page: _FakeBrowserPage) -> None:
+        self._page = page
+        self.closed = False
+
+    async def new_page(self) -> _FakeBrowserPage:
+        return self._page
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeChromiumBrowser:
+    def __init__(self, page: _FakeBrowserPage) -> None:
+        self._page = page
+        self.context_kwargs: list[dict[str, object]] = []
+        self.closed = False
+
+    async def new_context(self, **kwargs: object) -> _FakeBrowserContext:
+        self.context_kwargs.append(kwargs)
+        return _FakeBrowserContext(self._page)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeChromium:
+    def __init__(self, browser: _FakeChromiumBrowser) -> None:
+        self._browser = browser
+
+    async def launch(self, *, headless: bool, args: list[str]) -> _FakeChromiumBrowser:
+        _ = headless, args
+        return self._browser
+
+
+class _FakePlaywrightManager:
+    def __init__(self, page: _FakeBrowserPage) -> None:
+        self.browser = _FakeChromiumBrowser(page)
+        self.chromium = _FakeChromium(self.browser)
+
+    async def __aenter__(self) -> "_FakePlaywrightManager":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        _ = exc_type, exc, tb
 
 
 def _build_http_fetch_result(
@@ -501,6 +606,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.workspace_dir = Path(self._tmp.name) / "workspace"
         self.workspace_dir.mkdir()
         settings = ToolSettings.from_workspace_dir(self.workspace_dir)
+        self.settings = settings
         self.registry = ToolRegistry.default(settings)
         self.runtime = ToolRuntime(registry=self.registry)
         self.context = ToolExecutionContext(workspace_dir=self.workspace_dir)
@@ -1388,6 +1494,74 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         render_mock.assert_awaited_once()
         self.assertEqual(result.metadata["strategy"], "tier3_playwright_html_to_markdown")
         self.assertTrue(result.metadata["browser_rendered"])
+
+    def test_validate_browser_request_url_allows_data_scheme(self) -> None:
+        _validate_browser_request_url("data:text/plain,hello")
+
+    def test_validate_browser_request_url_denies_non_http_scheme(self) -> None:
+        with self.assertRaises(WebFetchRequestError):
+            _validate_browser_request_url("javascript:alert(1)")
+
+    async def test_render_page_html_blocks_non_public_browser_subrequests(self) -> None:
+        requested_url = "https://example.com/app"
+        page = _FakeBrowserPage(
+            final_url=requested_url,
+            html="<html><body><main>Rendered</main></body></html>",
+            request_urls=(
+                requested_url,
+                "http://127.0.0.1:8080/debug",
+            ),
+        )
+        manager = _FakePlaywrightManager(page)
+
+        def validate_public_url(url: str) -> None:
+            if "127.0.0.1" in url:
+                raise WebFetchRequestError(
+                    "web_fetch does not allow private, loopback, or reserved IP targets."
+                )
+
+        with patch("tools.basic.web_fetch.tool.async_playwright", return_value=manager):
+            with patch(
+                "tools.basic.web_fetch.tool._validate_public_url",
+                side_effect=validate_public_url,
+            ):
+                result = await _render_page_html(
+                    url=requested_url,
+                    settings=self.settings,
+                )
+
+        self.assertEqual(result.final_url, requested_url)
+        self.assertEqual(manager.browser.context_kwargs, [{"service_workers": "block"}])
+        self.assertEqual(len(page.handled_routes), 2)
+        self.assertTrue(page.handled_routes[0].continued)
+        self.assertTrue(page.handled_routes[1].aborted)
+        self.assertEqual(page.handled_routes[1].abort_error_code, "blockedbyclient")
+
+    async def test_render_page_html_rejects_private_final_url(self) -> None:
+        requested_url = "https://example.com/app"
+        page = _FakeBrowserPage(
+            final_url="http://127.0.0.1:8080/debug",
+            html="<html><body><main>Blocked</main></body></html>",
+            request_urls=(requested_url,),
+        )
+        manager = _FakePlaywrightManager(page)
+
+        def validate_public_url(url: str) -> None:
+            if "127.0.0.1" in url:
+                raise WebFetchRequestError(
+                    "web_fetch does not allow private, loopback, or reserved IP targets."
+                )
+
+        with patch("tools.basic.web_fetch.tool.async_playwright", return_value=manager):
+            with patch(
+                "tools.basic.web_fetch.tool._validate_public_url",
+                side_effect=validate_public_url,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "blocked final URL"):
+                    await _render_page_html(
+                        url=requested_url,
+                        settings=self.settings,
+                    )
 
     async def test_web_fetch_returns_configuration_error_when_account_id_missing(self) -> None:
         requested_url = "https://example.com/docs"

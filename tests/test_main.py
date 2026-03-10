@@ -92,6 +92,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         )
         ui_settings = UISettings(
             telegram_token="token",
+            telegram_allowed_user_id=777,
             gateway_ws_base_url="ws://example.com/remote",
         )
 
@@ -114,6 +115,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             captured_ui_settings[0].gateway_ws_base_url,
             "ws://127.0.0.1:8181/ws",
         )
+        self.assertFalse(fake_server.config["access_log"])
         self.assertEqual(fake_server.config["host"], "0.0.0.0")
         self.assertEqual(fake_server.config["port"], 8181)
 
@@ -141,7 +143,10 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
                                     websocket_path="/ws",
                                     max_message_chars=32_000,
                                 ),
-                                ui_settings=UISettings(telegram_token="token"),
+                                ui_settings=UISettings(
+                                    telegram_token="token",
+                                    telegram_allowed_user_id=777,
+                                ),
                             )
         self.assertEqual(str(context.exception), "gateway boom")
 
@@ -152,7 +157,7 @@ class MainFunctionTests(unittest.TestCase):
             raise KeyboardInterrupt
 
         with patch("main.load_docker_secrets_if_present"):
-            with patch("main.logging.basicConfig"):
+            with patch("main.configure_application_logging"):
                 with patch("main.run_system", side_effect=fake_run_system):
                     with self.assertLogs("main", level="INFO") as captured_logs:
                         main.main()

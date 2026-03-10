@@ -198,6 +198,7 @@ class _FakeGatewayClient:
 def _settings(**overrides: object) -> UISettings:
     values: dict[str, object] = {
         "telegram_token": "test-token",
+        "telegram_allowed_user_id": 777,
         "stream_draft_min_interval_seconds": 0.0,
         "stream_draft_min_chars": 1,
     }
@@ -212,7 +213,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 "update_id": 10,
                 "message": {
                     "message_id": 100,
-                    "from": {"id": 123},
+                    "from": {"id": 123, "is_bot": False},
                     "chat": {"id": 123, "type": "private"},
                     "text": "hello",
                 },
@@ -226,7 +227,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(),
+            settings=_settings(telegram_allowed_user_id=123),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -243,7 +244,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 "update_id": 10,
                 "message": {
                     "message_id": 100,
-                    "from": {"id": 123},
+                    "from": {"id": 123, "is_bot": False},
                     "chat": {"id": 123, "type": "private"},
                     "caption": "please review",
                     "document": {
@@ -276,7 +277,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             bridge = TelegramGatewayBridge(
-                settings=_settings(telegram_temp_dir=Path(tmp)),
+                settings=_settings(
+                    telegram_allowed_user_id=123,
+                    telegram_temp_dir=Path(tmp),
+                ),
                 telegram_client=telegram,
                 gateway_client=gateway,
             )
@@ -301,7 +305,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 "update_id": 10,
                 "message": {
                     "message_id": 100,
-                    "from": {"id": 123},
+                    "from": {"id": 123, "is_bot": False},
                     "chat": {"id": 123, "type": "private"},
                     "text": "hello",
                 },
@@ -320,11 +324,16 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             gateway_client=gateway,
         )
 
-        next_offset = await bridge.poll_once(offset=None)
+        with self.assertLogs("ui.telegram.bot", level="WARNING") as captured_logs:
+            next_offset = await bridge.poll_once(offset=None)
 
         self.assertEqual(next_offset, 11)
         self.assertEqual(gateway.calls, [])
         self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(
+            captured_logs.output,
+            ["WARNING:ui.telegram.bot:Ignoring unauthorized Telegram private message."],
+        )
 
     async def test_poll_once_advances_offset_for_ignored_update(self) -> None:
         telegram = _FakeTelegramClient(
@@ -638,7 +647,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await bridge.handle_message(
-            IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
         self.assertEqual(len(telegram.sent_messages), 2)
@@ -657,7 +666,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await bridge.handle_message(
-            IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
         self.assertEqual(
@@ -723,7 +732,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await bridge.handle_message(
-            IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
         self.assertEqual(len(telegram.sent_messages), 1)
@@ -755,7 +764,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await bridge.handle_message(
-            IncomingTextMessage(update_id=1, chat_id=9, chat_type="private", text="hi"),
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
         self.assertEqual(telegram.message_attempts, 2)
@@ -770,7 +779,7 @@ class TelegramBotHelpersTests(unittest.TestCase):
             {
                 "update_id": 12,
                 "message": {
-                    "from": {"id": 321},
+                    "from": {"id": 321, "is_bot": False},
                     "chat": {"id": 321, "type": "private"},
                     "text": "  hello ",
                 },
@@ -789,7 +798,7 @@ class TelegramBotHelpersTests(unittest.TestCase):
             {
                 "update_id": 14,
                 "message": {
-                    "from": {"id": 321},
+                    "from": {"id": 321, "is_bot": False},
                     "chat": {"id": 321, "type": "private"},
                     "caption": "review this",
                     "document": {
@@ -818,6 +827,46 @@ class TelegramBotHelpersTests(unittest.TestCase):
                 extra_metadata=(),
             ),
         )
+
+    def test_parse_incoming_message_rejects_sender_chat_updates(self) -> None:
+        parsed = parse_incoming_message(
+            {
+                "update_id": 15,
+                "message": {
+                    "from": {"id": 321, "is_bot": False},
+                    "sender_chat": {"id": -1000},
+                    "chat": {"id": 321, "type": "private"},
+                    "text": "hello",
+                },
+            }
+        )
+        self.assertIsNone(parsed)
+
+    def test_parse_incoming_message_rejects_bot_sender(self) -> None:
+        parsed = parse_incoming_message(
+            {
+                "update_id": 16,
+                "message": {
+                    "from": {"id": 321, "is_bot": True},
+                    "chat": {"id": 321, "type": "private"},
+                    "text": "hello",
+                },
+            }
+        )
+        self.assertIsNone(parsed)
+
+    def test_parse_incoming_message_rejects_private_sender_chat_id_mismatch(self) -> None:
+        parsed = parse_incoming_message(
+            {
+                "update_id": 17,
+                "message": {
+                    "from": {"id": 321, "is_bot": False},
+                    "chat": {"id": 999, "type": "private"},
+                    "text": "hello",
+                },
+            }
+        )
+        self.assertIsNone(parsed)
 
     def test_clear_directory_contents_removes_files_and_subdirectories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

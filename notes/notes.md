@@ -59,3 +59,5 @@
 - Telegram Bot API calls now use `httpx.AsyncClient` instead of `requests` in worker threads, so long-poll shutdown is cancellation-friendly and Ctrl+C should stop much faster.
 - Identities bootstrap is now a single-container flow: the `dev` service copies `/repo/src/identities/.` into `/workspace/identities/` during startup, and there is no separate `init-identities` compose service.
 - The dev container `shm_size` is intentionally `12gb`; Docker Desktop disk-image size remains a host-level setting outside repo control.
+- Telegram UI is now fail-closed on `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; the bot only accepts canonical private-user updates from that owner and rejects bot/sender_chat/mismatched private-chat updates.
+- The gateway default bind is now `127.0.0.1`, and `web_fetch` Playwright blocks non-public browser subrequests plus revalidates the final navigated URL before returning rendered HTML.

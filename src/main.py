@@ -10,6 +10,7 @@ from dataclasses import replace
 import uvicorn
 
 from gateway import GatewaySettings, create_app
+from logging_setup import configure_application_logging
 from runtime_env import load_docker_secrets_if_present
 from ui.telegram import UISettings, run_telegram_ui
 
@@ -34,6 +35,7 @@ async def run_system(
             host=resolved_gateway_settings.host,
             port=resolved_gateway_settings.port,
             lifespan="on",
+            access_log=False,
         )
     )
 
@@ -85,10 +87,7 @@ async def run_system(
 
 def main() -> None:
     load_docker_secrets_if_present()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_application_logging()
     try:
         asyncio.run(run_system())
     except KeyboardInterrupt:

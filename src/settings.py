@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Final
 
 # Gateway websocket runtime.
-JARVIS_GATEWAY_HOST: Final = "0.0.0.0"
+JARVIS_GATEWAY_HOST: Final = "127.0.0.1"
 JARVIS_GATEWAY_PORT: Final = 8080
 JARVIS_GATEWAY_WS_PATH: Final = "/ws"
 JARVIS_GATEWAY_MAX_MESSAGE_CHARS: Final = 32_000

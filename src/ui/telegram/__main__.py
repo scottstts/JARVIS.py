@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
+from logging_setup import configure_application_logging
 from .bot import run_telegram_ui
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_application_logging()
     asyncio.run(run_telegram_ui())
 
 

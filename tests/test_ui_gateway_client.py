@@ -88,3 +88,22 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(GatewayBridgeError) as context:
                 _ = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
         self.assertEqual(context.exception.code, "internal_error")
+
+    async def test_stream_turn_hides_route_id_when_connect_fails(self) -> None:
+        client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
+
+        def fail_connect(*args, **kwargs):
+            _ = (args, kwargs)
+            raise RuntimeError("connect failed for ws://localhost:8080/ws/tg_123")
+
+        with patch(
+            "ui.telegram.gateway_client._resolve_websocket_connect",
+            return_value=fail_connect,
+        ):
+            with self.assertRaises(GatewayBridgeError) as context:
+                _ = [event async for event in client.stream_turn(route_id="tg_123", user_text="hi")]
+
+        self.assertEqual(context.exception.code, "gateway_unavailable")
+        self.assertTrue(context.exception.__suppress_context__)
+        self.assertIsNone(context.exception.__cause__)
+        self.assertNotIn("tg_123", str(context.exception))

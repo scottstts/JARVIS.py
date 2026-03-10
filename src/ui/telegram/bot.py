@@ -118,6 +118,8 @@ class IncomingTelegramMessage:
     chat_type: str
     text: str
     sender_user_id: int | None = None
+    sender_is_bot: bool = False
+    has_sender_chat: bool = False
     file_attachment: IncomingTelegramFile | None = None
 
 
@@ -156,15 +158,9 @@ class TelegramGatewayBridge:
             "Telegram temp dir is %s",
             self._settings.telegram_temp_dir,
         )
-        if self._settings.telegram_allowed_user_id is None:
-            LOGGER.warning(
-                "Telegram owner gate is disabled; any private chat can reach the bot."
-            )
-        else:
-            LOGGER.info(
-                "Telegram bridge restricted to user_id=%s",
-                self._settings.telegram_allowed_user_id,
-            )
+        LOGGER.info(
+            "Telegram bridge restricted to the configured owner.",
+        )
 
         next_offset: int | None = None
         while True:
@@ -206,11 +202,7 @@ class TelegramGatewayBridge:
             message=message,
             allowed_user_id=self._settings.telegram_allowed_user_id,
         ):
-            LOGGER.warning(
-                "Ignoring unauthorized Telegram message from user_id=%s chat_id=%s",
-                _effective_private_user_id(message),
-                message.chat_id,
-            )
+            LOGGER.warning("Ignoring unauthorized Telegram private message.")
             return
 
         user_text = message.text
@@ -218,10 +210,7 @@ class TelegramGatewayBridge:
             try:
                 user_text = await self._build_file_turn_text(message)
             except TelegramAPIError:
-                LOGGER.exception(
-                    "Telegram file download failed for chat_id=%s",
-                    message.chat_id,
-                )
+                LOGGER.exception("Telegram file download failed.")
                 await self._send_final_text(
                     chat_id=message.chat_id,
                     text=_FILE_DOWNLOAD_ERROR_REPLY,
@@ -279,8 +268,7 @@ class TelegramGatewayBridge:
                             )
                             if exc.retry_after_seconds is not None:
                                 LOGGER.warning(
-                                    "sendMessageDraft rate-limited for chat_id=%s; pausing drafts for %ss.",
-                                    message.chat_id,
+                                    "sendMessageDraft rate-limited; pausing drafts for %ss.",
                                     exc.retry_after_seconds,
                                 )
                             else:
@@ -332,25 +320,22 @@ class TelegramGatewayBridge:
                 text=_GENERIC_ERROR_REPLY,
             )
         except GatewayBridgeError as exc:
-            LOGGER.exception("Gateway bridge failed for chat_id=%s", message.chat_id)
+            LOGGER.exception("Gateway bridge failed.")
             await self._send_final_text(
                 chat_id=message.chat_id,
                 text=exc.message if exc.message else _GENERIC_ERROR_REPLY,
             )
         except TelegramAPIError:
-            LOGGER.exception("Telegram API send failed for chat_id=%s", message.chat_id)
+            LOGGER.exception("Telegram API send failed.")
         except Exception:
-            LOGGER.exception("Unexpected bridge error for chat_id=%s", message.chat_id)
+            LOGGER.exception("Unexpected bridge error.")
             try:
                 await self._send_final_text(
                     chat_id=message.chat_id,
                     text=_GENERIC_ERROR_REPLY,
                 )
             except TelegramAPIError:
-                LOGGER.exception(
-                    "Failed to send fallback error text for chat_id=%s",
-                    message.chat_id,
-                )
+                LOGGER.exception("Failed to send fallback error text.")
 
     async def aclose(self) -> None:
         await self._telegram.aclose()
@@ -503,12 +488,19 @@ def parse_incoming_message(update: dict[str, Any]) -> IncomingTelegramMessage | 
     elif isinstance(message.get("caption"), str):
         text = message["caption"].strip()
 
-    sender_user_id: int | None = None
     from_user = message.get("from")
-    if isinstance(from_user, dict):
-        from_user_id = from_user.get("id")
-        if isinstance(from_user_id, int):
-            sender_user_id = from_user_id
+    if not isinstance(from_user, dict):
+        return None
+    sender_user_id = from_user.get("id")
+    sender_is_bot = from_user.get("is_bot")
+    if not isinstance(sender_user_id, int):
+        return None
+    if not isinstance(sender_is_bot, bool):
+        return None
+    if sender_is_bot:
+        return None
+    if message.get("sender_chat") is not None:
+        return None
 
     chat = message.get("chat")
     if not isinstance(chat, dict):
@@ -518,6 +510,8 @@ def parse_incoming_message(update: dict[str, Any]) -> IncomingTelegramMessage | 
     if not isinstance(chat_id, int):
         return None
     if not isinstance(chat_type, str):
+        return None
+    if chat_type == "private" and chat_id != sender_user_id:
         return None
 
     file_attachment = _extract_file_attachment(message)
@@ -530,6 +524,8 @@ def parse_incoming_message(update: dict[str, Any]) -> IncomingTelegramMessage | 
         chat_type=chat_type,
         text=text,
         sender_user_id=sender_user_id,
+        sender_is_bot=sender_is_bot,
+        has_sender_chat=False,
         file_attachment=file_attachment,
     )
 
@@ -681,7 +677,11 @@ def _is_authorized_private_message(
     allowed_user_id: int | None,
 ) -> bool:
     if allowed_user_id is None:
-        return True
+        return False
+    if message.chat_type != "private":
+        return False
+    if message.sender_is_bot or message.has_sender_chat:
+        return False
     effective_user_id = _effective_private_user_id(message)
     return effective_user_id == allowed_user_id and message.chat_id == allowed_user_id
 

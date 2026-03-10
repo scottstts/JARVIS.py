@@ -211,7 +211,7 @@ def create_app(
                     return
                 continue
             except Exception:
-                LOGGER.exception("Unhandled gateway turn error for route_id=%s", route_id)
+                LOGGER.exception("Unhandled gateway turn error.")
                 if not await _send_json_if_open(
                     websocket,
                     build_error_event(

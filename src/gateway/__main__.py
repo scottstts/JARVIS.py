@@ -14,6 +14,7 @@ def main() -> None:
         factory=True,
         host=settings.host,
         port=settings.port,
+        access_log=False,
     )
 
 

@@ -154,11 +154,11 @@ class TelegramBotAPIClient:
                     async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
                         if chunk:
                             handle.write(chunk)
-        except httpx.RequestError as exc:
+        except httpx.RequestError:
             raise TelegramAPIError(
                 code="telegram_http_error",
                 message=f"Telegram file download failed for path '{remote_file_path}'.",
-            ) from exc
+            ) from None
         return destination
 
     async def send_message(
@@ -223,11 +223,11 @@ class TelegramBotAPIClient:
                     files=files,
                     timeout=self._file_transfer_timeout_seconds,
                 )
-            except httpx.RequestError as exc:
+            except httpx.RequestError:
                 raise TelegramAPIError(
                     code="telegram_http_error",
                     message="Telegram request failed for method 'sendDocument'.",
-                ) from exc
+                ) from None
 
         result = self._parse_method_response(response, method="sendDocument")
         if not isinstance(result, dict):
@@ -252,11 +252,11 @@ class TelegramBotAPIClient:
         url = f"{self._api_base_url}/bot{self._token}/{method}"
         try:
             response = await self._session.post(url, json=payload, timeout=timeout)
-        except httpx.RequestError as exc:
+        except httpx.RequestError:
             raise TelegramAPIError(
                 code="telegram_http_error",
                 message=f"Telegram request failed for method '{method}'.",
-            ) from exc
+            ) from None
 
         return self._parse_method_response(response, method=method)
 

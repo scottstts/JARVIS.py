@@ -147,11 +147,11 @@ class GatewayWebSocketClient:
                         )
         except GatewayBridgeError:
             raise
-        except Exception as exc:  # pragma: no cover - exception types depend on websocket lib
+        except Exception:  # pragma: no cover - exception types depend on websocket lib
             raise GatewayBridgeError(
                 code="gateway_unavailable",
                 message="Could not communicate with the gateway websocket.",
-            ) from exc
+            ) from None
 
 
 def _resolve_websocket_connect():

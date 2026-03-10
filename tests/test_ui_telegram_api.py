@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from ui.telegram.api import (
     DraftMessage,
     TelegramAPIError,
@@ -134,6 +136,30 @@ class _BlockingSession(_FakeSession):
         self.started.set()
         await self._release.wait()
         raise AssertionError("Blocking session should be cancelled before completing.")
+
+
+class _RequestErrorSession:
+    def __init__(self, exc: httpx.RequestError) -> None:
+        self._exc = exc
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,
+        data: dict[str, object] | None = None,
+        files: dict[str, object] | None = None,
+        timeout: float,
+    ) -> _FakeResponse:
+        _ = (url, json, data, files, timeout)
+        raise self._exc
+
+    def stream(self, method: str, url: str, *, timeout: float) -> _FakeStream:
+        _ = (method, url, timeout)
+        raise self._exc
+
+    async def aclose(self) -> None:
+        return None
 
 
 class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
@@ -291,3 +317,71 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(asyncio.CancelledError):
             await task
+
+    async def test_send_message_hides_token_when_transport_fails(self) -> None:
+        session = _RequestErrorSession(
+            httpx.RequestError(
+                "network down",
+                request=httpx.Request(
+                    "POST",
+                    "https://api.telegram.org/bot123456:secret/sendMessage",
+                ),
+            )
+        )
+        client = TelegramBotAPIClient(token="123456:secret")
+        client._session = session
+
+        with self.assertRaises(TelegramAPIError) as context:
+            await client.send_message(chat_id=123, text="hi")
+
+        self.assertTrue(context.exception.__suppress_context__)
+        self.assertIsNone(context.exception.__cause__)
+        self.assertNotIn("123456:secret", str(context.exception))
+
+    async def test_download_file_hides_token_when_transport_fails(self) -> None:
+        session = _RequestErrorSession(
+            httpx.RequestError(
+                "network down",
+                request=httpx.Request(
+                    "GET",
+                    "https://api.telegram.org/file/bot123456:secret/documents/report.pdf",
+                ),
+            )
+        )
+        client = TelegramBotAPIClient(token="123456:secret")
+        client._session = session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(TelegramAPIError) as context:
+                await client.download_file(
+                    remote_file_path="documents/report.pdf",
+                    destination_path=Path(tmp) / "report.pdf",
+                )
+
+        self.assertTrue(context.exception.__suppress_context__)
+        self.assertIsNone(context.exception.__cause__)
+        self.assertNotIn("123456:secret", str(context.exception))
+
+    async def test_send_document_hides_token_when_transport_fails(self) -> None:
+        session = _RequestErrorSession(
+            httpx.RequestError(
+                "network down",
+                request=httpx.Request(
+                    "POST",
+                    "https://api.telegram.org/bot123456:secret/sendDocument",
+                ),
+            )
+        )
+        client = TelegramBotAPIClient(token="123456:secret")
+        client._session = session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "report.txt"
+            file_path.write_text("hello", encoding="utf-8")
+
+            with self.assertRaises(TelegramAPIError) as context:
+                await client.send_document(chat_id=123, file_path=file_path)
+
+        self.assertTrue(context.exception.__suppress_context__)
+        self.assertIsNone(context.exception.__cause__)
+        self.assertNotIn("123456:secret", str(context.exception))

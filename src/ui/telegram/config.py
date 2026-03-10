@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import settings as app_settings
@@ -50,6 +50,13 @@ def _parse_optional_int_env(name: str, default: int | None) -> int | None:
         return int(value)
     except ValueError as exc:
         raise UIConfigurationError(f"{name} must be an integer, got: {raw}") from exc
+
+
+def _required_int_env(name: str, default: int | None) -> int:
+    value = _parse_optional_int_env(name, default)
+    if value is None:
+        raise UIConfigurationError(f"{name} must be explicitly set in the environment.")
+    return value
 
 
 def _parse_float_env(name: str, default: float) -> float:
@@ -134,9 +141,12 @@ def _default_telegram_temp_dir() -> Path:
 
 @dataclass(slots=True, frozen=True)
 class UISettings:
-    telegram_token: str
+    telegram_token: str = field(repr=False)
     telegram_api_base_url: str = app_settings.TELEGRAM_API_BASE_URL
-    telegram_allowed_user_id: int | None = app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID
+    telegram_allowed_user_id: int | None = field(
+        default=app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID,
+        repr=False,
+    )
     telegram_temp_dir: Path = _default_telegram_temp_dir()
     telegram_poll_timeout_seconds: int = app_settings.JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS
     telegram_poll_limit: int = app_settings.JARVIS_UI_TELEGRAM_POLL_LIMIT
@@ -154,7 +164,11 @@ class UISettings:
             raise UIConfigurationError("TELEGRAM_TOKEN cannot be empty.")
         if not self.telegram_api_base_url.startswith("https://"):
             raise UIConfigurationError("TELEGRAM_API_BASE_URL must start with https://.")
-        if self.telegram_allowed_user_id is not None and self.telegram_allowed_user_id <= 0:
+        if self.telegram_allowed_user_id is None:
+            raise UIConfigurationError(
+                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID must be explicitly set."
+            )
+        if self.telegram_allowed_user_id <= 0:
             raise UIConfigurationError("JARVIS_UI_TELEGRAM_ALLOWED_USER_ID must be > 0.")
         if not str(self.telegram_temp_dir).strip():
             raise UIConfigurationError("JARVIS_UI_TELEGRAM_TEMP_DIR cannot be empty.")
@@ -188,6 +202,11 @@ class UISettings:
             if gateway_raw is not None
             else _derive_gateway_ws_base_url()
         )
+        telegram_token = _required_env("TELEGRAM_TOKEN")
+        telegram_allowed_user_id = _required_int_env(
+            "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID",
+            app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID,
+        )
         workspace_dir = resolve_workspace_dir(error_type=UIConfigurationError)
         default_telegram_temp_dir = resolve_workspace_child(
             env_name="JARVIS_UI_TELEGRAM_TEMP_DIR",
@@ -197,15 +216,12 @@ class UISettings:
         )
 
         return cls(
-            telegram_token=_required_env("TELEGRAM_TOKEN"),
+            telegram_token=telegram_token,
             telegram_api_base_url=_optional_env(
                 "TELEGRAM_API_BASE_URL",
                 app_settings.TELEGRAM_API_BASE_URL,
             ).rstrip("/"),
-            telegram_allowed_user_id=_parse_optional_int_env(
-                "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID",
-                app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID,
-            ),
+            telegram_allowed_user_id=telegram_allowed_user_id,
             telegram_temp_dir=_parse_path_env(
                 "JARVIS_UI_TELEGRAM_TEMP_DIR",
                 default_telegram_temp_dir,

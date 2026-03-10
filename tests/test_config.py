@@ -11,6 +11,7 @@ import settings as app_settings
 
 from core.config import ContextPolicySettings, CoreSettings
 from core.errors import CoreConfigurationError
+from gateway import GatewaySettings
 
 
 class ContextPolicySettingsTests(unittest.TestCase):
@@ -113,3 +114,11 @@ class CoreSettingsTests(unittest.TestCase):
                 "JARVIS_CORE_TIMEZONE must be a valid IANA timezone",
             ):
                 CoreSettings.from_env()
+
+
+class GatewaySettingsTests(unittest.TestCase):
+    def test_defaults_host_to_localhost(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = GatewaySettings.from_env()
+
+        self.assertEqual(settings.host, "127.0.0.1")
