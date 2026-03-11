@@ -1,7 +1,6 @@
 # USER.md
 
 Name: Scott
-Timezone: Dublin/Europe
 My Website Markdown: https://scottsun.io/llm.txt
 
 ## Context
