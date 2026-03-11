@@ -1,5 +1,6 @@
 """Discoverable tool packages."""
 
+from .ffmpeg_cli import build_ffmpeg_cli_discoverable
 from .generate_edit_image import (
     GenerateEditImagePolicy,
     build_generate_edit_image_discoverable,
@@ -7,6 +8,7 @@ from .generate_edit_image import (
 )
 
 __all__ = [
+    "build_ffmpeg_cli_discoverable",
     "GenerateEditImagePolicy",
     "build_generate_edit_image_discoverable",
     "build_generate_edit_image_tool",

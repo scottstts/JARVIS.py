@@ -33,6 +33,9 @@ from tools.basic.web_fetch.tool import (
 
 _PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
 _BASH_SANDBOX_RUNTIME_AVAILABLE = shutil.which("bwrap") is not None
+_FFMPEG_BASH_RUNTIME_AVAILABLE = (
+    _BASH_SANDBOX_RUNTIME_AVAILABLE and shutil.which("ffmpeg") is not None
+)
 _PYTHON_INTERPRETER_RUNTIME_AVAILABLE = (
     shutil.which("bwrap") is not None and _PYTHON_INTERPRETER_VENV.exists()
 )
@@ -347,11 +350,22 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search_discoverable("archive"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("")],
-                ["generate_edit_image"],
+                ["ffmpeg_cli", "generate_edit_image"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("edit image")],
                 ["generate_edit_image"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("ffmpeg")],
+                ["ffmpeg_cli"],
+            )
+            self.assertEqual(
+                [
+                    tool.name
+                    for tool in registry.resolve_discoverable_tool_definitions(["ffmpeg_cli"])
+                ],
+                [],
             )
 
     def test_search_discoverable_matches_name_alias_and_description(self) -> None:
@@ -761,6 +775,45 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (self.workspace_dir / "note.txt").read_text(encoding="utf-8"),
             "hello",
+        )
+
+    @unittest.skipUnless(
+        _FFMPEG_BASH_RUNTIME_AVAILABLE,
+        "ffmpeg bash runtime is only available when bubblewrap and ffmpeg are installed",
+    )
+    async def test_bash_can_execute_ffmpeg_when_installed(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_ffmpeg_version",
+                name="bash",
+                arguments={"command": "ffmpeg -version | head -n 1"},
+                raw_arguments='{"command":"ffmpeg -version | head -n 1"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("ffmpeg version", result.content)
+
+    @unittest.skipUnless(
+        _BASH_SANDBOX_RUNTIME_AVAILABLE,
+        "bash sandbox runtime is only available when bubblewrap is installed",
+    )
+    async def test_bash_mounts_etc_read_only(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_etc_read_only",
+                name="bash",
+                arguments={"command": "printf 'jarvis' > /etc/jarvis-bash-test"},
+                raw_arguments='{"command":"printf \\"jarvis\\" > /etc/jarvis-bash-test"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            "Read-only file system" in result.content
+            or "Permission denied" in result.content
         )
 
     async def test_file_patch_creates_new_file_with_write_operation(self) -> None:
@@ -1853,6 +1906,28 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result.metadata["activated_discoverable_tool_names"],
             ["archive"],
+        )
+
+    async def test_tool_search_high_verbosity_ffmpeg_cli_is_docs_only_and_not_activated(
+        self,
+    ) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_ffmpeg_cli",
+                name="tool_search",
+                arguments={"query": "ffmpeg", "verbosity": "high"},
+                raw_arguments='{"query":"ffmpeg","verbosity":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("ffmpeg_cli", result.content)
+        self.assertIn("Use the basic `bash` tool", result.content)
+        self.assertEqual(result.metadata["activated_discoverable_tool_names"], [])
+        self.assertEqual(
+            [match["name"] for match in result.metadata["matches"]],
+            ["ffmpeg_cli"],
         )
 
     async def test_web_fetch_uses_tier1_markdown_when_available(self) -> None:

@@ -279,7 +279,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - runs inside `bubblewrap`
 - mounts the real workspace at `/workspace`
 - binds `/tmp` to a workspace-owned internal temp directory
-- mounts only the minimal read-only system runtime paths needed to execute installed commands
+- mounts `/usr` and the full system `/etc` read-only so dynamically linked CLI tools can resolve loader config, alternatives, certificates, and other runtime metadata
 - does not mount `/repo` or `/run/secrets`
 - runs bash with `--noprofile --norc`
 - clears the environment and sets only a minimal runtime env (`PATH`, `HOME`, `PWD`, `TMPDIR`, `LANG`, `LC_ALL`)
@@ -300,7 +300,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 #### Current Limitations
 
 - not a full general-purpose container shell: user-controlled data access is limited to `/workspace`
-- runtime support mounts such as `/usr`, selected `/etc` entries, and `/dev` are present so installed commands can run
+- system runtime paths such as `/usr`, `/etc`, and `/dev` are present, but `/etc` is mounted read-only and user-writable data is still limited to `/workspace`
 - command availability depends on what is installed in the runtime image
 - requires `bubblewrap` to be installed in the runtime environment
 
@@ -616,6 +616,28 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - output settings are intentionally minimal; the tool does not yet expose aspect ratio or background controls
 - the tool saves the image locally but does not automatically send it to Telegram; a later `send_file` call is still needed for delivery
 
+### `ffmpeg_cli`
+
+- Status: implemented
+- Exposure: `discoverable`
+- Package: `src/tools/discoverable/ffmpeg_cli/`
+- Purpose: help the agent discover that ffmpeg and ffprobe are already installed and should be used through the basic `bash` tool
+
+#### Discoverable Entry
+
+- Name: `ffmpeg_cli`
+- Aliases: `ffmpeg`, `ffprobe`, `media_convert`
+- Purpose: use the installed ffmpeg or ffprobe CLI through bash for audio or video conversion, trimming, muxing, probing, and stream extraction
+- Detailed Description: this is a docs-only discoverable entry with no separate runtime; after discovery, invoke `ffmpeg` or `ffprobe` through the basic `bash` tool
+- Usage: use the basic `bash` tool to run `ffmpeg` or `ffprobe` directly inside the container, for example `ffmpeg -i /workspace/input.mp4 /workspace/output.mp3`, and keep all input and output paths inside `/workspace`
+- Metadata: `operator=bash`, `commands=[ffmpeg, ffprobe]`, `runtime=docs_only_discoverable`
+- Backing Tool: none
+
+#### Current Limitations
+
+- not a callable tool; `tool_search` can explain it but cannot activate a separate runtime
+- success depends on constructing a valid `bash` command and keeping file paths inside `/workspace`
+
 ## Tools To Be Implemented
 
 ### Basic Tools
@@ -634,10 +656,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 - Purpose: query and transform CSV, JSON, and SQLite-style tabular data through a higher-level interface
 
-#### `browser_automation`
-
-- Purpose: handle multi-step web tasks that simple search or fetch cannot cover, such as navigation, clicks, or form interaction
-
 #### `workspace_index`
 
 - Purpose: build and query a structured index of workspace files so the agent can find relevant project artifacts faster than raw shell search alone
@@ -646,4 +664,4 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 - Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`
 - Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `generate_edit_image`
+- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `generate_edit_image`

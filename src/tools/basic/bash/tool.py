@@ -19,14 +19,7 @@ _BWRAP_EXECUTABLE = "bwrap"
 _SANDBOX_WORKSPACE = "/workspace"
 _SANDBOX_TMPDIR = "/tmp"
 _SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin"
-_RUNTIME_ETC_FILES = (
-    Path("/etc/hosts"),
-    Path("/etc/nsswitch.conf"),
-    Path("/etc/resolv.conf"),
-)
-_RUNTIME_ETC_DIRS = (
-    Path("/etc/ssl"),
-)
+_RUNTIME_ETC = Path("/etc")
 
 
 class BashToolSetupError(RuntimeError):
@@ -218,25 +211,14 @@ class BashToolExecutor:
                 ]
             )
 
-        command_parts.extend(["--dir", "/etc"])
-        for etc_dir in _RUNTIME_ETC_DIRS:
-            if etc_dir.exists():
-                command_parts.extend(
-                    [
-                        "--ro-bind",
-                        str(etc_dir),
-                        str(etc_dir),
-                    ]
-                )
-        for etc_file in _RUNTIME_ETC_FILES:
-            if etc_file.exists():
-                command_parts.extend(
-                    [
-                        "--ro-bind",
-                        str(etc_file),
-                        str(etc_file),
-                    ]
-                )
+        if _RUNTIME_ETC.exists():
+            command_parts.extend(
+                [
+                    "--ro-bind",
+                    str(_RUNTIME_ETC),
+                    str(_RUNTIME_ETC),
+                ]
+            )
 
         command_parts.extend(
             [
@@ -313,7 +295,8 @@ def _build_bash_tool_description(settings: ToolSettings) -> str:
     return (
         "Run a bash command inside a bubblewrap sandbox. "
         "The sandbox mounts the real workspace at /workspace, scrubs the environment, "
-        "skips shell startup files, and does not expose /repo or /run/secrets. "
+        "mounts system runtime paths like /usr and /etc read-only, skips shell startup files, "
+        "and does not expose /repo or /run/secrets. "
         f"Default working directory is /workspace; the real workspace source is {settings.workspace_dir}. "
         "Examples of available command-line tools in the current runtime include rg, grep, find, file, curl, zip, and unzip. "
         "Use normal shell syntax, including pipes, redirects, command substitution, subshells, "
