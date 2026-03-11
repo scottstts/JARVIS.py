@@ -350,7 +350,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search_discoverable("archive"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("")],
-                ["ffmpeg_cli", "generate_edit_image", "transcribe"],
+                ["ffmpeg_cli", "generate_edit_image", "transcribe", "youtube"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("edit image")],
@@ -363,6 +363,10 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("ffmpeg")],
                 ["ffmpeg_cli"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("youtube")],
+                ["youtube"],
             )
             self.assertEqual(
                 [
@@ -675,6 +679,48 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("inside", decision.reason or "")
+
+    def test_youtube_allows_valid_youtube_urls(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="youtube",
+            arguments={
+                "video_urls": [
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    "https://youtu.be/3JZ_D3ELwOQ?t=43",
+                ]
+            },
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_youtube_denies_invalid_video_urls(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="youtube",
+            arguments={
+                "video_urls": [
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    "https://example.com/not-youtube",
+                    "https://youtu.be/not-a-real-id",
+                ]
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("[2] https://example.com/not-youtube", decision.reason or "")
+        self.assertIn("[3] https://youtu.be/not-a-real-id", decision.reason or "")
+
+    def test_youtube_denies_more_than_ten_urls(self) -> None:
+        video_urls = [
+            f"https://www.youtube.com/watch?v=vid{i:08d}"
+            for i in range(11)
+        ]
+        decision = self.policy.authorize(
+            tool_name="youtube",
+            arguments={"video_urls": video_urls},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("at most 10", decision.reason or "")
 
     def test_web_search_allows_non_empty_query(self) -> None:
         decision = self.policy.authorize(
@@ -1850,6 +1896,226 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("25 MB limit", result.content)
 
+    async def test_youtube_executes_with_default_objectives(self) -> None:
+        captured: dict[str, object] = {}
+
+        class _FakeUsageMetadata:
+            def model_dump(self, *, exclude_none: bool = False) -> dict[str, int]:
+                _ = exclude_none
+                return {"total_token_count": 55}
+
+        class _FakeGeminiModels:
+            def generate_content(self, *, model, contents, config):
+                captured["model"] = model
+                captured["contents"] = contents
+                captured["config"] = config
+                return type(
+                    "_FakeGeminiResponse",
+                    (),
+                    {
+                        "model_version": "gemini-3-flash-preview",
+                        "response_id": "resp_youtube_123",
+                        "usage_metadata": _FakeUsageMetadata(),
+                        "candidates": [
+                            type(
+                                "_FakeCandidate",
+                                (),
+                                {
+                                    "content": type(
+                                        "_FakeContent",
+                                        (),
+                                        {
+                                            "parts": [
+                                                type(
+                                                    "_FakeTextPart",
+                                                    (),
+                                                    {
+                                                        "text": "Video one explains the launch plan.",
+                                                    },
+                                                )(),
+                                                type(
+                                                    "_FakeTextPart",
+                                                    (),
+                                                    {
+                                                        "text": " Video two adds implementation details.",
+                                                    },
+                                                )(),
+                                            ],
+                                        },
+                                    )(),
+                                },
+                            )()
+                        ],
+                    },
+                )()
+
+        class _FakeGeminiClient:
+            def __init__(self, *, api_key: str) -> None:
+                captured["api_key"] = api_key
+                self.models = _FakeGeminiModels()
+
+            def close(self) -> None:
+                captured["closed"] = True
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
+            with patch(
+                "tools.discoverable.youtube.tool.genai.Client",
+                _FakeGeminiClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_youtube_default",
+                        name="youtube",
+                        arguments={
+                            "video_urls": [
+                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                "https://youtu.be/3JZ_D3ELwOQ",
+                            ]
+                        },
+                        raw_arguments=(
+                            '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ",'
+                            '"https://youtu.be/3JZ_D3ELwOQ"]}'
+                        ),
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["provider"], "gemini")
+        self.assertEqual(result.metadata["model"], "gemini-3-flash-preview")
+        self.assertEqual(result.metadata["video_count"], 2)
+        self.assertEqual(result.metadata["objectives_source"], "default")
+        self.assertEqual(captured["api_key"], "test-google-key")
+        self.assertEqual(captured["model"], "gemini-3-flash-preview")
+        self.assertTrue(captured["closed"])
+        config = captured["config"]
+        self.assertIn("You are helping another agent", config.system_instruction)
+        self.assertIn("Summarize each provided video", config.system_instruction)
+        contents = captured["contents"]
+        self.assertEqual(len(contents), 3)
+        self.assertEqual(
+            [contents[0].file_data.file_uri, contents[1].file_data.file_uri],
+            [
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "https://youtu.be/3JZ_D3ELwOQ",
+            ],
+        )
+        self.assertEqual(
+            contents[2],
+            "Analyze the provided YouTube videos using the active system instruction.",
+        )
+        self.assertEqual(
+            result.metadata["usage"],
+            {"total_token_count": 55},
+        )
+        self.assertIn("YouTube analysis completed", result.content)
+        self.assertIn("Video one explains the launch plan.", result.content)
+
+    async def test_youtube_executes_with_custom_objectives(self) -> None:
+        captured: dict[str, object] = {}
+
+        class _FakeGeminiModels:
+            def generate_content(self, *, model, contents, config):
+                captured["model"] = model
+                captured["contents"] = contents
+                captured["config"] = config
+                return type(
+                    "_FakeGeminiResponse",
+                    (),
+                    {
+                        "model_version": "gemini-3-flash-preview",
+                        "candidates": [
+                            type(
+                                "_FakeCandidate",
+                                (),
+                                {
+                                    "content": type(
+                                        "_FakeContent",
+                                        (),
+                                        {
+                                            "parts": [
+                                                type(
+                                                    "_FakeTextPart",
+                                                    (),
+                                                    {
+                                                        "text": "The release date claim appears at the start of the video.",
+                                                    },
+                                                )(),
+                                            ],
+                                        },
+                                    )(),
+                                },
+                            )()
+                        ],
+                    },
+                )()
+
+        class _FakeGeminiClient:
+            def __init__(self, *, api_key: str) -> None:
+                _ = api_key
+                self.models = _FakeGeminiModels()
+
+        custom_objectives = (
+            "Context: I do not need a general summary. I only need release-date evidence "
+            "from this video for downstream planning. Task: extract only concrete claims "
+            "about release timing, attribute each claim clearly, and separate direct "
+            "statements from speculation."
+        )
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
+            with patch(
+                "tools.discoverable.youtube.tool.genai.Client",
+                _FakeGeminiClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_youtube_custom_objectives",
+                        name="youtube",
+                        arguments={
+                            "video_urls": [
+                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                            ],
+                            "objectives": custom_objectives,
+                        },
+                        raw_arguments=(
+                            '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],'
+                            '"objectives":"Context: I do not need a general summary. I only need release-date evidence from this video for downstream planning. Task: extract only concrete claims about release timing, attribute each claim clearly, and separate direct statements from speculation."}'
+                        ),
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["objectives_source"], "provided")
+        self.assertEqual(result.metadata["objectives"], custom_objectives)
+        self.assertEqual(captured["model"], "gemini-3-flash-preview")
+        self.assertIn("You are helping another agent", captured["config"].system_instruction)
+        self.assertIn(custom_objectives, captured["config"].system_instruction)
+        self.assertIn("release date", result.content)
+
+    async def test_youtube_invalid_urls_fail_before_execution(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_youtube_invalid",
+                name="youtube",
+                arguments={
+                    "video_urls": [
+                        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        "https://example.com/not-youtube",
+                    ]
+                },
+                raw_arguments=(
+                    '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ",'
+                    '"https://example.com/not-youtube"]}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.metadata["policy_denied"])
+        self.assertIn("[2] https://example.com/not-youtube", result.content)
+
     async def test_web_search_executes_and_normalizes_results(self) -> None:
         def _fake_requests_get(url, *, params, headers, timeout):
             self.assertEqual(url, "https://api.search.brave.com/res/v1/web/search")
@@ -2094,6 +2360,26 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],
             ["transcribe"],
+        )
+
+    async def test_tool_search_high_verbosity_youtube_activates_tool(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_youtube",
+                name="tool_search",
+                arguments={"query": "youtube", "verbosity": "high"},
+                raw_arguments='{"query":"youtube","verbosity":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("youtube", result.content)
+        self.assertIn("gemini-3-flash-preview", result.content)
+        self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["youtube"])
+        self.assertEqual(
+            [match["name"] for match in result.metadata["matches"]],
+            ["youtube"],
         )
 
     async def test_web_fetch_uses_tier1_markdown_when_available(self) -> None:

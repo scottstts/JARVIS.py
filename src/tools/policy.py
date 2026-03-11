@@ -13,6 +13,7 @@ from .basic.view_image import ViewImagePolicy
 from .config import ToolSettings
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .discoverable.transcribe import TranscribePolicy
+from .discoverable.youtube import YouTubePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
 
 
@@ -83,6 +84,12 @@ class ToolPolicy:
                 context=context,
             )
 
+        if tool_name == "youtube":
+            return YouTubePolicy().authorize(
+                arguments=arguments,
+                context=context,
+            )
+
         if tool_name not in {
             "bash",
             "file_patch",
@@ -94,6 +101,7 @@ class ToolPolicy:
             "tool_search",
             "generate_edit_image",
             "transcribe",
+            "youtube",
         }:
             return ToolPolicyDecision(
                 allowed=False,

@@ -25,6 +25,10 @@ from .discoverable.transcribe import (
     build_transcribe_discoverable,
     build_transcribe_tool,
 )
+from .discoverable.youtube import (
+    build_youtube_discoverable,
+    build_youtube_tool,
+)
 from .types import DiscoverableTool, RegisteredTool
 
 _SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -59,10 +63,12 @@ class ToolRegistry:
         registry.register(build_send_file_tool(settings))
         registry.register(build_generate_edit_image_tool(settings))
         registry.register(build_transcribe_tool(settings))
+        registry.register(build_youtube_tool(settings))
         registry.register(build_tool_search_tool(registry))
         registry.register_discoverable(build_ffmpeg_cli_discoverable())
         registry.register_discoverable(build_generate_edit_image_discoverable())
         registry.register_discoverable(build_transcribe_discoverable())
+        registry.register_discoverable(build_youtube_discoverable())
         return registry
 
     def register(self, tool: RegisteredTool) -> None:

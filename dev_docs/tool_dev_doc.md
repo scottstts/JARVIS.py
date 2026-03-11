@@ -651,6 +651,41 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - files larger than `25 MB` must be trimmed, split, or converted first, typically via `ffmpeg_cli`
 - the tool relies on `OPENAI_API_KEY` at runtime and does not currently support alternate transcription providers
 
+### `youtube`
+
+- Status: implemented
+- Exposure: `discoverable`
+- Package: `src/tools/discoverable/youtube/`
+- Purpose: understand one or more public YouTube videos by URL through Gemini after discovery through `tool_search`
+
+#### Input Schema
+
+- `video_urls: string[]` required; list of one or more valid YouTube video URLs
+- `objectives: string` optional; replaces the default summary task while preserving the tool's shared system instruction when provided
+
+#### Executor Behavior
+
+- stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
+- uses Gemini model `gemini-3-flash-preview`
+- sends each public YouTube URL to Gemini as a video input part and appends a short text prompt after the video parts, following the current Gemini video-understanding guidance
+- always keeps a built-in shared system instruction with universal context and guidelines
+- uses a built-in summary-oriented task objective by default
+- replaces only that default task objective when `objectives` is provided
+- validates all `video_urls` before execution and returns an indexed invalid-URL error instead of making the Gemini call when any URL is malformed
+- returns normalized metadata including provider, model, video count, objectives source, response size, and usage metadata when Gemini returns it
+
+#### Policy
+
+- `video_urls` must be a non-empty list
+- every entry in `video_urls` must be a valid YouTube video URL
+- the current implementation allows at most `10` video URLs per call
+
+#### Current Limitations
+
+- v1 only does simple regex validation; it does not verify that a valid-looking YouTube URL is actually reachable, public, or still available
+- the tool is text-output only; it does not expose structured extraction or timestamp-specific controls beyond what the caller writes into the task-specific `objectives`
+- the tool relies on `GOOGLE_API_KEY` at runtime and does not currently support alternate providers
+
 ### `ffmpeg_cli`
 
 - Status: implemented
@@ -683,10 +718,6 @@ None currently planned.
 
 These should stay hidden by default and only be surfaced through `tool_search`.
 
-#### `view_youtube`
-
-- Purpose: get a summary of a given youtube video.
-
 #### `tabular_query`
 
 - Purpose: query and transform CSV, JSON, and SQLite-style tabular data through a higher-level interface
@@ -697,6 +728,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`, `transcribe`
+- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`, `transcribe`, `youtube`
 - Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `generate_edit_image`, `transcribe`
+- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `generate_edit_image`, `transcribe`, `youtube`

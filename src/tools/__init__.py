@@ -14,6 +14,7 @@ from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .discoverable.transcribe import TranscribePolicy
+from .discoverable.youtube import YouTubePolicy
 from .types import (
     ToolExecutionContext,
     ToolExecutionResult,
@@ -32,6 +33,7 @@ __all__ = [
     "RegisteredTool",
     "SendFilePolicy",
     "TranscribePolicy",
+    "YouTubePolicy",
     "ToolExecutionContext",
     "ToolExecutionResult",
     "ToolExposure",
