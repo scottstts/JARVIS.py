@@ -463,6 +463,40 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["Working on it.", "🔧 Used <b>bash</b> tool.", "Done."],
         )
 
+    async def test_handle_message_preserves_underscores_in_tool_notice(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayToolCallEvent(
+                    session_id="session",
+                    tool_names=("generate_edit_image",),
+                ),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 Used <b>generate_edit_image</b> tool.",
+                "Done.",
+            ],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.sent_messages],
+            ["HTML", "HTML"],
+        )
+
     async def test_handle_message_flushes_pending_stream_text_before_tool_notice(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(

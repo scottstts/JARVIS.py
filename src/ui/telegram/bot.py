@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import shutil
@@ -310,9 +311,9 @@ class TelegramGatewayBridge:
                         delivered_any_segment = True
                         pending_finalized_text_for_dedup = flushed_text
                     for tool_name in event.tool_names:
-                        await self._send_final_text(
+                        await self._send_html_message(
                             chat_id=message.chat_id,
-                            text=_format_tool_usage_notice(tool_name),
+                            html_text=_format_tool_usage_notice(tool_name),
                         )
                         delivered_any_segment = True
                     accumulated_text = ""
@@ -478,6 +479,29 @@ class TelegramGatewayBridge:
                 if not _is_formatting_error(exc):
                     raise
 
+        await self._telegram.send_message(chat_id=chat_id, text=plain_text)
+
+    async def _send_html_message(self, *, chat_id: int, html_text: str) -> None:
+        normalized_html = html_text.strip()
+        if not normalized_html:
+            return
+
+        try:
+            await self._telegram.send_message(
+                chat_id=chat_id,
+                text=normalized_html,
+                parse_mode="HTML",
+            )
+            return
+        except TelegramAPIError as exc:
+            if not _is_formatting_error(exc):
+                raise
+
+        plain_text = _coalesce_visible_text(
+            html.unescape(_HTML_TAG_PATTERN.sub("", normalized_html))
+        )
+        if plain_text is None:
+            return
         await self._telegram.send_message(chat_id=chat_id, text=plain_text)
 
     def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
@@ -876,8 +900,8 @@ def _has_visible_telegram_text(text: str) -> bool:
 
 
 def _format_tool_usage_notice(tool_name: str) -> str:
-    normalized_name = tool_name.strip() or "unknown"
-    return f"🔧 Used **{normalized_name}** tool."
+    normalized_name = html.escape(tool_name.strip() or "unknown")
+    return f"🔧 Used <b>{normalized_name}</b> tool."
 
 
 def _coalesce_visible_text(*candidates: str) -> str | None:
