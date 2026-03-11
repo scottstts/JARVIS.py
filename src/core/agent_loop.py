@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import base64
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,15 @@ _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
     "Continue in a new turn if you want me to keep using tools."
+)
+_FOLLOWUP_COMPACTION_FAILED_TEXT = (
+    "Follow-up request overflow occurred and compaction could not proceed."
+)
+_FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT = (
+    "Follow-up retry aborted: compacted request still exceeds preflight limit."
+)
+_FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
+    "Follow-up retry aborted: compacted request still overflowed the provider context limit."
 )
 
 
@@ -277,15 +287,20 @@ class AgentLoop:
             ),
             self._build_assistant_record(session.session_id, response),
         ]
-        final_response, final_estimated_input_tokens, _used_tool_rounds = (
-            await self._execute_followup_tool_rounds(
-                session=session,
-                base_records=base_records,
-                pending_records=pending_records,
-                current_response=response,
-                current_estimated_input_tokens=final_estimated_input_tokens,
-            )
+        (
+            session,
+            final_response,
+            final_estimated_input_tokens,
+            followup_compacted,
+        ) = await self._execute_followup_tool_rounds(
+            session=session,
+            base_records=base_records,
+            pending_records=pending_records,
+            current_response=response,
+            current_estimated_input_tokens=final_estimated_input_tokens,
         )
+        if followup_compacted:
+            did_compaction = True
 
         self._persist_successful_turn(
             session_id=session.session_id,
@@ -643,33 +658,83 @@ class AgentLoop:
                 current_response = final_response
                 break
 
-            request, final_estimated_input_tokens = await self._execute_tool_calls_and_build_request(
-                session_id=session.session_id,
-                base_records=base_records,
-                pending_records=pending_records,
-                current_response=current_response,
-            )
+            followup_compaction_attempted = False
+            try:
+                request, final_estimated_input_tokens = (
+                    await self._execute_tool_calls_and_build_request(
+                        session_id=session.session_id,
+                        base_records=base_records,
+                        pending_records=pending_records,
+                        current_response=current_response,
+                    )
+                )
+            except ContextBudgetError:
+                (
+                    session,
+                    base_records,
+                    rebound_pending_records,
+                    request,
+                    final_estimated_input_tokens,
+                ) = await self._compact_followup_and_rebuild_request(
+                    session=session,
+                    pending_records=pending_records,
+                    reason="followup_preflight",
+                )
+                pending_records[:] = rebound_pending_records
+                did_compaction = True
+                followup_compaction_attempted = True
 
-            streamed_response: LLMResponse | None = None
-            noticed_followup_tool_call_ids: set[str] = set()
-            async for event in self._llm_service.stream_generate(request):
-                if event.type == "text_delta":
-                    if event.delta:
-                        yield AgentTextDeltaEvent(
-                            session_id=session.session_id,
-                            delta=event.delta,
-                        )
-                elif event.type == "tool_call_delta":
-                    tool_name = str(event.tool_name or "").strip()
-                    call_id = event.call_id.strip()
-                    if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
-                        noticed_followup_tool_call_ids.add(call_id)
-                        yield AgentToolCallEvent(
-                            session_id=session.session_id,
-                            tool_names=(tool_name,),
-                        )
-                elif event.type == "done":
-                    streamed_response = event.response
+            while True:
+                streamed_response: LLMResponse | None = None
+                noticed_followup_tool_call_ids: set[str] = set()
+                emitted_any = False
+                try:
+                    async for event in self._llm_service.stream_generate(request):
+                        if event.type == "text_delta":
+                            emitted_any = True
+                            if event.delta:
+                                yield AgentTextDeltaEvent(
+                                    session_id=session.session_id,
+                                    delta=event.delta,
+                                )
+                        elif event.type == "tool_call_delta":
+                            emitted_any = True
+                            tool_name = str(event.tool_name or "").strip()
+                            call_id = event.call_id.strip()
+                            if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
+                                noticed_followup_tool_call_ids.add(call_id)
+                                yield AgentToolCallEvent(
+                                    session_id=session.session_id,
+                                    tool_names=(tool_name,),
+                                )
+                        elif event.type == "done":
+                            streamed_response = event.response
+                    break
+                except ProviderBadRequestError as exc:
+                    if (
+                        not _is_context_overflow_error(exc)
+                        or emitted_any
+                    ):
+                        raise
+                    if followup_compaction_attempted:
+                        raise ContextBudgetError(
+                            _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
+                        ) from exc
+
+                (
+                    session,
+                    base_records,
+                    rebound_pending_records,
+                    request,
+                    final_estimated_input_tokens,
+                ) = await self._compact_followup_and_rebuild_request(
+                    session=session,
+                    pending_records=pending_records,
+                    reason="followup_overflow",
+                )
+                pending_records[:] = rebound_pending_records
+                did_compaction = True
+                followup_compaction_attempted = True
 
             if streamed_response is None:
                 raise RuntimeError(
@@ -885,35 +950,117 @@ class AgentLoop:
         pending_records: list[ConversationRecord],
         current_response: LLMResponse,
         current_estimated_input_tokens: int,
-    ) -> tuple[LLMResponse, int, bool]:
+    ) -> tuple[SessionMetadata, LLMResponse, int, bool]:
         tool_rounds = 0
+        did_compaction = False
+        current_session = session
+        current_base_records = list(base_records)
 
         while current_response.tool_calls:
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                 current_response, current_estimated_input_tokens = (
                     await self._recover_from_tool_round_limit(
-                        session_id=session.session_id,
-                        base_records=base_records,
+                        session_id=current_session.session_id,
+                        base_records=current_base_records,
                         pending_records=pending_records,
                         attempted_round=tool_rounds,
                     )
                 )
                 break
 
-            request, current_estimated_input_tokens = await self._execute_tool_calls_and_build_request(
-                session_id=session.session_id,
-                base_records=base_records,
-                pending_records=pending_records,
-                current_response=current_response,
-            )
+            followup_compaction_attempted = False
+            try:
+                request, current_estimated_input_tokens = (
+                    await self._execute_tool_calls_and_build_request(
+                        session_id=current_session.session_id,
+                        base_records=current_base_records,
+                        pending_records=pending_records,
+                        current_response=current_response,
+                    )
+                )
+            except ContextBudgetError:
+                (
+                    current_session,
+                    current_base_records,
+                    rebound_pending_records,
+                    request,
+                    current_estimated_input_tokens,
+                ) = await self._compact_followup_and_rebuild_request(
+                    session=current_session,
+                    pending_records=pending_records,
+                    reason="followup_preflight",
+                )
+                pending_records[:] = rebound_pending_records
+                did_compaction = True
+                followup_compaction_attempted = True
 
-            current_response = await self._llm_service.generate(request)
+            while True:
+                try:
+                    current_response = await self._llm_service.generate(request)
+                    break
+                except ProviderBadRequestError as exc:
+                    if not _is_context_overflow_error(exc):
+                        raise
+                    if followup_compaction_attempted:
+                        raise ContextBudgetError(
+                            _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
+                        ) from exc
+
+                (
+                    current_session,
+                    current_base_records,
+                    rebound_pending_records,
+                    request,
+                    current_estimated_input_tokens,
+                ) = await self._compact_followup_and_rebuild_request(
+                    session=current_session,
+                    pending_records=pending_records,
+                    reason="followup_overflow",
+                )
+                pending_records[:] = rebound_pending_records
+                did_compaction = True
+                followup_compaction_attempted = True
+
             pending_records.append(
-                self._build_assistant_record(session.session_id, current_response)
+                self._build_assistant_record(current_session.session_id, current_response)
             )
 
-        return current_response, current_estimated_input_tokens, tool_rounds > 0
+        return current_session, current_response, current_estimated_input_tokens, did_compaction
+
+    async def _compact_followup_and_rebuild_request(
+        self,
+        *,
+        session: SessionMetadata,
+        pending_records: Sequence[ConversationRecord],
+        reason: str,
+    ) -> tuple[SessionMetadata, list[ConversationRecord], list[ConversationRecord], LLMRequest, int]:
+        compacted = await self._compact_session(session, reason=reason)
+        if compacted is None:
+            raise ContextBudgetError(_FOLLOWUP_COMPACTION_FAILED_TEXT)
+
+        rebound_pending_records = [
+            self._clone_record_for_session(compacted.session_id, record)
+            for record in pending_records
+        ]
+        base_records = self._storage.load_records(compacted.session_id)
+        activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
+            rebound_pending_records
+        )
+        request = self._build_request(
+            list(base_records) + rebound_pending_records,
+            activated_discoverable_tool_names=activated_discoverable_tool_names,
+        )
+        estimated_input_tokens = estimate_request_input_tokens(request)
+        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+            raise ContextBudgetError(_FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT)
+        return (
+            compacted,
+            list(base_records),
+            rebound_pending_records,
+            request,
+            estimated_input_tokens,
+        )
 
     def _ensure_active_session(self) -> SessionMetadata:
         active = self._storage.get_active_session()
@@ -1159,6 +1306,21 @@ class AgentLoop:
             metadata=metadata,
         )
         self._storage.append_record(session_id, record)
+
+    def _clone_record_for_session(
+        self,
+        session_id: str,
+        record: ConversationRecord,
+    ) -> ConversationRecord:
+        return ConversationRecord(
+            record_id=uuid4().hex,
+            session_id=session_id,
+            created_at=_utc_now_iso(),
+            role=record.role,
+            content=record.content,
+            kind=record.kind,
+            metadata=deepcopy(record.metadata),
+        )
 
     def _build_turn_context_text(self) -> str:
         current_time = datetime.now(ZoneInfo(self._settings.turn_timezone))

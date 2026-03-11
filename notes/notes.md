@@ -8,6 +8,7 @@
 - Session bootstrap now injects `src/identities/PROGRAM.md`, `src/identities/REACTOR.md`, `src/identities/USER.md`, and `src/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
 - Compaction policy is now provider-agnostic and driven by global environment settings: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
 - Preflight token estimation no longer counts inline image base64 payloads as text; image inputs now use small detail-based heuristic token costs instead.
+- Follow-up tool rounds now compact and continue on a new session when the follow-up request overflows preflight budget or gets a provider context-length error before any streamed follow-up output is emitted.
 - Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
 - Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
 - Added Starlette websocket gateway under src/gateway with route-scoped SessionRouter, one AgentLoop per route, and JSON events (ready, assistant_message, error).

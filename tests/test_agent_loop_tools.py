@@ -18,6 +18,7 @@ from llm import (
     LLMResponse,
     ToolDefinition,
     LLMUsage,
+    ProviderBadRequestError,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -55,6 +56,19 @@ def _build_response(
         finish_reason=finish_reason,  # type: ignore[arg-type]
         usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
         response_id="resp_fake",
+    )
+
+
+def _is_compaction_request(request: LLMRequest) -> bool:
+    return (
+        len(request.messages) == 2
+        and request.messages[0].role == "system"
+        and request.messages[1].role == "user"
+        and any(
+            isinstance(part, TextPart)
+            and "Compact the following transcript." in part.text
+            for part in request.messages[1].parts
+        )
     )
 
 
@@ -657,6 +671,138 @@ class _FakeToolRoundLimitLLMService:
         )
 
 
+class _FakeFollowupPreflightCompactionLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        if _is_compaction_request(request):
+            return _build_response("Compacted summary")
+
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response("Seed history.")
+        if self.generate_calls == 2:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="bash_compact_1",
+                        name="bash",
+                        arguments={"command": "printf 'hello' | tee note.txt"},
+                        raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if not any(message.role == "developer" for message in request.messages):
+            raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
+        if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
+            raise AssertionError("Expected assistant/tool history to survive follow-up compaction.")
+        return _build_response("Recovered after compaction.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeStreamingFollowupOverflowCompactionLLMService:
+    def __init__(self) -> None:
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        if _is_compaction_request(request):
+            return _build_response("Compacted summary")
+        raise AssertionError("Non-compaction generate should not be used in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.stream_calls == 1:
+            yield TextDeltaEvent(delta="Seed history.")
+            yield DoneEvent(response=_build_response("Seed history."))
+            return
+        if self.stream_calls == 2:
+            yield DoneEvent(
+                response=_build_response(
+                    "Working on it.",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="bash_stream_compact_1",
+                            name="bash",
+                            arguments={"command": "printf 'hello' | tee note.txt"},
+                            raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+        if self.stream_calls == 3:
+            raise ProviderBadRequestError("context_length_exceeded")
+
+        if not any(message.role == "developer" for message in request.messages):
+            raise AssertionError("Expected the compacted streamed follow-up request to include a summary seed.")
+        if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
+            raise AssertionError("Expected assistant/tool history to survive streamed follow-up compaction.")
+        yield TextDeltaEvent(delta="Recovered after compaction.")
+        yield DoneEvent(response=_build_response("Recovered after compaction."))
+
+
+class _FakeFollowupOverflowCompactionLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        if _is_compaction_request(request):
+            return _build_response("Compacted summary")
+
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response("Seed history.")
+        if self.generate_calls == 2:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="bash_compact_overflow_1",
+                        name="bash",
+                        arguments={"command": "printf 'hello' | tee note.txt"},
+                        raw_arguments='{"command":"printf \\"hello\\" | tee note.txt"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if self.generate_calls == 3:
+            raise ProviderBadRequestError("context_length_exceeded")
+
+        if not any(message.role == "developer" for message in request.messages):
+            raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
+        if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
+            raise AssertionError("Expected assistant/tool history to survive follow-up compaction.")
+        return _build_response("Recovered after compaction.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -734,6 +880,52 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "bash")
             self.assertIn("Bash execution result", message_records[-2].content)
 
+    async def test_handle_user_input_auto_compacts_when_followup_preflight_budget_is_exceeded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeFollowupPreflightCompactionLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            seeded = await loop.handle_user_input("Seed history.")
+
+            def _estimate_with_followup_overflow(request: LLMRequest) -> int:
+                has_tool_result = any(message.role == "tool" for message in request.messages)
+                has_summary_seed = any(message.role == "developer" for message in request.messages)
+                if has_tool_result and not has_summary_seed:
+                    return settings.context_policy.preflight_limit_tokens
+                return 10
+
+            with patch(
+                "core.agent_loop.estimate_request_input_tokens",
+                side_effect=_estimate_with_followup_overflow,
+            ):
+                result = await loop.handle_user_input("Write hello into note.txt.")
+
+            self.assertEqual(result.response_text, "Recovered after compaction.")
+            self.assertTrue(result.compaction_performed)
+            self.assertNotEqual(result.session_id, seeded.session_id)
+            self.assertEqual(
+                (settings.workspace_dir / "note.txt").read_text(encoding="utf-8"),
+                "hello",
+            )
+
+            old_session = storage.get_session(seeded.session_id)
+            self.assertIsNotNone(old_session)
+            self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
+
+            new_records = storage.load_records(result.session_id)
+            self.assertTrue(
+                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+            )
+            self.assertEqual(new_records[-1].role, "assistant")
+            self.assertEqual(new_records[-1].content, "Recovered after compaction.")
+
     async def test_stream_user_input_completes_tool_round_and_emits_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -806,6 +998,82 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             if not isinstance(first_message, AgentAssistantMessageEvent):
                 self.fail("Expected the mixed response text to still be finalized.")
             self.assertEqual(first_message.text, "Working on it.")
+
+    async def test_handle_user_input_auto_compacts_when_followup_provider_overflows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeFollowupOverflowCompactionLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            seeded = await loop.handle_user_input("Seed history.")
+            result = await loop.handle_user_input("Write hello into note.txt.")
+
+            self.assertEqual(result.response_text, "Recovered after compaction.")
+            self.assertTrue(result.compaction_performed)
+            self.assertNotEqual(result.session_id, seeded.session_id)
+            self.assertEqual(
+                (settings.workspace_dir / "note.txt").read_text(encoding="utf-8"),
+                "hello",
+            )
+
+            old_session = storage.get_session(seeded.session_id)
+            self.assertIsNotNone(old_session)
+            self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
+
+            new_records = storage.load_records(result.session_id)
+            self.assertTrue(
+                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+            )
+            self.assertEqual(new_records[-1].content, "Recovered after compaction.")
+
+    async def test_stream_user_input_auto_compacts_when_followup_provider_overflows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeStreamingFollowupOverflowCompactionLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            seeded_events = [event async for event in loop.stream_user_input("Seed history.")]
+            seeded_done = seeded_events[-1]
+            if not isinstance(seeded_done, AgentTurnDoneEvent):
+                self.fail("Expected the seeded turn to complete with a done event.")
+
+            events = [event async for event in loop.stream_user_input("Write hello into note.txt.")]
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertEqual(done.response_text, "Recovered after compaction.")
+            self.assertTrue(done.compaction_performed)
+            self.assertNotEqual(done.session_id, seeded_done.session_id)
+            self.assertEqual(
+                (settings.workspace_dir / "note.txt").read_text(encoding="utf-8"),
+                "hello",
+            )
+
+            old_session = storage.get_session(seeded_done.session_id)
+            self.assertIsNotNone(old_session)
+            self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
+
+            assistant_messages = [
+                event.text
+                for event in events
+                if isinstance(event, AgentAssistantMessageEvent)
+            ]
+            self.assertEqual(assistant_messages[-1], "Recovered after compaction.")
+
+            new_records = storage.load_records(done.session_id)
+            self.assertTrue(
+                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+            )
+            self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 
     async def test_handle_user_input_executes_view_image_tool_and_keeps_attachment_transient(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
