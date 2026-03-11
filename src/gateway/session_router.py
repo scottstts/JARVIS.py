@@ -30,6 +30,9 @@ class AgentLoopLike(Protocol):
     def active_session_id(self) -> str | None:
         """Return active session id for this route."""
 
+    def request_stop(self) -> bool:
+        """Request cooperative stop for the active turn, if any."""
+
 
 def validate_route_id(route_id: str) -> str:
     normalized = route_id.strip()
@@ -67,6 +70,10 @@ class SessionRouter:
     def active_session_id(self, route_id: str) -> str | None:
         context = self.get_or_create(route_id)
         return context.agent_loop.active_session_id()
+
+    def request_stop(self, route_id: str) -> bool:
+        context = self.get_or_create(route_id)
+        return context.agent_loop.request_stop()
 
     async def run_turn(self, route_id: str, user_text: str) -> AgentTurnResult:
         context = self.get_or_create(route_id)

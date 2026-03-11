@@ -44,6 +44,9 @@ class GatewayClientLike(Protocol):
     async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[Any]:
         """Streams one gateway turn."""
 
+    async def request_stop(self, *, route_id: str) -> bool:
+        """Requests cooperative stop for the active turn on the given route."""
+
 
 class TelegramClientLike(Protocol):
     async def get_me(self) -> dict[str, Any]:
@@ -149,6 +152,8 @@ class TelegramGatewayBridge:
         self._next_draft_ids: dict[int, int] = {}
         self._draft_retry_until_by_chat: dict[int, float] = {}
         self._draft_min_interval_by_chat: dict[int, float] = {}
+        self._chat_queues: dict[int, asyncio.Queue[IncomingTelegramMessage]] = {}
+        self._chat_workers: dict[int, asyncio.Task[None]] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -194,8 +199,55 @@ class TelegramGatewayBridge:
             message = parse_incoming_message(update)
             if message is None:
                 continue
-            await self.handle_message(message)
+            await self.dispatch_message(message)
         return next_offset
+
+    async def dispatch_message(self, message: IncomingTelegramMessage) -> None:
+        if message.chat_type != "private":
+            return
+        if not _is_authorized_private_message(
+            message=message,
+            allowed_user_id=self._settings.telegram_allowed_user_id,
+        ):
+            LOGGER.warning("Ignoring unauthorized Telegram private message.")
+            return
+        if message.file_attachment is None and _is_stop_command_text(message.text):
+            await self._handle_stop_command(message)
+            return
+
+        queue = self._chat_queues.get(message.chat_id)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._chat_queues[message.chat_id] = queue
+        await queue.put(message)
+
+        worker = self._chat_workers.get(message.chat_id)
+        if worker is None or worker.done():
+            self._chat_workers[message.chat_id] = asyncio.create_task(
+                self._chat_worker(message.chat_id),
+                name=f"jarvis-telegram-chat-{message.chat_id}",
+            )
+
+    async def _chat_worker(self, chat_id: int) -> None:
+        queue = self._chat_queues[chat_id]
+        try:
+            while True:
+                message = await queue.get()
+                try:
+                    await self.handle_message(message)
+                finally:
+                    queue.task_done()
+                if queue.empty():
+                    return
+        except asyncio.CancelledError:
+            raise
+        finally:
+            worker = self._chat_workers.get(chat_id)
+            current_task = asyncio.current_task()
+            if worker is current_task:
+                self._chat_workers.pop(chat_id, None)
+            if queue.empty():
+                self._chat_queues.pop(chat_id, None)
 
     async def handle_message(self, message: IncomingTelegramMessage) -> None:
         if message.chat_type != "private":
@@ -205,6 +257,9 @@ class TelegramGatewayBridge:
             allowed_user_id=self._settings.telegram_allowed_user_id,
         ):
             LOGGER.warning("Ignoring unauthorized Telegram private message.")
+            return
+        if message.file_attachment is None and _is_stop_command_text(message.text):
+            await self._handle_stop_command(message)
             return
 
         user_text = message.text
@@ -324,6 +379,8 @@ class TelegramGatewayBridge:
                     continue
 
                 if isinstance(event, GatewayTurnDoneEvent):
+                    if event.interrupted:
+                        return
                     if not delivered_any_segment:
                         final_text = (
                             _coalesce_visible_text(
@@ -361,7 +418,45 @@ class TelegramGatewayBridge:
                 LOGGER.exception("Failed to send fallback error text.")
 
     async def aclose(self) -> None:
+        for worker in self._chat_workers.values():
+            worker.cancel()
+        for worker in self._chat_workers.values():
+            with suppress(asyncio.CancelledError):
+                await worker
+        self._chat_workers.clear()
+        self._chat_queues.clear()
         await self._telegram.aclose()
+
+    async def wait_for_chat_idle(self, chat_id: int) -> None:
+        queue = self._chat_queues.get(chat_id)
+        if queue is not None:
+            await queue.join()
+        worker = self._chat_workers.get(chat_id)
+        if worker is not None:
+            await worker
+
+    async def _handle_stop_command(self, message: IncomingTelegramMessage) -> None:
+        route_id = route_id_for_chat(message.chat_id)
+        try:
+            stop_requested = await self._gateway.request_stop(route_id=route_id)
+        except GatewayBridgeError as exc:
+            LOGGER.exception("Gateway stop request failed.")
+            await self._send_final_text(
+                chat_id=message.chat_id,
+                text=exc.message if exc.message else _GENERIC_ERROR_REPLY,
+            )
+            return
+
+        if stop_requested:
+            await self._send_final_text(
+                chat_id=message.chat_id,
+                text="Stop requested. I will stop after the current step.",
+            )
+            return
+        await self._send_final_text(
+            chat_id=message.chat_id,
+            text="Nothing is currently running.",
+        )
 
     async def send_file(
         self,
@@ -902,6 +997,13 @@ def _has_visible_telegram_text(text: str) -> bool:
 def _format_tool_usage_notice(tool_name: str) -> str:
     normalized_name = html.escape(tool_name.strip() or "unknown")
     return f"🔧 Used <b>{normalized_name}</b> tool."
+
+
+def _is_stop_command_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return stripped.split(maxsplit=1)[0] == "/stop"
 
 
 def _coalesce_visible_text(*candidates: str) -> str | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from base64 import b64decode
@@ -27,7 +28,15 @@ from llm import (
 )
 from storage import SessionStorage
 from tests.helpers import build_core_settings
-from tools import DiscoverableTool, RegisteredTool, ToolRegistry, ToolSettings
+from tools import (
+    DiscoverableTool,
+    RegisteredTool,
+    ToolExecutionResult,
+    ToolPolicyDecision,
+    ToolRegistry,
+    ToolRuntime,
+    ToolSettings,
+)
 from tools.basic.web_fetch.tool import HTTPFetchResult
 
 _EXPECTED_BASIC_TOOL_NAMES = [
@@ -803,6 +812,274 @@ class _FakeFollowupOverflowCompactionLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _BlockingToolExecutor:
+    def __init__(
+        self,
+        *,
+        name: str = "slow_tool",
+        content: str = "slow tool finished",
+    ) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self._name = name
+        self._content = content
+
+    async def __call__(self, *, call_id: str, arguments: dict[str, object], context) -> ToolExecutionResult:
+        _ = arguments, context
+        self.started.set()
+        await self.release.wait()
+        return ToolExecutionResult(
+            call_id=call_id,
+            name=self._name,
+            ok=True,
+            content=self._content,
+            metadata={"source": "test"},
+        )
+
+
+class _FakeStopDuringToolLLMService:
+    def __init__(
+        self,
+        *,
+        tool_name: str = "slow_tool",
+        assistant_text: str = "Using the slow tool.",
+    ) -> None:
+        self.stream_calls = 0
+        self._tool_name = tool_name
+        self._assistant_text = assistant_text
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generate is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != [self._tool_name]:
+            raise AssertionError(f"Expected only {self._tool_name} to be registered, got {names}.")
+        if self.stream_calls > 1:
+            raise AssertionError("Stop should prevent follow-up model calls after the tool batch.")
+        yield DoneEvent(
+            response=_build_response(
+                self._assistant_text,
+                tool_calls=[
+                    ToolCall(
+                        call_id=f"{self._tool_name}_1",
+                        name=self._tool_name,
+                        arguments={},
+                        raw_arguments="{}",
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+
+
+class _LargeOutputToolExecutor:
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    async def __call__(self, *, call_id: str, arguments: dict[str, object], context) -> ToolExecutionResult:
+        _ = arguments, context
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="large_tool",
+            ok=True,
+            content=self._content,
+        )
+
+
+class _FakeCurrentTurnResidualCompactionLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        if _is_compaction_request(request):
+            return _build_response("Compacted current-turn summary")
+
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != ["large_tool"]:
+            raise AssertionError(f"Expected only large_tool to be registered, got {names}.")
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="large_tool_1",
+                        name="large_tool",
+                        arguments={},
+                        raw_arguments="{}",
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if not any(message.role == "developer" for message in request.messages):
+            raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
+        tool_messages = [message for message in request.messages if message.role == "tool"]
+        if len(tool_messages) != 1:
+            raise AssertionError("Expected one carried-forward tool result message.")
+        tool_text_parts = [
+            part.content
+            for part in tool_messages[0].parts
+            if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_text_parts) != 1:
+            raise AssertionError("Expected one carried-forward tool result part.")
+        if len(tool_text_parts[0]) >= 2_500:
+            raise AssertionError("Expected carried-forward tool output to be compacted.")
+        return _build_response("Recovered after compacting the current turn.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
+class _InterruptedToolProposalContinuationLLMService:
+    def __init__(self) -> None:
+        self.stream_started = asyncio.Event()
+        self.release_stream = asyncio.Event()
+        self.generate_requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_requests.append(request)
+        if any(
+            isinstance(part, ToolCall) and part.name == "python_interpreter"
+            for message in request.messages
+            if message.role == "assistant"
+            for part in message.parts
+        ):
+            raise AssertionError("Dangling interrupted python tool calls should be normalized before prompt build.")
+        if not any(
+            isinstance(part, TextPart)
+            and "python_interpreter" in part.text
+            and "Treat them as not run." in part.text
+            for message in request.messages
+            if message.role == "system"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected a normalization note for the unexecuted interrupted tool call.")
+        return _build_response("continued")
+
+    async def stream_generate(self, request: LLMRequest):
+        if "python_interpreter" not in [tool.name for tool in request.tools]:
+            raise AssertionError("Expected python_interpreter to be available in the initial tool request.")
+        yield TextDeltaEvent(delta="I'll use python.")
+        self.stream_started.set()
+        await self.release_stream.wait()
+        yield DoneEvent(
+            response=_build_response(
+                "I'll use python.",
+                tool_calls=[
+                    ToolCall(
+                        call_id="python_1",
+                        name="python_interpreter",
+                        arguments={"code": "print('x')"},
+                        raw_arguments='{"code":"print(\\"x\\")"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+
+
+class _InterruptedCompletedToolContinuationLLMService:
+    def __init__(self) -> None:
+        self.stream_calls = 0
+        self.generate_requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_requests.append(request)
+        if not any(
+            isinstance(part, ToolCall) and part.name == "slow_tool"
+            for message in request.messages
+            if message.role == "assistant"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected the interrupted turn's completed slow_tool call to remain in context.")
+        if not any(
+            isinstance(part, ToolResultPart) and part.content == "slow tool finished"
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected the interrupted turn's completed tool result to remain in context.")
+        return _build_response("continued after tool")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != ["slow_tool"]:
+            raise AssertionError(f"Expected only slow_tool to be registered, got {names}.")
+        if self.stream_calls > 1:
+            raise AssertionError("Stop should prevent follow-up model calls after the tool batch.")
+        yield DoneEvent(
+            response=_build_response(
+                "Using the slow tool.",
+                tool_calls=[
+                    ToolCall(
+                        call_id="slow_tool_1",
+                        name="slow_tool",
+                        arguments={},
+                        raw_arguments="{}",
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+
+
+class _StopMidToolCallStreamingLLMService:
+    def __init__(self) -> None:
+        self.tool_call_started = asyncio.Event()
+        self.release_stream = asyncio.Event()
+        self.stream_closed = asyncio.Event()
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generate is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        try:
+            names = [tool.name for tool in request.tools]
+            if "python_interpreter" not in names:
+                raise AssertionError("Expected python_interpreter to be available in the request.")
+            yield TextDeltaEvent(delta="I'll use Python for this.")
+            yield ToolCallDeltaEvent(
+                call_id="python_1",
+                tool_name="python_interpreter",
+                arguments_delta='{"code":"print(',
+            )
+            self.tool_call_started.set()
+            await self.release_stream.wait()
+            yield ToolCallDeltaEvent(
+                call_id="python_1",
+                tool_name="python_interpreter",
+                arguments_delta='"hello world")"}',
+            )
+            yield DoneEvent(
+                response=_build_response(
+                    "I'll use Python for this.",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="python_1",
+                            name="python_interpreter",
+                            arguments={"code": 'print("hello world")'},
+                            raw_arguments='{"code":"print(\\"hello world\\")"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+        finally:
+            self.stream_closed.set()
+
+
+class _AllowAllToolPolicy:
+    def authorize(self, *, tool_name: str, arguments: dict[str, object], context) -> ToolPolicyDecision:
+        _ = tool_name, arguments, context
+        return ToolPolicyDecision(allowed=True)
+
+
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -926,6 +1203,85 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(new_records[-1].role, "assistant")
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 
+    async def test_handle_user_input_auto_compacts_when_current_turn_itself_overflows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            large_output = "L" * 8_000
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="large_tool",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="large_tool",
+                            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                            description="Large-output test tool.",
+                        ),
+                        executor=_LargeOutputToolExecutor(large_output),
+                    )
+                ]
+            )
+            loop = AgentLoop(
+                llm_service=_FakeCurrentTurnResidualCompactionLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            def _estimate_current_turn_overflow(request: LLMRequest) -> int:
+                tool_parts = [
+                    part.content
+                    for message in request.messages
+                    if message.role == "tool"
+                    for part in message.parts
+                    if isinstance(part, ToolResultPart)
+                ]
+                if not tool_parts:
+                    return 10
+                has_summary_seed = any(message.role == "developer" for message in request.messages)
+                if not has_summary_seed:
+                    return settings.context_policy.preflight_limit_tokens
+                if max(len(content) for content in tool_parts) >= 2_500:
+                    return settings.context_policy.preflight_limit_tokens
+                return 10
+
+            with patch(
+                "core.agent_loop.estimate_request_input_tokens",
+                side_effect=_estimate_current_turn_overflow,
+            ):
+                result = await loop.handle_user_input("Use the large tool.")
+
+            self.assertEqual(result.response_text, "Recovered after compacting the current turn.")
+            self.assertTrue(result.compaction_performed)
+
+            new_session = storage.get_session(result.session_id)
+            self.assertIsNotNone(new_session)
+            self.assertEqual(new_session.start_reason, "compaction")  # type: ignore[union-attr]
+            self.assertIsNotNone(new_session.parent_session_id)  # type: ignore[union-attr]
+
+            new_records = storage.load_records(result.session_id, include_all_turns=True)
+            self.assertTrue(
+                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+            )
+            new_tool_records = [record for record in new_records if record.role == "tool"]
+            self.assertEqual(len(new_tool_records), 1)
+            self.assertTrue(new_tool_records[0].metadata.get("carry_forward_compacted"))
+            self.assertLess(len(new_tool_records[0].content), 2_500)
+
+            archived_session_id = new_session.parent_session_id  # type: ignore[union-attr]
+            archived_session = storage.get_session(archived_session_id)
+            self.assertIsNotNone(archived_session)
+            self.assertEqual(archived_session.status, "archived")  # type: ignore[union-attr]
+            archived_records = storage.load_records(archived_session_id, include_all_turns=True)
+            archived_tool_records = [record for record in archived_records if record.role == "tool"]
+            self.assertEqual(len(archived_tool_records), 1)
+            self.assertEqual(archived_tool_records[0].content, large_output)
+
     async def test_stream_user_input_completes_tool_round_and_emits_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -998,6 +1354,256 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             if not isinstance(first_message, AgentAssistantMessageEvent):
                 self.fail("Expected the mixed response text to still be finalized.")
             self.assertEqual(first_message.text, "Working on it.")
+
+    async def test_stream_user_input_interrupts_after_current_tool_batch_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            tool_executor = _BlockingToolExecutor()
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="slow_tool",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="slow_tool",
+                            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                            description="Slow test tool.",
+                        ),
+                        executor=tool_executor,
+                    )
+                ]
+            )
+            loop = AgentLoop(
+                llm_service=_FakeStopDuringToolLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("Use the slow tool.")]
+
+            task = asyncio.create_task(_collect_events())
+            await tool_executor.started.wait()
+
+            self.assertTrue(loop.request_stop())
+            tool_executor.release.set()
+            events = await task
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+            self.assertEqual(done.response_text, "Using the slow tool.")
+
+            all_records = storage.load_records(done.session_id, include_all_turns=True)
+            message_records = [record for record in all_records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "system")
+            self.assertEqual(message_records[-2].content, "slow tool finished")
+
+    async def test_stream_user_input_persists_text_when_stop_interrupts_mid_tool_call_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _StopMidToolCallStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("Use python.")]
+
+            task = asyncio.create_task(_collect_events())
+            await llm_service.tool_call_started.wait()
+
+            self.assertTrue(loop.request_stop())
+            llm_service.release_stream.set()
+            events = await task
+            await llm_service.stream_closed.wait()
+
+            self.assertEqual(
+                [event.type for event in events],
+                ["text_delta", "tool_call", "done"],
+            )
+            tool_event = events[1]
+            if not isinstance(tool_event, AgentToolCallEvent):
+                self.fail("Expected the second event to be an AgentToolCallEvent.")
+            self.assertEqual(tool_event.tool_names, ("python_interpreter",))
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+            self.assertEqual(done.response_text, "I'll use Python for this.")
+
+            records = storage.load_records(done.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual([record.role for record in message_records[-3:]], ["user", "assistant", "system"])
+            self.assertEqual(message_records[-2].content, "I'll use Python for this.")
+            self.assertEqual(message_records[-2].metadata.get("tool_calls"), None)
+            self.assertFalse(any(record.role == "tool" for record in message_records))
+
+    async def test_next_turn_normalizes_unexecuted_interrupted_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _InterruptedToolProposalContinuationLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("Use python.")]
+
+            task = asyncio.create_task(_collect_events())
+            await llm_service.stream_started.wait()
+
+            self.assertTrue(loop.request_stop())
+            llm_service.release_stream.set()
+            events = await task
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+
+            result = await loop.handle_user_input("continue")
+            self.assertEqual(result.response_text, "continued")
+            self.assertEqual(len(llm_service.generate_requests), 1)
+
+    async def test_next_turn_keeps_completed_tool_results_from_interrupted_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            tool_executor = _BlockingToolExecutor()
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="slow_tool",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="slow_tool",
+                            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                            description="Slow test tool.",
+                        ),
+                        executor=tool_executor,
+                    )
+                ]
+            )
+            llm_service = _InterruptedCompletedToolContinuationLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("Use the slow tool.")]
+
+            task = asyncio.create_task(_collect_events())
+            await tool_executor.started.wait()
+
+            self.assertTrue(loop.request_stop())
+            tool_executor.release.set()
+            events = await task
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+
+            result = await loop.handle_user_input("continue")
+            self.assertEqual(result.response_text, "continued after tool")
+            self.assertEqual(len(llm_service.generate_requests), 1)
+
+    async def test_stream_user_input_stops_after_large_tool_batch_without_compacting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            large_output = "tool-output-" * 800
+            tool_executor = _BlockingToolExecutor(
+                name="large_tool",
+                content=large_output,
+            )
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="large_tool",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="large_tool",
+                            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                            description="Large-output stop test tool.",
+                        ),
+                        executor=tool_executor,
+                    )
+                ]
+            )
+            loop = AgentLoop(
+                llm_service=_FakeStopDuringToolLLMService(
+                    tool_name="large_tool",
+                    assistant_text="Using the large tool.",
+                ),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            def _estimate_with_tool_overflow(request: LLMRequest) -> int:
+                if any(message.role == "tool" for message in request.messages):
+                    return settings.context_policy.preflight_limit_tokens
+                return 10
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("Use the large tool.")]
+
+            with patch(
+                "core.agent_loop.estimate_request_input_tokens",
+                side_effect=_estimate_with_tool_overflow,
+            ):
+                task = asyncio.create_task(_collect_events())
+                await tool_executor.started.wait()
+
+                self.assertTrue(loop.request_stop())
+                tool_executor.release.set()
+                events = await task
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+            self.assertFalse(done.compaction_performed)
+            self.assertEqual(done.response_text, "Using the large tool.")
+
+            session = storage.get_session(done.session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.compaction_count, 0)  # type: ignore[union-attr]
+
+            all_records = storage.load_records(done.session_id, include_all_turns=True)
+            tool_records = [record for record in all_records if record.role == "tool"]
+            self.assertEqual(len(tool_records), 1)
+            self.assertEqual(tool_records[0].content, large_output)
 
     async def test_handle_user_input_auto_compacts_when_followup_provider_overflows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

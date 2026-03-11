@@ -25,6 +25,13 @@ class GatewayProtocolTests(unittest.TestCase):
             parse_client_event({"type": "ping"}, max_message_chars=100)
         self.assertEqual(context.exception.code, "unsupported_event_type")
 
+    def test_parse_stop_turn_success(self) -> None:
+        parsed = parse_client_event(
+            {"type": "stop_turn"},
+            max_message_chars=100,
+        )
+        self.assertEqual(type(parsed).__name__, "ClientStopTurn")
+
     def test_text_must_be_non_empty_string(self) -> None:
         with self.assertRaises(ProtocolError) as non_string:
             parse_client_event({"type": "user_message", "text": 123}, max_message_chars=100)

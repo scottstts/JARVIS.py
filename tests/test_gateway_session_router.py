@@ -15,9 +15,14 @@ class _TrackingLoop:
         self.messages: list[str] = []
         self.active_calls = 0
         self.max_concurrency = 0
+        self.stop_requests = 0
 
     def active_session_id(self) -> str | None:
         return self._session_id
+
+    def request_stop(self) -> bool:
+        self.stop_requests += 1
+        return True
 
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         self.active_calls += 1
@@ -111,6 +116,15 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0].type, "text_delta")
         self.assertEqual(events[1].type, "assistant_message")
         self.assertEqual(events[2].type, "done")
+
+    async def test_request_stop_delegates_to_route_loop(self) -> None:
+        loop = _TrackingLoop(session_id="alpha-session")
+        router = SessionRouter(lambda _route_id: loop)
+
+        stop_requested = router.request_stop("alpha")
+
+        self.assertTrue(stop_requested)
+        self.assertEqual(loop.stop_requests, 1)
 
 
 class ValidateRouteIDTests(unittest.TestCase):

@@ -23,9 +23,14 @@ class _FakeRouter:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.active_sessions: dict[str, str | None] = {}
+        self.stop_requests: list[str] = []
 
     def active_session_id(self, route_id: str) -> str | None:
         return self.active_sessions.get(route_id)
+
+    def request_stop(self, route_id: str) -> bool:
+        self.stop_requests.append(route_id)
+        return route_id == "dm_stop"
 
     async def stream_turn(self, route_id: str, user_text: str):
         self.calls.append((route_id, user_text))
@@ -110,6 +115,22 @@ class GatewayAppTests(unittest.TestCase):
 
                 done = socket.receive_json()
                 self.assertEqual(done["type"], "turn_done")
+
+    def test_stop_turn_event_is_acknowledged(self) -> None:
+        router = _FakeRouter()
+        app = create_app(
+            gateway_settings=GatewaySettings(websocket_path="/ws", max_message_chars=50),
+            router=router,
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/dm_stop") as socket:
+                _ = socket.receive_json()  # ready
+                socket.send_json({"type": "stop_turn"})
+                ack = socket.receive_json()
+                self.assertEqual(ack["type"], "stop_ack")
+                self.assertTrue(ack["stop_requested"])
+                self.assertEqual(router.stop_requests, ["dm_stop"])
 
     def test_invalid_json_emits_error_event(self) -> None:
         app = create_app(

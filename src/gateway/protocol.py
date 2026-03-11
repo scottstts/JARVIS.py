@@ -20,7 +20,16 @@ class ClientUserMessage:
     text: str
 
 
-def parse_client_event(payload: Any, *, max_message_chars: int) -> ClientUserMessage:
+@dataclass(slots=True, frozen=True)
+class ClientStopTurn:
+    pass
+
+
+def parse_client_event(
+    payload: Any,
+    *,
+    max_message_chars: int,
+) -> ClientUserMessage | ClientStopTurn:
     if not isinstance(payload, dict):
         raise ProtocolError(
             code="invalid_payload",
@@ -28,10 +37,12 @@ def parse_client_event(payload: Any, *, max_message_chars: int) -> ClientUserMes
         )
 
     event_type = payload.get("type")
+    if event_type == "stop_turn":
+        return ClientStopTurn()
     if event_type != "user_message":
         raise ProtocolError(
             code="unsupported_event_type",
-            message="Only 'user_message' events are supported.",
+            message="Only 'user_message' and 'stop_turn' events are supported.",
         )
 
     raw_text = payload.get("text")
@@ -100,6 +111,7 @@ def build_turn_done_event(
     response_text: str,
     command: str | None,
     compaction_performed: bool,
+    interrupted: bool,
 ) -> dict[str, Any]:
     return {
         "type": "turn_done",
@@ -107,6 +119,14 @@ def build_turn_done_event(
         "response_text": response_text,
         "command": command,
         "compaction_performed": compaction_performed,
+        "interrupted": interrupted,
+    }
+
+
+def build_stop_ack_event(*, stop_requested: bool) -> dict[str, Any]:
+    return {
+        "type": "stop_ack",
+        "stop_requested": stop_requested,
     }
 
 

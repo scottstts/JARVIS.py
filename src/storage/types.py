@@ -8,6 +8,7 @@ from typing import Any, Literal
 RecordKind = Literal["message", "compaction"]
 RecordRole = Literal["system", "developer", "user", "assistant", "tool"]
 SessionStatus = Literal["active", "archived"]
+TurnStatus = Literal["in_progress", "completed", "interrupted", "superseded"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -21,11 +22,13 @@ class SessionMetadata:
     parent_session_id: str | None = None
     status: SessionStatus = "active"
     pending_reactive_compaction: bool = False
+    pending_interruption_notice: bool = False
     compaction_count: int = 0
     last_input_tokens: int | None = None
     last_output_tokens: int | None = None
     last_total_tokens: int | None = None
     last_estimated_input_tokens: int | None = None
+    turn_states: dict[str, TurnStatus] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -36,11 +39,13 @@ class SessionMetadata:
             "parent_session_id": self.parent_session_id,
             "status": self.status,
             "pending_reactive_compaction": self.pending_reactive_compaction,
+            "pending_interruption_notice": self.pending_interruption_notice,
             "compaction_count": self.compaction_count,
             "last_input_tokens": self.last_input_tokens,
             "last_output_tokens": self.last_output_tokens,
             "last_total_tokens": self.last_total_tokens,
             "last_estimated_input_tokens": self.last_estimated_input_tokens,
+            "turn_states": dict(self.turn_states),
         }
 
     @classmethod
@@ -53,11 +58,13 @@ class SessionMetadata:
             parent_session_id=data.get("parent_session_id"),
             status="archived" if data.get("status") == "archived" else "active",
             pending_reactive_compaction=bool(data.get("pending_reactive_compaction", False)),
+            pending_interruption_notice=bool(data.get("pending_interruption_notice", False)),
             compaction_count=int(data.get("compaction_count", 0)),
             last_input_tokens=_optional_int(data.get("last_input_tokens")),
             last_output_tokens=_optional_int(data.get("last_output_tokens")),
             last_total_tokens=_optional_int(data.get("last_total_tokens")),
             last_estimated_input_tokens=_optional_int(data.get("last_estimated_input_tokens")),
+            turn_states=_normalize_turn_states(data.get("turn_states")),
         )
 
 
@@ -118,3 +125,19 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_turn_states(value: Any) -> dict[str, TurnStatus]:
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, TurnStatus] = {}
+    for raw_turn_id, raw_status in value.items():
+        turn_id = str(raw_turn_id).strip()
+        if not turn_id:
+            continue
+        status = str(raw_status).strip()
+        if status not in {"in_progress", "completed", "interrupted", "superseded"}:
+            continue
+        normalized[turn_id] = status
+    return normalized

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from collections.abc import AsyncIterator
@@ -183,10 +184,13 @@ class _FakeGatewayClient:
             GatewayDeltaEvent | GatewayMessageEvent | GatewayToolCallEvent | GatewayTurnDoneEvent
         ] | None = None,
         error: GatewayBridgeError | None = None,
+        stop_requested: bool = False,
     ) -> None:
         self._events = events or []
         self._error = error
+        self._stop_requested = stop_requested
         self.calls: list[tuple[str, str]] = []
+        self.stop_calls: list[str] = []
 
     async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[Any]:
         self.calls.append((route_id, user_text))
@@ -194,6 +198,32 @@ class _FakeGatewayClient:
             raise self._error
         for event in self._events:
             yield event
+
+    async def request_stop(self, *, route_id: str) -> bool:
+        self.stop_calls.append(route_id)
+        return self._stop_requested
+
+
+class _BlockingGatewayClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.stop_calls: list[str] = []
+        self.stream_started = asyncio.Event()
+        self.release_turn = asyncio.Event()
+
+    async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[Any]:
+        self.calls.append((route_id, user_text))
+        self.stream_started.set()
+        await self.release_turn.wait()
+        yield GatewayTurnDoneEvent(
+            session_id="session",
+            response_text="",
+            interrupted=True,
+        )
+
+    async def request_stop(self, *, route_id: str) -> bool:
+        self.stop_calls.append(route_id)
+        return True
 
 
 def _settings(**overrides: object) -> UISettings:
@@ -234,6 +264,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         next_offset = await bridge.poll_once(offset=None)
+        await bridge.wait_for_chat_idle(123)
 
         self.assertEqual(next_offset, 11)
         self.assertEqual(gateway.calls, [("tg_123", "hello")])
@@ -287,6 +318,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             await bridge.poll_once(offset=None)
+            await bridge.wait_for_chat_idle(123)
 
             self.assertEqual(len(telegram.downloaded_files), 1)
             downloaded_path = telegram.downloaded_files[0].destination_path
@@ -759,6 +791,56 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             ["gateway failed"],
+        )
+
+    async def test_handle_message_does_not_send_placeholder_for_interrupted_turn(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayTurnDoneEvent(
+                    session_id="session",
+                    response_text="",
+                    interrupted=True,
+                )
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(telegram.sent_messages, [])
+
+    async def test_dispatch_message_routes_stop_outside_active_turn_queue(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _BlockingGatewayClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        await gateway.stream_started.wait()
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="/stop"),
+        )
+        gateway.release_turn.set()
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(gateway.calls, [("tg_777", "hi")])
+        self.assertEqual(gateway.stop_calls, ["tg_777"])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["Stop requested. I will stop after the current step."],
         )
 
     async def test_draft_rate_limit_disables_drafts_for_current_and_next_turn(self) -> None:

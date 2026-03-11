@@ -50,7 +50,14 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps({"type": "assistant_delta", "session_id": "s1", "delta": "hel"}),
                 json.dumps({"type": "tool_call", "session_id": "s1", "tool_names": ["bash"]}),
                 json.dumps({"type": "assistant_message", "session_id": "s1", "text": "hello"}),
-                json.dumps({"type": "turn_done", "session_id": "s1", "response_text": "hello"}),
+                json.dumps(
+                    {
+                        "type": "turn_done",
+                        "session_id": "s1",
+                        "response_text": "hello",
+                        "interrupted": True,
+                    }
+                ),
             ]
         )
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
@@ -69,8 +76,28 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1].tool_names, ("bash",))
         self.assertEqual(events[2].text, "hello")
         self.assertEqual(events[3].response_text, "hello")
+        self.assertTrue(events[3].interrupted)
         outbound = json.loads(socket.sent[0])
         self.assertEqual(outbound, {"type": "user_message", "text": "hi"})
+
+    async def test_request_stop_returns_acknowledged_state(self) -> None:
+        socket = _FakeSocket(
+            incoming=[
+                json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
+                json.dumps({"type": "stop_ack", "stop_requested": True}),
+            ]
+        )
+        client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
+
+        with patch(
+            "ui.telegram.gateway_client._resolve_websocket_connect",
+            return_value=lambda *args, **kwargs: _FakeConnection(socket),
+        ):
+            stop_requested = await client.request_stop(route_id="tg_1")
+
+        self.assertTrue(stop_requested)
+        outbound = json.loads(socket.sent[0])
+        self.assertEqual(outbound, {"type": "stop_turn"})
 
     async def test_stream_turn_raises_on_gateway_error_event(self) -> None:
         socket = _FakeSocket(

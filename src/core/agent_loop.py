@@ -46,6 +46,8 @@ _OVERFLOW_ERROR_HINTS = (
 _TRANSIENT_RECORD_METADATA_KEY = "transient"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
 _TURN_CONTEXT_METADATA_KEY = "turn_context"
+_TURN_ID_METADATA_KEY = "turn_id"
+_INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
 _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
@@ -60,6 +62,8 @@ _FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT = (
 _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
     "Follow-up retry aborted: compacted request still overflowed the provider context limit."
 )
+_PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
+_TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,6 +72,7 @@ class AgentTurnResult:
     response_text: str
     command: str | None = None
     compaction_performed: bool = False
+    interrupted: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -97,6 +102,7 @@ class AgentTurnDoneEvent:
     response_text: str
     command: str | None = None
     compaction_performed: bool = False
+    interrupted: bool = False
     type: Literal["done"] = "done"
 
     def to_result(self) -> AgentTurnResult:
@@ -105,6 +111,7 @@ class AgentTurnDoneEvent:
             response_text=self.response_text,
             command=self.command,
             compaction_performed=self.compaction_performed,
+            interrupted=self.interrupted,
         )
 
 
@@ -144,6 +151,8 @@ class AgentLoop:
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
         )
+        self._active_turn_id: str | None = None
+        self._stop_requested_turn_id: str | None = None
 
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         command = parse_user_command(user_text)
@@ -169,6 +178,13 @@ class AgentLoop:
     def active_session_id(self) -> str | None:
         active = self._storage.get_active_session()
         return active.session_id if active is not None else None
+
+    def request_stop(self) -> bool:
+        active_turn_id = self._active_turn_id
+        if active_turn_id is None:
+            return False
+        self._stop_requested_turn_id = active_turn_id
+        return True
 
     async def _handle_new_command(self, command: ParsedCommand) -> AgentTurnResult:
         session = self._start_session(start_reason="user_new")
@@ -251,6 +267,7 @@ class AgentLoop:
             session,
             base_records,
             turn_context_text,
+            interruption_notice_text,
             request,
             estimated_input_tokens,
             did_compaction,
@@ -258,94 +275,151 @@ class AgentLoop:
             user_text=user_text,
             force_session_id=force_session_id,
         )
-
-        (
-            session,
-            response,
-            overflow_compacted,
-            final_estimated_input_tokens,
-        ) = await self._generate_with_overflow_retry(
-            session=session,
-            user_text=user_text,
-            turn_context_text=turn_context_text,
-            request=request,
-            estimated_input_tokens=estimated_input_tokens,
-        )
-        if overflow_compacted:
-            did_compaction = True
-
-        base_records = self._storage.load_records(session.session_id)
+        turn_id = uuid4().hex
         pending_records = [
             self._build_turn_context_record(
                 session_id=session.session_id,
                 turn_context_text=turn_context_text,
-            ),
-            self._build_message_record(
-                session_id=session.session_id,
-                role="user",
-                content=user_text,
-            ),
-            self._build_assistant_record(session.session_id, response),
+            )
         ]
-        (
-            session,
-            final_response,
-            final_estimated_input_tokens,
-            followup_compacted,
-        ) = await self._execute_followup_tool_rounds(
-            session=session,
-            base_records=base_records,
-            pending_records=pending_records,
-            current_response=response,
-            current_estimated_input_tokens=final_estimated_input_tokens,
-        )
-        if followup_compacted:
-            did_compaction = True
-
-        self._persist_successful_turn(
+        if interruption_notice_text is not None:
+            pending_records.append(
+                self._build_interruption_notice_record(
+                    session_id=session.session_id,
+                    text=interruption_notice_text,
+                )
+            )
+        user_record = self._build_message_record(
             session_id=session.session_id,
-            records=pending_records,
-            response=final_response,
-            estimated_input_tokens=final_estimated_input_tokens,
+            role="user",
+            content=user_text,
+            turn_id=turn_id,
+        )
+        self._begin_turn(session_id=session.session_id, turn_id=turn_id)
+        self._append_turn_record(
+            session_id=session.session_id,
+            pending_records=pending_records,
+            record=user_record,
         )
 
-        refreshed = self._storage.get_session(session.session_id)
-        threshold_observed = (
-            final_response.usage.input_tokens
-            if final_response.usage is not None and final_response.usage.input_tokens is not None
-            else final_estimated_input_tokens
-        )
-        should_enqueue_reactive = (
-            threshold_observed >= self._settings.context_policy.compact_threshold_tokens
-        )
-        if refreshed is not None:
-            self._storage.update_session(
-                refreshed.session_id,
-                pending_reactive_compaction=should_enqueue_reactive,
+        try:
+            (
+                session,
+                response,
+                overflow_compacted,
+                final_estimated_input_tokens,
+                rebound_pending_records,
+            ) = await self._generate_with_overflow_retry(
+                session=session,
+                user_text=user_text,
+                turn_context_text=turn_context_text,
+                interruption_notice_text=interruption_notice_text,
+                request=request,
+                estimated_input_tokens=estimated_input_tokens,
+                pending_records=pending_records,
+                turn_id=turn_id,
+            )
+            pending_records = rebound_pending_records
+            if overflow_compacted:
+                did_compaction = True
+
+            assistant_record = self._build_assistant_record(
+                session.session_id,
+                response,
+                turn_id=turn_id,
+            )
+            self._append_turn_record(
+                session_id=session.session_id,
+                pending_records=pending_records,
+                record=assistant_record,
+            )
+            if self._stop_requested(turn_id):
+                return self._interrupt_turn(
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    command=None,
+                    compaction_performed=did_compaction,
+                    response_text=response.text,
+                )
+
+            base_records = self._storage.load_records(session.session_id)
+            (
+                session,
+                final_response,
+                final_estimated_input_tokens,
+                followup_compacted,
+                interrupted,
+            ) = await self._execute_followup_tool_rounds(
+                session=session,
+                base_records=base_records,
+                pending_records=pending_records,
+                current_response=response,
+                current_estimated_input_tokens=final_estimated_input_tokens,
+                turn_id=turn_id,
+            )
+            if followup_compacted:
+                did_compaction = True
+            if interrupted:
+                return self._interrupt_turn(
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    command=None,
+                    compaction_performed=did_compaction,
+                    response_text=final_response.text,
+                )
+
+            self._persist_successful_turn(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                response=final_response,
+                estimated_input_tokens=final_estimated_input_tokens,
             )
 
-        return AgentTurnResult(
-            session_id=session.session_id,
-            response_text=final_response.text,
-            compaction_performed=did_compaction,
-        )
+            refreshed = self._storage.get_session(session.session_id)
+            threshold_observed = (
+                final_response.usage.input_tokens
+                if final_response.usage is not None and final_response.usage.input_tokens is not None
+                else final_estimated_input_tokens
+            )
+            should_enqueue_reactive = (
+                threshold_observed >= self._settings.context_policy.compact_threshold_tokens
+            )
+            if refreshed is not None:
+                self._storage.update_session(
+                    refreshed.session_id,
+                    pending_reactive_compaction=should_enqueue_reactive,
+                )
 
-    async def _execute_tool_calls_and_build_request(
+            return AgentTurnResult(
+                session_id=session.session_id,
+                response_text=final_response.text,
+                compaction_performed=did_compaction,
+            )
+        finally:
+            self._clear_turn_control(turn_id)
+
+    async def _execute_tool_calls(
         self,
         *,
         session_id: str,
-        base_records: Sequence[ConversationRecord],
         pending_records: list[ConversationRecord],
         current_response: LLMResponse,
-    ) -> tuple[LLMRequest, int]:
+        turn_id: str,
+    ) -> None:
         transient_records: list[ConversationRecord] = []
         for tool_call in current_response.tool_calls:
             tool_result = await self._tool_runtime.execute(
                 tool_call=tool_call,
                 context=self._tool_context,
             )
-            pending_records.append(
-                self._build_tool_record(session_id, tool_result)
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=self._build_tool_record(
+                    session_id,
+                    tool_result,
+                    turn_id=turn_id,
+                ),
             )
             transient_records.extend(
                 self._build_transient_records_from_tool_result(
@@ -355,12 +429,19 @@ class AgentLoop:
             )
 
         pending_records.extend(transient_records)
+
+    def _build_followup_request(
+        self,
+        *,
+        base_records: Sequence[ConversationRecord],
+        pending_records: Sequence[ConversationRecord],
+    ) -> tuple[LLMRequest, int]:
         activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
             pending_records
         )
 
         request = self._build_request(
-            list(base_records) + pending_records,
+            list(base_records) + list(pending_records),
             activated_discoverable_tool_names=activated_discoverable_tool_names,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
@@ -402,15 +483,8 @@ class AgentLoop:
         activated_discoverable_tool_names: Sequence[str] = (),
         allow_tools: bool = True,
     ) -> LLMRequest:
-        messages: list[LLMMessage] = []
-        for record in records:
-            if record.kind != "message":
-                continue
-            llm_message = _record_to_llm_message(record)
-            if llm_message is not None:
-                messages.append(llm_message)
         return LLMRequest(
-            messages=tuple(messages),
+            messages=_records_to_llm_messages(records),
             tools=(
                 self._compose_request_tools(activated_discoverable_tool_names)
                 if allow_tools
@@ -466,6 +540,7 @@ class AgentLoop:
         base_records: Sequence[ConversationRecord],
         pending_records: list[ConversationRecord],
         attempted_round: int,
+        turn_id: str,
     ) -> tuple[LLMResponse, int]:
         request, estimated_input_tokens = self._build_tool_round_limit_recovery_request(
             session_id=session_id,
@@ -475,7 +550,15 @@ class AgentLoop:
         )
         response = await self._llm_service.generate(request)
         normalized = self._normalize_tool_round_limit_recovery_response(response)
-        pending_records.append(self._build_assistant_record(session_id, normalized))
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=self._build_assistant_record(
+                session_id,
+                normalized,
+                turn_id=turn_id,
+            ),
+        )
         return normalized, estimated_input_tokens
 
     async def _stream_recover_from_tool_round_limit(
@@ -485,6 +568,7 @@ class AgentLoop:
         base_records: Sequence[ConversationRecord],
         pending_records: list[ConversationRecord],
         attempted_round: int,
+        turn_id: str,
     ) -> tuple[list[AgentTurnStreamEvent], LLMResponse, int]:
         request, estimated_input_tokens = self._build_tool_round_limit_recovery_request(
             session_id=session_id,
@@ -512,7 +596,15 @@ class AgentLoop:
             )
 
         normalized = self._normalize_tool_round_limit_recovery_response(streamed_response)
-        pending_records.append(self._build_assistant_record(session_id, normalized))
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=self._build_assistant_record(
+                session_id,
+                normalized,
+                turn_id=turn_id,
+            ),
+        )
         if normalized.text:
             recovery_events.append(
                 AgentAssistantMessageEvent(
@@ -533,6 +625,7 @@ class AgentLoop:
             session,
             _base_records,
             turn_context_text,
+            interruption_notice_text,
             request,
             estimated_input_tokens,
             did_compaction,
@@ -540,264 +633,444 @@ class AgentLoop:
             user_text=user_text,
             force_session_id=force_session_id,
         )
-
-        overflow_compacted = False
-        overflow_retry_attempted = False
-        initial_response: LLMResponse | None = None
-        final_estimated_input_tokens = estimated_input_tokens
-
-        while True:
-            streamed_response: LLMResponse | None = None
-            emitted_any = False
-            noticed_initial_tool_call_ids: set[str] = set()
-            try:
-                async for event in self._llm_service.stream_generate(request):
-                    if event.type == "text_delta":
-                        emitted_any = True
-                        if event.delta:
-                            yield AgentTextDeltaEvent(
-                                session_id=session.session_id,
-                                delta=event.delta,
-                            )
-                    elif event.type == "tool_call_delta":
-                        emitted_any = True
-                        tool_name = str(event.tool_name or "").strip()
-                        call_id = event.call_id.strip()
-                        if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
-                            noticed_initial_tool_call_ids.add(call_id)
-                            yield AgentToolCallEvent(
-                                session_id=session.session_id,
-                                tool_names=(tool_name,),
-                            )
-                    elif event.type == "done":
-                        streamed_response = event.response
-
-                if streamed_response is None:
-                    raise RuntimeError(
-                        "Streaming generation completed without a final done event."
-                    )
-                initial_response = streamed_response
-                break
-            except ProviderBadRequestError as exc:
-                if overflow_retry_attempted or emitted_any or not _is_context_overflow_error(exc):
-                    raise
-
-            compacted = await self._compact_session(session, reason="overflow")
-            if compacted is None:
-                raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
-
-            records = self._storage.load_records(compacted.session_id)
-            request = self._build_turn_request(
-                session_id=compacted.session_id,
-                records=records,
-                user_text=user_text,
-                turn_context_text=turn_context_text,
-            )
-            retry_estimate = estimate_request_input_tokens(request)
-            if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
-                raise ContextBudgetError(
-                    "Overflow retry aborted: compacted request still exceeds preflight limit."
-                )
-
-            session = compacted
-            final_estimated_input_tokens = retry_estimate
-            overflow_compacted = True
-            overflow_retry_attempted = True
-
-        if initial_response is None:
-            raise RuntimeError("Streaming generation produced no final response.")
-        if overflow_compacted:
-            did_compaction = True
-
-        base_records = self._storage.load_records(session.session_id)
+        turn_id = uuid4().hex
         pending_records = [
             self._build_turn_context_record(
                 session_id=session.session_id,
                 turn_context_text=turn_context_text,
-            ),
-            self._build_message_record(
-                session_id=session.session_id,
-                role="user",
-                content=user_text,
-            ),
-            self._build_assistant_record(session.session_id, initial_response),
+            )
         ]
-        if initial_response.text:
-            yield AgentAssistantMessageEvent(
-                session_id=session.session_id,
-                text=initial_response.text,
-            )
-        if initial_response.tool_calls:
-            tool_names = _pending_tool_notice_names(
-                initial_response.tool_calls,
-                noticed_initial_tool_call_ids,
-            )
-            if tool_names:
-                yield AgentToolCallEvent(
+        if interruption_notice_text is not None:
+            pending_records.append(
+                self._build_interruption_notice_record(
                     session_id=session.session_id,
-                    tool_names=tool_names,
+                    text=interruption_notice_text,
                 )
+            )
+        user_record = self._build_message_record(
+            session_id=session.session_id,
+            role="user",
+            content=user_text,
+            turn_id=turn_id,
+        )
+        self._begin_turn(session_id=session.session_id, turn_id=turn_id)
+        self._append_turn_record(
+            session_id=session.session_id,
+            pending_records=pending_records,
+            record=user_record,
+        )
 
-        current_response = initial_response
-        tool_rounds = 0
-        while current_response.tool_calls:
-            tool_rounds += 1
-            if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
-                (
-                    recovery_events,
-                    final_response,
-                    final_estimated_input_tokens,
-                ) = await self._stream_recover_from_tool_round_limit(
-                    session_id=session.session_id,
-                    base_records=base_records,
-                    pending_records=pending_records,
-                    attempted_round=tool_rounds,
-                )
-                for recovery_event in recovery_events:
-                    yield recovery_event
-                current_response = final_response
-                break
-
-            followup_compaction_attempted = False
-            try:
-                request, final_estimated_input_tokens = (
-                    await self._execute_tool_calls_and_build_request(
-                        session_id=session.session_id,
-                        base_records=base_records,
-                        pending_records=pending_records,
-                        current_response=current_response,
-                    )
-                )
-            except ContextBudgetError:
-                (
-                    session,
-                    base_records,
-                    rebound_pending_records,
-                    request,
-                    final_estimated_input_tokens,
-                ) = await self._compact_followup_and_rebuild_request(
-                    session=session,
-                    pending_records=pending_records,
-                    reason="followup_preflight",
-                )
-                pending_records[:] = rebound_pending_records
-                did_compaction = True
-                followup_compaction_attempted = True
+        try:
+            overflow_compacted = False
+            overflow_retry_attempted = False
+            initial_response: LLMResponse | None = None
+            final_estimated_input_tokens = estimated_input_tokens
+            noticed_initial_tool_call_ids: set[str] = set()
+            streamed_initial_text = ""
+            persisted_initial_text_prefix: str | None = None
 
             while True:
                 streamed_response: LLMResponse | None = None
-                noticed_followup_tool_call_ids: set[str] = set()
                 emitted_any = False
+                noticed_initial_tool_call_ids = set()
+                streamed_initial_text = ""
+                persisted_initial_text_prefix = None
                 try:
                     async for event in self._llm_service.stream_generate(request):
                         if event.type == "text_delta":
                             emitted_any = True
                             if event.delta:
+                                streamed_initial_text += event.delta
                                 yield AgentTextDeltaEvent(
                                     session_id=session.session_id,
                                     delta=event.delta,
                                 )
                         elif event.type == "tool_call_delta":
                             emitted_any = True
+                            if persisted_initial_text_prefix is None and streamed_initial_text:
+                                partial_record = self._build_streamed_assistant_text_record(
+                                    session_id=session.session_id,
+                                    text=streamed_initial_text,
+                                    turn_id=turn_id,
+                                )
+                                if partial_record is not None:
+                                    self._append_turn_record(
+                                        session_id=session.session_id,
+                                        pending_records=pending_records,
+                                        record=partial_record,
+                                    )
+                                    persisted_initial_text_prefix = streamed_initial_text
                             tool_name = str(event.tool_name or "").strip()
                             call_id = event.call_id.strip()
-                            if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
-                                noticed_followup_tool_call_ids.add(call_id)
+                            if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
+                                noticed_initial_tool_call_ids.add(call_id)
                                 yield AgentToolCallEvent(
                                     session_id=session.session_id,
                                     tool_names=(tool_name,),
                                 )
+                            if (
+                                self._stop_requested(turn_id)
+                                and persisted_initial_text_prefix is not None
+                                and tool_name
+                                and call_id
+                            ):
+                                interrupted = self._interrupt_turn(
+                                    session_id=session.session_id,
+                                    turn_id=turn_id,
+                                    command=command_override,
+                                    compaction_performed=did_compaction,
+                                    response_text=streamed_initial_text,
+                                )
+                                yield AgentTurnDoneEvent(
+                                    session_id=interrupted.session_id,
+                                    response_text=interrupted.response_text,
+                                    command=interrupted.command,
+                                    compaction_performed=interrupted.compaction_performed,
+                                    interrupted=True,
+                                )
+                                return
                         elif event.type == "done":
                             streamed_response = event.response
+
+                    if streamed_response is None:
+                        raise RuntimeError(
+                            "Streaming generation completed without a final done event."
+                        )
+                    initial_response = streamed_response
                     break
                 except ProviderBadRequestError as exc:
-                    if (
-                        not _is_context_overflow_error(exc)
-                        or emitted_any
-                    ):
+                    if overflow_retry_attempted or emitted_any or not _is_context_overflow_error(exc):
                         raise
-                    if followup_compaction_attempted:
-                        raise ContextBudgetError(
-                            _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
-                        ) from exc
 
                 (
                     session,
-                    base_records,
+                    _base_records,
                     rebound_pending_records,
                     request,
-                    final_estimated_input_tokens,
+                    retry_estimate,
                 ) = await self._compact_followup_and_rebuild_request(
                     session=session,
                     pending_records=pending_records,
-                    reason="followup_overflow",
+                    reason="overflow",
+                    turn_id=turn_id,
                 )
                 pending_records[:] = rebound_pending_records
+                final_estimated_input_tokens = retry_estimate
+                overflow_compacted = True
+                overflow_retry_attempted = True
+
+            if initial_response is None:
+                raise RuntimeError("Streaming generation produced no final response.")
+            if overflow_compacted:
                 did_compaction = True
-                followup_compaction_attempted = True
 
-            if streamed_response is None:
-                raise RuntimeError(
-                    "Streaming follow-up generation completed without a final done event."
-                )
-
-            current_response = streamed_response
-            pending_records.append(
-                self._build_assistant_record(session.session_id, current_response)
+            final_initial_record = self._build_final_stream_assistant_record(
+                session_id=session.session_id,
+                response=initial_response,
+                turn_id=turn_id,
+                persisted_text_prefix=persisted_initial_text_prefix,
             )
-            if current_response.text:
+            if final_initial_record is not None:
+                self._append_turn_record(
+                    session_id=session.session_id,
+                    pending_records=pending_records,
+                    record=final_initial_record,
+                )
+            if initial_response.text:
                 yield AgentAssistantMessageEvent(
                     session_id=session.session_id,
-                    text=current_response.text,
+                    text=initial_response.text,
                 )
-            if current_response.tool_calls:
+            if initial_response.tool_calls:
                 tool_names = _pending_tool_notice_names(
-                    current_response.tool_calls,
-                    noticed_followup_tool_call_ids,
+                    initial_response.tool_calls,
+                    noticed_initial_tool_call_ids,
                 )
                 if tool_names:
                     yield AgentToolCallEvent(
                         session_id=session.session_id,
                         tool_names=tool_names,
                     )
+            if self._stop_requested(turn_id):
+                interrupted = self._interrupt_turn(
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    command=command_override,
+                    compaction_performed=did_compaction,
+                    response_text=initial_response.text,
+                )
+                yield AgentTurnDoneEvent(
+                    session_id=interrupted.session_id,
+                    response_text=interrupted.response_text,
+                    command=interrupted.command,
+                    compaction_performed=interrupted.compaction_performed,
+                    interrupted=True,
+                )
+                return
 
-        final_response = current_response
+            base_records = self._storage.load_records(session.session_id)
+            current_response = initial_response
+            tool_rounds = 0
+            while current_response.tool_calls:
+                if self._stop_requested(turn_id):
+                    interrupted = self._interrupt_turn(
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                        command=command_override,
+                        compaction_performed=did_compaction,
+                        response_text=current_response.text,
+                    )
+                    yield AgentTurnDoneEvent(
+                        session_id=interrupted.session_id,
+                        response_text=interrupted.response_text,
+                        command=interrupted.command,
+                        compaction_performed=interrupted.compaction_performed,
+                        interrupted=True,
+                    )
+                    return
 
-        self._persist_successful_turn(
-            session_id=session.session_id,
-            records=pending_records,
-            response=final_response,
-            estimated_input_tokens=final_estimated_input_tokens,
-        )
+                tool_rounds += 1
+                if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
+                    (
+                        recovery_events,
+                        final_response,
+                        final_estimated_input_tokens,
+                    ) = await self._stream_recover_from_tool_round_limit(
+                        session_id=session.session_id,
+                        base_records=base_records,
+                        pending_records=pending_records,
+                        attempted_round=tool_rounds,
+                        turn_id=turn_id,
+                    )
+                    for recovery_event in recovery_events:
+                        yield recovery_event
+                    current_response = final_response
+                    break
 
-        refreshed = self._storage.get_session(session.session_id)
-        threshold_observed = (
-            final_response.usage.input_tokens
-            if final_response.usage is not None and final_response.usage.input_tokens is not None
-            else final_estimated_input_tokens
-        )
-        should_enqueue_reactive = (
-            threshold_observed >= self._settings.context_policy.compact_threshold_tokens
-        )
-        if refreshed is not None:
-            self._storage.update_session(
-                refreshed.session_id,
-                pending_reactive_compaction=should_enqueue_reactive,
+                followup_compaction_attempted = False
+                try:
+                    await self._execute_tool_calls(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        current_response=current_response,
+                        turn_id=turn_id,
+                    )
+                    if self._stop_requested(turn_id):
+                        interrupted = self._interrupt_turn(
+                            session_id=session.session_id,
+                            turn_id=turn_id,
+                            command=command_override,
+                            compaction_performed=did_compaction,
+                            response_text=current_response.text,
+                        )
+                        yield AgentTurnDoneEvent(
+                            session_id=interrupted.session_id,
+                            response_text=interrupted.response_text,
+                            command=interrupted.command,
+                            compaction_performed=interrupted.compaction_performed,
+                            interrupted=True,
+                        )
+                        return
+                    request, final_estimated_input_tokens = self._build_followup_request(
+                        base_records=base_records,
+                        pending_records=pending_records,
+                    )
+                except ContextBudgetError:
+                    (
+                        session,
+                        base_records,
+                        rebound_pending_records,
+                        request,
+                        final_estimated_input_tokens,
+                    ) = await self._compact_followup_and_rebuild_request(
+                        session=session,
+                        pending_records=pending_records,
+                        reason="followup_preflight",
+                        turn_id=turn_id,
+                    )
+                    pending_records[:] = rebound_pending_records
+                    did_compaction = True
+                    followup_compaction_attempted = True
+
+                while True:
+                    streamed_response: LLMResponse | None = None
+                    noticed_followup_tool_call_ids: set[str] = set()
+                    emitted_any = False
+                    streamed_followup_text = ""
+                    persisted_followup_text_prefix: str | None = None
+                    try:
+                        async for event in self._llm_service.stream_generate(request):
+                            if event.type == "text_delta":
+                                emitted_any = True
+                                if event.delta:
+                                    streamed_followup_text += event.delta
+                                    yield AgentTextDeltaEvent(
+                                        session_id=session.session_id,
+                                        delta=event.delta,
+                                    )
+                            elif event.type == "tool_call_delta":
+                                emitted_any = True
+                                if persisted_followup_text_prefix is None and streamed_followup_text:
+                                    partial_record = self._build_streamed_assistant_text_record(
+                                        session_id=session.session_id,
+                                        text=streamed_followup_text,
+                                        turn_id=turn_id,
+                                    )
+                                    if partial_record is not None:
+                                        self._append_turn_record(
+                                            session_id=session.session_id,
+                                            pending_records=pending_records,
+                                            record=partial_record,
+                                        )
+                                        persisted_followup_text_prefix = streamed_followup_text
+                                tool_name = str(event.tool_name or "").strip()
+                                call_id = event.call_id.strip()
+                                if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
+                                    noticed_followup_tool_call_ids.add(call_id)
+                                    yield AgentToolCallEvent(
+                                        session_id=session.session_id,
+                                        tool_names=(tool_name,),
+                                    )
+                                if (
+                                    self._stop_requested(turn_id)
+                                    and persisted_followup_text_prefix is not None
+                                    and tool_name
+                                    and call_id
+                                ):
+                                    interrupted = self._interrupt_turn(
+                                        session_id=session.session_id,
+                                        turn_id=turn_id,
+                                        command=command_override,
+                                        compaction_performed=did_compaction,
+                                        response_text=streamed_followup_text,
+                                    )
+                                    yield AgentTurnDoneEvent(
+                                        session_id=interrupted.session_id,
+                                        response_text=interrupted.response_text,
+                                        command=interrupted.command,
+                                        compaction_performed=interrupted.compaction_performed,
+                                        interrupted=True,
+                                    )
+                                    return
+                            elif event.type == "done":
+                                streamed_response = event.response
+                        break
+                    except ProviderBadRequestError as exc:
+                        if (
+                            not _is_context_overflow_error(exc)
+                            or emitted_any
+                        ):
+                            raise
+                        if followup_compaction_attempted:
+                            raise ContextBudgetError(
+                                _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
+                            ) from exc
+
+                    (
+                        session,
+                        base_records,
+                        rebound_pending_records,
+                        request,
+                        final_estimated_input_tokens,
+                    ) = await self._compact_followup_and_rebuild_request(
+                        session=session,
+                        pending_records=pending_records,
+                        reason="followup_overflow",
+                        turn_id=turn_id,
+                    )
+                    pending_records[:] = rebound_pending_records
+                    did_compaction = True
+                    followup_compaction_attempted = True
+
+                if streamed_response is None:
+                    raise RuntimeError(
+                        "Streaming follow-up generation completed without a final done event."
+                    )
+
+                current_response = streamed_response
+                final_followup_record = self._build_final_stream_assistant_record(
+                    session_id=session.session_id,
+                    response=current_response,
+                    turn_id=turn_id,
+                    persisted_text_prefix=persisted_followup_text_prefix,
+                )
+                if final_followup_record is not None:
+                    self._append_turn_record(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        record=final_followup_record,
+                    )
+                if current_response.text:
+                    yield AgentAssistantMessageEvent(
+                        session_id=session.session_id,
+                        text=current_response.text,
+                    )
+                if current_response.tool_calls:
+                    tool_names = _pending_tool_notice_names(
+                        current_response.tool_calls,
+                        noticed_followup_tool_call_ids,
+                    )
+                    if tool_names:
+                        yield AgentToolCallEvent(
+                            session_id=session.session_id,
+                            tool_names=tool_names,
+                        )
+                if self._stop_requested(turn_id):
+                    interrupted = self._interrupt_turn(
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                        command=command_override,
+                        compaction_performed=did_compaction,
+                        response_text=current_response.text,
+                    )
+                    yield AgentTurnDoneEvent(
+                        session_id=interrupted.session_id,
+                        response_text=interrupted.response_text,
+                        command=interrupted.command,
+                        compaction_performed=interrupted.compaction_performed,
+                        interrupted=True,
+                    )
+                    return
+
+            final_response = current_response
+
+            self._persist_successful_turn(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                response=final_response,
+                estimated_input_tokens=final_estimated_input_tokens,
             )
 
-        yield AgentTurnDoneEvent(
-            session_id=session.session_id,
-            response_text=final_response.text,
-            command=command_override,
-            compaction_performed=did_compaction,
-        )
+            refreshed = self._storage.get_session(session.session_id)
+            threshold_observed = (
+                final_response.usage.input_tokens
+                if final_response.usage is not None and final_response.usage.input_tokens is not None
+                else final_estimated_input_tokens
+            )
+            should_enqueue_reactive = (
+                threshold_observed >= self._settings.context_policy.compact_threshold_tokens
+            )
+            if refreshed is not None:
+                self._storage.update_session(
+                    refreshed.session_id,
+                    pending_reactive_compaction=should_enqueue_reactive,
+                )
+
+            yield AgentTurnDoneEvent(
+                session_id=session.session_id,
+                response_text=final_response.text,
+                command=command_override,
+                compaction_performed=did_compaction,
+            )
+        finally:
+            self._clear_turn_control(turn_id)
 
     async def _prepare_message_turn(
         self,
         *,
         user_text: str,
         force_session_id: str | None = None,
-    ) -> tuple[SessionMetadata, list[ConversationRecord], str, LLMRequest, int, bool]:
+    ) -> tuple[SessionMetadata, list[ConversationRecord], str, str | None, LLMRequest, int, bool]:
         turn_context_text = self._build_turn_context_text()
         session = self._storage.get_session(force_session_id) if force_session_id else None
         if session is None:
@@ -811,11 +1084,17 @@ class AgentLoop:
                 did_compaction = True
 
         records = self._storage.load_records(session.session_id)
+        interruption_notice_text = (
+            _PREVIOUS_TASK_INTERRUPTED_TEXT
+            if session.pending_interruption_notice
+            else None
+        )
         request = self._build_turn_request(
             session_id=session.session_id,
             records=records,
             user_text=user_text,
             turn_context_text=turn_context_text,
+            interruption_notice_text=interruption_notice_text,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -825,11 +1104,17 @@ class AgentLoop:
                 session = compacted
                 did_compaction = True
                 records = self._storage.load_records(session.session_id)
+                interruption_notice_text = (
+                    _PREVIOUS_TASK_INTERRUPTED_TEXT
+                    if session.pending_interruption_notice
+                    else None
+                )
                 request = self._build_turn_request(
                     session_id=session.session_id,
                     records=records,
                     user_text=user_text,
                     turn_context_text=turn_context_text,
+                    interruption_notice_text=interruption_notice_text,
                 )
                 estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -842,6 +1127,7 @@ class AgentLoop:
             session,
             records,
             turn_context_text,
+            interruption_notice_text,
             request,
             estimated_input_tokens,
             did_compaction,
@@ -853,51 +1139,51 @@ class AgentLoop:
         session: SessionMetadata,
         user_text: str,
         turn_context_text: str,
+        interruption_notice_text: str | None,
         request: LLMRequest,
         estimated_input_tokens: int,
-    ) -> tuple[SessionMetadata, LLMResponse, bool, int]:
+        pending_records: list[ConversationRecord],
+        turn_id: str,
+    ) -> tuple[SessionMetadata, LLMResponse, bool, int, list[ConversationRecord]]:
         try:
             response = await self._llm_service.generate(request)
-            return session, response, False, estimated_input_tokens
+            return session, response, False, estimated_input_tokens, pending_records
         except ProviderBadRequestError as exc:
             if not _is_context_overflow_error(exc):
                 raise
 
-        compacted = await self._compact_session(session, reason="overflow")
-        if compacted is None:
-            raise ContextBudgetError("Context overflow occurred and compaction could not proceed.")
-
-        records = self._storage.load_records(compacted.session_id)
-        retry_request = self._build_turn_request(
-            session_id=compacted.session_id,
-            records=records,
-            user_text=user_text,
-            turn_context_text=turn_context_text,
+        (
+            compacted,
+            records,
+            rebound_pending_records,
+            retry_request,
+            retry_estimate,
+        ) = await self._compact_followup_and_rebuild_request(
+            session=session,
+            pending_records=pending_records,
+            reason="overflow",
+            turn_id=turn_id,
         )
-        retry_estimate = estimate_request_input_tokens(retry_request)
-        if retry_estimate >= self._settings.context_policy.preflight_limit_tokens:
-            raise ContextBudgetError(
-                "Overflow retry aborted: compacted request still exceeds preflight limit."
-            )
         response = await self._llm_service.generate(retry_request)
-        return compacted, response, True, retry_estimate
+        return compacted, response, True, retry_estimate, rebound_pending_records
 
     def _persist_successful_turn(
         self,
         *,
         session_id: str,
-        records: Sequence[ConversationRecord],
+        turn_id: str,
         response: LLMResponse,
         estimated_input_tokens: int,
     ) -> None:
-        for record in records:
-            if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
-                continue
-            self._storage.append_record(session_id, record)
-
+        self._finish_turn(
+            session_id=session_id,
+            turn_id=turn_id,
+            status="completed",
+        )
         usage = response.usage
         self._storage.update_session(
             session_id,
+            pending_interruption_notice=False,
             last_input_tokens=usage.input_tokens if usage is not None else None,
             last_output_tokens=usage.output_tokens if usage is not None else None,
             last_total_tokens=usage.total_tokens if usage is not None else None,
@@ -926,21 +1212,29 @@ class AgentLoop:
         records: Sequence[ConversationRecord],
         user_text: str,
         turn_context_text: str,
+        interruption_notice_text: str | None = None,
     ) -> LLMRequest:
-        return self._build_request(
-            list(records)
-            + [
-                self._build_turn_context_record(
+        turn_records: list[ConversationRecord] = [
+            self._build_turn_context_record(
+                session_id=session_id,
+                turn_context_text=turn_context_text,
+            )
+        ]
+        if interruption_notice_text is not None:
+            turn_records.append(
+                self._build_interruption_notice_record(
                     session_id=session_id,
-                    turn_context_text=turn_context_text,
-                ),
-                self._build_message_record(
-                    session_id=session_id,
-                    role="user",
-                    content=user_text,
-                ),
-            ]
+                    text=interruption_notice_text,
+                )
+            )
+        turn_records.append(
+            self._build_message_record(
+                session_id=session_id,
+                role="user",
+                content=user_text,
+            )
         )
+        return self._build_request(list(records) + turn_records)
 
     async def _execute_followup_tool_rounds(
         self,
@@ -950,13 +1244,16 @@ class AgentLoop:
         pending_records: list[ConversationRecord],
         current_response: LLMResponse,
         current_estimated_input_tokens: int,
-    ) -> tuple[SessionMetadata, LLMResponse, int, bool]:
+        turn_id: str,
+    ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool]:
         tool_rounds = 0
         did_compaction = False
         current_session = session
         current_base_records = list(base_records)
 
         while current_response.tool_calls:
+            if self._stop_requested(turn_id):
+                return current_session, current_response, current_estimated_input_tokens, did_compaction, True
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                 current_response, current_estimated_input_tokens = (
@@ -965,19 +1262,30 @@ class AgentLoop:
                         base_records=current_base_records,
                         pending_records=pending_records,
                         attempted_round=tool_rounds,
+                        turn_id=turn_id,
                     )
                 )
                 break
 
             followup_compaction_attempted = False
             try:
-                request, current_estimated_input_tokens = (
-                    await self._execute_tool_calls_and_build_request(
-                        session_id=current_session.session_id,
-                        base_records=current_base_records,
-                        pending_records=pending_records,
-                        current_response=current_response,
+                await self._execute_tool_calls(
+                    session_id=current_session.session_id,
+                    pending_records=pending_records,
+                    current_response=current_response,
+                    turn_id=turn_id,
+                )
+                if self._stop_requested(turn_id):
+                    return (
+                        current_session,
+                        current_response,
+                        current_estimated_input_tokens,
+                        did_compaction,
+                        True,
                     )
+                request, current_estimated_input_tokens = self._build_followup_request(
+                    base_records=current_base_records,
+                    pending_records=pending_records,
                 )
             except ContextBudgetError:
                 (
@@ -990,6 +1298,7 @@ class AgentLoop:
                     session=current_session,
                     pending_records=pending_records,
                     reason="followup_preflight",
+                    turn_id=turn_id,
                 )
                 pending_records[:] = rebound_pending_records
                 did_compaction = True
@@ -1017,16 +1326,23 @@ class AgentLoop:
                     session=current_session,
                     pending_records=pending_records,
                     reason="followup_overflow",
+                    turn_id=turn_id,
                 )
                 pending_records[:] = rebound_pending_records
                 did_compaction = True
                 followup_compaction_attempted = True
 
-            pending_records.append(
-                self._build_assistant_record(current_session.session_id, current_response)
+            self._append_turn_record(
+                session_id=current_session.session_id,
+                pending_records=pending_records,
+                record=self._build_assistant_record(
+                    current_session.session_id,
+                    current_response,
+                    turn_id=turn_id,
+                ),
             )
 
-        return current_session, current_response, current_estimated_input_tokens, did_compaction
+        return current_session, current_response, current_estimated_input_tokens, did_compaction, False
 
     async def _compact_followup_and_rebuild_request(
         self,
@@ -1034,13 +1350,29 @@ class AgentLoop:
         session: SessionMetadata,
         pending_records: Sequence[ConversationRecord],
         reason: str,
+        turn_id: str,
     ) -> tuple[SessionMetadata, list[ConversationRecord], list[ConversationRecord], LLMRequest, int]:
-        compacted = await self._compact_session(session, reason=reason)
+        compacted = await self._compact_session(
+            session,
+            reason=reason,
+            include_turn_ids=(turn_id,),
+        )
         if compacted is None:
             raise ContextBudgetError(_FOLLOWUP_COMPACTION_FAILED_TEXT)
 
+        stop_requested = self._stop_requested(turn_id)
+        self._storage.set_turn_status(
+            session.session_id,
+            turn_id=turn_id,
+            status="superseded",
+        )
+        self._storage.set_turn_status(
+            compacted.session_id,
+            turn_id=turn_id,
+            status="in_progress",
+        )
         rebound_pending_records = [
-            self._clone_record_for_session(compacted.session_id, record)
+            self._clone_carry_forward_record_for_session(compacted.session_id, record)
             for record in pending_records
         ]
         base_records = self._storage.load_records(compacted.session_id)
@@ -1053,7 +1385,28 @@ class AgentLoop:
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
         if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
-            raise ContextBudgetError(_FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT)
+            rebound_pending_records = [
+                self._strongly_compact_carry_forward_record(record)
+                for record in rebound_pending_records
+            ]
+            activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
+                rebound_pending_records
+            )
+            request = self._build_request(
+                list(base_records) + rebound_pending_records,
+                activated_discoverable_tool_names=activated_discoverable_tool_names,
+            )
+            estimated_input_tokens = estimate_request_input_tokens(request)
+            if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
+                raise ContextBudgetError(_FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT)
+
+        for record in rebound_pending_records:
+            if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+                continue
+            self._storage.append_record(compacted.session_id, record)
+        self._active_turn_id = turn_id
+        if stop_requested:
+            self._stop_requested_turn_id = turn_id
         return (
             compacted,
             list(base_records),
@@ -1112,8 +1465,12 @@ class AgentLoop:
         *,
         reason: str,
         user_instruction: str | None = None,
+        include_turn_ids: tuple[str, ...] = (),
     ) -> SessionMetadata | None:
-        records = self._storage.load_records(session.session_id)
+        records = self._storage.load_records(
+            session.session_id,
+            include_turn_ids=include_turn_ids,
+        )
         compactable_records = [
             record
             for record in records
@@ -1140,6 +1497,7 @@ class AgentLoop:
         self._storage.update_session(
             next_session.session_id,
             pending_reactive_compaction=False,
+            pending_interruption_notice=session.pending_interruption_notice,
         )
         return self._storage.get_session(next_session.session_id) or next_session
 
@@ -1179,7 +1537,11 @@ class AgentLoop:
         role: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        turn_id: str | None = None,
     ) -> ConversationRecord:
+        resolved_metadata = dict(metadata or {})
+        if turn_id is not None:
+            resolved_metadata[_TURN_ID_METADATA_KEY] = turn_id
         return ConversationRecord(
             record_id=uuid4().hex,
             session_id=session_id,
@@ -1187,13 +1549,15 @@ class AgentLoop:
             role=role,  # type: ignore[arg-type]
             content=content,
             kind="message",
-            metadata=metadata or {},
+            metadata=resolved_metadata,
         )
 
     def _build_assistant_record(
         self,
         session_id: str,
         response: LLMResponse,
+        *,
+        turn_id: str | None = None,
     ) -> ConversationRecord:
         assistant_metadata: dict[str, Any] = {
             "provider": response.provider,
@@ -1216,12 +1580,59 @@ class AgentLoop:
             role="assistant",
             content=response.text,
             metadata=assistant_metadata,
+            turn_id=turn_id,
+        )
+
+    def _build_streamed_assistant_text_record(
+        self,
+        *,
+        session_id: str,
+        text: str,
+        turn_id: str,
+    ) -> ConversationRecord | None:
+        if not text:
+            return None
+        return self._build_message_record(
+            session_id=session_id,
+            role="assistant",
+            content=text,
+            metadata={"stream_checkpoint": "text_before_tool_call"},
+            turn_id=turn_id,
+        )
+
+    def _build_final_stream_assistant_record(
+        self,
+        *,
+        session_id: str,
+        response: LLMResponse,
+        turn_id: str,
+        persisted_text_prefix: str | None,
+    ) -> ConversationRecord | None:
+        normalized = response
+        if persisted_text_prefix:
+            if response.text == persisted_text_prefix:
+                if not response.tool_calls:
+                    return None
+                normalized = replace(response, text="")
+            elif response.text.startswith(persisted_text_prefix):
+                normalized = replace(
+                    response,
+                    text=response.text[len(persisted_text_prefix):],
+                )
+        if not normalized.text and not normalized.tool_calls:
+            return None
+        return self._build_assistant_record(
+            session_id,
+            normalized,
+            turn_id=turn_id,
         )
 
     def _build_tool_record(
         self,
         session_id: str,
         result: ToolExecutionResult,
+        *,
+        turn_id: str | None = None,
     ) -> ConversationRecord:
         metadata = dict(result.metadata)
         metadata.update(
@@ -1236,6 +1647,7 @@ class AgentLoop:
             role="tool",
             content=result.content,
             metadata=metadata,
+            turn_id=turn_id,
         )
 
     def _build_turn_context_record(
@@ -1251,6 +1663,22 @@ class AgentLoop:
             metadata={
                 _TRANSIENT_RECORD_METADATA_KEY: True,
                 _TURN_CONTEXT_METADATA_KEY: "datetime",
+            },
+        )
+
+    def _build_interruption_notice_record(
+        self,
+        *,
+        session_id: str,
+        text: str,
+    ) -> ConversationRecord:
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=text,
+            metadata={
+                _TRANSIENT_RECORD_METADATA_KEY: True,
+                _INTERRUPTION_NOTICE_METADATA_KEY: True,
             },
         )
 
@@ -1307,6 +1735,87 @@ class AgentLoop:
         )
         self._storage.append_record(session_id, record)
 
+    def _begin_turn(self, *, session_id: str, turn_id: str) -> None:
+        self._storage.set_turn_status(
+            session_id,
+            turn_id=turn_id,
+            status="in_progress",
+        )
+        self._active_turn_id = turn_id
+        self._stop_requested_turn_id = None
+
+    def _finish_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        status: Literal["completed", "interrupted", "superseded"],
+    ) -> None:
+        self._storage.set_turn_status(
+            session_id,
+            turn_id=turn_id,
+            status=status,
+        )
+        if self._active_turn_id == turn_id:
+            self._active_turn_id = None
+        if self._stop_requested_turn_id == turn_id:
+            self._stop_requested_turn_id = None
+
+    def _stop_requested(self, turn_id: str) -> bool:
+        return self._stop_requested_turn_id == turn_id
+
+    def _clear_turn_control(self, turn_id: str) -> None:
+        if self._active_turn_id == turn_id:
+            self._active_turn_id = None
+        if self._stop_requested_turn_id == turn_id:
+            self._stop_requested_turn_id = None
+
+    def _append_turn_record(
+        self,
+        *,
+        session_id: str,
+        pending_records: list[ConversationRecord],
+        record: ConversationRecord,
+    ) -> None:
+        pending_records.append(record)
+        if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+            return
+        self._storage.append_record(session_id, record)
+
+    def _interrupt_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        command: str | None,
+        compaction_performed: bool,
+        response_text: str,
+    ) -> AgentTurnResult:
+        interruption_record = self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=_TURN_INTERRUPTED_RECORD_TEXT,
+            metadata={"interrupted_by_user": True},
+            turn_id=turn_id,
+        )
+        self._storage.append_record(session_id, interruption_record)
+        self._finish_turn(
+            session_id=session_id,
+            turn_id=turn_id,
+            status="interrupted",
+        )
+        self._storage.update_session(
+            session_id,
+            pending_interruption_notice=True,
+        )
+        return AgentTurnResult(
+            session_id=session_id,
+            response_text=response_text,
+            command=command,
+            compaction_performed=compaction_performed,
+            interrupted=True,
+        )
+
     def _clone_record_for_session(
         self,
         session_id: str,
@@ -1320,6 +1829,49 @@ class AgentLoop:
             content=record.content,
             kind=record.kind,
             metadata=deepcopy(record.metadata),
+        )
+
+    def _clone_carry_forward_record_for_session(
+        self,
+        session_id: str,
+        record: ConversationRecord,
+    ) -> ConversationRecord:
+        cloned = self._clone_record_for_session(session_id, record)
+        return self._compact_carry_forward_record(cloned)
+
+    def _compact_carry_forward_record(
+        self,
+        record: ConversationRecord,
+    ) -> ConversationRecord:
+        limit = _carry_forward_soft_limit(record)
+        if limit is None or len(record.content) <= limit:
+            return record
+        return _copy_record_with_content(
+            record,
+            content=_truncate_carry_forward_text(record.content, limit=limit),
+            metadata_updates={
+                "carry_forward_compacted": True,
+                "carry_forward_compaction_strength": "soft",
+            },
+        )
+
+    def _strongly_compact_carry_forward_record(
+        self,
+        record: ConversationRecord,
+    ) -> ConversationRecord:
+        if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+            return record
+        if record.role not in {"user", "assistant", "tool"}:
+            return record
+        if not record.content:
+            return record
+        return _copy_record_with_content(
+            record,
+            content=_strong_carry_forward_text(record),
+            metadata_updates={
+                "carry_forward_compacted": True,
+                "carry_forward_compaction_strength": "strong",
+            },
         )
 
     def _build_turn_context_text(self) -> str:
@@ -1343,7 +1895,98 @@ def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:
     return any(hint in message for hint in _OVERFLOW_ERROR_HINTS)
 
 
-def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
+def _records_to_llm_messages(
+    records: Sequence[ConversationRecord],
+) -> tuple[LLMMessage, ...]:
+    messages: list[LLMMessage] = []
+    pending_assistant: ConversationRecord | None = None
+    pending_tool_records: list[ConversationRecord] = []
+    pending_call_ids: set[str] = set()
+    pending_tool_names: tuple[str, ...] = ()
+
+    def _append_record(
+        record: ConversationRecord,
+        *,
+        include_tool_calls: bool = True,
+    ) -> None:
+        llm_message = _record_to_llm_message(
+            record,
+            include_tool_calls=include_tool_calls,
+        )
+        if llm_message is not None:
+            messages.append(llm_message)
+
+    def _clear_pending() -> None:
+        nonlocal pending_assistant, pending_tool_records, pending_call_ids, pending_tool_names
+        pending_assistant = None
+        pending_tool_records = []
+        pending_call_ids = set()
+        pending_tool_names = ()
+
+    def _flush_resolved_pending() -> None:
+        if pending_assistant is None:
+            return
+        _append_record(pending_assistant, include_tool_calls=True)
+        for tool_record in pending_tool_records:
+            _append_record(tool_record)
+        _clear_pending()
+
+    def _flush_unresolved_pending() -> None:
+        if pending_assistant is None:
+            return
+        _append_record(pending_assistant, include_tool_calls=False)
+        messages.append(
+            _build_unexecuted_tool_call_note_message(
+                pending_tool_names,
+            )
+        )
+        _clear_pending()
+
+    for record in records:
+        if record.kind != "message":
+            continue
+
+        call_specs = _assistant_tool_call_specs(record)
+        if pending_assistant is None:
+            if call_specs:
+                pending_assistant = record
+                pending_tool_records = []
+                pending_call_ids = {call_id for call_id, _name in call_specs}
+                pending_tool_names = tuple(_ordered_unique_names(name for _call_id, name in call_specs))
+                continue
+
+            _append_record(record)
+            continue
+
+        if record.role == "tool":
+            call_id = str(record.metadata.get("call_id", "")).strip()
+            if call_id and call_id in pending_call_ids:
+                pending_tool_records.append(record)
+                pending_call_ids.remove(call_id)
+                if not pending_call_ids:
+                    _flush_resolved_pending()
+                continue
+
+        _flush_unresolved_pending()
+        if call_specs:
+            pending_assistant = record
+            pending_tool_records = []
+            pending_call_ids = {call_id for call_id, _name in call_specs}
+            pending_tool_names = tuple(_ordered_unique_names(name for _call_id, name in call_specs))
+            continue
+        _append_record(record)
+
+    if pending_assistant is not None:
+        _flush_unresolved_pending()
+
+    return tuple(messages)
+
+
+def _record_to_llm_message(
+    record: ConversationRecord,
+    *,
+    include_tool_calls: bool = True,
+) -> LLMMessage | None:
     if record.role in {"system", "developer", "user"}:
         parts: list[ImagePart | TextPart] = []
         image_part = _record_image_part(record)
@@ -1359,27 +2002,28 @@ def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
         parts: list[TextPart | ToolCall] = []
         if record.content:
             parts.append(TextPart(text=record.content))
-        for tool_call in record.metadata.get("tool_calls", []):
-            if not isinstance(tool_call, dict):
-                continue
-            call_id = str(tool_call.get("call_id", "")).strip()
-            name = str(tool_call.get("name", "")).strip()
-            raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
-            arguments = tool_call.get("arguments", {})
-            provider_metadata = tool_call.get("provider_metadata", {})
-            if not call_id or not name or not raw_arguments or not isinstance(arguments, dict):
-                continue
-            if not isinstance(provider_metadata, dict):
-                provider_metadata = {}
-            parts.append(
-                ToolCall(
-                    call_id=call_id,
-                    name=name,
-                    arguments=dict(arguments),
-                    raw_arguments=raw_arguments,
-                    provider_metadata=dict(provider_metadata),
+        if include_tool_calls:
+            for tool_call in record.metadata.get("tool_calls", []):
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("call_id", "")).strip()
+                name = str(tool_call.get("name", "")).strip()
+                raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
+                arguments = tool_call.get("arguments", {})
+                provider_metadata = tool_call.get("provider_metadata", {})
+                if not call_id or not name or not raw_arguments or not isinstance(arguments, dict):
+                    continue
+                if not isinstance(provider_metadata, dict):
+                    provider_metadata = {}
+                parts.append(
+                    ToolCall(
+                        call_id=call_id,
+                        name=name,
+                        arguments=dict(arguments),
+                        raw_arguments=raw_arguments,
+                        provider_metadata=dict(provider_metadata),
+                    )
                 )
-            )
         if not parts:
             return None
         return LLMMessage(role="assistant", parts=tuple(parts))
@@ -1402,6 +2046,58 @@ def _record_to_llm_message(record: ConversationRecord) -> LLMMessage | None:
         )
 
     return None
+
+
+def _assistant_tool_call_specs(
+    record: ConversationRecord,
+) -> tuple[tuple[str, str], ...]:
+    if record.role != "assistant":
+        return ()
+
+    specs: list[tuple[str, str]] = []
+    for tool_call in record.metadata.get("tool_calls", []):
+        if not isinstance(tool_call, dict):
+            continue
+        call_id = str(tool_call.get("call_id", "")).strip()
+        name = str(tool_call.get("name", "")).strip()
+        raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
+        arguments = tool_call.get("arguments", {})
+        if not call_id or not name or not raw_arguments or not isinstance(arguments, dict):
+            continue
+        specs.append((call_id, name))
+    return tuple(specs)
+
+
+def _ordered_unique_names(names: Sequence[str] | list[str] | tuple[str, ...] | Any) -> tuple[str, ...]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw_name in names:
+        name = str(raw_name).strip()
+        if not name or name in seen:
+            continue
+        ordered.append(name)
+        seen.add(name)
+    return tuple(ordered)
+
+
+def _build_unexecuted_tool_call_note_message(
+    tool_names: Sequence[str],
+) -> LLMMessage:
+    if tool_names:
+        names_text = ", ".join(tool_names)
+        text = (
+            "The previous turn was interrupted before these proposed tool calls were executed: "
+            f"{names_text}. Treat them as not run."
+        )
+    else:
+        text = (
+            "The previous turn was interrupted before the assistant's proposed tool calls were executed. "
+            "Treat them as not run."
+        )
+    return LLMMessage(
+        role="system",
+        parts=(TextPart(text=text),),
+    )
 
 
 def _collect_activated_discoverable_tool_names(
@@ -1462,4 +2158,58 @@ def _record_image_part(record: ConversationRecord) -> ImagePart | None:
         media_type=media_type,
         data_base64=base64.b64encode(data).decode("ascii"),
         detail=raw_detail,  # type: ignore[arg-type]
+    )
+
+
+def _carry_forward_soft_limit(record: ConversationRecord) -> int | None:
+    if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+        return None
+    if record.role == "tool":
+        return 1_800
+    if record.role in {"user", "assistant"}:
+        return 1_200
+    return None
+
+
+def _truncate_carry_forward_text(text: str, *, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = max(1, limit // 2)
+    tail = max(1, limit - head)
+    return f"{text[:head]}\n...[carry-forward truncated]...\n{text[-tail:]}"
+
+
+def _strong_carry_forward_text(record: ConversationRecord) -> str:
+    if record.role == "tool":
+        return (
+            "Tool result compacted after mid-turn overflow.\n"
+            "See the archived session transcript for the full tool output."
+        )
+    if record.role == "assistant":
+        return (
+            "Assistant message compacted after mid-turn overflow.\n"
+            "See the archived session transcript for the full assistant text."
+        )
+    return (
+        "User message compacted after mid-turn overflow.\n"
+        "See the archived session transcript for the full user text."
+    )
+
+
+def _copy_record_with_content(
+    record: ConversationRecord,
+    *,
+    content: str,
+    metadata_updates: dict[str, Any],
+) -> ConversationRecord:
+    metadata = deepcopy(record.metadata)
+    metadata.update(metadata_updates)
+    return ConversationRecord(
+        record_id=record.record_id,
+        session_id=record.session_id,
+        created_at=record.created_at,
+        role=record.role,
+        content=content,
+        kind=record.kind,
+        metadata=metadata,
     )

@@ -45,6 +45,7 @@ class GatewayTurnDoneEvent:
     response_text: str
     command: str | None = None
     compaction_performed: bool = False
+    interrupted: bool = False
     type: str = "turn_done"
 
 
@@ -138,6 +139,7 @@ class GatewayWebSocketClient:
                                 else None
                             ),
                             compaction_performed=bool(payload.get("compaction_performed", False)),
+                            interrupted=bool(payload.get("interrupted", False)),
                         )
                         return
                     if event_type == "error":
@@ -145,6 +147,51 @@ class GatewayWebSocketClient:
                             code=str(payload.get("code", "gateway_error")),
                             message=str(payload.get("message", "Gateway returned an error.")),
                         )
+        except GatewayBridgeError:
+            raise
+        except Exception:  # pragma: no cover - exception types depend on websocket lib
+            raise GatewayBridgeError(
+                code="gateway_unavailable",
+                message="Could not communicate with the gateway websocket.",
+            ) from None
+
+    async def request_stop(self, *, route_id: str) -> bool:
+        websocket_url = f"{self._websocket_base_url}/{route_id}"
+        connect = _resolve_websocket_connect()
+
+        try:
+            async with connect(
+                websocket_url,
+                open_timeout=self._connect_timeout_seconds,
+                close_timeout=self._connect_timeout_seconds,
+            ) as socket:
+                ready_payload = await _recv_json(socket)
+                ready_type = ready_payload.get("type")
+                if ready_type == "error":
+                    raise GatewayBridgeError(
+                        code=str(ready_payload.get("code", "gateway_error")),
+                        message=str(ready_payload.get("message", "Gateway returned an error.")),
+                    )
+                if ready_type != "ready":
+                    raise GatewayBridgeError(
+                        code="invalid_ready_event",
+                        message="Gateway did not send a ready event.",
+                    )
+
+                await socket.send(json.dumps({"type": "stop_turn"}))
+                payload = await _recv_json(socket)
+                event_type = payload.get("type")
+                if event_type == "stop_ack":
+                    return bool(payload.get("stop_requested", False))
+                if event_type == "error":
+                    raise GatewayBridgeError(
+                        code=str(payload.get("code", "gateway_error")),
+                        message=str(payload.get("message", "Gateway returned an error.")),
+                    )
+                raise GatewayBridgeError(
+                    code="invalid_stop_ack",
+                    message="Gateway did not send a stop acknowledgement.",
+                )
         except GatewayBridgeError:
             raise
         except Exception:  # pragma: no cover - exception types depend on websocket lib

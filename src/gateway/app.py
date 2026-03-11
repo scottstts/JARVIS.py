@@ -27,11 +27,13 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .config import GatewaySettings
 from .protocol import (
+    ClientStopTurn,
     ProtocolError,
     build_assistant_delta_event,
     build_assistant_message_event,
     build_error_event,
     build_ready_event,
+    build_stop_ack_event,
     build_tool_call_event,
     build_turn_done_event,
     parse_client_event,
@@ -144,6 +146,16 @@ def create_app(
                     return
                 continue
 
+            if isinstance(event, ClientStopTurn):
+                if not await _send_json_if_open(
+                    websocket,
+                    build_stop_ack_event(
+                        stop_requested=resolved_router.request_stop(route_id)
+                    ),
+                ):
+                    return
+                continue
+
             try:
                 async for turn_event in resolved_router.stream_turn(route_id, event.text):
                     if isinstance(turn_event, AgentTextDeltaEvent):
@@ -187,6 +199,7 @@ def create_app(
                                 response_text=turn_event.response_text,
                                 command=turn_event.command,
                                 compaction_performed=turn_event.compaction_performed,
+                                interrupted=turn_event.interrupted,
                             )
                         ):
                             return

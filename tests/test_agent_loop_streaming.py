@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,6 +45,24 @@ class _FakeTurnContextLLMService:
 
     async def stream_generate(self, _request):
         raise AssertionError("Streaming is not expected in this test.")
+
+
+class _InterruptibleStreamingLLMService:
+    def __init__(self) -> None:
+        self.stream_started = asyncio.Event()
+        self.release_stream = asyncio.Event()
+        self.generate_requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest):
+        self.generate_requests.append(request)
+        return _build_response("next-turn")
+
+    async def stream_generate(self, _request):
+        yield TextDeltaEvent(delta="stream-")
+        self.stream_started.set()
+        await self.release_stream.wait()
+        yield TextDeltaEvent(delta="reply")
+        yield DoneEvent(response=_build_response("stream-reply"))
 
 
 class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
@@ -142,3 +161,105 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
                     for record in persisted_records
                 )
             )
+
+    async def test_stream_user_input_interrupts_after_current_streamed_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _InterruptibleStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("hello")]
+
+            task = asyncio.create_task(_collect_events())
+            await llm_service.stream_started.wait()
+
+            self.assertTrue(loop.request_stop())
+            llm_service.release_stream.set()
+            events = await task
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+            self.assertEqual(done.response_text, "stream-reply")
+
+            visible_records = storage.load_records(done.session_id)
+            visible_message_records = [record for record in visible_records if record.kind == "message"]
+            self.assertEqual(visible_message_records[-3].role, "user")
+            self.assertEqual(visible_message_records[-3].content, "hello")
+            self.assertEqual(visible_message_records[-2].role, "assistant")
+            self.assertEqual(visible_message_records[-2].content, "stream-reply")
+            self.assertEqual(visible_message_records[-1].role, "system")
+
+            all_records = storage.load_records(done.session_id, include_all_turns=True)
+            message_records = [record for record in all_records if record.kind == "message"]
+            self.assertEqual(message_records[-3].role, "user")
+            self.assertEqual(message_records[-2].role, "assistant")
+            self.assertEqual(message_records[-1].role, "system")
+            self.assertEqual(message_records[-1].content, "This turn was interrupted by the user before it completed.")
+
+            session = storage.get_session(done.session_id)
+            self.assertIsNotNone(session)
+            self.assertTrue(session.pending_interruption_notice)  # type: ignore[union-attr]
+
+    async def test_next_turn_includes_previous_task_interruption_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _InterruptibleStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("hello")]
+
+            task = asyncio.create_task(_collect_events())
+            await llm_service.stream_started.wait()
+            self.assertTrue(loop.request_stop())
+            llm_service.release_stream.set()
+            _ = await task
+
+            result = await loop.handle_user_input("continue")
+            self.assertEqual(result.response_text, "next-turn")
+            self.assertEqual(len(llm_service.generate_requests), 1)
+
+            request = llm_service.generate_requests[0]
+            self.assertTrue(
+                any(
+                    message.role == "user"
+                    and any(isinstance(part, TextPart) and part.text == "hello" for part in message.parts)
+                    for message in request.messages
+                )
+            )
+            self.assertTrue(
+                any(
+                    message.role == "assistant"
+                    and any(isinstance(part, TextPart) and part.text == "stream-reply" for part in message.parts)
+                    for message in request.messages
+                )
+            )
+            interruption_messages = [
+                part.text
+                for message in request.messages
+                if message.role == "system"
+                for part in message.parts
+                if isinstance(part, TextPart)
+                and "The previous task was interrupted by the user." in part.text
+            ]
+            self.assertEqual(
+                interruption_messages,
+                ["The previous task was interrupted by the user."],
+            )
+
+            session = storage.get_session(result.session_id)
+            self.assertIsNotNone(session)
+            self.assertFalse(session.pending_interruption_notice)  # type: ignore[union-attr]

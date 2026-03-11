@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .types import ConversationRecord, SessionMetadata
+from .types import ConversationRecord, SessionMetadata, TurnStatus
 
 
 class SessionStorage:
@@ -74,6 +74,25 @@ class SessionStorage:
             pending_reactive_compaction=False,
         )
 
+    def set_turn_status(
+        self,
+        session_id: str,
+        *,
+        turn_id: str,
+        status: TurnStatus,
+    ) -> SessionMetadata:
+        normalized_turn_id = turn_id.strip()
+        if not normalized_turn_id:
+            raise ValueError("turn_id cannot be empty.")
+
+        session = self.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session id: {session_id}")
+
+        turn_states = dict(session.turn_states)
+        turn_states[normalized_turn_id] = status
+        return self.update_session(session_id, turn_states=turn_states)
+
     def update_session(self, session_id: str, **changes: Any) -> SessionMetadata:
         index = self._load_index()
         raw = index["sessions"].get(session_id)
@@ -98,11 +117,20 @@ class SessionStorage:
             handle.write("\n")
         self.update_session(session_id)
 
-    def load_records(self, session_id: str) -> list[ConversationRecord]:
+    def load_records(
+        self,
+        session_id: str,
+        *,
+        include_turn_ids: tuple[str, ...] = (),
+        include_all_turns: bool = False,
+    ) -> list[ConversationRecord]:
         path = self._session_path(session_id)
         if not path.exists():
             return []
 
+        session = self.get_session(session_id)
+        turn_states = session.turn_states if session is not None else {}
+        included_turn_ids = {turn_id.strip() for turn_id in include_turn_ids if turn_id.strip()}
         records: list[ConversationRecord] = []
         with path.open("r", encoding="utf-8") as handle:
             for raw_line in handle:
@@ -116,9 +144,16 @@ class SessionStorage:
                 if not isinstance(payload, dict):
                     continue
                 try:
-                    records.append(ConversationRecord.from_dict(payload))
+                    record = ConversationRecord.from_dict(payload)
                 except KeyError:
                     continue
+                if not include_all_turns and not _record_is_visible(
+                    record,
+                    turn_states=turn_states,
+                    include_turn_ids=included_turn_ids,
+                ):
+                    continue
+                records.append(record)
         return records
 
     def _session_path(self, session_id: str) -> Path:
@@ -161,3 +196,21 @@ class SessionStorage:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _record_is_visible(
+    record: ConversationRecord,
+    *,
+    turn_states: dict[str, TurnStatus],
+    include_turn_ids: set[str],
+) -> bool:
+    raw_turn_id = record.metadata.get("turn_id")
+    if raw_turn_id is None:
+        return True
+
+    turn_id = str(raw_turn_id).strip()
+    if not turn_id:
+        return True
+    if turn_id in include_turn_ids:
+        return True
+    return turn_states.get(turn_id) in {"completed", "interrupted"}
