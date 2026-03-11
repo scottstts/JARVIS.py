@@ -616,6 +616,41 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - output settings are intentionally minimal; the tool does not yet expose aspect ratio or background controls
 - the tool saves the image locally but does not automatically send it to Telegram; a later `send_file` call is still needed for delivery
 
+### `transcribe`
+
+- Status: implemented
+- Exposure: `discoverable`
+- Package: `src/tools/discoverable/transcribe/`
+- Purpose: transcribe spoken audio from one workspace media file to plain text through OpenAI after discovery through `tool_search`
+
+#### Input Schema
+
+- `audio_path: string` required; workspace path to one supported local media file
+
+#### Executor Behavior
+
+- stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
+- uses OpenAI model `gpt-4o-mini-transcribe`
+- uploads exactly one local media file and returns the transcript text directly in the tool result content
+- pre-validates the file extension before upload and accepts the currently wired endpoint-safe formats: `flac`, `m4a`, `mp3`, `mp4`, `mpeg`, `mpga`, `ogg`, `wav`, `webm`
+- pre-validates the current OpenAI Audio API upload limit of `25 MB` before sending the request
+- tool guidance tells the agent to split larger sources into smaller chunks before transcription
+- uses `response_format="json"` so the runtime can reliably extract transcript text from the structured response
+- stores normalized metadata including model, input format, file size, transcript character count, and optional language/duration fields when returned
+
+#### Policy
+
+- `audio_path` must be non-empty
+- `audio_path` must stay inside `/workspace`
+- `audio_path` must use one of the supported filename extensions
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
+
+#### Current Limitations
+
+- v1 exposes only a single `audio_path` argument; it does not expose optional language, prompt, timestamp, or diarization controls
+- files larger than `25 MB` must be trimmed, split, or converted first, typically via `ffmpeg_cli`
+- the tool relies on `OPENAI_API_KEY` at runtime and does not currently support alternate transcription providers
+
 ### `ffmpeg_cli`
 
 - Status: implemented
@@ -662,6 +697,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`
+- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`, `transcribe`
 - Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `generate_edit_image`
+- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `generate_edit_image`, `transcribe`

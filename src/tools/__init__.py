@@ -13,6 +13,7 @@ from .basic.tool_search import ToolSearchPolicy
 from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
+from .discoverable.transcribe import TranscribePolicy
 from .types import (
     ToolExecutionContext,
     ToolExecutionResult,
@@ -30,6 +31,7 @@ __all__ = [
     "PythonInterpreterPolicy",
     "RegisteredTool",
     "SendFilePolicy",
+    "TranscribePolicy",
     "ToolExecutionContext",
     "ToolExecutionResult",
     "ToolExposure",

@@ -350,11 +350,15 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search_discoverable("archive"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("")],
-                ["ffmpeg_cli", "generate_edit_image"],
+                ["ffmpeg_cli", "generate_edit_image", "transcribe"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("edit image")],
                 ["generate_edit_image"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("transcribe")],
+                ["transcribe"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("ffmpeg")],
@@ -631,6 +635,42 @@ class ToolPolicyTests(unittest.TestCase):
                 "prompt": "A minimal product photo of a coffee mug.",
                 "output_path": str(outside),
             },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
+
+    def test_transcribe_allows_supported_audio_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="transcribe",
+            arguments={"audio_path": "temp/meeting.wav"},
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_transcribe_denies_missing_audio_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="transcribe",
+            arguments={},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("audio_path", decision.reason or "")
+
+    def test_transcribe_denies_unsupported_extension(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="transcribe",
+            arguments={"audio_path": "temp/meeting.aac"},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("supported extension", decision.reason or "")
+
+    def test_transcribe_denies_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "meeting.wav"
+        decision = self.policy.authorize(
+            tool_name="transcribe",
+            arguments={"audio_path": str(outside)},
             context=self.context,
         )
         self.assertFalse(decision.allowed)
@@ -1704,6 +1744,112 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("candidate_part_types=text", result.content)
         self.assertIn("response_text=No image was produced.", result.content)
 
+    async def test_transcribe_executes_openai_transcription(self) -> None:
+        captured: dict[str, object] = {}
+        audio_path = self.workspace_dir / "temp" / "meeting.wav"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_path.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+
+        class _FakeTranscriptionResponse:
+            text = "Hello from the meeting transcript."
+
+            @staticmethod
+            def model_dump(*, exclude_none: bool = False) -> dict[str, object]:
+                _ = exclude_none
+                return {
+                    "text": "Hello from the meeting transcript.",
+                    "language": "en",
+                    "duration": 12.345,
+                }
+
+        class _FakeTranscriptionsAPI:
+            def create(self, **kwargs):
+                captured["model"] = kwargs["model"]
+                captured["response_format"] = kwargs["response_format"]
+                captured["uploaded_file_name"] = kwargs["file"].name
+                return _FakeTranscriptionResponse()
+
+        class _FakeAudioAPI:
+            def __init__(self) -> None:
+                self.transcriptions = _FakeTranscriptionsAPI()
+
+        class _FakeOpenAIClient:
+            def __init__(self, **kwargs) -> None:
+                captured["client_kwargs"] = kwargs
+                self.audio = _FakeAudioAPI()
+
+            def close(self) -> None:
+                captured["closed"] = True
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-openai-key"}, clear=False):
+            with patch(
+                "tools.discoverable.transcribe.tool.OpenAI",
+                _FakeOpenAIClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_transcribe_openai",
+                        name="transcribe",
+                        arguments={"audio_path": "temp/meeting.wav"},
+                        raw_arguments='{"audio_path":"temp/meeting.wav"}',
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["model"], "gpt-4o-mini-transcribe")
+        self.assertEqual(result.metadata["response_format"], "json")
+        self.assertEqual(result.metadata["input_format"], "wav")
+        self.assertEqual(result.metadata["language"], "en")
+        self.assertEqual(result.metadata["duration_seconds"], 12.345)
+        self.assertEqual(
+            result.metadata["transcript_char_count"],
+            len("Hello from the meeting transcript."),
+        )
+        self.assertEqual(
+            captured["client_kwargs"],
+            {
+                "api_key": "test-openai-key",
+                "timeout": 60.0,
+                "max_retries": 2,
+            },
+        )
+        self.assertEqual(captured["model"], "gpt-4o-mini-transcribe")
+        self.assertEqual(captured["response_format"], "json")
+        self.assertEqual(captured["uploaded_file_name"], str(audio_path))
+        self.assertTrue(captured["closed"])
+        self.assertIn("Audio transcription completed", result.content)
+        self.assertIn("transcript:", result.content)
+        self.assertIn("Hello from the meeting transcript.", result.content)
+
+    async def test_transcribe_rejects_oversized_audio_before_openai_call(self) -> None:
+        audio_path = self.workspace_dir / "temp" / "oversized.wav"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        with audio_path.open("wb") as handle:
+            handle.truncate((25 * 1024 * 1024) + 1)
+
+        class _FailIfCalledOpenAIClient:
+            def __init__(self, **kwargs) -> None:
+                _ = kwargs
+                raise AssertionError("OpenAI client should not be created for oversized audio.")
+
+        with patch(
+            "tools.discoverable.transcribe.tool.OpenAI",
+            _FailIfCalledOpenAIClient,
+        ):
+            result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_transcribe_oversized",
+                    name="transcribe",
+                    arguments={"audio_path": "temp/oversized.wav"},
+                    raw_arguments='{"audio_path":"temp/oversized.wav"}',
+                ),
+                context=self.context,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("25 MB limit", result.content)
+
     async def test_web_search_executes_and_normalizes_results(self) -> None:
         def _fake_requests_get(url, *, params, headers, timeout):
             self.assertEqual(url, "https://api.search.brave.com/res/v1/web/search")
@@ -1928,6 +2074,26 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],
             ["ffmpeg_cli"],
+        )
+
+    async def test_tool_search_high_verbosity_transcribe_activates_tool(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_transcribe",
+                name="tool_search",
+                arguments={"query": "transcribe", "verbosity": "high"},
+                raw_arguments='{"query":"transcribe","verbosity":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("transcribe", result.content)
+        self.assertIn("gpt-4o-mini-transcribe", result.content)
+        self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["transcribe"])
+        self.assertEqual(
+            [match["name"] for match in result.metadata["matches"]],
+            ["transcribe"],
         )
 
     async def test_web_fetch_uses_tier1_markdown_when_available(self) -> None:
