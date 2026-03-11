@@ -340,7 +340,7 @@ class GenerateEditImageToolExecutor:
         contents.append(prompt)
 
         config = genai_types.GenerateContentConfig(
-            response_modalities=["TEXT", "IMAGE"],
+            response_modalities=[genai_types.Modality.IMAGE],
             image_config=genai_types.ImageConfig(
                 image_size=resolution,
             ),
@@ -614,7 +614,8 @@ def _build_generate_edit_image_tool_description(settings: ToolSettings) -> str:
         "Provider-specific tuning is optional: OpenAI quality supports low/medium/high and "
         "Gemini resolution supports 512/1K/2K/4K. Leave those unset unless the prompt "
         "explicitly needs a non-default tradeoff; the tool defaults to OpenAI medium and "
-        "Gemini 1K."
+        "Gemini 1K. Gemini requests image-only output because this tool is intended for "
+        "image generation/editing rather than mixed text responses."
     )
 
 
@@ -695,11 +696,29 @@ def _extract_gemini_response_payload(
     response: Any,
 ) -> tuple[str | None, bytes, str]:
     text_parts: list[str] = []
+    candidate_summaries: list[str] = []
     for candidate in getattr(response, "candidates", ()) or ():
+        candidate_details: list[str] = []
+        finish_reason = _normalize_optional_string(
+            getattr(candidate, "finish_reason", None)
+        )
+        if finish_reason is not None:
+            candidate_details.append(f"candidate_finish_reason={finish_reason}")
+        finish_message = _normalize_optional_string(
+            getattr(candidate, "finish_message", None)
+        )
+        if finish_message is not None:
+            candidate_details.append(
+                f"candidate_finish_message={_truncate_for_error(finish_message)}"
+            )
         content = getattr(candidate, "content", None)
         if content is None:
+            if candidate_details:
+                candidate_summaries.append(", ".join(candidate_details))
             continue
+        part_types: list[str] = []
         for part in getattr(content, "parts", ()) or ():
+            part_types.extend(_summarize_gemini_part_types(part))
             text = _normalize_optional_string(getattr(part, "text", None))
             if text is not None:
                 text_parts.append(text)
@@ -711,10 +730,64 @@ def _extract_gemini_response_payload(
             mime_type = _normalize_optional_string(getattr(inline_data, "mime_type", None))
             if isinstance(data, bytes) and data and mime_type is not None:
                 return ("\n".join(text_parts).strip() or None, data, mime_type)
+        if part_types:
+            candidate_details.append(
+                "candidate_part_types=" + ",".join(dict.fromkeys(part_types))
+            )
+        if candidate_details:
+            candidate_summaries.append(", ".join(candidate_details))
 
-    raise GenerateEditImageRequestError(
-        "Gemini did not return an inline image payload."
-    )
+    diagnostics: list[str] = []
+    candidate_count = len(getattr(response, "candidates", ()) or ())
+    diagnostics.append(f"candidate_count={candidate_count}")
+    prompt_feedback = _model_dump(getattr(response, "prompt_feedback", None))
+    if prompt_feedback is not None:
+        block_reason = _normalize_optional_string(prompt_feedback.get("block_reason"))
+        if block_reason is not None:
+            diagnostics.append(f"prompt_block_reason={block_reason}")
+        block_reason_message = _normalize_optional_string(
+            prompt_feedback.get("block_reason_message")
+        )
+        if block_reason_message is not None:
+            diagnostics.append(
+                "prompt_block_reason_message="
+                + _truncate_for_error(block_reason_message)
+            )
+    if candidate_summaries:
+        diagnostics.extend(candidate_summaries)
+    response_text = _normalize_optional_string(getattr(response, "text", None))
+    if response_text is not None:
+        diagnostics.append(f"response_text={_truncate_for_error(response_text)}")
+
+    reason = "Gemini did not return an inline image payload."
+    if diagnostics:
+        reason += " " + "; ".join(diagnostics)
+    raise GenerateEditImageRequestError(reason)
+
+
+def _summarize_gemini_part_types(part: Any) -> list[str]:
+    part_types: list[str] = []
+    text = _normalize_optional_string(getattr(part, "text", None))
+    if text is not None:
+        part_types.append("text")
+    for field_name in (
+        "inline_data",
+        "file_data",
+        "function_call",
+        "function_response",
+        "executable_code",
+        "code_execution_result",
+    ):
+        if getattr(part, field_name, None) is not None:
+            part_types.append(field_name)
+    return part_types
+
+
+def _truncate_for_error(value: str, *, limit: int = 160) -> str:
+    collapsed = " ".join(value.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3] + "..."
 
 
 def _model_dump(value: Any) -> dict[str, Any] | None:

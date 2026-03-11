@@ -69,3 +69,4 @@
 - `generate_edit_image` is the first default discoverable executable tool; it activates through `tool_search`, defaults to Gemini (`gemini-3.1-flash-image-preview`), falls back to OpenAI on request (`gpt-image-1.5`), and writes to an agent-chosen workspace `output_path`.
 - `generate_edit_image` exposes provider-specific fidelity knobs but should usually leave them unset: OpenAI defaults `quality` to `medium`, while Gemini defaults `resolution` to `1K`.
 - `generate_edit_image` no longer uses a fixed output directory; the agent must pass `output_path`, and the tool auto-creates missing parent directories before writing.
+- Gemini image generation now explicitly requests image-only output with `response_modalities=['Image']` to reduce intermittent text-only responses from `gemini-3.1-flash-image-preview`.

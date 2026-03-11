@@ -1493,14 +1493,6 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                         {
                                             "parts": [
                                                 type(
-                                                    "_FakeTextPart",
-                                                    (),
-                                                    {
-                                                        "text": "Edited image ready.",
-                                                        "inline_data": None,
-                                                    },
-                                                )(),
-                                                type(
                                                     "_FakeImagePart",
                                                     (),
                                                     {
@@ -1559,11 +1551,11 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.metadata["image_path"], str(input_path))
         self.assertEqual(result.metadata["input_media_type"], "image/png")
-        self.assertEqual(result.metadata["provider_text"], "Edited image ready.")
+        self.assertNotIn("provider_text", result.metadata)
         self.assertEqual(captured["api_key"], "test-google-key")
         self.assertEqual(captured["model"], "gemini-3.1-flash-image-preview")
         config = captured["config"]
-        self.assertEqual(config.response_modalities, ["TEXT", "IMAGE"])
+        self.assertEqual(config.response_modalities, ["IMAGE"])
         self.assertEqual(config.image_config.image_size, "1K")
         self.assertEqual(result.metadata["resolution"], "1K")
         contents = captured["contents"]
@@ -1573,6 +1565,91 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(output_path.exists())
         self.assertEqual(output_path.name, "edited-input.png")
         self.assertEqual(output_path.read_bytes(), b"gemini-image-bytes")
+
+    async def test_generate_edit_image_reports_gemini_no_image_diagnostics(self) -> None:
+        class _FakeGeminiModels:
+            def generate_content(self, *, model, contents, config):
+                _ = model, contents, config
+                return type(
+                    "_FakeGeminiResponse",
+                    (),
+                    {
+                        "model_version": "gemini-3.1-flash-image-preview",
+                        "response_id": "resp_gemini_missing_image",
+                        "prompt_feedback": type(
+                            "_FakePromptFeedback",
+                            (),
+                            {
+                                "model_dump": staticmethod(
+                                    lambda *, exclude_none=False: {
+                                        "block_reason": "IMAGE_OTHER",
+                                    }
+                                )
+                            },
+                        )(),
+                        "candidates": [
+                            type(
+                                "_FakeCandidate",
+                                (),
+                                {
+                                    "finish_reason": "NO_IMAGE",
+                                    "finish_message": "The model did not generate an image.",
+                                    "content": type(
+                                        "_FakeContent",
+                                        (),
+                                        {
+                                            "parts": [
+                                                type(
+                                                    "_FakeTextPart",
+                                                    (),
+                                                    {
+                                                        "text": "No image was produced.",
+                                                        "inline_data": None,
+                                                    },
+                                                )(),
+                                            ],
+                                        },
+                                    )(),
+                                },
+                            )()
+                        ],
+                        "text": "No image was produced.",
+                    },
+                )()
+
+        class _FakeGeminiClient:
+            def __init__(self, *, api_key: str) -> None:
+                _ = api_key
+                self.models = _FakeGeminiModels()
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
+            with patch(
+                "tools.discoverable.generate_edit_image.tool.genai.Client",
+                _FakeGeminiClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_generate_edit_image_gemini_missing_image",
+                        name="generate_edit_image",
+                        arguments={
+                            "prompt": "An abstract machine mind in darkness.",
+                            "output_path": "artifacts/gemini/missing-image.png",
+                        },
+                        raw_arguments=(
+                            '{"prompt":"An abstract machine mind in darkness.",'
+                            '"output_path":"artifacts/gemini/missing-image.png"}'
+                        ),
+                    ),
+                    context=self.context,
+                )
+
+        self.assertFalse(result.ok)
+        self.assertIn("Gemini did not return an inline image payload.", result.content)
+        self.assertIn("candidate_count=1", result.content)
+        self.assertIn("prompt_block_reason=IMAGE_OTHER", result.content)
+        self.assertIn("candidate_finish_reason=NO_IMAGE", result.content)
+        self.assertIn("candidate_part_types=text", result.content)
+        self.assertIn("response_text=No image was produced.", result.content)
 
     async def test_web_search_executes_and_normalizes_results(self) -> None:
         def _fake_requests_get(url, *, params, headers, timeout):

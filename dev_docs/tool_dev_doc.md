@@ -596,6 +596,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - uses OpenAI model `gpt-image-1.5` when `provider="openai"`
 - applies OpenAI `quality` only for the OpenAI path, defaulting to `medium`
 - applies Gemini `resolution` only for the Gemini path, defaulting to `1K`
+- forces Gemini image-only responses with `response_modalities=['Image']` so the tool does not intermittently receive text-only payloads
 - returns normalized tool-result metadata including operation, provider, model, output path, MIME type, and provider usage metadata when available
 
 #### Policy
@@ -612,7 +613,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 #### Current Limitations
 
 - v1 supports a single input image only; no masks or multi-image compositing yet
-- output settings are intentionally minimal; the tool does not yet expose size, aspect ratio, quality, or background controls
+- output settings are intentionally minimal; the tool does not yet expose aspect ratio or background controls
 - the tool saves the image locally but does not automatically send it to Telegram; a later `send_file` call is still needed for delivery
 
 ## Tools To Be Implemented
