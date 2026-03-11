@@ -6,7 +6,7 @@ services:
     container_name: jarvis
     cap_add:
       - SYS_ADMIN
-    shm_size: 12gb
+    shm_size: 512m
     security_opt:
       - seccomp:unconfined
     volumes:
