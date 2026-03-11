@@ -12,6 +12,7 @@ from .basic.send_file import SendFilePolicy
 from .basic.tool_search import ToolSearchPolicy
 from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
+from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .types import (
     ToolExecutionContext,
     ToolExecutionResult,
@@ -25,6 +26,7 @@ __all__ = [
     "BashCommandPolicy",
     "DiscoverableTool",
     "FilePatchPolicy",
+    "GenerateEditImagePolicy",
     "PythonInterpreterPolicy",
     "RegisteredTool",
     "SendFilePolicy",

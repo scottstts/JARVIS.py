@@ -1,7 +1,7 @@
-"""Discoverable tool packages."""
+"""Generate-edit-image discoverable tool package."""
 
-from .generate_edit_image import (
-    GenerateEditImagePolicy,
+from .policy import GenerateEditImagePolicy
+from .tool import (
     build_generate_edit_image_discoverable,
     build_generate_edit_image_tool,
 )

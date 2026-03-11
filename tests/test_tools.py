@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from base64 import b64decode
+from base64 import b64decode, b64encode
 from dataclasses import dataclass
 import os
 import shutil
@@ -21,6 +21,7 @@ from tools import (
     ToolRuntime,
     ToolSettings,
 )
+from tools.basic.tool_search import build_tool_search_tool
 from tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     HTTPFetchResult,
@@ -336,7 +337,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search("view_image"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("image", include_basic=True)],
-                ["python_interpreter", "view_image"],
+                ["python_interpreter", "view_image", "generate_edit_image"],
             )
             self.assertEqual(registry.search("send"), ())
             self.assertEqual(
@@ -344,7 +345,14 @@ class ToolRegistryTests(unittest.TestCase):
                 ["send_file"],
             )
             self.assertEqual(registry.search_discoverable("archive"), ())
-            self.assertEqual(registry.search_discoverable(""), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("")],
+                ["generate_edit_image"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("edit image")],
+                ["generate_edit_image"],
+            )
 
     def test_search_discoverable_matches_name_alias_and_description(self) -> None:
         registry = ToolRegistry()
@@ -527,6 +535,92 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn(".env", decision.reason or "")
+
+    def test_generate_edit_image_allows_prompt_only(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+            },
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_generate_edit_image_denies_missing_output_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={"prompt": "A minimal product photo of a coffee mug."},
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("output_path", decision.reason or "")
+
+    def test_generate_edit_image_denies_invalid_provider(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+                "provider": "stability",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("provider", decision.reason or "")
+
+    def test_generate_edit_image_denies_invalid_quality(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+                "quality": "ultra",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("quality", decision.reason or "")
+
+    def test_generate_edit_image_denies_invalid_resolution(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+                "resolution": "8K",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("resolution", decision.reason or "")
+
+    def test_generate_edit_image_denies_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "outside.png"
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "Swap the background to blue.",
+                "image_path": str(outside),
+                "output_path": "artifacts/result.png",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
+
+    def test_generate_edit_image_denies_output_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "outside.png"
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": str(outside),
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
 
     def test_web_search_allows_non_empty_query(self) -> None:
         decision = self.policy.authorize(
@@ -1280,6 +1374,206 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             str(image_path),
         )
 
+    async def test_generate_edit_image_executes_openai_generation(self) -> None:
+        captured: dict[str, object] = {}
+        fake_image_bytes = b"openai-image-bytes"
+        fake_image_b64 = b64encode(fake_image_bytes).decode("ascii")
+
+        class _FakeUsage:
+            def model_dump(self, *, exclude_none: bool = False) -> dict[str, int]:
+                _ = exclude_none
+                return {"total_tokens": 12}
+
+        class _FakeImagesAPI:
+            def generate(self, **kwargs):
+                captured["generate_kwargs"] = kwargs
+                return type(
+                    "_FakeOpenAIResponse",
+                    (),
+                    {
+                        "data": [
+                            type(
+                                "_FakeOpenAIImage",
+                                (),
+                                {
+                                    "b64_json": fake_image_b64,
+                                    "revised_prompt": "Refined studio product photo prompt.",
+                                },
+                            )()
+                        ],
+                        "usage": _FakeUsage(),
+                    },
+                )()
+
+        class _FakeOpenAIClient:
+            def __init__(self, **kwargs) -> None:
+                captured["client_kwargs"] = kwargs
+                self.images = _FakeImagesAPI()
+
+            def close(self) -> None:
+                captured["closed"] = True
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-openai-key"}, clear=False):
+            with patch(
+                "tools.discoverable.generate_edit_image.tool.OpenAI",
+                _FakeOpenAIClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_generate_edit_image_openai",
+                        name="generate_edit_image",
+                        arguments={
+                            "prompt": "A matte black coffee grinder on a white studio background.",
+                            "output_path": "artifacts/openai/grinder",
+                            "provider": "openai",
+                        },
+                        raw_arguments=(
+                            '{"prompt":"A matte black coffee grinder on a white studio '
+                            'background.","output_path":"artifacts/openai/grinder","provider":"openai"}'
+                        ),
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["provider"], "openai")
+        self.assertEqual(
+            result.metadata["model"],
+            "gpt-image-1.5",
+        )
+        self.assertEqual(result.metadata["mime_type"], "image/png")
+        self.assertEqual(result.metadata["file_size_bytes"], len(fake_image_bytes))
+        self.assertEqual(
+            captured["generate_kwargs"],
+            {
+                "model": "gpt-image-1.5",
+                "prompt": "A matte black coffee grinder on a white studio background.",
+                "quality": "medium",
+                "output_format": "png",
+            },
+        )
+        self.assertTrue(captured["closed"])
+        self.assertEqual(result.metadata["quality"], "medium")
+        output_path = Path(result.metadata["output_path"])
+        self.assertTrue(output_path.exists())
+        self.assertEqual(output_path.name, "grinder.png")
+        self.assertEqual(output_path.read_bytes(), fake_image_bytes)
+
+    async def test_generate_edit_image_executes_gemini_edit(self) -> None:
+        captured: dict[str, object] = {}
+        input_path = self.workspace_dir / "temp" / "input.png"
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+        input_path.write_bytes(b"\x89PNG\r\n\x1a\nfake_png_payload")
+
+        class _FakeUsageMetadata:
+            def model_dump(self, *, exclude_none: bool = False) -> dict[str, int]:
+                _ = exclude_none
+                return {"total_token_count": 21}
+
+        class _FakeGeminiModels:
+            def generate_content(self, *, model, contents, config):
+                captured["model"] = model
+                captured["contents"] = contents
+                captured["config"] = config
+                return type(
+                    "_FakeGeminiResponse",
+                    (),
+                    {
+                        "model_version": "gemini-3.1-flash-image-preview",
+                        "response_id": "resp_gemini_123",
+                        "usage_metadata": _FakeUsageMetadata(),
+                        "candidates": [
+                            type(
+                                "_FakeCandidate",
+                                (),
+                                {
+                                    "content": type(
+                                        "_FakeContent",
+                                        (),
+                                        {
+                                            "parts": [
+                                                type(
+                                                    "_FakeTextPart",
+                                                    (),
+                                                    {
+                                                        "text": "Edited image ready.",
+                                                        "inline_data": None,
+                                                    },
+                                                )(),
+                                                type(
+                                                    "_FakeImagePart",
+                                                    (),
+                                                    {
+                                                        "text": None,
+                                                        "inline_data": type(
+                                                            "_FakeInlineData",
+                                                            (),
+                                                            {
+                                                                "data": b"gemini-image-bytes",
+                                                                "mime_type": "image/png",
+                                                            },
+                                                        )(),
+                                                    },
+                                                )(),
+                                            ],
+                                        },
+                                    )(),
+                                },
+                            )()
+                        ],
+                    },
+                )()
+
+        class _FakeGeminiClient:
+            def __init__(self, *, api_key: str) -> None:
+                captured["api_key"] = api_key
+                self.models = _FakeGeminiModels()
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
+            with patch(
+                "tools.discoverable.generate_edit_image.tool.genai.Client",
+                _FakeGeminiClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_generate_edit_image_gemini",
+                        name="generate_edit_image",
+                        arguments={
+                            "prompt": "Replace the background with a sunrise gradient.",
+                            "image_path": "temp/input.png",
+                            "output_path": "artifacts/gemini/edited-input.png",
+                        },
+                        raw_arguments=(
+                            '{"prompt":"Replace the background with a sunrise gradient.",'
+                            '"image_path":"temp/input.png","output_path":"artifacts/gemini/edited-input.png"}'
+                        ),
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["provider"], "gemini")
+        self.assertEqual(
+            result.metadata["model"],
+            "gemini-3.1-flash-image-preview",
+        )
+        self.assertEqual(result.metadata["image_path"], str(input_path))
+        self.assertEqual(result.metadata["input_media_type"], "image/png")
+        self.assertEqual(result.metadata["provider_text"], "Edited image ready.")
+        self.assertEqual(captured["api_key"], "test-google-key")
+        self.assertEqual(captured["model"], "gemini-3.1-flash-image-preview")
+        config = captured["config"]
+        self.assertEqual(config.response_modalities, ["TEXT", "IMAGE"])
+        self.assertEqual(config.image_config.image_size, "1K")
+        self.assertEqual(result.metadata["resolution"], "1K")
+        contents = captured["contents"]
+        self.assertEqual(len(contents), 2)
+        self.assertEqual(contents[1], "Replace the background with a sunrise gradient.")
+        output_path = Path(result.metadata["output_path"])
+        self.assertTrue(output_path.exists())
+        self.assertEqual(output_path.name, "edited-input.png")
+        self.assertEqual(output_path.read_bytes(), b"gemini-image-bytes")
+
     async def test_web_search_executes_and_normalizes_results(self) -> None:
         def _fake_requests_get(url, *, params, headers, timeout):
             self.assertEqual(url, "https://api.search.brave.com/res/v1/web/search")
@@ -1385,7 +1679,11 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rate limit exceeded", result.content)
 
     async def test_tool_search_returns_empty_low_verbosity_listing_when_no_discoverables_exist(self) -> None:
-        result = await self.runtime.execute(
+        registry = ToolRegistry()
+        registry.register(build_tool_search_tool(registry))
+        runtime = ToolRuntime(registry=registry)
+
+        result = await runtime.execute(
             tool_call=ToolCall(
                 call_id="call_tool_search_empty",
                 name="tool_search",
@@ -1400,6 +1698,27 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("verbosity: low", result.content)
         self.assertEqual(result.metadata["match_count"], 0)
         self.assertEqual(result.metadata["activated_discoverable_tool_names"], [])
+
+    async def test_tool_search_lists_default_generate_edit_image_without_activation_at_low_verbosity(
+        self,
+    ) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_generate_edit_image",
+                name="tool_search",
+                arguments={"query": "image", "verbosity": "low"},
+                raw_arguments='{"query":"image","verbosity":"low"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("generate_edit_image", result.content)
+        self.assertEqual(result.metadata["activated_discoverable_tool_names"], [])
+        self.assertEqual(
+            [match["name"] for match in result.metadata["matches"]],
+            ["generate_edit_image"],
+        )
 
     async def test_tool_search_returns_high_verbosity_details_and_activation_metadata(self) -> None:
         archive_tool = RegisteredTool(

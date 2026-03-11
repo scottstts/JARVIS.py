@@ -565,9 +565,55 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 #### Current Limitations
 
-- there are currently no discoverable catalog entries registered in the default runtime
 - activation only applies to discoverable entries that link to a real executable tool
 - search does not currently index arbitrary `usage` or `metadata` payload contents
+
+### `generate_edit_image`
+
+- Status: implemented
+- Exposure: `discoverable`
+- Package: `src/tools/discoverable/generate_edit_image/`
+- Purpose: generate a new image from a prompt or edit an existing workspace image through Gemini or OpenAI after discovery through `tool_search`
+
+#### Input Schema
+
+- `prompt: string` required
+- `image_path: string` optional; include it only for edit mode
+- `output_path: string` required; output file path inside `/workspace`
+- `provider: string` optional enum `gemini | openai`; defaults to `gemini`
+- `quality: string` optional enum `low | medium | high`; OpenAI only, defaults to `medium`
+- `resolution: string` optional enum `512 | 1K | 2K | 4K`; Gemini only, defaults to `1K`
+
+#### Executor Behavior
+
+- stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
+- treats omitted `image_path` as generation mode and provided `image_path` as edit mode
+- requires an explicit `output_path` inside `/workspace`
+- creates missing parent directories for `output_path` automatically before writing the image
+- appends a provider-safe image extension automatically when `output_path` has no suffix
+- resolves edit inputs from `/workspace` and only accepts provider-safe image formats shared by the current implementation (`image/png`, `image/jpeg`, `image/webp`)
+- defaults to Gemini with model `gemini-3.1-flash-image-preview`
+- uses OpenAI model `gpt-image-1.5` when `provider="openai"`
+- applies OpenAI `quality` only for the OpenAI path, defaulting to `medium`
+- applies Gemini `resolution` only for the Gemini path, defaulting to `1K`
+- returns normalized tool-result metadata including operation, provider, model, output path, MIME type, and provider usage metadata when available
+
+#### Policy
+
+- `prompt` must be non-empty and stay within the configured hard caps
+- `output_path` must be non-empty
+- `provider` must be either `gemini` or `openai`
+- `quality`, when present, must be one of `low`, `medium`, or `high`
+- `resolution`, when present, must be one of `512`, `1K`, `2K`, or `4K`
+- `image_path` is optional, but if present it must be an explicit path inside `/workspace`
+- `output_path` must also stay inside `/workspace`
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected for both `image_path` and `output_path`
+
+#### Current Limitations
+
+- v1 supports a single input image only; no masks or multi-image compositing yet
+- output settings are intentionally minimal; the tool does not yet expose size, aspect ratio, quality, or background controls
+- the tool saves the image locally but does not automatically send it to Telegram; a later `send_file` call is still needed for delivery
 
 ## Tools To Be Implemented
 
@@ -597,6 +643,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
+- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`
 - Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: none
+- Implemented discoverable tools: `generate_edit_image`

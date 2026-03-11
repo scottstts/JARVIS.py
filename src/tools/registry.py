@@ -16,6 +16,10 @@ from .basic.web_fetch import build_web_fetch_tool
 from .basic.web_search import build_web_search_tool
 from .basic.view_image import build_view_image_tool
 from .config import ToolSettings
+from .discoverable.generate_edit_image import (
+    build_generate_edit_image_discoverable,
+    build_generate_edit_image_tool,
+)
 from .types import DiscoverableTool, RegisteredTool
 
 _SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -48,7 +52,9 @@ class ToolRegistry:
         registry.register(build_web_fetch_tool(settings))
         registry.register(build_view_image_tool(settings))
         registry.register(build_send_file_tool(settings))
+        registry.register(build_generate_edit_image_tool(settings))
         registry.register(build_tool_search_tool(registry))
+        registry.register_discoverable(build_generate_edit_image_discoverable())
         return registry
 
     def register(self, tool: RegisteredTool) -> None:

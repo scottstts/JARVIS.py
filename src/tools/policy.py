@@ -11,6 +11,7 @@ from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
 from .basic.view_image import ViewImagePolicy
 from .config import ToolSettings
+from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
 
 
@@ -69,6 +70,12 @@ class ToolPolicy:
                 context=context,
             )
 
+        if tool_name == "generate_edit_image":
+            return GenerateEditImagePolicy().authorize(
+                arguments=arguments,
+                context=context,
+            )
+
         if tool_name not in {
             "bash",
             "file_patch",
@@ -78,6 +85,7 @@ class ToolPolicy:
             "view_image",
             "send_file",
             "tool_search",
+            "generate_edit_image",
         }:
             return ToolPolicyDecision(
                 allowed=False,
