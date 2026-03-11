@@ -16,6 +16,13 @@ from llm.types import (
     ToolResultPart,
 )
 
+_IMAGE_DETAIL_TOKEN_ESTIMATES = {
+    "low": 128,
+    "auto": 256,
+    "high": 384,
+    "original": 512,
+}
+
 
 def estimate_request_input_tokens(request: LLMRequest) -> int:
     """Estimate request input tokens from the fully assembled payload."""
@@ -39,7 +46,9 @@ def estimate_request_input_tokens(request: LLMRequest) -> int:
     }
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     # Roughly 4 characters per token; used only for preflight heuristics.
-    return max(1, math.ceil(len(serialized) / 4))
+    text_token_estimate = max(1, math.ceil(len(serialized) / 4))
+    image_token_estimate = sum(_estimate_message_image_tokens(message) for message in request.messages)
+    return text_token_estimate + image_token_estimate
 
 
 def _serialize_message(message: LLMMessage) -> dict[str, Any]:
@@ -51,8 +60,9 @@ def _serialize_message(message: LLMMessage) -> dict[str, Any]:
             parts.append(
                 {
                     "type": "image",
-                    "image_url": part.image_url,
-                    "file_id": part.file_id,
+                    # Avoid letting raw base64 payloads dominate the estimate.
+                    "image_url": "<image-url>" if part.image_url is not None else None,
+                    "file_id": "<file-id>" if part.file_id is not None else None,
                     "detail": part.detail,
                 }
             )
@@ -77,6 +87,18 @@ def _serialize_message(message: LLMMessage) -> dict[str, Any]:
                 }
             )
     return {"role": message.role, "parts": parts}
+
+
+def _estimate_message_image_tokens(message: LLMMessage) -> int:
+    return sum(
+        _estimate_image_tokens(part)
+        for part in message.parts
+        if isinstance(part, ImagePart)
+    )
+
+
+def _estimate_image_tokens(part: ImagePart) -> int:
+    return _IMAGE_DETAIL_TOKEN_ESTIMATES.get(part.detail, _IMAGE_DETAIL_TOKEN_ESTIMATES["auto"])
 
 
 def _serialize_tool_choice(request: LLMRequest) -> dict[str, Any]:

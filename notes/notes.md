@@ -7,6 +7,7 @@
 - Implemented file-backed `src/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
 - Session bootstrap now injects `src/identities/PROGRAM.md`, `src/identities/REACTOR.md`, `src/identities/USER.md`, and `src/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
 - Compaction policy is now provider-agnostic and driven by global environment settings: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
+- Preflight token estimation no longer counts inline image base64 payloads as text; image inputs now use small detail-based heuristic token costs instead.
 - Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
 - Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
 - Added Starlette websocket gateway under src/gateway with route-scoped SessionRouter, one AgentLoop per route, and JSON events (ready, assistant_message, error).

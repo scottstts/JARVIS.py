@@ -1,0 +1,81 @@
+"""Unit tests for request token estimation heuristics."""
+
+from __future__ import annotations
+
+import unittest
+
+from core.token_estimator import estimate_request_input_tokens
+from llm import ImagePart, LLMMessage, LLMRequest
+
+
+class TokenEstimatorTests(unittest.TestCase):
+    def test_base64_payload_size_does_not_dominate_image_estimation(self) -> None:
+        small_request = LLMRequest(
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64="AAAA",
+                            detail="auto",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        large_request = LLMRequest(
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64="A" * 500_000,
+                            detail="auto",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            estimate_request_input_tokens(small_request),
+            estimate_request_input_tokens(large_request),
+        )
+
+    def test_high_detail_images_cost_more_than_auto_detail_images(self) -> None:
+        auto_request = LLMRequest(
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64="AAAA",
+                            detail="auto",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        high_request = LLMRequest(
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart.from_base64(
+                            media_type="image/png",
+                            data_base64="AAAA",
+                            detail="high",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            estimate_request_input_tokens(high_request)
+            - estimate_request_input_tokens(auto_request),
+            128,
+        )
