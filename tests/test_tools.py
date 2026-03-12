@@ -304,6 +304,9 @@ class ToolRegistryTests(unittest.TestCase):
                 [
                     "bash",
                     "file_patch",
+                    "memory_search",
+                    "memory_get",
+                    "memory_write",
                     "python_interpreter",
                     "web_search",
                     "web_fetch",
@@ -321,6 +324,14 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [tool.name for tool in registry.search("patch", include_basic=True)],
                 ["file_patch"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search("memory")],
+                ["memory_admin"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search("memory", include_basic=True)],
+                ["memory_search", "memory_get", "memory_write", "memory_admin"],
             )
             self.assertEqual(registry.search("python"), ())
             self.assertEqual(
@@ -350,11 +361,15 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search_discoverable("archive"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("")],
-                ["ffmpeg_cli", "generate_edit_image", "transcribe", "youtube"],
+                ["ffmpeg_cli", "generate_edit_image", "memory_admin", "transcribe", "youtube"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("edit image")],
                 ["generate_edit_image"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("memory")],
+                ["memory_admin"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("transcribe")],

@@ -5,6 +5,7 @@ import base64
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Sequence
 from uuid import uuid4
@@ -23,6 +24,7 @@ from llm import (
     ToolDefinition,
     ToolResultPart,
 )
+from memory import MemoryService, MemorySettings
 from storage import ConversationRecord, SessionMetadata, SessionStorage
 from tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 
@@ -64,6 +66,7 @@ _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
 )
 _PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
 _TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -144,12 +147,21 @@ class AgentLoop:
             llm_service=self._llm_service,
             context_policy=self._settings.context_policy,
         )
+        memory_settings = MemorySettings.from_workspace_dir(self._settings.workspace_dir)
+        memory_llm_service = self._llm_service if isinstance(self._llm_service, LLMService) else None
+        if memory_llm_service is None:
+            memory_settings = replace(memory_settings, enable_reflection=False)
+        self._memory_service = MemoryService(
+            settings=memory_settings,
+            llm_service=memory_llm_service,
+        )
         self._tool_settings = ToolSettings.from_workspace_dir(self._settings.workspace_dir)
         self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
         self._tool_context = ToolExecutionContext(
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
+            memory_service=self._memory_service,
         )
         self._active_turn_id: str | None = None
         self._stop_requested_turn_id: str | None = None
@@ -187,7 +199,8 @@ class AgentLoop:
         return True
 
     async def _handle_new_command(self, command: ParsedCommand) -> AgentTurnResult:
-        session = self._start_session(start_reason="user_new")
+        await self._ensure_memory_runtime_ready()
+        session = await self._start_session(start_reason="user_new")
         if command.body:
             return await self._handle_message_turn(command.body, force_session_id=session.session_id)
         return AgentTurnResult(
@@ -197,7 +210,8 @@ class AgentLoop:
         )
 
     async def _handle_compact_command(self, command: ParsedCommand) -> AgentTurnResult:
-        active = self._ensure_active_session()
+        await self._ensure_memory_runtime_ready()
+        active = await self._ensure_active_session()
         compacted = await self._compact_session(
             active,
             reason="manual",
@@ -220,7 +234,8 @@ class AgentLoop:
         self,
         command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
-        session = self._start_session(start_reason="user_new")
+        await self._ensure_memory_runtime_ready()
+        session = await self._start_session(start_reason="user_new")
         if command.body:
             async for event in self._stream_message_turn(
                 command.body,
@@ -374,6 +389,10 @@ class AgentLoop:
                 response=final_response,
                 estimated_input_tokens=final_estimated_input_tokens,
             )
+            await self._reflect_completed_turn(
+                session_id=session.session_id,
+                turn_id=turn_id,
+            )
 
             refreshed = self._storage.get_session(session.session_id)
             threshold_observed = (
@@ -410,7 +429,7 @@ class AgentLoop:
         for tool_call in current_response.tool_calls:
             tool_result = await self._tool_runtime.execute(
                 tool_call=tool_call,
-                context=self._tool_context,
+                context=replace(self._tool_context, session_id=session_id),
             )
             self._append_turn_record(
                 session_id=session_id,
@@ -1071,10 +1090,11 @@ class AgentLoop:
         user_text: str,
         force_session_id: str | None = None,
     ) -> tuple[SessionMetadata, list[ConversationRecord], str, str | None, LLMRequest, int, bool]:
+        await self._ensure_memory_runtime_ready()
         turn_context_text = self._build_turn_context_text()
         session = self._storage.get_session(force_session_id) if force_session_id else None
         if session is None:
-            session = self._ensure_active_session()
+            session = await self._ensure_active_session()
 
         did_compaction = False
         if session.pending_reactive_compaction:
@@ -1415,13 +1435,13 @@ class AgentLoop:
             estimated_input_tokens,
         )
 
-    def _ensure_active_session(self) -> SessionMetadata:
+    async def _ensure_active_session(self) -> SessionMetadata:
         active = self._storage.get_active_session()
         if active is not None:
             return active
-        return self._start_session(start_reason="initial")
+        return await self._start_session(start_reason="initial")
 
-    def _start_session(
+    async def _start_session(
         self,
         *,
         start_reason: str,
@@ -1434,20 +1454,46 @@ class AgentLoop:
             start_reason=start_reason,
         )
 
-        bootstrap_messages = self._identity_loader.load_bootstrap_messages(
-            summary_text=summary_text,
-        )
+        bootstrap_messages = self._identity_loader.load_bootstrap_messages()
         for message in bootstrap_messages:
-            metadata: dict[str, Any]
-            if message.role == "developer":
-                metadata = {"summary_seed": True}
-            else:
-                metadata = {"bootstrap_identity": True}
             self._append_message(
                 session_id=session.session_id,
                 role=message.role,
                 content=message.parts[0].text,
-                metadata=metadata,
+                metadata={"bootstrap_identity": True},
+            )
+
+        try:
+            core_memory_bootstrap, ongoing_memory_bootstrap = (
+                await self._memory_service.render_bootstrap_messages()
+            )
+        except Exception:
+            LOGGER.exception("Memory bootstrap rendering failed.")
+            core_memory_bootstrap, ongoing_memory_bootstrap = "", ""
+        if core_memory_bootstrap.strip():
+            self._append_message(
+                session_id=session.session_id,
+                role="developer",
+                content="Runtime core memory bootstrap:\n\n" + core_memory_bootstrap,
+                metadata={"memory_bootstrap": "core"},
+            )
+        if ongoing_memory_bootstrap.strip():
+            self._append_message(
+                session_id=session.session_id,
+                role="developer",
+                content="Runtime ongoing memory bootstrap:\n\n" + ongoing_memory_bootstrap,
+                metadata={"memory_bootstrap": "ongoing"},
+            )
+        if summary_text:
+            self._append_message(
+                session_id=session.session_id,
+                role="developer",
+                content=(
+                    "Summarized context from previous session compaction.\n"
+                    "Use this as prior conversational state:\n\n"
+                    f"{summary_text.strip()}"
+                ),
+                metadata={"summary_seed": True},
             )
 
         if compaction_count > 0:
@@ -1471,10 +1517,21 @@ class AgentLoop:
             session.session_id,
             include_turn_ids=include_turn_ids,
         )
+        try:
+            await self._memory_service.flush_before_compaction(
+                route_id=self._tool_context.route_id,
+                session_id=session.session_id,
+                records=tuple(records),
+            )
+        except Exception:
+            LOGGER.exception("Memory pre-compaction flush failed.")
         compactable_records = [
             record
             for record in records
-            if record.kind == "message" and not record.metadata.get("bootstrap_identity", False)
+            if record.kind == "message"
+            and not record.metadata.get("bootstrap_identity", False)
+            and not record.metadata.get("memory_bootstrap")
+            and not record.metadata.get("summary_seed", False)
         ]
         if not compactable_records:
             self._storage.update_session(session.session_id, pending_reactive_compaction=False)
@@ -1488,7 +1545,7 @@ class AgentLoop:
         self._storage.archive_session(session.session_id)
 
         next_compaction_count = session.compaction_count + 1
-        next_session = self._start_session(
+        next_session = await self._start_session(
             start_reason="compaction",
             parent_session_id=session.session_id,
             summary_text=outcome.summary_text,
@@ -1500,6 +1557,35 @@ class AgentLoop:
             pending_interruption_notice=session.pending_interruption_notice,
         )
         return self._storage.get_session(next_session.session_id) or next_session
+
+    async def _ensure_memory_runtime_ready(self) -> None:
+        try:
+            await self._memory_service.ensure_index_synced()
+            await self._memory_service.run_due_maintenance()
+        except Exception:
+            LOGGER.exception("Memory runtime maintenance failed.")
+
+    async def _reflect_completed_turn(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        try:
+            turn_records = tuple(
+                record
+                for record in self._storage.load_records(session_id)
+                if str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip() == turn_id
+            )
+            if not turn_records:
+                return
+            await self._memory_service.reflect_completed_turn(
+                route_id=self._tool_context.route_id,
+                session_id=session_id,
+                records=turn_records,
+            )
+        except Exception:
+            LOGGER.exception("Memory post-turn reflection failed.")
 
     def _append_compaction_record(
         self,

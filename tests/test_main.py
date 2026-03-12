@@ -3,17 +3,40 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import ModuleType
+from unittest.mock import Mock, patch
 
-import main
+import main as repo_main
 from gateway import GatewaySettings
 from ui.telegram import UISettings
 
 from runtime_env import load_docker_secrets_if_present
+
+_SRC_MAIN_PATH = Path(__file__).resolve().parents[1] / "src" / "main.py"
+
+
+def _load_src_main_module() -> ModuleType:
+    src_dir = _SRC_MAIN_PATH.parent
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    spec = importlib.util.spec_from_file_location("jarvis_test_src_main", _SRC_MAIN_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load main module from {_SRC_MAIN_PATH}.")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+SRC_MAIN = _load_src_main_module()
 
 
 class _FakeServer:
@@ -96,11 +119,11 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             gateway_ws_base_url="ws://example.com/remote",
         )
 
-        with patch("main.create_app", side_effect=fake_create_app):
-            with patch("main.uvicorn.Config", side_effect=fake_config):
-                with patch("main.uvicorn.Server", side_effect=fake_server_factory):
-                    with patch("main.run_telegram_ui", side_effect=fake_run_telegram_ui):
-                        await main.run_system(
+        with patch.object(SRC_MAIN, "create_app", side_effect=fake_create_app):
+            with patch.object(SRC_MAIN.uvicorn, "Config", side_effect=fake_config):
+                with patch.object(SRC_MAIN.uvicorn, "Server", side_effect=fake_server_factory):
+                    with patch.object(SRC_MAIN, "run_telegram_ui", side_effect=fake_run_telegram_ui):
+                        await SRC_MAIN.run_system(
                             gateway_settings=gateway_settings,
                             ui_settings=ui_settings,
                         )
@@ -131,12 +154,12 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         async def fake_run_telegram_ui(_settings: UISettings) -> None:
             self.fail("Telegram UI should not start when gateway startup fails.")
 
-        with patch("main.create_app", return_value=object()):
-            with patch("main.uvicorn.Config", side_effect=fake_config):
-                with patch("main.uvicorn.Server", side_effect=fake_server_factory):
-                    with patch("main.run_telegram_ui", side_effect=fake_run_telegram_ui):
+        with patch.object(SRC_MAIN, "create_app", return_value=object()):
+            with patch.object(SRC_MAIN.uvicorn, "Config", side_effect=fake_config):
+                with patch.object(SRC_MAIN.uvicorn, "Server", side_effect=fake_server_factory):
+                    with patch.object(SRC_MAIN, "run_telegram_ui", side_effect=fake_run_telegram_ui):
                         with self.assertRaises(RuntimeError) as context:
-                            await main.run_system(
+                            await SRC_MAIN.run_system(
                                 gateway_settings=GatewaySettings(
                                     host="127.0.0.1",
                                     port=8080,
@@ -156,13 +179,23 @@ class MainFunctionTests(unittest.TestCase):
         async def fake_run_system() -> None:
             raise KeyboardInterrupt
 
-        with patch("main.load_docker_secrets_if_present"):
-            with patch("main.configure_application_logging"):
-                with patch("main.run_system", side_effect=fake_run_system):
-                    with self.assertLogs("main", level="INFO") as captured_logs:
-                        main.main()
+        with patch.object(SRC_MAIN, "load_docker_secrets_if_present"):
+            with patch.object(SRC_MAIN, "configure_application_logging"):
+                with patch.object(SRC_MAIN, "run_system", side_effect=fake_run_system):
+                    with self.assertLogs(SRC_MAIN.LOGGER.name, level="INFO") as captured_logs:
+                        SRC_MAIN.main()
 
         self.assertIn(
             "Shutdown requested via Ctrl+C; exiting cleanly.",
             captured_logs.output[0],
         )
+
+
+class RepoRootMainShimTests(unittest.TestCase):
+    def test_main_delegates_to_loaded_src_module(self) -> None:
+        fake_module = Mock()
+
+        with patch.object(repo_main, "_load_src_main_module", return_value=fake_module):
+            repo_main.main()
+
+        fake_module.main.assert_called_once_with()

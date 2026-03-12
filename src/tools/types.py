@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from llm import ToolDefinition
 
 ToolExposure = Literal["basic", "discoverable"]
+
+if TYPE_CHECKING:
+    from memory import MemoryService
 
 
 @dataclass(slots=True, frozen=True)
@@ -17,6 +20,8 @@ class ToolExecutionContext:
 
     workspace_dir: Path
     route_id: str | None = None
+    session_id: str | None = None
+    memory_service: "MemoryService | None" = None
 
 
 @dataclass(slots=True, frozen=True)

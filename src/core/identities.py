@@ -16,7 +16,7 @@ class IdentityBootstrapLoader:
     def __init__(self, settings: CoreSettings) -> None:
         self._settings = settings
 
-    def load_bootstrap_messages(self, *, summary_text: str | None = None) -> list[LLMMessage]:
+    def load_bootstrap_messages(self) -> list[LLMMessage]:
         identities_dir = self._settings.identities_dir
         program = self._read_identity_file(identities_dir / self._settings.program_file_name)
         reactor = self._read_identity_file(identities_dir / self._settings.reactor_file_name)
@@ -29,17 +29,6 @@ class IdentityBootstrapLoader:
             LLMMessage.text("system", user),
             LLMMessage.text("system", armor),
         ]
-        if summary_text:
-            messages.append(
-                LLMMessage.text(
-                    "developer",
-                    (
-                        "Summarized context from previous session compaction.\n"
-                        "Use this as prior conversational state:\n\n"
-                        f"{summary_text.strip()}"
-                    ),
-                )
-            )
         return messages
 
     def _read_identity_file(self, path: Path) -> str:

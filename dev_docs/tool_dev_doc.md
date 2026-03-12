@@ -568,6 +568,151 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - activation only applies to discoverable entries that link to a real executable tool
 - search does not currently index arbitrary `usage` or `metadata` payload contents
 
+### `memory_search`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/basic/memory_search/`
+- Purpose: search canonical runtime memory through lexical, semantic, graph, or hybrid retrieval before opening or mutating memory
+
+#### Input Schema
+
+- `query: string` required
+- `mode: string` optional enum `auto | lexical | semantic | graph | hybrid`
+- `scopes: array[string]` optional enum members `core | ongoing | daily | archive`
+- `top_k: integer` optional
+- `daily_lookback_days: integer` optional
+- `expand: integer` optional enum `0 | 1 | 2`
+- `include_expired: boolean` optional
+
+#### Executor Behavior
+
+- routes all retrieval through the canonical memory service rather than raw filesystem reads
+- reconciles checksum drift before search so out-of-band edits are reindexed opportunistically
+- returns normalized ranked matches with `document_id`, `path`, `kind`, `section_path`, `score`, `snippet`, `match_reasons`, and `source_ref_ids`
+- propagates `semantic_disabled=true` in metadata when `sqlite-vec` is unavailable and the runtime falls back to lexical + graph only
+
+#### Policy
+
+- `query` must be non-empty
+- all other validation is delegated to the memory service
+
+#### Current Limitations
+
+- fallback retrieval planning for weak hybrid results is not yet implemented
+- semantic search depends on `sqlite-vec`; on current container builds it may legitimately run in degraded lexical/graph mode
+
+### `memory_get`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/basic/memory_get/`
+- Purpose: open a full canonical memory document or one named section after discovery
+
+#### Input Schema
+
+- `document_id: string` optional
+- `path: string` optional
+- `section_path: string` optional
+- `include_frontmatter: boolean` optional
+- `include_sources: boolean` optional
+
+#### Executor Behavior
+
+- resolves the target by `document_id` or canonical path through the memory index
+- can return the full Markdown document, just the body, or a single named section
+- can append a compact source-ref section for provenance inspection
+
+#### Policy
+
+- requires either `document_id` or `path`
+- direct `path` access is restricted to the workspace memory directory
+
+#### Current Limitations
+
+- section access is by exact top-level section name only
+- source rendering is intentionally compact and does not yet expand transcript provenance inline
+
+### `memory_write`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/tools/basic/memory_write/`
+- Purpose: create or update canonical memory documents through validated structured operations instead of generic file edits
+
+#### Input Schema
+
+- `operation: string` required enum `create | upsert | append_daily | close | archive | promote | demote`
+- `target_kind: string` required enum `core | ongoing | daily`
+- `document_id: string` optional
+- `title: string` optional
+- `summary: string` optional
+- `priority: integer` optional
+- `pinned: boolean` optional
+- `locked: boolean` optional
+- `review_after: string` optional
+- `expires_at: string` optional
+- `facts: array[object]` optional
+- `relations: array[object]` optional
+- `body_sections: object` optional
+- `source_refs: array[object]` optional
+- `date: string` optional
+- `timezone: string` optional
+- `close_reason: string` optional
+
+#### Executor Behavior
+
+- routes all normal memory mutations through the memory service, not raw file patching
+- writes canonical Markdown, reindexes affected documents, refreshes lexical/graph state, and updates embeddings when semantic indexing is available
+- supports explicit daily appends, ongoing close/archive flows, and cross-kind promote/demote migrations
+- applies relation-conflict reconciliation so older `single` cardinality current relations are superseded when a newer conflicting relation is written
+
+#### Policy
+
+- `operation` and `target_kind` must be valid enums
+- deeper payload validation is delegated to the memory service and canonical Markdown validator
+
+#### Current Limitations
+
+- the tool schema is intentionally non-strict because nested structured payloads are too broad for provider-strict JSON schema without a large nullable expansion
+- automatic LLM-backed maintenance promotions and reviews are still conservative compared with the full design ambitions in `dev_docs/memory_doc.md`
+
+### `memory_admin`
+
+- Status: implemented
+- Exposure: `discoverable`
+- Package: `src/tools/discoverable/memory_admin/`
+- Purpose: run manual reindex, integrity, maintenance, embedding-rebuild, and bootstrap-preview actions when the user explicitly asks for memory administration
+
+#### Input Schema
+
+- `action: string` required enum `reindex_all | reindex_dirty | rebuild_embeddings | run_due_maintenance | integrity_check | render_bootstrap_preview`
+
+#### Executor Behavior
+
+- stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
+- runs the requested operator action through the shared memory service instance
+- returns structured metadata for maintenance runs, integrity issues, and rebuild summaries
+
+#### Policy
+
+- `action` must be one of the implemented admin operations
+
+#### Current Limitations
+
+- the current due-maintenance lane includes local jobs plus explicit placeholders for the LLM-backed review/consolidation jobs that are not yet richly implemented
+- admin actions are operator-grade but still route through the same in-process memory service rather than a separate maintenance worker
+
+### Discoverable Entry: `memory_admin`
+
+- Name: `memory_admin`
+- Aliases: `memory maintenance`, `memory reindex`, `memory integrity`
+- Purpose: expose manual memory maintenance capabilities without permanently inflating the default tool list
+- Detailed Description: use only when the user explicitly requests memory administration, reindexing, embedding rebuilds, integrity checks, due maintenance, or a bootstrap preview
+- Usage: choose one of `reindex_all`, `reindex_dirty`, `rebuild_embeddings`, `run_due_maintenance`, `integrity_check`, or `render_bootstrap_preview`
+- Metadata: none beyond the discoverable purpose/usage payload
+- Backing Tool: `memory_admin`
+
 ### `generate_edit_image`
 
 - Status: implemented
@@ -712,7 +857,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 ### Basic Tools
 
-None currently planned.
+- No additional basic tools currently planned beyond the memory tool surface added in this pass.
 
 ### Discoverable Tools
 
@@ -728,6 +873,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `generate_edit_image`, `transcribe`, `youtube`
-- Implemented basic tools: `bash`, `file_patch`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `generate_edit_image`, `transcribe`, `youtube`
+- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
+- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`

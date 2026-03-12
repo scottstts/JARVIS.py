@@ -42,6 +42,9 @@ from tools.basic.web_fetch.tool import HTTPFetchResult
 _EXPECTED_BASIC_TOOL_NAMES = [
     "bash",
     "file_patch",
+    "memory_search",
+    "memory_get",
+    "memory_write",
     "python_interpreter",
     "web_search",
     "web_fetch",

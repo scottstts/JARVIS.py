@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from .basic.bash import BashCommandPolicy
 from .basic.file_patch import FilePatchPolicy
+from .basic.memory_get import MemoryGetPolicy
+from .basic.memory_search import MemorySearchPolicy
+from .basic.memory_write import MemoryWritePolicy
 from .basic.python_interpreter import PythonInterpreterPolicy
 from .basic.send_file import SendFilePolicy
 from .basic.tool_search import ToolSearchPolicy
@@ -12,6 +15,7 @@ from .basic.web_search import WebSearchPolicy
 from .basic.view_image import ViewImagePolicy
 from .config import ToolSettings
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
+from .discoverable.memory_admin import MemoryAdminPolicy
 from .discoverable.transcribe import TranscribePolicy
 from .discoverable.youtube import YouTubePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
@@ -41,6 +45,30 @@ class ToolPolicy:
         if tool_name == "file_patch":
             path = str(arguments.get("path", "")).strip()
             return FilePatchPolicy().authorize(path=path, context=context)
+
+        if tool_name == "memory_search":
+            query = str(arguments.get("query", "")).strip()
+            return MemorySearchPolicy().authorize(query=query, context=context)
+
+        if tool_name == "memory_get":
+            raw_document_id = arguments.get("document_id")
+            document_id = None if raw_document_id is None else str(raw_document_id)
+            raw_path = arguments.get("path")
+            path = None if raw_path is None else str(raw_path)
+            return MemoryGetPolicy().authorize(
+                document_id=document_id,
+                path=path,
+                context=context,
+            )
+
+        if tool_name == "memory_write":
+            operation = str(arguments.get("operation", "")).strip()
+            target_kind = str(arguments.get("target_kind", "")).strip()
+            return MemoryWritePolicy().authorize(
+                operation=operation,
+                target_kind=target_kind,
+                context=context,
+            )
 
         if tool_name == "python_interpreter":
             settings = ToolSettings.from_workspace_dir(context.workspace_dir)
@@ -78,6 +106,10 @@ class ToolPolicy:
                 context=context,
             )
 
+        if tool_name == "memory_admin":
+            action = str(arguments.get("action", "")).strip()
+            return MemoryAdminPolicy().authorize(action=action, context=context)
+
         if tool_name == "transcribe":
             return TranscribePolicy().authorize(
                 arguments=arguments,
@@ -94,12 +126,16 @@ class ToolPolicy:
             "bash",
             "file_patch",
             "python_interpreter",
+            "memory_search",
+            "memory_get",
+            "memory_write",
             "web_search",
             "web_fetch",
             "view_image",
             "send_file",
             "tool_search",
             "generate_edit_image",
+            "memory_admin",
             "transcribe",
             "youtube",
         }:

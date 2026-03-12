@@ -9,6 +9,9 @@ from llm import ToolDefinition
 
 from .basic.bash import build_bash_tool
 from .basic.file_patch import build_file_patch_tool
+from .basic.memory_get import build_memory_get_tool
+from .basic.memory_search import build_memory_search_tool
+from .basic.memory_write import build_memory_write_tool
 from .basic.python_interpreter import build_python_interpreter_tool
 from .basic.send_file import build_send_file_tool
 from .basic.tool_search import build_tool_search_tool
@@ -20,6 +23,10 @@ from .discoverable.ffmpeg_cli import build_ffmpeg_cli_discoverable
 from .discoverable.generate_edit_image import (
     build_generate_edit_image_discoverable,
     build_generate_edit_image_tool,
+)
+from .discoverable.memory_admin import (
+    build_memory_admin_discoverable,
+    build_memory_admin_tool,
 )
 from .discoverable.transcribe import (
     build_transcribe_discoverable,
@@ -56,17 +63,22 @@ class ToolRegistry:
         registry = cls()
         registry.register(build_bash_tool(settings))
         registry.register(build_file_patch_tool(settings))
+        registry.register(build_memory_search_tool())
+        registry.register(build_memory_get_tool())
+        registry.register(build_memory_write_tool())
         registry.register(build_python_interpreter_tool(settings))
         registry.register(build_web_search_tool(settings))
         registry.register(build_web_fetch_tool(settings))
         registry.register(build_view_image_tool(settings))
         registry.register(build_send_file_tool(settings))
         registry.register(build_generate_edit_image_tool(settings))
+        registry.register(build_memory_admin_tool())
         registry.register(build_transcribe_tool(settings))
         registry.register(build_youtube_tool(settings))
         registry.register(build_tool_search_tool(registry))
         registry.register_discoverable(build_ffmpeg_cli_discoverable())
         registry.register_discoverable(build_generate_edit_image_discoverable())
+        registry.register_discoverable(build_memory_admin_discoverable())
         registry.register_discoverable(build_transcribe_discoverable())
         registry.register_discoverable(build_youtube_discoverable())
         return registry
