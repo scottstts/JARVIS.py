@@ -5,7 +5,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash git curl ca-certificates tini \
     bubblewrap \
-    file ripgrep zip unzip \
+    file gcc libc6-dev libsqlite3-dev ripgrep zip unzip \
     ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
@@ -22,26 +22,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     JARVIS_TOOL_PYTHON_INTERPRETER_VENV=/opt/jarvis-python-tool-venv \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
-    SQLITE_VEC_ARM64_OVERRIDE_URL=https://github.com/asg017/sqlite-vec/releases/download/v0.1.7-alpha.10/sqlite-vec-0.1.7-alpha.10-loadable-linux-aarch64.tar.gz \
-    SQLITE_VEC_ARM64_OVERRIDE_SHA256=b7760ed7985627346ae091214cbd69db98fbf0f60128f5575932e6ee0f5fce7b \
+    SQLITE_VEC_VENDOR_VERSION=v0.1.7-alpha.10 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /tmp/jarvis-deps
 COPY pyproject.toml uv.lock ./
 COPY src/settings.py ./src/settings.py
+COPY vendor/sqlite-vec ./vendor/sqlite-vec
 
 # Install locked Python dependencies into an image-level venv so the bind-mounted repo
 # does not hide them at runtime, pre-download Chromium for Playwright fallback,
 # and prepare the dedicated sandboxed interpreter venv for the future tool.
-RUN uv sync --frozen --no-install-project \
-  && if [ "$(uname -m)" = "aarch64" ]; then \
-       mkdir -p /opt/sqlite-vec; \
-       curl -fsSL "${SQLITE_VEC_ARM64_OVERRIDE_URL}" -o /tmp/sqlite-vec-arm64.tgz; \
-       echo "${SQLITE_VEC_ARM64_OVERRIDE_SHA256}  /tmp/sqlite-vec-arm64.tgz" | sha256sum -c -; \
-       tar -xzf /tmp/sqlite-vec-arm64.tgz -C /opt/sqlite-vec; \
-       rm /tmp/sqlite-vec-arm64.tgz; \
-     fi \
+RUN mkdir -p /opt/sqlite-vec \
+  && gcc -O3 -fPIC -shared \
+       "/tmp/jarvis-deps/vendor/sqlite-vec/${SQLITE_VEC_VENDOR_VERSION}/amalgamation/sqlite-vec.c" \
+       -o /opt/sqlite-vec/vec0.so \
+       -lm \
+  && python -c "import os, sqlite3; conn = sqlite3.connect(':memory:'); conn.enable_load_extension(True); conn.load_extension('/opt/sqlite-vec/vec0'); conn.enable_load_extension(False); version = conn.execute('select vec_version()').fetchone()[0]; expected = os.environ['SQLITE_VEC_VENDOR_VERSION']; assert version == expected, (version, expected)" \
+  && uv sync --frozen --no-install-project \
   && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" pytest \
   && python -m playwright install --with-deps chromium \
   && python -m venv "${JARVIS_TOOL_PYTHON_INTERPRETER_VENV}" \

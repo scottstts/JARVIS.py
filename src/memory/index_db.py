@@ -1132,11 +1132,9 @@ class MemoryIndexDB:
             )
 
     def _load_sqlite_vec_for_connection(self, conn: sqlite3.Connection) -> None:
-        import sqlite_vec
-
         conn.enable_load_extension(True)
         try:
-            _load_sqlite_vec_extension(conn, sqlite_vec_module=sqlite_vec)
+            _load_sqlite_vec_extension(conn)
         finally:
             conn.enable_load_extension(False)
 
@@ -1213,7 +1211,7 @@ def _embedding_items_for_document(
     return items
 
 
-def _load_sqlite_vec_extension(conn: sqlite3.Connection, *, sqlite_vec_module: Any) -> None:
+def _load_sqlite_vec_extension(conn: sqlite3.Connection, *, sqlite_vec_module: Any | None = None) -> None:
     if _SQLITE_VEC_OVERRIDE_PATH.with_suffix(".so").exists():
         try:
             conn.load_extension(str(_SQLITE_VEC_OVERRIDE_PATH))
@@ -1224,6 +1222,8 @@ def _load_sqlite_vec_extension(conn: sqlite3.Connection, *, sqlite_vec_module: A
                 _SQLITE_VEC_OVERRIDE_PATH.with_suffix(".so"),
                 exc_info=True,
             )
+    if sqlite_vec_module is None:
+        import sqlite_vec as sqlite_vec_module
     sqlite_vec_module.load(conn)
 
 
