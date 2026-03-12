@@ -82,6 +82,7 @@ For tools listed as yet to be built, doesn't mean you'll just build them unpromp
 ## Dev Rules and Preferences
 
 - Use ruff for python lint checking at the end of each turn
+- Use pytest for testing
 - Build production grade code, **BUT** avoid excessive abstraction layers
 - all source code go into src/ dir
 - make sure code is modular inside src/
@@ -89,7 +90,7 @@ For tools listed as yet to be built, doesn't mean you'll just build them unpromp
 - throughout the implementation, you will constantly ask me design choice questions like "option ABC, which do you want". This is because I'm not sure about some design choices yet, so constantly offer me options, alternatives, and challenge me when something doesn't seem to make obvious sense.
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
 - No need to delete __pycache__/
-- agent system runtime settings live in src/settings.py, and only secrets (api keys, bot tokens, etc.) and vars that needs to be in .env (like docker volume path for docker compose) will live in .env (and also .env.example--but use placeholders)
+- agent system runtime settings live in src/settings.py, and only secrets (api keys, bot tokens, etc.) need to be in secrets/
 
 # Notes & Lessons
 

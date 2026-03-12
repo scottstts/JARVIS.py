@@ -10,6 +10,7 @@ secrets/*
 !secrets/.gitignore
 !secrets/README.md
 .ruff_cache/
+.pytest_cache/
 
 # Virtual environments
 .venv
