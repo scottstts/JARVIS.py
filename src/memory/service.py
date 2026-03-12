@@ -32,7 +32,7 @@ from .types import (
     IntegrityIssue,
     MaintenanceRunResult,
     MemoryDocument,
-    MemorySearchResult,
+    MemorySearchResponse,
     MemoryWriteResult,
     Relation,
     SourceReference,
@@ -64,6 +64,7 @@ class MemoryService:
                 refresh_document=self._refresh_document,
                 archive_document=self._archive_document,
                 recompute_priorities=self.recompute_priorities,
+                repair_missing_embeddings=self._repair_missing_embeddings,
                 integrity_check=self._integrity_check_dicts,
             ),
         )
@@ -78,6 +79,16 @@ class MemoryService:
             markdown_paths=markdown_paths,
             indexed_checksums=self._index_db.indexed_checksums(),
         )
+        repairable_paths = self._index_db.paths_missing_searchable_chunks()
+        if repairable_paths:
+            dirty_documents = dirty_documents + tuple(
+                DirtyDocument(
+                    path=path,
+                    detected_at=_utc_now_iso(),
+                    reason="missing_searchable_chunks",
+                )
+                for path in repairable_paths
+            )
         if dirty_documents:
             self._index_db.mark_dirty_documents(dirty_documents)
         recorded_dirty = self._index_db.list_dirty_documents()
@@ -97,9 +108,9 @@ class MemoryService:
         include_expired: bool = False,
         route_id: str | None = None,
         session_id: str | None = None,
-    ) -> tuple[MemorySearchResult, ...]:
+    ) -> MemorySearchResponse:
         await self.ensure_index_synced()
-        results = await self._retriever.search(
+        response = await self._retriever.search(
             query=query,
             mode=mode,
             scopes=scopes,
@@ -121,10 +132,10 @@ class MemoryService:
                     "chunk_id": result.section_path,
                     "score": result.score,
                 }
-                for result in results
+                for result in response.results
             ],
         )
-        return results
+        return response
 
     async def get_document(
         self,
@@ -179,6 +190,8 @@ class MemoryService:
         if operation == "append_daily":
             document = await self._append_daily(
                 body_sections=body_sections or {},
+                title=title,
+                summary=summary,
                 route_id=route_id,
                 session_id=session_id,
                 date=date,
@@ -215,13 +228,13 @@ class MemoryService:
                 close_reason=close_reason or current.close_reason,
                 updated_at=_utc_now_iso(),
             )
-            persisted = await self._persist_document(updated)
+            persisted = await self._archive_document(updated)
             return MemoryWriteResult(
                 operation="close",
                 document_id=persisted.document_id,
                 path=persisted.path,
                 summary=f"Closed ongoing memory '{persisted.title}'.",
-                changed_paths=(persisted.path,),
+                changed_paths=(current.path, persisted.path),
             )
 
         if operation in {"promote", "demote"}:
@@ -255,12 +268,18 @@ class MemoryService:
             session_id=session_id,
         )
         resolved_sections = _merge_sections(base_document=base_document, overrides=body_sections or {})
-        if summary is None and "Summary" in resolved_sections and resolved_sections["Summary"].strip():
-            summary = _first_paragraph(resolved_sections["Summary"])
+        resolved_summary = summary if summary is not None else base_document.summary
+        if target_kind != "daily":
+            resolved_sections = _seed_summary_section(
+                sections=resolved_sections,
+                summary=resolved_summary,
+            )
+        if resolved_summary is None and "Summary" in resolved_sections and resolved_sections["Summary"].strip():
+            resolved_summary = _first_paragraph(resolved_sections["Summary"])
         updated_document = replace(
             base_document,
             title=title or base_document.title,
-            summary=summary if target_kind != "daily" else None,
+            summary=resolved_summary if target_kind != "daily" else None,
             priority=priority if priority is not None else base_document.priority,
             pinned=pinned if pinned is not None else base_document.pinned,
             locked=locked if locked is not None else base_document.locked,
@@ -411,6 +430,61 @@ class MemoryService:
             "semantic_enabled": self._index_db.semantic_enabled,
             "semantic_error": self._index_db.semantic_error,
             "rebuilt_documents": rebuilt,
+        }
+
+    async def _repair_missing_embeddings(self) -> dict[str, Any]:
+        if self._llm_service is None:
+            return {
+                "checked_documents": 0,
+                "repaired_documents": 0,
+                "failed_documents": 0,
+                "reason": "no_llm_service",
+            }
+        if not self._index_db.semantic_enabled:
+            return {
+                "checked_documents": 0,
+                "repaired_documents": 0,
+                "failed_documents": 0,
+                "reason": "semantic_disabled",
+            }
+        documents = self._store.read_all_documents()
+        checked = 0
+        repaired = 0
+        failed = 0
+        vector_table_missing = not self._index_db.embedding_vector_table_exists()
+        for document in documents:
+            chunks = chunk_document(document)
+            expected_items = self._index_db.expected_embedding_item_count(
+                document=document,
+                chunks=chunks,
+            )
+            if expected_items == 0:
+                continue
+            checked += 1
+            actual_items = self._index_db.embedding_vector_count_for_document(document.document_id)
+            if not vector_table_missing and actual_items == expected_items:
+                continue
+            try:
+                await self._index_db.upsert_embeddings_for_document(
+                    document=document,
+                    chunks=chunks,
+                    llm_service=self._llm_service,
+                )
+            except Exception:
+                failed += 1
+                LOGGER.exception("Failed repairing missing memory embeddings for: %s", document.path)
+                continue
+            refreshed_items = self._index_db.embedding_vector_count_for_document(document.document_id)
+            if refreshed_items == expected_items:
+                repaired += 1
+            else:
+                failed += 1
+            vector_table_missing = not self._index_db.embedding_vector_table_exists()
+        return {
+            "checked_documents": checked,
+            "repaired_documents": repaired,
+            "failed_documents": failed,
+            "vector_table_missing": vector_table_missing,
         }
 
     async def render_bootstrap_preview(self) -> str:
@@ -748,6 +822,8 @@ class MemoryService:
         self,
         *,
         body_sections: dict[str, str],
+        title: str | None,
+        summary: str | None,
         route_id: str | None,
         session_id: str | None,
         date: str | None,
@@ -766,7 +842,12 @@ class MemoryService:
         else:
             document = await self.ensure_daily_for_today()
         sections = OrderedDict(document.sections)
-        for heading, content in body_sections.items():
+        resolved_body_sections = _normalize_daily_append_sections(
+            body_sections=body_sections,
+            title=title,
+            summary=summary,
+        )
+        for heading, content in resolved_body_sections.items():
             if heading not in sections:
                 continue
             existing = sections[heading].rstrip()
@@ -908,6 +989,46 @@ def _merge_sections(*, base_document: MemoryDocument, overrides: dict[str, str])
             continue
         sections[heading] = content.strip()
     return sections
+
+
+def _seed_summary_section(
+    *,
+    sections: OrderedDict[str, str],
+    summary: str | None,
+) -> OrderedDict[str, str]:
+    if summary is None or not summary.strip():
+        return sections
+    if "Summary" not in sections or sections["Summary"].strip():
+        return sections
+    seeded = OrderedDict(sections)
+    seeded["Summary"] = summary.strip()
+    return seeded
+
+
+def _normalize_daily_append_sections(
+    *,
+    body_sections: dict[str, str],
+    title: str | None,
+    summary: str | None,
+) -> dict[str, str]:
+    if any(content.strip() for content in body_sections.values()):
+        return body_sections
+    auto_entry = _render_daily_auto_entry(title=title, summary=summary)
+    if auto_entry is None:
+        return body_sections
+    return {"Notable Events": auto_entry}
+
+
+def _render_daily_auto_entry(*, title: str | None, summary: str | None) -> str | None:
+    normalized_title = title.strip() if title and title.strip() else None
+    normalized_summary = summary.strip() if summary and summary.strip() else None
+    if normalized_title and normalized_summary:
+        return f"- {normalized_title}: {normalized_summary}"
+    if normalized_summary:
+        return f"- {normalized_summary}"
+    if normalized_title:
+        return f"- {normalized_title}"
+    return None
 
 
 def _normalize_source_refs(

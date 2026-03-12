@@ -22,6 +22,7 @@ from tools import (
     ToolSettings,
 )
 from tools.basic.tool_search import build_tool_search_tool
+from tools.basic.memory_search.tool import _format_memory_search_result
 from tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     HTTPFetchResult,
@@ -291,6 +292,17 @@ class ToolSettingsTests(unittest.TestCase):
 
 
 class ToolRegistryTests(unittest.TestCase):
+    def test_memory_search_result_formats_sys_warning(self) -> None:
+        rendered = _format_memory_search_result(
+            query="current project",
+            results=[],
+            warnings=["semantic search was skipped because the embedding vector table is missing; used lexical+graph fallback"],
+            semantic_disabled=True,
+        )
+
+        self.assertIn("semantic_disabled: true", rendered)
+        self.assertIn("sys_warning: semantic search was skipped because the embedding vector table is missing; used lexical+graph fallback", rendered)
+
     def test_default_registry_exposes_basic_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"

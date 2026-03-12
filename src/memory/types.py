@@ -193,6 +193,13 @@ class MemorySearchResult:
 
 
 @dataclass(slots=True, frozen=True)
+class MemorySearchResponse:
+    results: tuple[MemorySearchResult, ...]
+    warnings: tuple[str, ...] = ()
+    semantic_disabled: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class IntegrityIssue:
     path: Path | None
     severity: Literal["warning", "error"]
@@ -245,4 +252,3 @@ class MaintenanceLLMRequest:
     job_name: str
     prompt: str
     max_output_tokens: int
-

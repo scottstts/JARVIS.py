@@ -124,10 +124,11 @@ class MarkdownMemoryStore:
 
     def archive_document(self, document: MemoryDocument) -> MemoryDocument:
         destination = self.archive_path_for(document)
+        archived_status = "closed" if document.kind == "ongoing" and document.status == "closed" else "archived"
         archived = replace(
             document,
             path=destination,
-            status="archived",
+            status=archived_status,
         )
         self.write_document(archived)
         if document.path != destination and document.path.exists():

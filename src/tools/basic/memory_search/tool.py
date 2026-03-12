@@ -43,7 +43,7 @@ class MemorySearchToolExecutor:
             if isinstance(raw_scopes, list)
             else ("core", "ongoing", "daily")
         )
-        results = await service.search(
+        response = await service.search(
             query=query,
             mode=str(arguments.get("mode", "hybrid")).strip() or "hybrid",
             scopes=scopes if scopes else ("core", "ongoing", "daily"),
@@ -56,6 +56,8 @@ class MemorySearchToolExecutor:
         )
         metadata = {
             "query": query,
+            "warnings": list(response.warnings),
+            "semantic_disabled": response.semantic_disabled,
             "results": [
                 {
                     "document_id": result.document_id,
@@ -68,14 +70,19 @@ class MemorySearchToolExecutor:
                     "source_ref_ids": list(result.source_ref_ids),
                     "semantic_disabled": result.semantic_disabled,
                 }
-                for result in results
+                for result in response.results
             ],
         }
         return ToolExecutionResult(
             call_id=call_id,
             name="memory_search",
             ok=True,
-            content=_format_memory_search_result(query=query, results=metadata["results"]),
+            content=_format_memory_search_result(
+                query=query,
+                results=metadata["results"],
+                warnings=metadata["warnings"],
+                semantic_disabled=response.semantic_disabled,
+            ),
             metadata=metadata,
         )
 
@@ -118,12 +125,22 @@ def build_memory_search_tool() -> RegisteredTool:
     )
 
 
-def _format_memory_search_result(*, query: str, results: list[dict[str, Any]]) -> str:
+def _format_memory_search_result(
+    *,
+    query: str,
+    results: list[dict[str, Any]],
+    warnings: list[str],
+    semantic_disabled: bool,
+) -> str:
     lines = [
         "Memory search result",
         f"query: {query}",
         f"match_count: {len(results)}",
     ]
+    if semantic_disabled:
+        lines.append("semantic_disabled: true")
+    for warning in warnings:
+        lines.append(f"sys_warning: {warning}")
     if not results:
         lines.append("No memory matched.")
         return "\n".join(lines)
@@ -139,8 +156,6 @@ def _format_memory_search_result(*, query: str, results: list[dict[str, Any]]) -
                 f"snippet: {result['snippet']}",
             ]
         )
-        if result["semantic_disabled"]:
-            lines.append("semantic_disabled: true")
     return "\n".join(lines)
 
 

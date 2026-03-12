@@ -13,7 +13,7 @@ from llm import EmbeddingRequest, LLMService
 
 from .graph import expand_graph_candidates
 from .index_db import MemoryIndexDB
-from .types import MemorySearchResult, SearchCandidate
+from .types import MemorySearchResponse, MemorySearchResult, SearchCandidate
 
 
 class MemoryRetriever:
@@ -38,8 +38,9 @@ class MemoryRetriever:
         daily_lookback_days: int,
         expand: int,
         include_expired: bool,
-    ) -> tuple[MemorySearchResult, ...]:
+    ) -> MemorySearchResponse:
         normalized_mode = "hybrid" if mode == "auto" else mode
+        warnings: list[str] = []
 
         lexical_rows = (
             self._index_db.lexical_candidates(
@@ -52,17 +53,50 @@ class MemoryRetriever:
             if normalized_mode in {"lexical", "hybrid"}
             else []
         )
-        semantic_disabled = not self._index_db.semantic_enabled
+        semantic_requested = normalized_mode in {"semantic", "hybrid"}
+        semantic_disabled = not semantic_requested
+        semantic_ready = False
+        semantic_reason: str | None = None
+        if semantic_requested:
+            semantic_disabled = True
+            semantic_ready, semantic_reason = self._index_db.semantic_search_status()
+            if self._llm_service is None:
+                semantic_ready = False
+                semantic_reason = "the embedding service is not configured"
         semantic_rows: list[dict[str, Any]] = []
-        if normalized_mode in {"semantic", "hybrid"} and not semantic_disabled and self._llm_service is not None:
-            embedding_response = await self._llm_service.embed(EmbeddingRequest(inputs=query))
-            if embedding_response.embeddings:
-                semantic_rows = self._index_db.semantic_candidates(
-                    embedding=embedding_response.embeddings[0],
-                    scopes=scopes,
-                    include_expired=include_expired,
-                    daily_lookback_days=daily_lookback_days,
-                    limit=max(30, top_k),
+        if semantic_requested and semantic_ready and self._llm_service is not None:
+            semantic_disabled = False
+            try:
+                embedding_response = await self._llm_service.embed(EmbeddingRequest(inputs=query))
+                if embedding_response.embeddings:
+                    semantic_rows = self._index_db.semantic_candidates(
+                        embedding=embedding_response.embeddings[0],
+                        scopes=scopes,
+                        include_expired=include_expired,
+                        daily_lookback_days=daily_lookback_days,
+                        limit=max(30, top_k),
+                    )
+            except Exception as exc:
+                semantic_disabled = True
+                semantic_rows = []
+                if normalized_mode == "hybrid":
+                    warnings.append(
+                        f"semantic search failed at runtime and was skipped; used lexical+graph fallback: {exc}"
+                    )
+                else:
+                    warnings.append(
+                        f"semantic search failed at runtime and was skipped: {exc}"
+                    )
+        elif semantic_requested and semantic_reason is not None:
+            if normalized_mode == "hybrid":
+                warnings.append(
+                    "semantic search was skipped because "
+                    f"{semantic_reason}; used lexical+graph fallback"
+                )
+            else:
+                warnings.append(
+                    "semantic search was skipped because "
+                    f"{semantic_reason}"
                 )
 
         graph_candidates = (
@@ -94,19 +128,23 @@ class MemoryRetriever:
         else:
             final = _fuse_candidates(candidates.values())
 
-        return tuple(
-            MemorySearchResult(
-                document_id=item.document_id,
-                path=item.path,
-                kind=item.kind,
-                section_path=item.section_path,
-                score=round(item.fused_score if normalized_mode == "hybrid" else _mode_score(item, normalized_mode), 6),
-                snippet=item.snippet,
-                match_reasons=item.match_reasons,
-                source_ref_ids=item.source_ref_ids,
-                semantic_disabled=semantic_disabled,
-            )
-            for item in final[:top_k]
+        return MemorySearchResponse(
+            results=tuple(
+                MemorySearchResult(
+                    document_id=item.document_id,
+                    path=item.path,
+                    kind=item.kind,
+                    section_path=item.section_path,
+                    score=round(item.fused_score if normalized_mode == "hybrid" else _mode_score(item, normalized_mode), 6),
+                    snippet=item.snippet,
+                    match_reasons=item.match_reasons,
+                    source_ref_ids=item.source_ref_ids,
+                    semantic_disabled=semantic_disabled,
+                )
+                for item in final[:top_k]
+            ),
+            warnings=tuple(dict.fromkeys(warnings)),
+            semantic_disabled=semantic_disabled,
         )
 
 

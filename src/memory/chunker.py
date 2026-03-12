@@ -23,6 +23,8 @@ def _chunk_structured_document(document: MemoryDocument) -> tuple[DocumentChunk,
     ordinal = 0
     for heading, content in document.sections.items():
         section_text = content.strip()
+        if heading == "Summary" and not section_text and document.summary:
+            section_text = document.summary.strip()
         if not section_text:
             continue
         pieces = _split_text(section_text, target_min=600, target_max=1200, hard_max=1600)
@@ -37,6 +39,15 @@ def _chunk_structured_document(document: MemoryDocument) -> tuple[DocumentChunk,
                 )
             )
             ordinal += 1
+    if not chunks and document.title.strip():
+        chunks.append(
+            _build_chunk(
+                document=document,
+                ordinal=ordinal,
+                section_path="Title",
+                text=document.title.strip(),
+            )
+        )
     return tuple(chunks)
 
 
@@ -185,4 +196,3 @@ def _build_chunk(
         created_at=document.created_at,
         updated_at=document.updated_at,
     )
-

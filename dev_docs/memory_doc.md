@@ -34,12 +34,12 @@ It is a distributed concern with one coordinated design:
 1. Canonical memory state is Markdown under `/workspace/memory/`
 2. SQLite is a derived operational index, not the source of truth
 3. The agent and the human both inspect canonical memory through Markdown files
-4. The normal agent path for memory mutation is dedicated memory tools, not generic file editing
-5. Generic agent tools may still read or write memory files as fallback or escape hatches, and the memory system must detect, reconcile, and reindex those edits
+4. Jarvis must use dedicated memory tools for memory search, inspection, and mutation rather than generic file editing
+5. Out-of-band edits by a human or external system may still happen, and the memory system must detect, reconcile, and reindex those edits without treating generic tools as part of Jarvis's normal memory workflow
 6. The memory system includes graph memory from day one, but graph memory is implemented as a lightweight relations layer derived from canonical Markdown plus indexed in SQLite
 7. Identity files are not ordinary memory files and are not auto-mutated by the memory system
 8. Raw transcript archives remain immutable evidence and are never rewritten by memory maintenance
-9. Memory search must support lexical search, semantic search, graph expansion, and hybrid ranking
+9. Memory search must support lexical search, graph expansion, semantic retrieval when physically available, and hybrid ranking that degrades cleanly when semantic retrieval is not ready
 10. Memory maintenance must be mostly automatic, but manual inspection and intervention must stay simple
 
 ## What Counts As Memory
@@ -226,6 +226,7 @@ Canonical memory is Markdown with YAML frontmatter.
 
 The frontmatter is machine-validated.
 The body is human-readable narrative summary plus optional details.
+Search indexing is derived from the structured document, not only raw body markdown.
 
 ### Common Rules
 
@@ -237,6 +238,8 @@ The body is human-readable narrative summary plus optional details.
 - frontmatter is required for `daily/`
 - all timestamps use ISO 8601 UTC
 - all IDs are stable once created
+- for `core/` and `ongoing/`, important narrative text should normally live in body sections, especially `## Summary`
+- if a `core/` or `ongoing/` document carries meaningful `summary` text in frontmatter but the `## Summary` body section is blank, that summary text must still remain searchable
 
 ### Core Document Schema
 
@@ -463,6 +466,14 @@ If `sqlite-vec` is unavailable:
 - the runtime logs a clear warning
 - `memory_search` result metadata must indicate `semantic_disabled=true`
 
+Semantic availability is determined at runtime, not just by package installation.
+The system must treat semantic retrieval as unavailable if the extension cannot be loaded, if the vector table is missing, or if embeddings have not yet been initialized.
+
+When semantic retrieval is unavailable:
+
+- `hybrid`/`auto` search must fall back to the non-semantic path instead of failing the tool call
+- the search response must include a clear warning explaining that semantic retrieval was skipped
+
 ### Main SQLite Tables
 
 The main database must contain at least these tables:
@@ -676,6 +687,9 @@ The same Markdown file must produce the same chunk boundaries unless the file co
 - if a paragraph exceeds `1200` characters, split by sentence groups
 - target chunk size is `600..1200` characters
 - hard max per chunk is `1600` characters
+- chunk text is derived from canonical structured content, including title, section name, and section text
+- if `## Summary` is blank but frontmatter `summary` is present, that summary text is used as searchable/indexable summary content
+- if a structured document would otherwise yield no non-empty chunks, a minimal title-derived fallback chunk may be indexed so the document does not become invisible
 
 ### Daily Chunking
 
@@ -714,9 +728,12 @@ The default mode for `memory_search` is `hybrid`.
 Hybrid search performs:
 
 - FTS lexical candidate retrieval
-- vector candidate retrieval
+- vector candidate retrieval when semantic retrieval is ready
 - graph candidate retrieval
 - final score fusion
+
+`hybrid` capability is dynamically determined at query time.
+If semantic retrieval is not physically available or not yet initialized, hybrid search falls back to lexical plus graph retrieval and returns an explicit warning instead of failing.
 
 Hybrid retrieval treats retrieved candidates as prospects, not truth.
 Truthfulness is improved during score fusion by consulting status, contradiction, support, and recency signals.
@@ -868,11 +885,11 @@ At session start, Jarvis already loads:
 
 The memory system adds runtime memory bootstrap after those files and before any user turn content.
 
-Future prompt policy note:
+Prompt policy note:
 
-- `PROGRAM.md` should later explicitly instruct the agent to always use dedicated memory tools for memory operations
-- `PROGRAM.md` should later explicitly treat generic-tool memory access as exceptional fallback behavior rather than the normal path
-- this document defines that policy now even though `PROGRAM.md` is not being updated in this pass
+- `PROGRAM.md` explicitly instructs Jarvis to use dedicated memory tools for memory operations
+- Jarvis should not treat generic-tool memory access as a normal fallback path
+- this design still requires reconciliation of out-of-band edits made by a human or external system
 
 ### Bootstrap Order
 
@@ -933,8 +950,8 @@ Generic file tools are not enough for the standard path because they do not prov
 - provenance handling
 - bootstrap-aware mutation semantics
 
-Generic file tools still remain available as fallback readers and rare escape hatches.
-If they edit memory files, the memory system must detect drift and reconcile those edits back into the indexed state.
+Jarvis should use the memory tools as the full operating surface for memory work.
+If a human or external system changes canonical memory files out of band, the memory system must detect drift and reconcile those edits back into the indexed state.
 
 ### Tool Exposure
 
@@ -981,6 +998,8 @@ Returns:
 - `snippet`
 - `match_reasons`
 - `source_ref_ids`
+- top-level `semantic_disabled` status when semantic retrieval is unavailable for the query
+- warning text when hybrid search had to skip semantic retrieval and fall back
 
 ### `memory_get`
 
@@ -1052,19 +1071,19 @@ Actions:
 
 `bash` and `file_patch` are allowed to read `/workspace/memory/`.
 
-Generic tools may also write to `/workspace/memory/`, but that is not the normal memory path.
+Generic tools may also write to `/workspace/memory/`, but that is outside Jarvis's intended memory workflow.
 
 Agent-side write policy:
 
-- the agent should normally use `memory_search`, `memory_get`, and `memory_write` for memory operations
-- generic tools may be used only as rare fallback or escape-hatch operations
-- when generic tools touch memory files, those edits are treated as out-of-band memory mutations that must be detected and reconciled
+- Jarvis should use `memory_search`, `memory_get`, and `memory_write` for memory operations
+- Jarvis should not use generic tools as a memory fallback path
+- when memory files are changed by a human or external system through generic tools, those edits are treated as out-of-band memory mutations that must be detected and reconciled
 
 Prompt policy:
 
-- the agent should later be explicitly instructed in `PROGRAM.md` to always use memory tools for memory operations
-- the prompt should make clear that generic-tool memory writes are exceptional rather than forbidden
-- that prompt update is outside the scope of this document-only change
+- `PROGRAM.md` makes the memory-tool-only operating model explicit
+- the prompt should not advertise generic-tool memory writes as a fallback path for Jarvis
+- reconciliation of out-of-band edits remains required even though Jarvis is not instructed to use that path
 
 If a canonical memory file is changed outside the dedicated memory tools by a human, by generic tools, or by out-of-band system action:
 
@@ -1137,13 +1156,13 @@ Method details:
 
 - canonical Markdown validation: local computation only
 - frontmatter and section parsing: local computation only
-- chunk refresh: local computation only
+- chunk refresh from canonical sections plus searchable summary-bearing structured fields: local computation only
 - SQLite row updates: local computation and indexing only
 - FTS refresh: local computation and indexing only
 - graph relation refresh: local computation and indexing only
 - embeddings for changed chunks, facts, and relations: separate embedding calls through `src/llm/`
 - no LLM generation calls occur in immediate sync maintenance
-- this same sync path is used to reconcile out-of-band edits made through generic tools or manual human edits
+- this same sync path is used to reconcile out-of-band edits made by a human or external system
 
 ### Post-Turn Reflection Maintenance
 
@@ -1248,6 +1267,7 @@ Jobs:
 - `cold_archive_sweep`
 - `integrity_check`
 - `embedding_model_drift_check`
+- `repair_missing_embeddings`
 
 Per-job method details:
 
@@ -1339,6 +1359,14 @@ Per-job method details:
 - embedding calls: no for the check itself
 - LLM calls: no
 - if drift is detected, affected indexed content is marked dirty for later re-embedding or an admin-triggered rebuild
+
+`repair_missing_embeddings`
+
+- detects indexed memory documents whose expected embedding items are missing from the vector sidecar
+- attempts to backfill those embeddings automatically when semantic indexing is physically available
+- method: local computation plus embedding calls only for the missing items
+- embedding calls: yes, but only for documents missing expected semantic rows
+- LLM calls: no
 
 ### Heavy Reindex And Rebuild Operations
 
@@ -1646,8 +1674,9 @@ If post-turn reflection fails:
 If embedding creation fails for a changed item:
 
 - keep lexical and graph indexing
-- mark semantic index dirty
-- retry on next maintenance pass
+- mark semantic index incomplete or dirty
+- do not fail hybrid search; hybrid must continue with non-semantic retrieval and surface a clear warning
+- retry on the next maintenance pass, including the missing-embedding repair sweep
 
 ## Non-Goals
 
@@ -1664,9 +1693,9 @@ The memory system does not aim to:
 1. Canonical runtime memory lives under `/workspace/memory/`
 2. Memory code lives under `src/memory/`
 3. Dedicated memory tools are required even though Markdown is canonical
-4. Generic file tools remain allowed as fallback and rare escape hatches, and out-of-band memory edits must be detected and reconciled
+4. Jarvis uses dedicated memory tools rather than generic file-tool fallback, while out-of-band edits must still be detected and reconciled
 5. SQLite is a derived index and maintenance substrate, not a second source of truth
-6. Semantic search uses SQLite plus vector support through `sqlite-vec` when available
+6. Semantic search uses SQLite plus vector support through `sqlite-vec` only when the runtime can actually load and use that vector path
 7. Graph memory exists from day one as a relations layer, not a separate graph service
 8. `ongoing/` is the medium-horizon memory abstraction
 9. The memory model is explicitly `resources -> facts/relations -> summaries`

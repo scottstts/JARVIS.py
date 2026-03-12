@@ -15,6 +15,7 @@ from .config import MemorySettings
 from .types import DirtyDocument, DocumentChunk, MemoryDocument
 
 LOGGER = logging.getLogger(__name__)
+_SQLITE_VEC_OVERRIDE_PATH = Path("/opt/sqlite-vec/vec0")
 
 _DEFAULT_STATE = {
     "semantic_enabled": False,
@@ -43,6 +44,20 @@ class MemoryIndexDB:
         state = self.load_state()
         value = state.get("semantic_error")
         return str(value) if value is not None else None
+
+    def semantic_search_status(self) -> tuple[bool, str | None]:
+        state = self.load_state()
+        if not state.get("semantic_enabled"):
+            error = state.get("semantic_error")
+            if error is not None:
+                return False, str(error)
+            return False, "sqlite-vec is not available."
+        if state.get("embedding_dimensions") is None:
+            return False, "the embedding index is not initialized yet"
+        with self._connect_embeddings() as conn:
+            if not _table_exists(conn, "embedding_items_vec"):
+                return False, "the embedding vector table is missing"
+        return True, None
 
     def ensure_schema(self) -> None:
         with self._connect_main() as conn:
@@ -254,6 +269,48 @@ class MemoryIndexDB:
         with self._connect_main() as conn:
             rows = conn.execute("select path, checksum from documents").fetchall()
         return {str(row["path"]): str(row["checksum"]) for row in rows}
+
+    def paths_missing_searchable_chunks(self) -> tuple[Path, ...]:
+        with self._connect_main() as conn:
+            rows = conn.execute(
+                """
+                select d.path
+                from documents d
+                left join document_chunks c on c.document_id = d.document_id
+                where d.kind in ('core', 'ongoing')
+                  and coalesce(trim(d.summary), '') != ''
+                group by d.document_id, d.path
+                having count(c.chunk_id) = 0
+                """
+            ).fetchall()
+        return tuple(Path(str(row["path"])) for row in rows)
+
+    def embedding_vector_table_exists(self) -> bool:
+        with self._connect_embeddings() as conn:
+            return _table_exists(conn, "embedding_items_vec")
+
+    def embedding_vector_count_for_document(self, document_id: str) -> int:
+        if not self.embedding_vector_table_exists():
+            return 0
+        with self._connect_embeddings(load_vec=True) as conn:
+            row = conn.execute(
+                """
+                select count(*) as item_count
+                from embedding_items item
+                join embedding_items_vec vec on vec.rowid = item.embedding_id
+                where item.document_id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+        return int(row["item_count"]) if row is not None else 0
+
+    def expected_embedding_item_count(
+        self,
+        *,
+        document: MemoryDocument,
+        chunks: tuple[DocumentChunk, ...],
+    ) -> int:
+        return len(_embedding_items_for_document(document=document, chunks=chunks))
 
     def mark_dirty_documents(self, dirty_documents: tuple[DirtyDocument, ...]) -> None:
         if not dirty_documents:
@@ -577,48 +634,7 @@ class MemoryIndexDB:
     ) -> None:
         if llm_service is None:
             return
-        items = [
-            {
-                "item_key": f"chunk:{chunk.chunk_id}",
-                "item_type": "chunk",
-                "target_id": chunk.chunk_id,
-                "document_id": document.document_id,
-                "path": str(document.path),
-                "section_path": chunk.section_path,
-                "text": chunk.text,
-                "source_ref_ids": [source_ref.source_ref_id for source_ref in document.source_refs],
-            }
-            for chunk in chunks
-            if chunk.text.strip()
-        ]
-        items.extend(
-            {
-                "item_key": f"fact:{fact.fact_id}",
-                "item_type": "fact",
-                "target_id": fact.fact_id,
-                "document_id": document.document_id,
-                "path": str(document.path),
-                "section_path": "facts",
-                "text": fact.text,
-                "source_ref_ids": list(fact.source_ref_ids),
-            }
-            for fact in document.facts
-            if fact.text.strip()
-        )
-        items.extend(
-            {
-                "item_key": f"relation:{relation.relation_id}",
-                "item_type": "relation",
-                "target_id": relation.relation_id,
-                "document_id": document.document_id,
-                "path": str(document.path),
-                "section_path": "relations",
-                "text": relation.textualization,
-                "source_ref_ids": list(relation.source_ref_ids),
-            }
-            for relation in document.relations
-            if relation.textualization.strip()
-        )
+        items = _embedding_items_for_document(document=document, chunks=chunks)
         if not items:
             return
 
@@ -646,7 +662,7 @@ class MemoryIndexDB:
         self.write_state(state)
 
         self.delete_embeddings_for_document(document.document_id)
-        with self._connect_embeddings() as conn:
+        with self._connect_embeddings(load_vec=True) as conn:
             for item, embedding in zip(items, response.embeddings, strict=True):
                 cursor = conn.execute(
                     """
@@ -680,7 +696,7 @@ class MemoryIndexDB:
                 )
 
     def delete_embeddings_for_document(self, document_id: str) -> None:
-        with self._connect_embeddings() as conn:
+        with self._connect_embeddings(load_vec=self.embedding_vector_table_exists()) as conn:
             row_ids = [
                 int(row["embedding_id"])
                 for row in conn.execute(
@@ -754,13 +770,16 @@ class MemoryIndexDB:
     ) -> list[dict[str, Any]]:
         if not self.semantic_enabled:
             return []
+        ready, _reason = self.semantic_search_status()
+        if not ready:
+            return []
         clause, params = _document_filter_clause(
             scopes=scopes,
             include_expired=include_expired,
             daily_lookback_days=daily_lookback_days,
         )
         query_vector = json.dumps(list(embedding), ensure_ascii=True)
-        with self._connect_embeddings() as embeddings_conn:
+        with self._connect_embeddings(load_vec=True) as embeddings_conn:
             rows = embeddings_conn.execute(
                 """
                 select item.rowid as embedding_id, item.*
@@ -778,10 +797,10 @@ class MemoryIndexDB:
             document_rows = conn.execute(
                 f"""
                 select
-                    document_id, path, kind, updated_at, status, pinned, priority,
-                    summary, review_after, expires_at, archived_at
-                from documents
-                where document_id in ({placeholders}) and {clause}
+                    d.document_id, d.path, d.kind, d.updated_at, d.status, d.pinned, d.priority,
+                    d.summary, d.review_after, d.expires_at, d.archived_at
+                from documents d
+                where d.document_id in ({placeholders}) and {clause}
                 """,
                 (*document_ids, *params),
             ).fetchall()
@@ -1057,9 +1076,11 @@ class MemoryIndexDB:
         conn.execute("pragma foreign_keys = on")
         return conn
 
-    def _connect_embeddings(self) -> sqlite3.Connection:
+    def _connect_embeddings(self, *, load_vec: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(self._settings.embeddings_index_path)
         conn.row_factory = sqlite3.Row
+        if load_vec:
+            self._load_sqlite_vec_for_connection(conn)
         return conn
 
     def _ensure_embeddings_schema(self) -> None:
@@ -1088,12 +1109,8 @@ class MemoryIndexDB:
             )
 
         try:
-            import sqlite_vec
-
-            with self._connect_embeddings() as conn:
-                conn.enable_load_extension(True)
-                sqlite_vec.load(conn)
-                conn.enable_load_extension(False)
+            with self._connect_embeddings(load_vec=True):
+                pass
             state["semantic_enabled"] = True
             state["semantic_error"] = None
         except Exception as exc:  # pragma: no cover - platform specific
@@ -1107,12 +1124,21 @@ class MemoryIndexDB:
         if not state.get("semantic_enabled"):
             return
         current_dimensions = state.get("embedding_dimensions")
-        with self._connect_embeddings() as conn:
+        with self._connect_embeddings(load_vec=True) as conn:
             if current_dimensions is not None and int(current_dimensions) != dimensions:
                 conn.execute("drop table if exists embedding_items_vec")
             conn.execute(
                 f"create virtual table if not exists embedding_items_vec using vec0(embedding float[{dimensions}])"
             )
+
+    def _load_sqlite_vec_for_connection(self, conn: sqlite3.Connection) -> None:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        try:
+            _load_sqlite_vec_extension(conn, sqlite_vec_module=sqlite_vec)
+        finally:
+            conn.enable_load_extension(False)
 
 
 def _bool_to_int(value: bool | None) -> int | None:
@@ -1127,6 +1153,78 @@ def _checksum_text(text: str) -> str:
 
 def _entity_id_for_name(name: str) -> str:
     return "entity_" + "".join(character.lower() if character.isalnum() else "_" for character in name).strip("_")
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ? limit 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _embedding_items_for_document(
+    *,
+    document: MemoryDocument,
+    chunks: tuple[DocumentChunk, ...],
+) -> list[dict[str, Any]]:
+    items = [
+        {
+            "item_key": f"chunk:{chunk.chunk_id}",
+            "item_type": "chunk",
+            "target_id": chunk.chunk_id,
+            "document_id": document.document_id,
+            "path": str(document.path),
+            "section_path": chunk.section_path,
+            "text": chunk.text,
+            "source_ref_ids": [source_ref.source_ref_id for source_ref in document.source_refs],
+        }
+        for chunk in chunks
+        if chunk.text.strip()
+    ]
+    items.extend(
+        {
+            "item_key": f"fact:{fact.fact_id}",
+            "item_type": "fact",
+            "target_id": fact.fact_id,
+            "document_id": document.document_id,
+            "path": str(document.path),
+            "section_path": "facts",
+            "text": fact.text,
+            "source_ref_ids": list(fact.source_ref_ids),
+        }
+        for fact in document.facts
+        if fact.text.strip()
+    )
+    items.extend(
+        {
+            "item_key": f"relation:{relation.relation_id}",
+            "item_type": "relation",
+            "target_id": relation.relation_id,
+            "document_id": document.document_id,
+            "path": str(document.path),
+            "section_path": "relations",
+            "text": relation.textualization,
+            "source_ref_ids": list(relation.source_ref_ids),
+        }
+        for relation in document.relations
+        if relation.textualization.strip()
+    )
+    return items
+
+
+def _load_sqlite_vec_extension(conn: sqlite3.Connection, *, sqlite_vec_module: Any) -> None:
+    if _SQLITE_VEC_OVERRIDE_PATH.with_suffix(".so").exists():
+        try:
+            conn.load_extension(str(_SQLITE_VEC_OVERRIDE_PATH))
+            return
+        except Exception:
+            LOGGER.warning(
+                "Failed loading sqlite-vec override at %s; falling back to bundled wheel binary.",
+                _SQLITE_VEC_OVERRIDE_PATH.with_suffix(".so"),
+                exc_info=True,
+            )
+    sqlite_vec_module.load(conn)
 
 
 def _document_filter_clause(

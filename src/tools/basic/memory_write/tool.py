@@ -85,7 +85,8 @@ def build_memory_write_tool() -> RegisteredTool:
             name="memory_write",
             description=(
                 "Create or update canonical memory documents through validated structured operations. "
-                "Prefer this over generic file editing for normal memory mutations."
+                "Prefer this over generic file editing for normal memory mutations. "
+                "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary."
             ),
             input_schema={
                 "type": "object",
@@ -93,6 +94,10 @@ def build_memory_write_tool() -> RegisteredTool:
                     "operation": {
                         "type": "string",
                         "enum": ["create", "upsert", "append_daily", "close", "archive", "promote", "demote"],
+                        "description": (
+                            "Structured memory mutation. append_daily records daily log content; "
+                            "close ends an ongoing memory and removes it from the active set."
+                        ),
                     },
                     "target_kind": {
                         "type": "string",
@@ -100,7 +105,13 @@ def build_memory_write_tool() -> RegisteredTool:
                     },
                     "document_id": {"type": "string"},
                     "title": {"type": "string"},
-                    "summary": {"type": "string"},
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "Short summary text. For append_daily, summary-only writes are recorded "
+                            "under Notable Events when body_sections are omitted."
+                        ),
+                    },
                     "priority": {"type": "integer", "minimum": 0, "maximum": 100},
                     "pinned": {"type": "boolean"},
                     "locked": {"type": "boolean"},
@@ -108,7 +119,14 @@ def build_memory_write_tool() -> RegisteredTool:
                     "expires_at": {"type": "string"},
                     "facts": {"type": "array", "items": {"type": "object"}},
                     "relations": {"type": "array", "items": {"type": "object"}},
-                    "body_sections": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "body_sections": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "Canonical section content keyed by section name. This is the main searchable "
+                            "narrative text of the memory document."
+                        ),
+                    },
                     "source_refs": {"type": "array", "items": {"type": "object"}},
                     "date": {"type": "string"},
                     "timezone": {"type": "string"},
