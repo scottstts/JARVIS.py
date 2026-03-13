@@ -6,6 +6,16 @@ from typing import Any
 
 from llm import ToolDefinition
 
+from .contract import (
+    BODY_SECTIONS_SCHEMA,
+    FACT_EXAMPLE,
+    FACT_ITEM_SCHEMA,
+    MEMORY_WRITE_EXAMPLE,
+    RELATION_EXAMPLE,
+    RELATION_ITEM_SCHEMA,
+    format_memory_write_contract_error,
+    validate_memory_write_contract,
+)
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 
@@ -27,6 +37,25 @@ class MemoryWriteToolExecutor:
                 ok=False,
                 content="Memory service is not available in this runtime.",
             )
+        contract_errors = validate_memory_write_contract(
+            operation=str(arguments.get("operation", "")).strip(),
+            target_kind=str(arguments.get("target_kind", "")).strip(),
+            arguments=arguments,
+        )
+        if contract_errors:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="memory_write",
+                ok=False,
+                content=(
+                    "memory_write failed: "
+                    + format_memory_write_contract_error(
+                        operation=str(arguments.get("operation", "")).strip(),
+                        target_kind=str(arguments.get("target_kind", "")).strip(),
+                        errors=contract_errors,
+                    )
+                ),
+            )
         try:
             result = await service.write(
                 operation=str(arguments.get("operation", "")).strip(),
@@ -41,8 +70,8 @@ class MemoryWriteToolExecutor:
                 expires_at=_optional_string(arguments.get("expires_at")),
                 tags=_coerce_list_of_strings(arguments.get("tags")),
                 aliases=_coerce_list_of_strings(arguments.get("aliases")),
-                facts=_coerce_list_of_dicts(arguments.get("facts")),
-                relations=_coerce_list_of_dicts(arguments.get("relations")),
+                facts=_coerce_truth_list(arguments.get("facts"), field_name="facts"),
+                relations=_coerce_truth_list(arguments.get("relations"), field_name="relations"),
                 body_sections=_coerce_dict(arguments.get("body_sections")),
                 source_refs=_coerce_list_of_dicts(arguments.get("source_refs")),
                 entity_refs=_coerce_list_of_dicts(arguments.get("entity_refs")),
@@ -91,8 +120,14 @@ def build_memory_write_tool() -> RegisteredTool:
                 "Create or update canonical memory documents through validated structured operations. "
                 "Prefer this over generic file editing for normal memory mutations. "
                 "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary. "
+                "For core and ongoing create/upsert operations, facts and relations are explicit-decision fields: always set both. "
                 "When the user states an explicit durable fact, pass it in facts; when they state a structured relationship, "
                 "current preference, tool usage, ownership, or other subject-predicate-object claim, pass it in relations. "
+                'If there is genuinely no structured truth worth storing for one field, pass the literal string "None". '
+                "summary is not a substitute for facts or relations. "
+                "Minimal valid shapes: fact items use text/status, relation items use subject/predicate/object/status/cardinality, "
+                'and body_sections is an object like {"Overview":"..."}. '
+                f"Example payload pieces: {MEMORY_WRITE_EXAMPLE}. "
                 "When superseding memory through close or archive, first rewrite the memory content to the new terminal truth "
                 "using summary and body_sections, then let the operation flip status/archive state. "
                 "If you omit that rewrite, the system will apply a generic fallback terminal stamp."
@@ -121,6 +156,8 @@ def build_memory_write_tool() -> RegisteredTool:
                         "description": (
                             "Short summary text. For append_daily, summary-only writes are recorded "
                             "under Notable Events when body_sections are omitted. "
+                            "For core/ongoing create and upsert, summary is not a substitute for facts or relations; "
+                            'you must still explicitly provide both fields as structured arrays or the literal string "None". '
                             "For close/archive superseding transitions, provide the rewritten terminal summary here instead of leaving the old active wording."
                         ),
                     },
@@ -132,27 +169,76 @@ def build_memory_write_tool() -> RegisteredTool:
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}},
                     "facts": {
-                        "type": "array",
-                        "items": {"type": "object"},
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "items": FACT_ITEM_SCHEMA,
+                            },
+                            {
+                                "type": "array",
+                                "items": {},
+                            },
+                            {
+                                "type": "string",
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": {},
+                            },
+                        ],
                         "description": (
                             "Explicit fact statements to track as structured memory. "
-                            "Use this when the user gives a durable fact directly instead of burying that fact only in summary/body text."
+                            "Use this when the user gives a durable fact directly instead of burying that fact only in summary/body text. "
+                            'Each fact object should use at least {"text":"..."} and may also include status/currentness fields. '
+                            f"Minimal example: {FACT_EXAMPLE}. "
+                            'For core/ongoing create and upsert, this field is an explicit-decision field: pass a non-empty structured array or the literal string "None".'
                         ),
                     },
                     "relations": {
-                        "type": "array",
-                        "items": {"type": "object"},
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "items": RELATION_ITEM_SCHEMA,
+                            },
+                            {
+                                "type": "array",
+                                "items": {},
+                            },
+                            {
+                                "type": "string",
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": {},
+                            },
+                        ],
                         "description": (
                             "Structured subject-predicate-object claims. "
-                            "Use this for stated preferences, current tools or stacks, ownership, responsibilities, and other truth-tracked relationships."
+                            "Use this for stated preferences, current tools or stacks, ownership, responsibilities, and other truth-tracked relationships. "
+                            'Each relation object should use subject, predicate, and object, with optional status/cardinality. '
+                            f"Minimal example: {RELATION_EXAMPLE}. "
+                            'For core/ongoing create and upsert, this field is an explicit-decision field: pass a non-empty structured array or the literal string "None".'
                         ),
                     },
                     "body_sections": {
-                        "type": "object",
-                        "additionalProperties": {"type": "string"},
+                        "anyOf": [
+                            BODY_SECTIONS_SCHEMA,
+                            {
+                                "type": "object",
+                                "additionalProperties": {},
+                            },
+                            {
+                                "type": "array",
+                                "items": {},
+                            },
+                            {
+                                "type": "string",
+                            },
+                        ],
                         "description": (
                             "Canonical section content keyed by section name. This is the main searchable "
                             "narrative text of the memory document. "
+                            'Pass an object like {"Overview":"..."}; do not pass a list of section objects. '
                             "For close/archive superseding transitions, pass the rewritten terminal body here; "
                             "do not rely on status flip alone to supersede stale content."
                         ),
@@ -189,10 +275,45 @@ def _coerce_list_of_dicts(value: Any) -> list[dict[str, Any]] | None:
     return result
 
 
-def _coerce_dict(value: Any) -> dict[str, str] | None:
-    if value is None or not isinstance(value, dict):
+def _coerce_truth_list(value: Any, *, field_name: str) -> list[dict[str, Any]] | None:
+    if value is None:
         return None
-    return {str(key): str(item) for key, item in value.items()}
+    if isinstance(value, str):
+        if value.strip().lower() == "none":
+            return []
+        raise ValueError(
+            f'{field_name} must be a structured array or the literal string "None".'
+        )
+    if not isinstance(value, list):
+        raise ValueError(
+            f'{field_name} must be a structured array or the literal string "None".'
+        )
+    if not value:
+        raise ValueError(
+            f'{field_name} cannot be an empty array; use the literal string "None" instead.'
+        )
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError(f"{field_name} array items must be objects.")
+        result.append(dict(item))
+    return result
+
+
+def _coerce_dict(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("body_sections must be an object keyed by section name with string values.")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        normalized_key = str(key).strip()
+        if not normalized_key:
+            raise ValueError("body_sections section names must be non-empty strings.")
+        if not isinstance(item, str):
+            raise ValueError("body_sections values must be strings keyed by section name.")
+        result[normalized_key] = item
+    return result
 
 
 def _coerce_list_of_strings(value: Any) -> list[str] | None:

@@ -67,6 +67,7 @@ class ToolPolicy:
             return MemoryWritePolicy().authorize(
                 operation=operation,
                 target_kind=target_kind,
+                arguments=arguments,
                 context=context,
             )
 

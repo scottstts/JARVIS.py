@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from jsonschema import Draft202012Validator
 from llm import ToolCall, ToolDefinition
+from memory import MemoryService, MemorySettings
 from tools import (
     DiscoverableTool,
     RegisteredTool,
@@ -252,8 +254,11 @@ class ToolSettingsTests(unittest.TestCase):
         tool = build_memory_write_tool()
 
         self.assertIn("rewrite the memory content", tool.definition.description.lower())
+        self.assertIn("facts and relations are explicit-decision fields", tool.definition.description.lower())
         self.assertIn("explicit durable fact", tool.definition.description.lower())
         self.assertIn("subject-predicate-object", tool.definition.description.lower())
+        self.assertIn("minimal valid shapes", tool.definition.description.lower())
+        self.assertIn("example payload pieces", tool.definition.description.lower())
         operation_description = tool.definition.input_schema["properties"]["operation"]["description"].lower()
         summary_description = tool.definition.input_schema["properties"]["summary"]["description"].lower()
         facts_description = tool.definition.input_schema["properties"]["facts"]["description"].lower()
@@ -264,11 +269,83 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("close and archive are superseding transitions", operation_description)
         self.assertIn("durable fact", facts_description)
         self.assertIn("summary/body text", facts_description)
+        self.assertIn('literal string "none"', facts_description)
+        self.assertIn('{"text":"..."}', facts_description)
         self.assertIn("subject-predicate-object claims", relations_description)
         self.assertIn("preferences", relations_description)
+        self.assertIn('literal string "none"', relations_description)
+        self.assertIn("subject, predicate, and object", relations_description)
+        self.assertIn("summary is not a substitute", summary_description)
         self.assertIn("rewritten terminal summary", summary_description)
         self.assertIn("rewritten terminal body", body_description)
+        self.assertIn("do not pass a list of section objects", body_description)
         self.assertIn("not a substitute", close_reason_description)
+
+    def test_memory_write_schema_exposes_nested_truth_shapes(self) -> None:
+        tool = build_memory_write_tool()
+        facts_schema = tool.definition.input_schema["properties"]["facts"]["anyOf"][0]
+        relations_schema = tool.definition.input_schema["properties"]["relations"]["anyOf"][0]
+        body_sections_schema = tool.definition.input_schema["properties"]["body_sections"]["anyOf"][0]
+
+        self.assertEqual(facts_schema["type"], "array")
+        self.assertEqual(facts_schema["items"]["required"], ["text"])
+        self.assertEqual(
+            facts_schema["items"]["properties"]["status"]["enum"],
+            ["current", "past", "uncertain", "superseded"],
+        )
+        self.assertEqual(relations_schema["type"], "array")
+        self.assertEqual(relations_schema["items"]["required"], ["subject", "predicate", "object"])
+        self.assertEqual(
+            relations_schema["items"]["properties"]["cardinality"]["enum"],
+            ["single", "multi"],
+        )
+        self.assertEqual(body_sections_schema["type"], "object")
+        self.assertEqual(body_sections_schema["additionalProperties"]["type"], "string")
+
+    def test_memory_write_schema_accepts_broad_truth_arrays_for_runtime_rejection(self) -> None:
+        tool = build_memory_write_tool()
+        arguments = {
+            "operation": "create",
+            "target_kind": "ongoing",
+            "title": "Visual Pipeline Project",
+            "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+            "facts": ["Scott is building a Three.js/WebGPU/TSL shader playground."],
+            "relations": "None",
+        }
+
+        Draft202012Validator(tool.definition.input_schema).validate(arguments)
+
+    def test_memory_write_schema_accepts_truth_objects_for_runtime_rejection(self) -> None:
+        tool = build_memory_write_tool()
+        arguments = {
+            "operation": "create",
+            "target_kind": "ongoing",
+            "title": "Visual Pipeline Project",
+            "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+            "facts": {"text": "Scott is building a Three.js/WebGPU/TSL shader playground."},
+            "relations": "None",
+        }
+
+        Draft202012Validator(tool.definition.input_schema).validate(arguments)
+
+    def test_memory_write_schema_accepts_broad_body_sections_for_runtime_rejection(self) -> None:
+        tool = build_memory_write_tool()
+        arguments = {
+            "operation": "create",
+            "target_kind": "ongoing",
+            "title": "Visual Pipeline Project",
+            "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+            "facts": "None",
+            "relations": "None",
+            "body_sections": [
+                {
+                    "title": "Overview",
+                    "text": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                }
+            ],
+        }
+
+        Draft202012Validator(tool.definition.input_schema).validate(arguments)
 
     def test_uses_default_web_fetch_limits_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -553,6 +630,113 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("null bytes", decision.reason or "")
+
+    def test_memory_write_policy_denies_summary_only_core_create(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "create",
+                "target_kind": "core",
+                "title": "Backend Preference",
+                "summary": "Scott prefers Python for backend APIs.",
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("facts and relations", decision.reason or "")
+        self.assertIn('literal string "None"', decision.reason or "")
+        self.assertIn("summary is not a substitute", decision.reason or "")
+
+    def test_memory_write_policy_denies_empty_truth_arrays(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "create",
+                "target_kind": "ongoing",
+                "title": "Visual Pipeline Project",
+                "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                "facts": [],
+                "relations": "None",
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("empty arrays are not allowed", decision.reason or "")
+
+    def test_memory_write_policy_allows_explicit_none_truth_decision(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "create",
+                "target_kind": "core",
+                "title": "Visual Pipeline Project",
+                "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                "facts": "None",
+                "relations": "None",
+            },
+            context=self.context,
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_memory_write_policy_denies_list_body_sections(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "create",
+                "target_kind": "ongoing",
+                "title": "Visual Pipeline Project",
+                "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                "facts": "None",
+                "relations": "None",
+                "body_sections": [
+                    {
+                        "title": "Overview",
+                        "text": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                    }
+                ],
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("body_sections", decision.reason or "")
+        self.assertIn("Do not pass a list of section objects", decision.reason or "")
+
+    def test_memory_write_policy_reports_multiple_nested_errors_together(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "create",
+                "target_kind": "ongoing",
+                "title": "Visual Pipeline Project",
+                "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                "facts": [{"statement": "Scott is building a Three.js/WebGPU/TSL shader playground."}],
+                "relations": [
+                    {
+                        "subject": "Scott",
+                        "predicate": "is_building",
+                        "object": "Visual Pipeline Project",
+                        "status": "active",
+                    }
+                ],
+                "body_sections": [
+                    {
+                        "title": "Overview",
+                        "text": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                    }
+                ],
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("facts[0].text", decision.reason or "")
+        self.assertIn("relations[0].status", decision.reason or "")
+        self.assertIn("body_sections", decision.reason or "")
+        self.assertIn("Minimal valid example", decision.reason or "")
 
     def test_view_image_allows_workspace_relative_path(self) -> None:
         decision = self.policy.authorize(
@@ -1245,6 +1429,218 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("Tool execution failed", result.content)
         self.assertEqual(result.metadata["error_type"], "RuntimeError")
+
+    async def test_memory_write_runtime_denies_summary_only_core_create(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_summary_only",
+                name="memory_write",
+                arguments={
+                    "operation": "create",
+                    "target_kind": "core",
+                    "title": "Backend Preference",
+                    "summary": "Scott prefers Python for backend APIs.",
+                },
+                raw_arguments='{"operation":"create","target_kind":"core","title":"Backend Preference","summary":"Scott prefers Python for backend APIs."}',
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tool execution denied by policy", result.content)
+        self.assertIn("summary is not a substitute", result.content)
+
+    async def test_memory_write_runtime_accepts_explicit_none_truth_decision(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_explicit_none",
+                name="memory_write",
+                arguments={
+                    "operation": "create",
+                    "target_kind": "core",
+                    "title": "Backend Preference",
+                    "summary": "Scott prefers Python for backend APIs.",
+                    "facts": "None",
+                    "relations": "None",
+                },
+                raw_arguments='{"operation":"create","target_kind":"core","title":"Backend Preference","summary":"Scott prefers Python for backend APIs.","facts":"None","relations":"None"}',
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertTrue(result.ok)
+        document = memory_service._store.read_document(
+            self.workspace_dir / "memory" / "core" / "backend-preference.md"
+        )
+        self.assertEqual(document.facts, ())
+        self.assertEqual(document.relations, ())
+
+    async def test_memory_write_runtime_accepts_lowercase_none_truth_decision(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_lowercase_none",
+                name="memory_write",
+                arguments={
+                    "operation": "create",
+                    "target_kind": "core",
+                    "title": "Backend Preference",
+                    "summary": "Scott prefers Python for backend APIs.",
+                    "facts": "none",
+                    "relations": "none",
+                },
+                raw_arguments='{"operation":"create","target_kind":"core","title":"Backend Preference","summary":"Scott prefers Python for backend APIs.","facts":"none","relations":"none"}',
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertTrue(result.ok)
+        document = memory_service._store.read_document(
+            self.workspace_dir / "memory" / "core" / "backend-preference.md"
+        )
+        self.assertEqual(document.facts, ())
+        self.assertEqual(document.relations, ())
+
+    async def test_memory_write_runtime_denies_string_items_in_truth_arrays(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_bad_truth_array",
+                name="memory_write",
+                arguments={
+                    "operation": "create",
+                    "target_kind": "ongoing",
+                    "title": "Visual Pipeline Project",
+                    "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                    "facts": ["Scott is building a Three.js/WebGPU/TSL shader playground."],
+                    "relations": "None",
+                },
+                raw_arguments='{"operation":"create","target_kind":"ongoing","title":"Visual Pipeline Project","summary":"Scott is building a Three.js/WebGPU/TSL shader playground.","facts":["Scott is building a Three.js/WebGPU/TSL shader playground."],"relations":"None"}',
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tool execution denied by policy", result.content)
+        self.assertIn("array items must be objects", result.content)
+
+    async def test_memory_write_runtime_denies_list_body_sections(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_bad_body_sections",
+                name="memory_write",
+                arguments={
+                    "operation": "create",
+                    "target_kind": "ongoing",
+                    "title": "Visual Pipeline Project",
+                    "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                    "facts": "None",
+                    "relations": "None",
+                    "body_sections": [
+                        {
+                            "title": "Overview",
+                            "text": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                        }
+                    ],
+                },
+                raw_arguments='{"operation":"create","target_kind":"ongoing","title":"Visual Pipeline Project","summary":"Scott is building a Three.js/WebGPU/TSL shader playground.","facts":"None","relations":"None","body_sections":[{"title":"Overview","text":"Scott is building a Three.js/WebGPU/TSL shader playground."}]}',
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tool execution denied by policy", result.content)
+        self.assertIn("body_sections", result.content)
+
+    async def test_memory_write_runtime_reports_multiple_nested_errors_together(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_multi_error",
+                name="memory_write",
+                arguments={
+                    "operation": "create",
+                    "target_kind": "ongoing",
+                    "title": "Visual Pipeline Project",
+                    "summary": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                    "facts": [{"statement": "Scott is building a Three.js/WebGPU/TSL shader playground."}],
+                    "relations": [
+                        {
+                            "subject": "Scott",
+                            "predicate": "is_building",
+                            "object": "Visual Pipeline Project",
+                            "status": "active",
+                        }
+                    ],
+                    "body_sections": [
+                        {
+                            "title": "Overview",
+                            "text": "Scott is building a Three.js/WebGPU/TSL shader playground.",
+                        }
+                    ],
+                },
+                raw_arguments=(
+                    '{"operation":"create","target_kind":"ongoing","title":"Visual Pipeline Project",'
+                    '"summary":"Scott is building a Three.js/WebGPU/TSL shader playground.",'
+                    '"facts":[{"statement":"Scott is building a Three.js/WebGPU/TSL shader playground."}],'
+                    '"relations":[{"subject":"Scott","predicate":"is_building","object":"Visual Pipeline Project","status":"active"}],'
+                    '"body_sections":[{"title":"Overview","text":"Scott is building a Three.js/WebGPU/TSL shader playground."}]}'
+                ),
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tool execution denied by policy", result.content)
+        self.assertIn("facts[0].text", result.content)
+        self.assertIn("relations[0].status", result.content)
+        self.assertIn("body_sections", result.content)
+        self.assertIn("Minimal valid example", result.content)
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
