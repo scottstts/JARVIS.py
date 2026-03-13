@@ -22,6 +22,7 @@ from tools import (
     ToolRuntime,
     ToolSettings,
 )
+from tools.basic.memory_write.tool import build_memory_write_tool
 from tools.basic.tool_search import build_tool_search_tool
 from tools.basic.memory_search.tool import _format_memory_search_result
 from tools.basic.web_fetch.tool import (
@@ -246,6 +247,20 @@ class ToolSettingsTests(unittest.TestCase):
                 settings = ToolSettings.from_workspace_dir(workspace_dir)
 
         self.assertEqual(settings.web_search_result_count, 7)
+
+    def test_memory_write_tool_describes_superseding_rewrite_contract(self) -> None:
+        tool = build_memory_write_tool()
+
+        self.assertIn("rewrite the memory content", tool.definition.description.lower())
+        operation_description = tool.definition.input_schema["properties"]["operation"]["description"].lower()
+        summary_description = tool.definition.input_schema["properties"]["summary"]["description"].lower()
+        body_description = tool.definition.input_schema["properties"]["body_sections"]["description"].lower()
+        close_reason_description = tool.definition.input_schema["properties"]["close_reason"]["description"].lower()
+
+        self.assertIn("close and archive are superseding transitions", operation_description)
+        self.assertIn("rewritten terminal summary", summary_description)
+        self.assertIn("rewritten terminal body", body_description)
+        self.assertIn("not a substitute", close_reason_description)
 
     def test_uses_default_web_fetch_limits_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

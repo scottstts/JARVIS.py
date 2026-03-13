@@ -255,9 +255,178 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
             runs = await service.run_due_maintenance()
             integrity_run = next(run for run in runs if run.job_name == "integrity_check")
+            repair_run = next(run for run in runs if run.job_name == "repair_canonical_drift")
 
+            self.assertEqual(repair_run.status, "ok")
+            self.assertEqual(repair_run.summary["repaired_documents"], 1)
             self.assertEqual(integrity_run.status, "warning")
-            self.assertGreaterEqual(integrity_run.summary["issue_count"], 2)
+            self.assertGreaterEqual(integrity_run.summary["issue_count"], 1)
+
+    async def test_repair_canonical_drift_repairs_legacy_summary_section_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="core",
+                title="User communication preference",
+                summary="User prefers direct, honest explanations.",
+            )
+
+            drifted_text = created.path.read_text(encoding="utf-8").replace(
+                "\n## Summary\nUser prefers direct, honest explanations.",
+                "\n## Summary\n",
+                1,
+            )
+            created.path.write_text(drifted_text, encoding="utf-8")
+
+            issues_before = await service.integrity_check()
+            self.assertEqual({issue.code for issue in issues_before}, {"summary_section_empty"})
+
+            repair_summary = await service.repair_canonical_drift()
+            repaired_document = service._store.read_document(created.path)
+            issues_after = await service.integrity_check()
+
+            self.assertEqual(repair_summary["repaired_documents"], 1)
+            self.assertEqual(repair_summary["repaired_issue_counts"]["summary_section_empty"], 1)
+            self.assertEqual(repaired_document.sections["Summary"], "User prefers direct, honest explanations.")
+            self.assertFalse(issues_after)
+
+    async def test_close_rewrites_terminal_summary_before_archiving(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Jarvis memory system improvement",
+                summary="Scott is actively working on the Jarvis memory system improvement.",
+            )
+
+            closed = await service.write(
+                operation="close",
+                target_kind="ongoing",
+                document_id=created.document_id,
+                close_reason="Completed on 2026-03-13: Scott finished the Jarvis memory experiment.",
+            )
+
+            archived_document = service._store.read_document(closed.path)
+
+            self.assertEqual(
+                archived_document.summary,
+                "Completed on 2026-03-13: Scott finished the Jarvis memory experiment.",
+            )
+            self.assertEqual(
+                archived_document.sections["Summary"],
+                "Completed on 2026-03-13: Scott finished the Jarvis memory experiment.",
+            )
+            self.assertEqual(
+                archived_document.sections["Current State"],
+                "Completed on 2026-03-13: Scott finished the Jarvis memory experiment.",
+            )
+            self.assertIn(
+                "System terminal rewrite fallback applied on 2026-03-13",
+                archived_document.sections["Notes"],
+            )
+            self.assertFalse(any(issue.code == "closed_summary_present_tense" for issue in await service.integrity_check()))
+
+    async def test_close_uses_explicit_transition_rewrite_instead_of_preserving_old_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Three.js game project",
+                summary="Scott is starting a new project to build a three.js game.",
+                body_sections={
+                    "Summary": "Scott is starting a new project to build a three.js game.",
+                    "Current State": "- Project setup has started.",
+                    "Open Loops": "- Build the first level.",
+                    "Artifacts": "- Prototype notes.",
+                    "Notes": "- Active project.",
+                },
+            )
+
+            closed = await service.write(
+                operation="close",
+                target_kind="ongoing",
+                document_id=created.document_id,
+                summary="Scott completed the three.js game project.",
+                body_sections={
+                    "Current State": "- Project completed and no longer active.",
+                    "Open Loops": "",
+                    "Artifacts": "- Final build archived.",
+                    "Notes": "- Closed after completion.",
+                },
+                close_reason="Completed. Scott said the three.js game has been finished.",
+            )
+
+            archived_document = service._store.read_document(closed.path)
+
+            self.assertEqual(archived_document.summary, "Scott completed the three.js game project.")
+            self.assertEqual(archived_document.sections["Summary"], "Scott completed the three.js game project.")
+            self.assertEqual(archived_document.sections["Current State"], "- Project completed and no longer active.")
+            self.assertEqual(archived_document.sections["Open Loops"], "")
+            self.assertEqual(archived_document.sections["Artifacts"], "- Final build archived.")
+            self.assertEqual(archived_document.sections["Notes"], "- Closed after completion.")
+            self.assertNotIn("starting a new project", archived_document.body_markdown.lower())
+            self.assertNotIn("build the first level", archived_document.body_markdown.lower())
+
+    async def test_archive_without_rewrite_uses_generic_superseding_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Frontend stack preference",
+                summary="Scott currently prefers React for frontend work.",
+                body_sections={
+                    "Summary": "Scott currently prefers React for frontend work.",
+                    "Details": "- React is the default choice.",
+                    "Notes": "- Active preference.",
+                },
+            )
+
+            archived = await service.write(
+                operation="archive",
+                target_kind="core",
+                document_id=created.document_id,
+                close_reason="Superseded by a newer frontend preference record.",
+            )
+
+            archived_document = service._store.read_document(archived.path)
+
+            self.assertEqual(archived_document.status, "archived")
+            self.assertEqual(archived_document.summary, "Superseded by a newer frontend preference record.")
+            self.assertEqual(archived_document.sections["Summary"], "Superseded by a newer frontend preference record.")
+            self.assertEqual(archived_document.sections["Details"], "Superseded by a newer frontend preference record.")
+            self.assertIn(
+                "System archive rewrite fallback applied on",
+                archived_document.sections["Notes"],
+            )
+            self.assertNotIn("currently prefers React", archived_document.body_markdown)
 
     async def test_bootstrap_preview_includes_core_and_ongoing_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

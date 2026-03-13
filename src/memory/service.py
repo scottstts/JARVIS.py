@@ -71,6 +71,7 @@ class MemoryService:
                 archive_document=self._archive_document,
                 recompute_priorities=self.recompute_priorities,
                 repair_missing_embeddings=self._repair_missing_embeddings,
+                repair_canonical_drift=self.repair_canonical_drift,
                 integrity_check=self._integrity_check_dicts,
             ),
         )
@@ -247,7 +248,48 @@ class MemoryService:
             if current is None:
                 raise ValueError("Cannot archive a missing memory document.")
             _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
-            archived = await self._archive_document(current, allow_locked=allow_locked)
+            if current.kind == "daily":
+                archived = await self._archive_document(current, allow_locked=allow_locked)
+            else:
+                now = _utc_now_iso()
+                archived_summary, archived_sections = _transition_rewrite_payload(
+                    kind=current.kind,
+                    operation="archive",
+                    summary=summary,
+                    body_sections=body_sections,
+                    fallback_summary=_archived_summary_fallback(
+                        title=title or current.title,
+                        archive_reason=close_reason or current.close_reason,
+                        archived_at=now,
+                    ),
+                    occurred_at=now,
+                )
+                updated = self._compose_document_update(
+                    base_document=current,
+                    target_kind=current.kind,
+                    title=title,
+                    summary=archived_summary,
+                    priority=priority,
+                    pinned=pinned,
+                    locked=locked,
+                    review_after=review_after,
+                    expires_at=expires_at,
+                    tags=tags,
+                    aliases=aliases,
+                    facts=facts,
+                    relations=relations,
+                    body_sections=archived_sections,
+                    source_refs=source_refs,
+                    entity_refs=entity_refs,
+                    completion_criteria=completion_criteria,
+                    route_id=route_id,
+                    session_id=session_id,
+                    date=date,
+                    close_reason=close_reason,
+                    updated_at=now,
+                    path_override=current.path,
+                )
+                archived = await self._archive_document(updated, allow_locked=allow_locked)
             return MemoryWriteResult(
                 operation="archive",
                 document_id=archived.document_id,
@@ -261,11 +303,44 @@ class MemoryService:
             if current.kind != "ongoing":
                 raise ValueError("Only ongoing memory documents can be closed.")
             _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
-            updated = replace(
-                current,
+            now = _utc_now_iso()
+            closed_summary, closed_sections = _transition_rewrite_payload(
+                kind="ongoing",
+                operation="close",
+                summary=summary,
+                body_sections=body_sections,
+                fallback_summary=_closed_summary_fallback(
+                    title=title or current.title,
+                    close_reason=close_reason or current.close_reason,
+                    closed_at=now,
+                ),
+                occurred_at=now,
+            )
+            updated = self._compose_document_update(
+                base_document=current,
+                target_kind="ongoing",
+                title=title,
+                summary=closed_summary,
+                priority=priority,
+                pinned=pinned,
+                locked=locked,
+                review_after=review_after,
+                expires_at=expires_at,
+                tags=tags,
+                aliases=aliases,
+                facts=facts,
+                relations=relations,
+                body_sections=closed_sections,
+                source_refs=source_refs,
+                entity_refs=entity_refs,
+                completion_criteria=completion_criteria,
+                route_id=route_id,
+                session_id=session_id,
+                date=date,
+                close_reason=close_reason,
+                updated_at=now,
                 status="closed",
-                close_reason=close_reason or current.close_reason,
-                updated_at=_utc_now_iso(),
+                path_override=current.path,
             )
             persisted = await self._archive_document(updated, allow_locked=allow_locked)
             return MemoryWriteResult(
@@ -308,73 +383,29 @@ class MemoryService:
             route_id=route_id,
             session_id=session_id,
         )
-        resolved_source_refs = _normalize_source_refs(
-            payloads=source_refs,
-            existing=base_document.source_refs,
+        updated_document = self._compose_document_update(
+            base_document=base_document,
+            target_kind=target_kind,
+            title=title,
+            summary=summary,
+            priority=priority,
+            pinned=pinned,
+            locked=locked,
+            review_after=review_after,
+            expires_at=expires_at,
+            tags=tags,
+            aliases=aliases,
+            facts=facts,
+            relations=relations,
+            body_sections=body_sections,
+            source_refs=source_refs,
+            entity_refs=entity_refs,
+            completion_criteria=completion_criteria,
             route_id=route_id,
             session_id=session_id,
-        )
-        resolved_title = title or base_document.title
-        resolved_path = self._store.canonical_path_for(
-            kind=target_kind,
-            title=resolved_title,
-            date=date or base_document.date,
-            archived=base_document.archived,
-        )
-        resolved_sections = _merge_sections(base_document=base_document, overrides=body_sections or {})
-        resolved_summary = summary if summary is not None else base_document.summary
-        if target_kind != "daily":
-            resolved_sections = _reconcile_summary_section(
-                sections=resolved_sections,
-                summary=resolved_summary,
-                explicit_summary_section=(body_sections or {}).get("Summary"),
-            )
-        if resolved_summary is None and "Summary" in resolved_sections and resolved_sections["Summary"].strip():
-            resolved_summary = _first_paragraph(resolved_sections["Summary"])
-        updated_document = replace(
-            base_document,
-            path=resolved_path,
-            title=resolved_title,
-            summary=resolved_summary if target_kind != "daily" else None,
-            priority=priority if priority is not None else base_document.priority,
-            pinned=pinned if pinned is not None else base_document.pinned,
-            locked=locked if locked is not None else base_document.locked,
-            review_after=review_after if review_after is not None else base_document.review_after,
-            expires_at=expires_at if expires_at is not None else base_document.expires_at,
-            tags=_normalize_string_list(tags, existing=base_document.tags),
-            aliases=_normalize_string_list(aliases, existing=base_document.aliases),
+            date=date,
+            close_reason=close_reason,
             updated_at=now,
-            sections=resolved_sections,
-            facts=_normalize_facts(
-                payloads=facts,
-                existing=base_document.facts,
-                source_refs=resolved_source_refs,
-            )
-            if target_kind != "daily"
-            else (),
-            relations=_normalize_relations(
-                payloads=relations,
-                existing=base_document.relations,
-                source_refs=resolved_source_refs,
-            )
-            if target_kind != "daily"
-            else (),
-            source_refs=resolved_source_refs if target_kind != "daily" else base_document.source_refs,
-            entity_refs=_normalize_entity_refs(
-                payloads=entity_refs,
-                existing=base_document.entity_refs,
-            )
-            if target_kind != "daily"
-            else (),
-            completion_criteria=_normalize_string_list(
-                completion_criteria,
-                existing=base_document.completion_criteria,
-            )
-            if target_kind == "ongoing"
-            else (),
-            route_ids=tuple(dict.fromkeys(base_document.route_ids + ((route_id,) if route_id else ()))),
-            session_ids=tuple(dict.fromkeys(base_document.session_ids + ((session_id,) if session_id else ()))),
-            close_reason=close_reason if close_reason is not None else base_document.close_reason,
         )
         persisted = await self._persist_document(
             updated_document,
@@ -514,6 +545,43 @@ class MemoryService:
             "semantic_enabled": self._index_db.semantic_enabled,
             "semantic_error": self._index_db.semantic_error,
             "rebuilt_documents": rebuilt,
+        }
+
+    async def repair_canonical_drift(self) -> dict[str, Any]:
+        await self.ensure_index_synced()
+        checked = 0
+        repaired = 0
+        failed = 0
+        changed_paths: list[str] = []
+        repaired_issue_counts: dict[str, int] = {}
+        for document in self._store.read_all_documents():
+            checked += 1
+            repaired_document, repair_codes = self._repairable_document_variant(document)
+            if not repair_codes:
+                continue
+            try:
+                persisted = await self._persist_document(
+                    repaired_document,
+                    run_dirty_scan=False,
+                    allow_locked=True,
+                    existing_document=document,
+                )
+            except Exception:
+                failed += 1
+                LOGGER.exception("Failed repairing canonical memory drift for: %s", document.path)
+                continue
+            repaired += 1
+            changed_paths.append(str(persisted.path))
+            for code in repair_codes:
+                repaired_issue_counts[code] = repaired_issue_counts.get(code, 0) + 1
+        if repaired > 0:
+            await self.ensure_index_synced()
+        return {
+            "checked_documents": checked,
+            "repaired_documents": repaired,
+            "failed_documents": failed,
+            "changed_paths": changed_paths,
+            "repaired_issue_counts": repaired_issue_counts,
         }
 
     async def _repair_missing_embeddings(self) -> dict[str, Any]:
@@ -917,23 +985,7 @@ class MemoryService:
         if title is None or not title.strip():
             raise ValueError("title is required for core and ongoing memory documents.")
         path = self._store.active_path_for(kind=kind, title=title.strip())
-        summary_sections = OrderedDict(
-            (
-                ("Summary", summary_placeholder(kind)),
-                ("Details" if kind == "core" else "Current State", ""),
-                ("Notes" if kind == "core" else "Open Loops", ""),
-            )
-        )
-        if kind == "ongoing":
-            summary_sections = OrderedDict(
-                (
-                    ("Summary", ""),
-                    ("Current State", ""),
-                    ("Open Loops", ""),
-                    ("Artifacts", ""),
-                    ("Notes", ""),
-                )
-            )
+        summary_sections = _default_sections_for_kind(kind)
         return MemoryDocument(
             path=path,
             memory_id=f"{kind}_{slugify(title)}_{uuid4().hex[:8]}",
@@ -1198,8 +1250,7 @@ class MemoryService:
                     "message": "Frontmatter summary is populated, but the canonical 'Summary' section is empty.",
                 }
             )
-            return issues
-        if summary_section and not summary:
+        elif summary_section and not summary:
             issues.append(
                 {
                     "path": str(document.path),
@@ -1208,8 +1259,7 @@ class MemoryService:
                     "message": "Canonical 'Summary' section has content, but frontmatter summary is missing.",
                 }
             )
-            return issues
-        if summary and summary_section and _first_paragraph(summary_section) != summary:
+        elif summary and summary_section and _first_paragraph(summary_section) != summary:
             issues.append(
                 {
                     "path": str(document.path),
@@ -1218,11 +1268,231 @@ class MemoryService:
                     "message": "Frontmatter summary and canonical 'Summary' section disagree.",
                 }
             )
+        effective_summary = summary or summary_section
+        if (
+            document.kind == "ongoing"
+            and document.status != "active"
+            and effective_summary
+            and _summary_looks_present_tense(effective_summary)
+        ):
+            issues.append(
+                {
+                    "path": str(document.path),
+                    "severity": "warning",
+                    "code": "closed_summary_present_tense",
+                    "message": "Closed ongoing memory summary still reads like active present-state work.",
+                }
+            )
         return issues
+
+    def _compose_document_update(
+        self,
+        *,
+        base_document: MemoryDocument,
+        target_kind: str,
+        title: str | None,
+        summary: str | None,
+        priority: int | None,
+        pinned: bool | None,
+        locked: bool | None,
+        review_after: str | None,
+        expires_at: str | None,
+        tags: list[str] | None,
+        aliases: list[str] | None,
+        facts: list[dict[str, Any]] | None,
+        relations: list[dict[str, Any]] | None,
+        body_sections: dict[str, str] | None,
+        source_refs: list[dict[str, Any]] | None,
+        entity_refs: list[dict[str, Any]] | None,
+        completion_criteria: list[str] | None,
+        route_id: str | None,
+        session_id: str | None,
+        date: str | None,
+        close_reason: str | None,
+        updated_at: str,
+        status: str | None = None,
+        path_override: Path | None = None,
+        summary_fallback: str | None = None,
+    ) -> MemoryDocument:
+        resolved_source_refs = _normalize_source_refs(
+            payloads=source_refs,
+            existing=base_document.source_refs,
+            route_id=route_id,
+            session_id=session_id,
+        )
+        resolved_title = title or base_document.title
+        resolved_path = path_override or self._store.canonical_path_for(
+            kind=target_kind,
+            title=resolved_title,
+            date=date or base_document.date,
+            archived=base_document.archived,
+        )
+        resolved_sections = _merge_sections(base_document=base_document, overrides=body_sections or {})
+        explicit_summary_section = (body_sections or {}).get("Summary")
+        resolved_summary = summary
+        if resolved_summary is None and explicit_summary_section is not None and explicit_summary_section.strip():
+            resolved_summary = _first_paragraph(explicit_summary_section)
+        if resolved_summary is None:
+            resolved_summary = base_document.summary
+        if (
+            target_kind == "ongoing"
+            and status is not None
+            and status != "active"
+            and summary is None
+            and (explicit_summary_section is None or not explicit_summary_section.strip())
+            and resolved_summary is not None
+            and summary_fallback is not None
+            and _summary_looks_present_tense(resolved_summary)
+        ):
+            resolved_summary = summary_fallback.strip()
+        if target_kind != "daily" and resolved_summary is None and summary_fallback is not None and summary_fallback.strip():
+            resolved_summary = summary_fallback.strip()
+        if target_kind != "daily":
+            resolved_sections = _reconcile_summary_section(
+                sections=resolved_sections,
+                summary=resolved_summary,
+                explicit_summary_section=explicit_summary_section,
+            )
+        if resolved_summary is None and "Summary" in resolved_sections and resolved_sections["Summary"].strip():
+            resolved_summary = _first_paragraph(resolved_sections["Summary"])
+        return replace(
+            base_document,
+            path=resolved_path,
+            title=resolved_title,
+            status=status or base_document.status,
+            summary=resolved_summary if target_kind != "daily" else None,
+            priority=priority if priority is not None else base_document.priority,
+            pinned=pinned if pinned is not None else base_document.pinned,
+            locked=locked if locked is not None else base_document.locked,
+            review_after=review_after if review_after is not None else base_document.review_after,
+            expires_at=expires_at if expires_at is not None else base_document.expires_at,
+            tags=_normalize_string_list(tags, existing=base_document.tags),
+            aliases=_normalize_string_list(aliases, existing=base_document.aliases),
+            updated_at=updated_at,
+            sections=resolved_sections,
+            facts=_normalize_facts(
+                payloads=facts,
+                existing=base_document.facts,
+                source_refs=resolved_source_refs,
+            )
+            if target_kind != "daily"
+            else (),
+            relations=_normalize_relations(
+                payloads=relations,
+                existing=base_document.relations,
+                source_refs=resolved_source_refs,
+            )
+            if target_kind != "daily"
+            else (),
+            source_refs=resolved_source_refs if target_kind != "daily" else base_document.source_refs,
+            entity_refs=_normalize_entity_refs(
+                payloads=entity_refs,
+                existing=base_document.entity_refs,
+            )
+            if target_kind != "daily"
+            else (),
+            completion_criteria=_normalize_string_list(
+                completion_criteria,
+                existing=base_document.completion_criteria,
+            )
+            if target_kind == "ongoing"
+            else (),
+            route_ids=tuple(dict.fromkeys(base_document.route_ids + ((route_id,) if route_id else ()))),
+            session_ids=tuple(dict.fromkeys(base_document.session_ids + ((session_id,) if session_id else ()))),
+            close_reason=close_reason if close_reason is not None else base_document.close_reason,
+        )
+
+    def _repairable_document_variant(
+        self,
+        document: MemoryDocument,
+    ) -> tuple[MemoryDocument, tuple[str, ...]]:
+        repair_codes: list[str] = []
+        summary = document.summary
+        sections = OrderedDict(document.sections)
+        if document.kind != "daily":
+            summary_text = (summary or "").strip()
+            summary_section = sections.get("Summary", "").strip()
+            if (
+                document.kind == "ongoing"
+                and document.status != "active"
+                and document.close_reason
+                and _summary_looks_present_tense(summary_text or summary_section)
+            ):
+                closed_summary = _closed_summary_fallback(
+                    title=document.title,
+                    close_reason=document.close_reason,
+                    closed_at=document.updated_at,
+                )
+                summary = closed_summary
+                sections["Summary"] = closed_summary
+                summary_text = closed_summary
+                summary_section = closed_summary
+                repair_codes.append("closed_summary_present_tense")
+            if summary_text and not summary_section:
+                sections["Summary"] = summary_text
+                repair_codes.append("summary_section_empty")
+            elif summary_section and not summary_text:
+                summary = _first_paragraph(summary_section)
+                repair_codes.append("summary_frontmatter_missing")
+        path = document.path
+        expected_path = self._store.canonical_path_for(
+            kind=document.kind,
+            title=document.title,
+            date=document.date,
+            archived=document.archived,
+        )
+        if path != expected_path:
+            path = expected_path
+            repair_codes.append("title_path_mismatch")
+        if not repair_codes:
+            return document, ()
+        return (
+            replace(
+                document,
+                path=path,
+                summary=summary if document.kind != "daily" else document.summary,
+                sections=sections,
+                updated_at=_utc_now_iso(),
+            ),
+            tuple(dict.fromkeys(repair_codes)),
+        )
 
 
 def summary_placeholder(kind: str) -> str:
     return "" if kind == "ongoing" else ""
+
+
+def _default_sections_for_kind(kind: str) -> OrderedDict[str, str]:
+    if kind == "core":
+        return OrderedDict(
+            (
+                ("Summary", ""),
+                ("Details", ""),
+                ("Notes", ""),
+            )
+        )
+    if kind == "ongoing":
+        return OrderedDict(
+            (
+                ("Summary", ""),
+                ("Current State", ""),
+                ("Open Loops", ""),
+                ("Artifacts", ""),
+                ("Notes", ""),
+            )
+        )
+    if kind == "daily":
+        return OrderedDict(
+            (
+                ("Notable Events", ""),
+                ("Decisions", ""),
+                ("Active Commitments", ""),
+                ("Open Loops", ""),
+                ("Artifacts", ""),
+                ("Candidate Promotions", ""),
+            )
+        )
+    raise ValueError(f"Unsupported memory kind: {kind}")
 
 
 def _merge_sections(*, base_document: MemoryDocument, overrides: dict[str, str]) -> OrderedDict[str, str]:
@@ -1275,6 +1545,99 @@ def _render_daily_auto_entry(*, title: str | None, summary: str | None) -> str |
     if normalized_title:
         return f"- {normalized_title}"
     return None
+
+
+def _closed_summary_fallback(
+    *,
+    title: str,
+    close_reason: str | None,
+    closed_at: str,
+) -> str:
+    if close_reason is not None and close_reason.strip():
+        return close_reason.strip()
+    closed_date = closed_at[:10] if len(closed_at) >= 10 else closed_at
+    return f"{title} was closed on {closed_date}."
+
+
+def _archived_summary_fallback(
+    *,
+    title: str,
+    archive_reason: str | None,
+    archived_at: str,
+) -> str:
+    if archive_reason is not None and archive_reason.strip():
+        return archive_reason.strip()
+    archived_date = archived_at[:10] if len(archived_at) >= 10 else archived_at
+    return f"{title} was archived on {archived_date}."
+
+
+def _transition_rewrite_payload(
+    *,
+    kind: str,
+    operation: str,
+    summary: str | None,
+    body_sections: dict[str, str] | None,
+    fallback_summary: str,
+    occurred_at: str,
+) -> tuple[str, dict[str, str]]:
+    if kind == "daily":
+        return fallback_summary, {}
+
+    resolved_summary = (summary or "").strip()
+    provided_sections = {
+        str(heading): str(content).strip()
+        for heading, content in (body_sections or {}).items()
+    }
+    has_agent_rewrite = bool(resolved_summary) or any(content for content in provided_sections.values())
+    sections = _default_sections_for_kind(kind)
+
+    if has_agent_rewrite:
+        for heading in sections:
+            if heading in provided_sections:
+                sections[heading] = provided_sections[heading]
+        if not resolved_summary:
+            summary_section = sections.get("Summary", "").strip()
+            resolved_summary = _first_paragraph(summary_section) if summary_section else fallback_summary
+        if "Summary" in sections and not sections["Summary"].strip():
+            sections["Summary"] = resolved_summary
+        return resolved_summary, dict(sections)
+
+    system_stamp = _transition_system_stamp(operation=operation, occurred_at=occurred_at)
+    sections["Summary"] = fallback_summary
+    if kind == "ongoing":
+        sections["Current State"] = fallback_summary
+    elif kind == "core":
+        sections["Details"] = fallback_summary
+    if "Notes" in sections:
+        sections["Notes"] = system_stamp
+    return fallback_summary, dict(sections)
+
+
+def _transition_system_stamp(*, operation: str, occurred_at: str) -> str:
+    event_date = occurred_at[:10] if len(occurred_at) >= 10 else occurred_at
+    verb = "terminal rewrite" if operation == "close" else "archive rewrite"
+    return (
+        f"System {verb} fallback applied on {event_date} because no rewritten superseding "
+        "content was provided."
+    )
+
+
+def _summary_looks_present_tense(value: str) -> bool:
+    normalized = f" {value.strip().lower()} "
+    return any(
+        cue in normalized
+        for cue in (
+            " currently ",
+            " is currently ",
+            " actively ",
+            " is actively ",
+            " ongoing ",
+            " in progress ",
+            " working on ",
+            " being implemented ",
+            " underway ",
+        )
+    )
 
 
 def _normalize_source_refs(

@@ -90,7 +90,10 @@ def build_memory_write_tool() -> RegisteredTool:
             description=(
                 "Create or update canonical memory documents through validated structured operations. "
                 "Prefer this over generic file editing for normal memory mutations. "
-                "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary."
+                "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary. "
+                "When superseding memory through close or archive, first rewrite the memory content to the new terminal truth "
+                "using summary and body_sections, then let the operation flip status/archive state. "
+                "If you omit that rewrite, the system will apply a generic fallback terminal stamp."
             ),
             input_schema={
                 "type": "object",
@@ -100,7 +103,9 @@ def build_memory_write_tool() -> RegisteredTool:
                         "enum": ["create", "upsert", "append_daily", "close", "archive", "promote", "demote"],
                         "description": (
                             "Structured memory mutation. append_daily records daily log content; "
-                            "close ends an ongoing memory and removes it from the active set."
+                            "close ends an ongoing memory and removes it from the active set; "
+                            "close and archive are superseding transitions, so rewrite the memory's canonical content first "
+                            "with summary and body_sections before flipping status/archive state."
                         ),
                     },
                     "target_kind": {
@@ -113,7 +118,8 @@ def build_memory_write_tool() -> RegisteredTool:
                         "type": "string",
                         "description": (
                             "Short summary text. For append_daily, summary-only writes are recorded "
-                            "under Notable Events when body_sections are omitted."
+                            "under Notable Events when body_sections are omitted. "
+                            "For close/archive superseding transitions, provide the rewritten terminal summary here instead of leaving the old active wording."
                         ),
                     },
                     "priority": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -130,7 +136,9 @@ def build_memory_write_tool() -> RegisteredTool:
                         "additionalProperties": {"type": "string"},
                         "description": (
                             "Canonical section content keyed by section name. This is the main searchable "
-                            "narrative text of the memory document."
+                            "narrative text of the memory document. "
+                            "For close/archive superseding transitions, pass the rewritten terminal body here; "
+                            "do not rely on status flip alone to supersede stale content."
                         ),
                     },
                     "source_refs": {"type": "array", "items": {"type": "object"}},
@@ -138,7 +146,13 @@ def build_memory_write_tool() -> RegisteredTool:
                     "completion_criteria": {"type": "array", "items": {"type": "string"}},
                     "date": {"type": "string"},
                     "timezone": {"type": "string"},
-                    "close_reason": {"type": "string"},
+                    "close_reason": {
+                        "type": "string",
+                        "description": (
+                            "Reason for closing or archiving. This is metadata and fallback material, not a substitute "
+                            "for rewriting summary/body_sections during superseding transitions."
+                        ),
+                    },
                 },
                 "required": ["operation", "target_kind"],
                 "additionalProperties": False,

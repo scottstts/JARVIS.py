@@ -41,6 +41,10 @@ class MemoryAdminToolExecutor:
             summary = await service.rebuild_embeddings()
             metadata = {"action": action, "summary": dict(summary)}
             content = "Memory embeddings rebuild completed.\n" + json.dumps(summary, indent=2, sort_keys=True)
+        elif action == "repair_canonical_drift":
+            summary = await service.repair_canonical_drift()
+            metadata = {"action": action, "summary": dict(summary)}
+            content = "Canonical memory repair completed.\n" + json.dumps(summary, indent=2, sort_keys=True)
         elif action == "run_due_maintenance":
             runs = await service.run_due_maintenance()
             metadata = {
@@ -113,6 +117,7 @@ def build_memory_admin_tool() -> RegisteredTool:
                             "reindex_all",
                             "reindex_dirty",
                             "rebuild_embeddings",
+                            "repair_canonical_drift",
                             "run_due_maintenance",
                             "integrity_check",
                             "render_bootstrap_preview",
@@ -141,6 +146,7 @@ def build_memory_admin_discoverable() -> DiscoverableTool:
                 "reindex_all",
                 "reindex_dirty",
                 "rebuild_embeddings",
+                "repair_canonical_drift",
                 "run_due_maintenance",
                 "integrity_check",
                 "render_bootstrap_preview",
@@ -148,4 +154,3 @@ def build_memory_admin_discoverable() -> DiscoverableTool:
         },
         backing_tool_name="memory_admin",
     )
-

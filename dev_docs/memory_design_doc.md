@@ -808,6 +808,7 @@ Weak retrieval conditions include:
 - no results above minimum score
 - high contradiction density among top results
 - query appears underspecified or entity-ambiguous
+- reminder from transcript review: even when the top hit is correct, weak hybrid retrieval can still leak semantic-only junk into the tail, so future fallback/tuning work should treat low-support tail suppression as an explicit requirement rather than assuming semantic ranking is acceptable as-is
 
 Fallback planning behavior:
 

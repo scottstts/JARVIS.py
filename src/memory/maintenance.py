@@ -19,6 +19,7 @@ class MaintenanceContext:
     archive_document: Callable[[MemoryDocument], Awaitable[MemoryDocument]]
     recompute_priorities: Callable[[], Awaitable[int]]
     repair_missing_embeddings: Callable[[], Awaitable[dict[str, Any]]]
+    repair_canonical_drift: Callable[[], Awaitable[dict[str, Any]]]
     integrity_check: Callable[[], Awaitable[list[dict[str, Any]]]]
 
 
@@ -43,6 +44,7 @@ class MemoryMaintenanceManager:
         results.append(await self.cold_archive_sweep())
         results.append(await self.embedding_model_drift_check())
         results.append(await self.repair_missing_embeddings())
+        results.append(await self.repair_canonical_drift())
         results.append(await self.integrity_check())
         return tuple(results)
 
@@ -162,6 +164,17 @@ class MemoryMaintenanceManager:
             job_name="repair_missing_embeddings",
             status=status,
             summary=summary,
+        )
+
+    async def repair_canonical_drift(self) -> MaintenanceRunResult:
+        summary = await self._context.repair_canonical_drift()
+        failed_documents = int(summary.get("failed_documents", 0))
+        repaired_documents = int(summary.get("repaired_documents", 0))
+        status = "warning" if failed_documents > 0 else "ok"
+        return MaintenanceRunResult(
+            job_name="repair_canonical_drift",
+            status=status,
+            summary=summary | {"changed_documents": repaired_documents},
         )
 
     async def integrity_check(self) -> MaintenanceRunResult:
