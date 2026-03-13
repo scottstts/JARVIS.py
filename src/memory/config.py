@@ -37,6 +37,13 @@ def _parse_bool_env(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean-like value.")
 
 
+def _parse_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return float(raw)
+
+
 @dataclass(slots=True, frozen=True)
 class MemorySettings:
     workspace_dir: Path
@@ -59,6 +66,10 @@ class MemorySettings:
     semantic_candidate_count: int = 30
     graph_candidate_count: int = 20
     hybrid_result_count: int = 8
+    semantic_score_floor: float = 0.30
+    semantic_only_score_floor: float = 0.55
+    weak_result_score_threshold: float = 0.45
+    retrieval_fallback_max_queries: int = 2
 
     def __post_init__(self) -> None:
         if self.bootstrap_max_tokens <= 0:
@@ -87,6 +98,16 @@ class MemorySettings:
             raise ValueError("graph_candidate_count must be > 0.")
         if self.hybrid_result_count <= 0:
             raise ValueError("hybrid_result_count must be > 0.")
+        if not 0.0 <= self.semantic_score_floor <= 1.0:
+            raise ValueError("semantic_score_floor must be within 0..1.")
+        if not 0.0 <= self.semantic_only_score_floor <= 1.0:
+            raise ValueError("semantic_only_score_floor must be within 0..1.")
+        if self.semantic_only_score_floor < self.semantic_score_floor:
+            raise ValueError("semantic_only_score_floor must be >= semantic_score_floor.")
+        if not 0.0 <= self.weak_result_score_threshold <= 1.0:
+            raise ValueError("weak_result_score_threshold must be within 0..1.")
+        if self.retrieval_fallback_max_queries < 0:
+            raise ValueError("retrieval_fallback_max_queries must be >= 0.")
         if not self.maintenance_provider.strip():
             raise ValueError("maintenance_provider cannot be empty.")
         if not self.maintenance_model.strip():
@@ -184,6 +205,22 @@ class MemorySettings:
             hybrid_result_count=_parse_int_env(
                 "JARVIS_MEMORY_HYBRID_RESULT_COUNT",
                 app_settings.JARVIS_MEMORY_HYBRID_RESULT_COUNT,
+            ),
+            semantic_score_floor=_parse_float_env(
+                "JARVIS_MEMORY_SEMANTIC_SCORE_FLOOR",
+                app_settings.JARVIS_MEMORY_SEMANTIC_SCORE_FLOOR,
+            ),
+            semantic_only_score_floor=_parse_float_env(
+                "JARVIS_MEMORY_SEMANTIC_ONLY_SCORE_FLOOR",
+                app_settings.JARVIS_MEMORY_SEMANTIC_ONLY_SCORE_FLOOR,
+            ),
+            weak_result_score_threshold=_parse_float_env(
+                "JARVIS_MEMORY_WEAK_RESULT_SCORE_THRESHOLD",
+                app_settings.JARVIS_MEMORY_WEAK_RESULT_SCORE_THRESHOLD,
+            ),
+            retrieval_fallback_max_queries=_parse_int_env(
+                "JARVIS_MEMORY_RETRIEVAL_FALLBACK_MAX_QUERIES",
+                app_settings.JARVIS_MEMORY_RETRIEVAL_FALLBACK_MAX_QUERIES,
             ),
         )
 

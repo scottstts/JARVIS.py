@@ -89,6 +89,16 @@ _MEANINGFUL_SHORT_TOKENS = {
     "ui",
     "ux",
 }
+_FALLBACK_GENERIC_TOKENS = {
+    "again",
+    "detail",
+    "details",
+    "info",
+    "remember",
+    "remind",
+    "thing",
+    "things",
+}
 _RAW_TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9+#./_-]*")
 _FTS_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 _WHITESPACE_PATTERN = re.compile(r"\s+")
@@ -103,6 +113,7 @@ class _LexicalQueryVariant:
 @dataclass(slots=True, frozen=True)
 class _QueryPlan:
     normalized_query: str
+    keyword_tokens: tuple[str, ...]
     lexical_variants: tuple[_LexicalQueryVariant, ...]
     entity_terms: tuple[str, ...]
 
@@ -133,101 +144,56 @@ class MemoryRetriever:
         include_expired: bool,
     ) -> MemorySearchResponse:
         normalized_mode = "hybrid" if mode == "auto" else mode
-        warnings: list[str] = []
         query_plan = _build_query_plan(query)
+        candidates, warnings, semantic_disabled = await self._collect_candidates(
+            query=query,
+            query_plan=query_plan,
+            mode=normalized_mode,
+            scopes=scopes,
+            daily_lookback_days=daily_lookback_days,
+            expand=expand,
+            include_expired=include_expired,
+        )
 
-        lexical_variant_rows: list[tuple[_LexicalQueryVariant, list[dict[str, Any]]]] = []
-        if normalized_mode in {"lexical", "hybrid"}:
-            for variant in query_plan.lexical_variants:
-                rows = self._index_db.lexical_candidates(
-                    query=variant.match_query,
-                    scopes=scopes,
-                    include_expired=include_expired,
-                    daily_lookback_days=daily_lookback_days,
-                    limit=self._settings.lexical_candidate_count,
-                )
-                if rows:
-                    lexical_variant_rows.append((variant, rows))
-
-        semantic_requested = normalized_mode in {"semantic", "hybrid"}
-        semantic_disabled = not semantic_requested
-        semantic_ready = False
-        semantic_reason: str | None = None
-        if semantic_requested:
-            semantic_disabled = True
-            semantic_ready, semantic_reason = self._index_db.semantic_search_status()
-            if self._llm_service is None:
-                semantic_ready = False
-                semantic_reason = "the embedding service is not configured"
-
-        semantic_rows: list[dict[str, Any]] = []
-        if semantic_requested and semantic_ready and self._llm_service is not None:
-            semantic_disabled = False
-            try:
-                embedding_response = await self._llm_service.embed(EmbeddingRequest(inputs=query))
-                if embedding_response.embeddings:
-                    semantic_rows = self._index_db.semantic_candidates(
-                        embedding=embedding_response.embeddings[0],
+        if normalized_mode == "hybrid" and self._settings.retrieval_fallback_max_queries > 0:
+            initial_fused = _prune_weak_semantic_tail(
+                _fuse_candidates(candidates.values(), query=query, settings=self._settings),
+                settings=self._settings,
+            )
+            if _should_attempt_fallback(initial_fused, settings=self._settings):
+                used_queries = {
+                    _normalize_query_text(query),
+                    _normalize_query_text(query_plan.normalized_query),
+                }
+                fallback_used = False
+                for fallback_query in _fallback_queries(query=query, query_plan=query_plan)[
+                    : self._settings.retrieval_fallback_max_queries
+                ]:
+                    normalized_fallback = _normalize_query_text(fallback_query)
+                    if not normalized_fallback or normalized_fallback in used_queries:
+                        continue
+                    used_queries.add(normalized_fallback)
+                    fallback_used = True
+                    fallback_candidates, fallback_warnings, fallback_semantic_disabled = await self._collect_candidates(
+                        query=fallback_query,
+                        query_plan=_build_query_plan(fallback_query),
+                        mode=normalized_mode,
                         scopes=scopes,
-                        include_expired=include_expired,
                         daily_lookback_days=daily_lookback_days,
-                        limit=self._settings.semantic_candidate_count,
+                        expand=expand,
+                        include_expired=include_expired,
                     )
-            except Exception as exc:
-                semantic_disabled = True
-                semantic_rows = []
-                if normalized_mode == "hybrid":
+                    _merge_candidate_sets(
+                        candidates,
+                        fallback_candidates.values(),
+                        reason="retrieval_fallback",
+                    )
+                    warnings.extend(fallback_warnings)
+                    semantic_disabled = semantic_disabled and fallback_semantic_disabled
+                if fallback_used:
                     warnings.append(
-                        f"semantic search failed at runtime and was skipped; used lexical+graph fallback: {exc}"
+                        "hybrid retrieval looked weak on the first pass and used a bounded fallback query pass"
                     )
-                else:
-                    warnings.append(f"semantic search failed at runtime and was skipped: {exc}")
-        elif semantic_requested and semantic_reason is not None:
-            if normalized_mode == "hybrid":
-                warnings.append(
-                    "semantic search was skipped because "
-                    f"{semantic_reason}; used lexical+graph fallback"
-                )
-            else:
-                warnings.append("semantic search was skipped because " f"{semantic_reason}")
-
-        graph_candidates = (
-            expand_graph_candidates(
-                query=query,
-                normalized_query=query_plan.normalized_query,
-                entity_terms=query_plan.entity_terms,
-                entity_rows=self._index_db.graph_entities(),
-                relation_rows=self._index_db.graph_relations(
-                    scopes=scopes,
-                    include_expired=include_expired,
-                    daily_lookback_days=daily_lookback_days,
-                ),
-                expand=expand,
-                limit=self._settings.graph_candidate_count,
-            )
-            if normalized_mode in {"graph", "hybrid"} and expand > 0
-            else ()
-        )
-
-        candidates: OrderedDict[tuple[str, str], SearchCandidate] = OrderedDict()
-        for variant, rows in lexical_variant_rows:
-            _merge_ranked_rows(
-                candidates,
-                rows,
-                score_field="lexical_score",
-                raw_score_field="bm25_score",
-                reason=variant.reason,
-                lower_is_better=True,
-            )
-        _merge_ranked_rows(
-            candidates,
-            semantic_rows,
-            score_field="semantic_score",
-            raw_score_field="distance",
-            reason="semantic_match",
-            lower_is_better=True,
-        )
-        _merge_graph_candidates(candidates, graph_candidates)
 
         final_limit = max(top_k, self._settings.hybrid_result_count)
         if normalized_mode == "lexical":
@@ -249,7 +215,10 @@ class MemoryRetriever:
                 reverse=True,
             )
         else:
-            final = _fuse_candidates(candidates.values())[:final_limit]
+            final = _prune_weak_semantic_tail(
+                _fuse_candidates(candidates.values(), query=query, settings=self._settings),
+                settings=self._settings,
+            )[:final_limit]
 
         return MemorySearchResponse(
             results=tuple(
@@ -277,6 +246,114 @@ class MemoryRetriever:
             semantic_disabled=semantic_disabled,
         )
 
+    async def _collect_candidates(
+        self,
+        *,
+        query: str,
+        query_plan: _QueryPlan,
+        mode: str,
+        scopes: tuple[str, ...],
+        daily_lookback_days: int,
+        expand: int,
+        include_expired: bool,
+    ) -> tuple[OrderedDict[tuple[str, str], SearchCandidate], list[str], bool]:
+        warnings: list[str] = []
+        lexical_variant_rows: list[tuple[_LexicalQueryVariant, list[dict[str, Any]]]] = []
+        if mode in {"lexical", "hybrid"}:
+            for variant in query_plan.lexical_variants:
+                rows = self._index_db.lexical_candidates(
+                    query=variant.match_query,
+                    scopes=scopes,
+                    include_expired=include_expired,
+                    daily_lookback_days=daily_lookback_days,
+                    limit=self._settings.lexical_candidate_count,
+                )
+                if rows:
+                    lexical_variant_rows.append((variant, rows))
+
+        semantic_requested = mode in {"semantic", "hybrid"}
+        semantic_disabled = not semantic_requested
+        semantic_ready = False
+        semantic_reason: str | None = None
+        if semantic_requested:
+            semantic_disabled = True
+            semantic_ready, semantic_reason = self._index_db.semantic_search_status()
+            if self._llm_service is None:
+                semantic_ready = False
+                semantic_reason = "the embedding service is not configured"
+
+        semantic_rows: list[dict[str, Any]] = []
+        if semantic_requested and semantic_ready and self._llm_service is not None:
+            semantic_disabled = False
+            try:
+                embedding_response = await self._llm_service.embed(EmbeddingRequest(inputs=query))
+                if embedding_response.embeddings:
+                    semantic_rows = self._index_db.semantic_candidates(
+                        embedding=embedding_response.embeddings[0],
+                        scopes=scopes,
+                        include_expired=include_expired,
+                        daily_lookback_days=daily_lookback_days,
+                        limit=self._settings.semantic_candidate_count,
+                    )
+            except Exception as exc:
+                semantic_disabled = True
+                semantic_rows = []
+                if mode == "hybrid":
+                    warnings.append(
+                        f"semantic search failed at runtime and was skipped; used lexical+graph fallback: {exc}"
+                    )
+                else:
+                    warnings.append(f"semantic search failed at runtime and was skipped: {exc}")
+        elif semantic_requested and semantic_reason is not None:
+            if mode == "hybrid":
+                warnings.append(
+                    "semantic search was skipped because "
+                    f"{semantic_reason}; used lexical+graph fallback"
+                )
+            else:
+                warnings.append("semantic search was skipped because " f"{semantic_reason}")
+
+        graph_candidates = (
+            expand_graph_candidates(
+                query=query,
+                normalized_query=query_plan.normalized_query,
+                entity_terms=query_plan.entity_terms,
+                entity_rows=self._index_db.graph_entities(),
+                relation_rows=self._index_db.graph_relations(
+                    scopes=scopes,
+                    include_expired=include_expired,
+                    daily_lookback_days=daily_lookback_days,
+                ),
+                expand=expand,
+                limit=self._settings.graph_candidate_count,
+            )
+            if mode in {"graph", "hybrid"} and expand > 0
+            else ()
+        )
+
+        candidates: OrderedDict[tuple[str, str], SearchCandidate] = OrderedDict()
+        for variant, rows in lexical_variant_rows:
+            _merge_ranked_rows(
+                candidates,
+                rows,
+                score_field="lexical_score",
+                raw_score_field="bm25_score",
+                reason=variant.reason,
+                lower_is_better=True,
+            )
+        _merge_ranked_rows(
+            candidates,
+            semantic_rows,
+            score_field="semantic_score",
+            raw_score_field="semantic_similarity",
+            reason="semantic_match",
+            lower_is_better=False,
+            normalize_scores=False,
+            distance_field="distance",
+        )
+        _merge_graph_candidates(candidates, graph_candidates)
+        return candidates, warnings, semantic_disabled
+
 
 def _build_query_plan(query: str) -> _QueryPlan:
     raw_tokens = [token.lower() for token in _RAW_TOKEN_PATTERN.findall(query.lower())]
@@ -284,7 +361,7 @@ def _build_query_plan(query: str) -> _QueryPlan:
     meaningful_tokens = [
         token
         for token in safe_tokens
-        if token in _MEANINGFUL_SHORT_TOKENS or token not in _STOP_WORDS or len(token) > 2
+        if token in _MEANINGFUL_SHORT_TOKENS or token not in _STOP_WORDS
     ]
     if not meaningful_tokens:
         meaningful_tokens = safe_tokens
@@ -334,6 +411,7 @@ def _build_query_plan(query: str) -> _QueryPlan:
         entity_terms.insert(0, normalized_query)
     return _QueryPlan(
         normalized_query=normalized_query,
+        keyword_tokens=tuple(keyword_tokens),
         lexical_variants=tuple(_dedupe_variants(variants)),
         entity_terms=tuple(_dedupe_preserve_order(term for term in entity_terms if term.strip())),
     )
@@ -376,13 +454,19 @@ def _merge_ranked_rows(
     raw_score_field: str,
     reason: str,
     lower_is_better: bool,
+    normalize_scores: bool = True,
+    distance_field: str | None = None,
 ) -> None:
     if not rows:
         return
-    normalized_scores = _normalize_channel_scores(
-        rows=rows,
-        raw_score_field=raw_score_field,
-        lower_is_better=lower_is_better,
+    normalized_scores = (
+        _normalize_channel_scores(
+            rows=rows,
+            raw_score_field=raw_score_field,
+            lower_is_better=lower_is_better,
+        )
+        if normalize_scores
+        else _raw_channel_scores(rows=rows, raw_score_field=raw_score_field)
     )
     for row, normalized_score in zip(rows, normalized_scores, strict=True):
         key = (str(row["document_id"]), str(row["section_path"]))
@@ -394,6 +478,7 @@ def _merge_ranked_rows(
             raw_score_field=raw_score_field,
             value=normalized_score,
             reason=reason,
+            distance_field=distance_field,
         )
         candidates[key] = candidate
 
@@ -429,6 +514,11 @@ def _merge_graph_candidates(
             review_after=next_candidate.review_after,
             expires_at=next_candidate.expires_at,
             archived_at=next_candidate.archived_at,
+            truth_status=next_candidate.truth_status,
+            support_count=next_candidate.support_count,
+            contradiction_count=next_candidate.contradiction_count,
+            last_confirmed_at=next_candidate.last_confirmed_at,
+            last_contradicted_at=next_candidate.last_contradicted_at,
             lexical_raw_score=next_candidate.lexical_raw_score,
             lexical_score=next_candidate.lexical_score,
             semantic_distance=next_candidate.semantic_distance,
@@ -460,6 +550,11 @@ def _candidate_from_row(row: dict[str, Any]) -> SearchCandidate:
         review_after=_optional_str(row.get("review_after")),
         expires_at=_optional_str(row.get("expires_at")),
         archived_at=_optional_str(row.get("archived_at")),
+        truth_status=_optional_str(row.get("truth_status")),
+        support_count=_optional_int(row.get("support_count")) or 0,
+        contradiction_count=_optional_int(row.get("contradiction_count")) or 0,
+        last_confirmed_at=_optional_str(row.get("last_confirmed_at")),
+        last_contradicted_at=_optional_str(row.get("last_contradicted_at")),
         match_reasons=(),
     )
 
@@ -472,6 +567,7 @@ def _apply_score(
     raw_score_field: str,
     value: float,
     reason: str,
+    distance_field: str | None,
 ) -> SearchCandidate:
     lexical_raw_score = candidate.lexical_raw_score
     lexical_score = candidate.lexical_score
@@ -491,8 +587,9 @@ def _apply_score(
         raw_value = _optional_float(row.get(raw_score_field))
         if semantic_score <= value:
             next_candidate = _replace_candidate_content(candidate, _candidate_from_row(row))
-        if raw_value is not None:
-            semantic_distance = raw_value if semantic_distance is None else min(semantic_distance, raw_value)
+        distance_value = _optional_float(row.get(distance_field)) if distance_field is not None else raw_value
+        if distance_value is not None:
+            semantic_distance = distance_value if semantic_distance is None else min(semantic_distance, distance_value)
         semantic_score = max(semantic_score, value)
     else:
         if graph_score <= value:
@@ -515,6 +612,11 @@ def _apply_score(
         review_after=next_candidate.review_after,
         expires_at=next_candidate.expires_at,
         archived_at=next_candidate.archived_at,
+        truth_status=next_candidate.truth_status,
+        support_count=next_candidate.support_count,
+        contradiction_count=next_candidate.contradiction_count,
+        last_confirmed_at=next_candidate.last_confirmed_at,
+        last_contradicted_at=next_candidate.last_contradicted_at,
         lexical_raw_score=lexical_raw_score,
         lexical_score=lexical_score,
         semantic_distance=semantic_distance,
@@ -543,6 +645,11 @@ def _replace_candidate_content(candidate: SearchCandidate, replacement: SearchCa
         review_after=replacement.review_after,
         expires_at=replacement.expires_at,
         archived_at=replacement.archived_at,
+        truth_status=replacement.truth_status,
+        support_count=replacement.support_count,
+        contradiction_count=replacement.contradiction_count,
+        last_confirmed_at=replacement.last_confirmed_at,
+        last_contradicted_at=replacement.last_contradicted_at,
         lexical_raw_score=candidate.lexical_raw_score,
         lexical_score=candidate.lexical_score,
         semantic_distance=candidate.semantic_distance,
@@ -577,6 +684,17 @@ def _normalize_channel_scores(
     return normalized
 
 
+def _raw_channel_scores(
+    *,
+    rows: Sequence[dict[str, Any]],
+    raw_score_field: str,
+) -> list[float]:
+    raw_values = [_optional_float(row.get(raw_score_field)) for row in rows]
+    if any(value is None for value in raw_values):
+        return _rank_fallback_scores(len(rows))
+    return [_clamp_score(value) for value in raw_values if value is not None]
+
+
 def _rank_fallback_scores(count: int) -> list[float]:
     if count <= 0:
         return []
@@ -585,8 +703,98 @@ def _rank_fallback_scores(count: int) -> list[float]:
     return [1.0 - (index / (count - 1)) for index in range(count)]
 
 
-def _fuse_candidates(candidates: Iterable[SearchCandidate]) -> list[SearchCandidate]:
+def _merge_candidate_sets(
+    candidates: OrderedDict[tuple[str, str], SearchCandidate],
+    additions: Iterable[SearchCandidate],
+    *,
+    reason: str,
+) -> None:
+    for addition in additions:
+        key = (addition.document_id, addition.section_path)
+        existing = candidates.get(key)
+        tagged_addition = SearchCandidate(
+            document_id=addition.document_id,
+            title=addition.title,
+            path=addition.path,
+            kind=addition.kind,
+            chunk_id=addition.chunk_id,
+            section_path=addition.section_path,
+            snippet=addition.snippet,
+            source_ref_ids=addition.source_ref_ids,
+            updated_at=addition.updated_at,
+            status=addition.status,
+            pinned=addition.pinned,
+            priority=addition.priority,
+            review_after=addition.review_after,
+            expires_at=addition.expires_at,
+            archived_at=addition.archived_at,
+            truth_status=addition.truth_status,
+            support_count=addition.support_count,
+            contradiction_count=addition.contradiction_count,
+            last_confirmed_at=addition.last_confirmed_at,
+            last_contradicted_at=addition.last_contradicted_at,
+            lexical_raw_score=addition.lexical_raw_score,
+            lexical_score=addition.lexical_score,
+            semantic_distance=addition.semantic_distance,
+            semantic_score=addition.semantic_score,
+            graph_score=addition.graph_score,
+            recency_score=addition.recency_score,
+            fused_score=addition.fused_score,
+            match_reasons=tuple(dict.fromkeys(addition.match_reasons + (reason,))),
+        )
+        if existing is None:
+            candidates[key] = tagged_addition
+            continue
+        replacement = (
+            tagged_addition
+            if _candidate_strength(tagged_addition) > _candidate_strength(existing)
+            else existing
+        )
+        candidates[key] = SearchCandidate(
+            document_id=existing.document_id,
+            title=replacement.title,
+            path=replacement.path,
+            kind=replacement.kind,
+            chunk_id=replacement.chunk_id,
+            section_path=replacement.section_path,
+            snippet=replacement.snippet,
+            source_ref_ids=tuple(dict.fromkeys(existing.source_ref_ids + tagged_addition.source_ref_ids)),
+            updated_at=replacement.updated_at,
+            status=replacement.status,
+            pinned=replacement.pinned,
+            priority=replacement.priority,
+            review_after=replacement.review_after,
+            expires_at=replacement.expires_at,
+            archived_at=replacement.archived_at,
+            truth_status=replacement.truth_status,
+            support_count=max(existing.support_count, tagged_addition.support_count),
+            contradiction_count=max(existing.contradiction_count, tagged_addition.contradiction_count),
+            last_confirmed_at=_latest_timestamp(existing.last_confirmed_at, tagged_addition.last_confirmed_at),
+            last_contradicted_at=_latest_timestamp(
+                existing.last_contradicted_at,
+                tagged_addition.last_contradicted_at,
+            ),
+            lexical_raw_score=_min_optional(existing.lexical_raw_score, tagged_addition.lexical_raw_score),
+            lexical_score=max(existing.lexical_score, tagged_addition.lexical_score),
+            semantic_distance=_min_optional(existing.semantic_distance, tagged_addition.semantic_distance),
+            semantic_score=max(existing.semantic_score, tagged_addition.semantic_score),
+            graph_score=max(existing.graph_score, tagged_addition.graph_score),
+            recency_score=max(existing.recency_score, tagged_addition.recency_score),
+            fused_score=max(existing.fused_score, tagged_addition.fused_score),
+            match_reasons=tuple(
+                dict.fromkeys(existing.match_reasons + tagged_addition.match_reasons)
+            ),
+        )
+
+
+def _fuse_candidates(
+    candidates: Iterable[SearchCandidate],
+    *,
+    query: str,
+    settings: MemorySettings,
+) -> list[SearchCandidate]:
     now = datetime.now(timezone.utc)
+    present_state_query = _query_implies_present_state(query)
     fused: list[SearchCandidate] = []
     for candidate in candidates:
         recency_score = _recency_score(candidate.updated_at, candidate.kind, now=now)
@@ -606,6 +814,25 @@ def _fuse_candidates(candidates: Iterable[SearchCandidate]) -> list[SearchCandid
             modifier *= 0.50
         if _is_stale_ongoing(candidate, now=now):
             modifier *= 0.90 if candidate.pinned else 0.80
+        if _is_semantic_only(candidate):
+            if candidate.semantic_score < settings.semantic_only_score_floor:
+                modifier *= 0.55
+            elif candidate.support_count > 0:
+                modifier *= 0.96
+            else:
+                modifier *= 0.84
+        if candidate.support_count > 0:
+            modifier *= 1.0 + 0.04 * min(candidate.support_count, 5)
+        if candidate.contradiction_count > 0:
+            modifier *= max(0.50, 1.0 - 0.12 * min(candidate.contradiction_count, 4))
+            if _is_recent(candidate.last_contradicted_at, now=now, days=30):
+                modifier *= 0.88
+        if candidate.last_confirmed_at is not None:
+            modifier *= 1.0 + (0.06 * _confirmation_freshness_score(candidate.last_confirmed_at, now=now))
+        modifier *= _truth_status_modifier(
+            candidate.truth_status,
+            present_state_query=present_state_query,
+        )
         fused.append(
             SearchCandidate(
                 document_id=candidate.document_id,
@@ -623,6 +850,11 @@ def _fuse_candidates(candidates: Iterable[SearchCandidate]) -> list[SearchCandid
                 review_after=candidate.review_after,
                 expires_at=candidate.expires_at,
                 archived_at=candidate.archived_at,
+                truth_status=candidate.truth_status,
+                support_count=candidate.support_count,
+                contradiction_count=candidate.contradiction_count,
+                last_confirmed_at=candidate.last_confirmed_at,
+                last_contradicted_at=candidate.last_contradicted_at,
                 lexical_raw_score=candidate.lexical_raw_score,
                 lexical_score=candidate.lexical_score,
                 semantic_distance=candidate.semantic_distance,
@@ -643,6 +875,167 @@ def _fuse_candidates(candidates: Iterable[SearchCandidate]) -> list[SearchCandid
         reverse=True,
     )
     return fused
+
+
+def _prune_weak_semantic_tail(
+    candidates: list[SearchCandidate],
+    *,
+    settings: MemorySettings,
+) -> list[SearchCandidate]:
+    if not candidates:
+        return []
+    has_anchor_result = any(
+        item.fused_score >= settings.weak_result_score_threshold
+        and (_has_non_semantic_support(item) or item.semantic_score >= settings.semantic_only_score_floor)
+        for item in candidates[:3]
+    )
+    if not has_anchor_result:
+        return candidates
+    return [
+        item
+        for item in candidates
+        if not (
+            item.support_count <= 0
+            and item.fused_score < settings.weak_result_score_threshold
+            and (
+                (
+                    _is_semantic_only(item)
+                    and item.semantic_score < settings.semantic_only_score_floor
+                )
+                or (
+                    item.lexical_score <= 0.0
+                    and item.graph_score <= 0.0
+                    and item.semantic_score < settings.semantic_score_floor
+                )
+            )
+        )
+    ]
+
+
+def _should_attempt_fallback(
+    candidates: Sequence[SearchCandidate],
+    *,
+    settings: MemorySettings,
+) -> bool:
+    if not candidates:
+        return True
+    top = candidates[0]
+    if top.fused_score < settings.weak_result_score_threshold:
+        return True
+    top_window = candidates[:3]
+    if all(_is_semantic_only(item) for item in top_window):
+        return any(item.semantic_score < settings.semantic_only_score_floor for item in top_window)
+    return False
+
+
+def _fallback_queries(*, query: str, query_plan: _QueryPlan) -> tuple[str, ...]:
+    del query
+    queries: list[str] = []
+    queries.extend(
+        term
+        for term in query_plan.entity_terms
+        if " " in term and term != query_plan.normalized_query and _is_fallback_bigram(term)
+    )
+    if query_plan.normalized_query:
+        queries.append(query_plan.normalized_query)
+    if query_plan.keyword_tokens:
+        queries.append(" ".join(query_plan.keyword_tokens[:3]))
+    return tuple(
+        _dedupe_preserve_order(
+            candidate.strip()
+            for candidate in queries
+            if candidate.strip()
+        )
+    )
+
+
+def _has_non_semantic_support(candidate: SearchCandidate) -> bool:
+    return candidate.lexical_score > 0.0 or candidate.graph_score > 0.0 or candidate.support_count > 0
+
+
+def _is_semantic_only(candidate: SearchCandidate) -> bool:
+    return candidate.semantic_score > 0.0 and candidate.lexical_score <= 0.0 and candidate.graph_score <= 0.0
+
+
+def _truth_status_modifier(status: str | None, *, present_state_query: bool) -> float:
+    if status is None:
+        return 1.0
+    if status == "current":
+        return 1.08 if present_state_query else 1.0
+    if status == "past":
+        return 0.82 if present_state_query else 1.0
+    if status == "uncertain":
+        return 0.76 if present_state_query else 0.92
+    if status == "superseded":
+        return 0.55 if present_state_query else 0.78
+    return 1.0
+
+
+def _confirmation_freshness_score(confirmed_at: str, *, now: datetime) -> float:
+    parsed = _parse_iso(confirmed_at)
+    if parsed is None:
+        return 0.0
+    age_days = max(0.0, (now - parsed).total_seconds() / 86400.0)
+    return math.exp(-math.log(2) * age_days / 21.0)
+
+
+def _is_recent(value: str | None, *, now: datetime, days: int) -> bool:
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return False
+    return (now - parsed).total_seconds() <= days * 86400
+
+
+def _query_implies_present_state(query: str) -> bool:
+    normalized_tokens = set(_safe_query_tokens(_RAW_TOKEN_PATTERN.findall(query.lower())))
+    return bool(
+        normalized_tokens.intersection(
+            {
+                "active",
+                "currently",
+                "current",
+                "doing",
+                "does",
+                "is",
+                "now",
+                "ongoing",
+                "prefer",
+                "prefers",
+                "status",
+                "still",
+                "think",
+                "using",
+                "uses",
+                "working",
+            }
+        )
+    )
+
+
+def _candidate_strength(candidate: SearchCandidate) -> float:
+    return max(candidate.lexical_score, candidate.semantic_score, candidate.graph_score)
+
+
+def _min_optional(left: float | None, right: float | None) -> float | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return min(left, right)
+
+
+def _latest_timestamp(*values: str | None) -> str | None:
+    normalized = [value for value in values if value]
+    return max(normalized) if normalized else None
+
+
+def _normalize_query_text(value: str) -> str:
+    return " ".join(value.lower().strip().split())
+
+
+def _is_fallback_bigram(value: str) -> bool:
+    tokens = value.split()
+    return len(tokens) == 2 and all(token not in _FALLBACK_GENERIC_TOKENS for token in tokens)
 
 
 def _recency_score(updated_at: str, kind: str, *, now: datetime) -> float:
@@ -706,6 +1099,19 @@ def _optional_str(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 def _parse_iso(value: str | None) -> datetime | None:

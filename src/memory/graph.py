@@ -83,6 +83,11 @@ def expand_graph_candidates(
                 review_after=_optional_str(relation.get("review_after")),
                 expires_at=_optional_str(relation.get("expires_at")),
                 archived_at=_optional_str(relation.get("archived_at")),
+                truth_status=str(relation["status"]),
+                support_count=int(relation["support_count"] or 0),
+                contradiction_count=int(relation["contradiction_count"] or 0),
+                last_confirmed_at=_optional_str(relation.get("last_confirmed_at")),
+                last_contradicted_at=_optional_str(relation.get("last_contradicted_at")),
                 graph_score=score,
                 match_reasons=(reason, f"graph_relation_{relation['status']}"),
             )

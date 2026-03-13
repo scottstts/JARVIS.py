@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,6 +51,73 @@ class _FakeEmbeddingReflectionLLM:
             embeddings=embeddings,
             usage=LLMUsage(input_tokens=4, output_tokens=0, total_tokens=4),
         )
+
+
+class _SemanticTuningLLM(_FakeEmbeddingReflectionLLM):
+    _TOKEN_GROUPS = {
+        "graphics": 0,
+        "renderer": 0,
+        "render": 0,
+        "shader": 0,
+        "shaders": 0,
+        "threejs": 0,
+        "tsl": 0,
+        "webgpu": 0,
+        "hike": 1,
+        "hikes": 1,
+        "morning": 1,
+        "routine": 1,
+        "run": 1,
+        "runs": 1,
+        "archive": 2,
+        "bootstrap": 2,
+        "improvement": 2,
+        "memory": 2,
+        "retrieval": 2,
+    }
+
+    async def embed(self, request: EmbeddingRequest):
+        inputs = request.inputs if isinstance(request.inputs, list) else [request.inputs]
+        embeddings = [self._embed_text(str(item)) for item in inputs]
+        return EmbeddingResponse(
+            provider="fake",
+            model="semantic-tuning",
+            embeddings=embeddings,
+            usage=LLMUsage(input_tokens=4, output_tokens=0, total_tokens=4),
+        )
+
+    @classmethod
+    def _embed_text(cls, text: str) -> list[float]:
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        vector = [0.0, 0.0, 0.0]
+        for token in tokens:
+            index = cls._TOKEN_GROUPS.get(token)
+            if index is not None:
+                vector[index] += 1.0
+        return vector
+
+
+class _FallbackPlanningLLM(_FakeEmbeddingReflectionLLM):
+    async def embed(self, request: EmbeddingRequest):
+        inputs = request.inputs if isinstance(request.inputs, list) else [request.inputs]
+        embeddings = [self._embed_text(str(item)) for item in inputs]
+        return EmbeddingResponse(
+            provider="fake",
+            model="fallback-planning",
+            embeddings=embeddings,
+            usage=LLMUsage(input_tokens=4, output_tokens=0, total_tokens=4),
+        )
+
+    @staticmethod
+    def _embed_text(text: str) -> list[float]:
+        normalized = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+        if "graphics renderer" in normalized:
+            return [1.0, 0.0, 0.0]
+        if any(token in normalized for token in ("threejs", "webgpu", "tsl", "shader")):
+            return [1.0, 0.0, 0.0]
+        if any(token in normalized for token in ("morning", "run", "routine", "hike")):
+            return [0.0, 1.0, 0.0]
+        return [0.0, 0.0, 1.0]
 
 
 class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
@@ -566,3 +634,205 @@ class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(float(rows[0]["distance"]), float(rows[1]["distance"]))
             self.assertTrue(any(float(row["distance"]) > 0.0 for row in rows[1:]))
             self.assertFalse(hybrid_response.semantic_disabled)
+
+    async def test_truth_signals_are_populated_for_supported_and_conflicting_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(settings=MemorySettings.from_workspace_dir(workspace_dir), llm_service=None)
+
+            supporting_one = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Backend Language Preference",
+                summary="Scott prefers Python for backend APIs.",
+                facts=[{"text": "Scott prefers Python for backend APIs."}],
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "uses",
+                        "object": "Python",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "multi",
+                    }
+                ],
+            )
+            supporting_two = await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Backend Stack Notes",
+                summary="Scott prefers Python for backend APIs.",
+                facts=[{"text": "Scott prefers Python for backend APIs."}],
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "uses",
+                        "object": "Python",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "multi",
+                    }
+                ],
+            )
+            conflicting_locked = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Editor Preference Baseline",
+                summary="Scott currently prefers Vim.",
+                locked=True,
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "prefers_editor",
+                        "object": "Vim",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "single",
+                    }
+                ],
+            )
+            conflicting_new = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Editor Preference Update",
+                summary="Scott currently prefers Neovim.",
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "prefers_editor",
+                        "object": "Neovim",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "single",
+                    }
+                ],
+            )
+
+            with service._index_db._connect_main() as conn:
+                fact_rows = conn.execute(
+                    """
+                    select document_id, support_count, last_confirmed_at
+                    from facts
+                    where document_id in (?, ?)
+                    order by document_id asc
+                    """,
+                    (supporting_one.document_id, supporting_two.document_id),
+                ).fetchall()
+                relation_rows = conn.execute(
+                    """
+                    select document_id, support_count, last_confirmed_at
+                    from relations
+                    where document_id in (?, ?)
+                      and predicate = 'uses'
+                    order by document_id asc
+                    """,
+                    (supporting_one.document_id, supporting_two.document_id),
+                ).fetchall()
+                document_rows = conn.execute(
+                    """
+                    select document_id, support_count, contradiction_count, last_confirmed_at
+                    from documents
+                    where document_id in (?, ?)
+                    order by document_id asc
+                    """,
+                    (supporting_one.document_id, supporting_two.document_id),
+                ).fetchall()
+                conflict_rows = conn.execute(
+                    """
+                    select document_id, contradiction_count, last_contradicted_at
+                    from relations
+                    where document_id in (?, ?)
+                      and predicate = 'prefers_editor'
+                    order by document_id asc
+                    """,
+                    (conflicting_locked.document_id, conflicting_new.document_id),
+                ).fetchall()
+                conflicting_document_rows = conn.execute(
+                    """
+                    select document_id, contradiction_count, last_contradicted_at
+                    from documents
+                    where document_id in (?, ?)
+                    order by document_id asc
+                    """,
+                    (conflicting_locked.document_id, conflicting_new.document_id),
+                ).fetchall()
+
+            self.assertEqual([int(row["support_count"]) for row in fact_rows], [1, 1])
+            self.assertTrue(all(row["last_confirmed_at"] for row in fact_rows))
+            self.assertEqual([int(row["support_count"]) for row in relation_rows], [1, 1])
+            self.assertTrue(all(row["last_confirmed_at"] for row in relation_rows))
+            self.assertTrue(all(int(row["support_count"]) >= 2 for row in document_rows))
+            self.assertTrue(all(row["last_confirmed_at"] for row in document_rows))
+            self.assertEqual([int(row["contradiction_count"]) for row in conflict_rows], [1, 1])
+            self.assertTrue(all(row["last_contradicted_at"] for row in conflict_rows))
+            self.assertTrue(all(int(row["contradiction_count"]) >= 1 for row in conflicting_document_rows))
+            self.assertTrue(all(row["last_contradicted_at"] for row in conflicting_document_rows))
+
+    async def test_hybrid_search_keeps_strong_semantic_hit_and_suppresses_weak_tail(self) -> None:
+        fake_llm = _SemanticTuningLLM()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(settings=MemorySettings.from_workspace_dir(workspace_dir), llm_service=fake_llm)
+
+            target = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Three.js WebGPU Playground",
+                summary="Build a threejs webgpu tsl shader playground.",
+            )
+            await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Morning Run Routine",
+                summary="Morning run and hike routine before breakfast.",
+            )
+            await service.write(
+                operation="create",
+                target_kind="core",
+                title="Memory Retrieval Cleanup",
+                summary="Memory retrieval and archive cleanup work.",
+            )
+
+            response = await service.search(
+                query="graphics renderer thing",
+                mode="hybrid",
+                scopes=("core", "ongoing"),
+                top_k=5,
+            )
+
+            self.assertTrue(response.results)
+            self.assertEqual(response.results[0].document_id, target.document_id)
+            self.assertEqual(len(response.results), 1)
+            self.assertFalse(response.semantic_disabled)
+
+    async def test_hybrid_retrieval_runs_bounded_fallback_for_noisy_query(self) -> None:
+        fake_llm = _FallbackPlanningLLM()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(settings=MemorySettings.from_workspace_dir(workspace_dir), llm_service=fake_llm)
+
+            target = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Visual Pipeline Project",
+                summary="Build a threejs webgpu tsl shader playground.",
+            )
+            await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Morning Routine",
+                summary="Morning run routine before breakfast.",
+            )
+
+            response = await service.search(
+                query="What was the thing about graphics and renderer again?",
+                mode="hybrid",
+                scopes=("core", "ongoing"),
+            )
+
+            self.assertTrue(response.results)
+            self.assertEqual(response.results[0].document_id, target.document_id)
+            self.assertIn("retrieval_fallback", response.results[0].match_reasons)

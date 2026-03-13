@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import logging
 import hashlib
+import math
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -625,6 +627,154 @@ class MemoryIndexDB:
                         ),
                     )
 
+    def refresh_truth_signals(self) -> None:
+        with self._connect_main() as conn:
+            fact_rows = [dict(row) for row in conn.execute(_ACTIVE_FACT_SIGNAL_SQL).fetchall()]
+            relation_rows = [dict(row) for row in conn.execute(_ACTIVE_RELATION_SIGNAL_SQL).fetchall()]
+
+            fact_updates = _compute_fact_truth_updates(fact_rows)
+            relation_updates = _compute_relation_truth_updates(relation_rows)
+            document_updates = _aggregate_document_truth_updates(
+                fact_updates=fact_updates,
+                relation_updates=relation_updates,
+            )
+
+            conn.execute(
+                """
+                update documents
+                set support_count = 0,
+                    contradiction_count = 0,
+                    last_confirmed_at = null,
+                    last_contradicted_at = null
+                """
+            )
+            conn.execute(
+                """
+                update facts
+                set support_count = 0,
+                    contradiction_count = 0,
+                    last_confirmed_at = null,
+                    last_contradicted_at = null
+                """
+            )
+            conn.execute(
+                """
+                update relations
+                set support_count = 0,
+                    contradiction_count = 0,
+                    last_confirmed_at = null,
+                    last_contradicted_at = null
+                """
+            )
+
+            if fact_updates:
+                conn.executemany(
+                    """
+                    update facts
+                    set support_count = ?,
+                        contradiction_count = ?,
+                        last_confirmed_at = ?,
+                        last_contradicted_at = ?
+                    where fact_id = ?
+                    """,
+                    [
+                        (
+                            update["support_count"],
+                            update["contradiction_count"],
+                            update["last_confirmed_at"],
+                            update["last_contradicted_at"],
+                            fact_id,
+                        )
+                        for fact_id, update in fact_updates.items()
+                    ],
+                )
+
+            if relation_updates:
+                conn.executemany(
+                    """
+                    update relations
+                    set support_count = ?,
+                        contradiction_count = ?,
+                        last_confirmed_at = ?,
+                        last_contradicted_at = ?
+                    where relation_id = ?
+                    """,
+                    [
+                        (
+                            update["support_count"],
+                            update["contradiction_count"],
+                            update["last_confirmed_at"],
+                            update["last_contradicted_at"],
+                            relation_id,
+                        )
+                        for relation_id, update in relation_updates.items()
+                    ],
+                )
+
+            if document_updates:
+                conn.executemany(
+                    """
+                    update documents
+                    set support_count = ?,
+                        contradiction_count = ?,
+                        last_confirmed_at = ?,
+                        last_contradicted_at = ?
+                    where document_id = ?
+                    """,
+                    [
+                        (
+                            update["support_count"],
+                            update["contradiction_count"],
+                            update["last_confirmed_at"],
+                            update["last_contradicted_at"],
+                            document_id,
+                        )
+                        for document_id, update in document_updates.items()
+                    ],
+                )
+
+    def _fact_truth_rows(self, fact_ids: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        if not fact_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in fact_ids)
+        with self._connect_main() as conn:
+            rows = conn.execute(
+                f"""
+                select
+                    fact_id,
+                    status as truth_status,
+                    support_count,
+                    contradiction_count,
+                    last_confirmed_at,
+                    last_contradicted_at
+                from facts
+                where fact_id in ({placeholders})
+                """,
+                fact_ids,
+            ).fetchall()
+        return {str(row["fact_id"]): dict(row) for row in rows}
+
+    def _relation_truth_rows(self, relation_ids: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        if not relation_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in relation_ids)
+        with self._connect_main() as conn:
+            rows = conn.execute(
+                f"""
+                select
+                    relation_id,
+                    status as truth_status,
+                    support_count,
+                    contradiction_count,
+                    last_confirmed_at,
+                    last_contradicted_at
+                from relations
+                where relation_id in ({placeholders})
+                """,
+                relation_ids,
+            ).fetchall()
+        return {str(row["relation_id"]): dict(row) for row in rows}
+
     async def upsert_embeddings_for_document(
         self,
         *,
@@ -745,6 +895,10 @@ class MemoryIndexDB:
                     d.review_after,
                     d.expires_at,
                     d.archived_at,
+                    d.support_count,
+                    d.contradiction_count,
+                    d.last_confirmed_at,
+                    d.last_contradicted_at,
                     coalesce((
                         select json_group_array(source_ref_id)
                         from document_source_refs ds
@@ -786,6 +940,7 @@ class MemoryIndexDB:
                 select
                     vec.rowid as embedding_id,
                     distance,
+                    item.embedding_blob,
                     item.*
                 from embedding_items_vec vec
                 join embedding_items item on item.embedding_id = vec.rowid
@@ -803,30 +958,55 @@ class MemoryIndexDB:
                 f"""
                 select
                     d.document_id, d.path, d.kind, d.title, d.updated_at, d.status, d.pinned, d.priority,
-                    d.summary, d.review_after, d.expires_at, d.archived_at
+                    d.summary, d.review_after, d.expires_at, d.archived_at,
+                    d.support_count, d.contradiction_count, d.last_confirmed_at, d.last_contradicted_at
                 from documents d
                 where d.document_id in ({placeholders}) and {clause}
                 """,
                 (*document_ids, *params),
             ).fetchall()
         allowed = {str(row["document_id"]): dict(row) for row in document_rows}
+        fact_truth = self._fact_truth_rows(
+            tuple(
+                str(row["target_id"])
+                for row in rows
+                if str(row["item_type"]) == "fact"
+            )
+        )
+        relation_truth = self._relation_truth_rows(
+            tuple(
+                str(row["target_id"])
+                for row in rows
+                if str(row["item_type"]) == "relation"
+            )
+        )
+        normalized_query_embedding = [float(value) for value in embedding]
         candidates: list[dict[str, Any]] = []
         for row in rows:
             document = allowed.get(str(row["document_id"]))
             if document is None:
                 continue
+            item_type = str(row["item_type"])
+            target_id = str(row["target_id"])
+            truth_row = (
+                fact_truth.get(target_id)
+                if item_type == "fact"
+                else relation_truth.get(target_id)
+                if item_type == "relation"
+                else None
+            )
             source_ref_ids = json.loads(str(row["source_ref_ids_json"]))
             candidates.append(
                 {
-                    "chunk_id": (
-                        str(row["target_id"])
-                        if str(row["item_type"]) == "chunk"
-                        else str(row["item_key"])
-                    ),
+                    "chunk_id": target_id if item_type == "chunk" else str(row["item_key"]),
                     "document_id": str(row["document_id"]),
                     "section_path": str(row["section_path"]),
                     "snippet": str(row["text"]),
                     "distance": float(row["distance"]),
+                    "semantic_similarity": _cosine_similarity(
+                        normalized_query_embedding,
+                        _decode_embedding_blob(row["embedding_blob"]),
+                    ),
                     "path": document["path"],
                     "kind": document["kind"],
                     "title": document["title"],
@@ -838,6 +1018,27 @@ class MemoryIndexDB:
                     "review_after": document["review_after"],
                     "expires_at": document["expires_at"],
                     "archived_at": document["archived_at"],
+                    "truth_status": truth_row["truth_status"] if truth_row is not None else None,
+                    "support_count": (
+                        truth_row["support_count"]
+                        if truth_row is not None
+                        else document["support_count"]
+                    ),
+                    "contradiction_count": (
+                        truth_row["contradiction_count"]
+                        if truth_row is not None
+                        else document["contradiction_count"]
+                    ),
+                    "last_confirmed_at": (
+                        truth_row["last_confirmed_at"]
+                        if truth_row is not None
+                        else document["last_confirmed_at"]
+                    ),
+                    "last_contradicted_at": (
+                        truth_row["last_contradicted_at"]
+                        if truth_row is not None
+                        else document["last_contradicted_at"]
+                    ),
                     "source_ref_ids_json": json.dumps(source_ref_ids, ensure_ascii=True),
                 }
             )
@@ -892,6 +1093,10 @@ class MemoryIndexDB:
                     d.review_after,
                     d.expires_at,
                     d.archived_at,
+                    r.support_count,
+                    r.contradiction_count,
+                    r.last_confirmed_at,
+                    r.last_contradicted_at,
                     coalesce((
                         select json_group_array(source_ref_id)
                         from relation_source_refs rs
@@ -1155,6 +1360,36 @@ class MemoryIndexDB:
             conn.enable_load_extension(False)
 
 
+_ACTIVE_FACT_SIGNAL_SQL = """
+select
+    f.fact_id,
+    f.document_id,
+    f.text,
+    f.status,
+    f.last_seen_at
+from facts f
+join documents d on d.document_id = f.document_id
+where d.archived_at is null
+  and d.status = 'active'
+"""
+
+_ACTIVE_RELATION_SIGNAL_SQL = """
+select
+    r.relation_id,
+    r.document_id,
+    r.subject,
+    r.predicate,
+    r.object,
+    r.status,
+    r.cardinality,
+    r.last_seen_at
+from relations r
+join documents d on d.document_id = r.document_id
+where d.archived_at is null
+  and d.status = 'active'
+"""
+
+
 def _bool_to_int(value: bool | None) -> int | None:
     if value is None:
         return None
@@ -1276,3 +1511,154 @@ def _document_filter_clause(
         )
         params.append(daily_lookback_days)
     return " and ".join(where_parts), tuple(params)
+
+
+def _compute_fact_truth_updates(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    grouped_by_text: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    grouped_by_text_and_status: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        normalized_text = _normalize_signal_text(str(row["text"]))
+        if not normalized_text:
+            continue
+        grouped_by_text[normalized_text].append(row)
+        grouped_by_text_and_status[(normalized_text, str(row["status"]))].append(row)
+
+    updates: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        normalized_text = _normalize_signal_text(str(row["text"]))
+        if not normalized_text:
+            continue
+        same_status_rows = [
+            item
+            for item in grouped_by_text_and_status[(normalized_text, str(row["status"]))]
+            if str(item["fact_id"]) != str(row["fact_id"])
+        ]
+        contradictory_rows = [
+            item
+            for item in grouped_by_text[normalized_text]
+            if str(item["fact_id"]) != str(row["fact_id"])
+            and _fact_status_conflicts(str(row["status"]), str(item["status"]))
+        ]
+        updates[str(row["fact_id"])] = {
+            "document_id": str(row["document_id"]),
+            "support_count": len(same_status_rows),
+            "contradiction_count": len(contradictory_rows),
+            "last_confirmed_at": _latest_timestamp(item["last_seen_at"] for item in same_status_rows),
+            "last_contradicted_at": _latest_timestamp(
+                item["last_seen_at"] for item in contradictory_rows
+            ),
+        }
+    return updates
+
+
+def _compute_relation_truth_updates(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    grouped_by_triple_and_status: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    current_single_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        subject = _normalize_signal_text(str(row["subject"]))
+        predicate = _normalize_signal_text(str(row["predicate"]))
+        obj = _normalize_signal_text(str(row["object"]))
+        status = str(row["status"])
+        grouped_by_triple_and_status[(subject, predicate, obj, status)].append(row)
+        if status == "current" and str(row["cardinality"]) == "single":
+            current_single_groups[(subject, predicate)].append(row)
+
+    updates: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        subject = _normalize_signal_text(str(row["subject"]))
+        predicate = _normalize_signal_text(str(row["predicate"]))
+        obj = _normalize_signal_text(str(row["object"]))
+        status = str(row["status"])
+        row_id = str(row["relation_id"])
+        same_status_rows = [
+            item
+            for item in grouped_by_triple_and_status[(subject, predicate, obj, status)]
+            if str(item["relation_id"]) != row_id
+        ]
+        contradictory_rows: list[dict[str, Any]] = []
+        if status == "current" and str(row["cardinality"]) == "single":
+            contradictory_rows = [
+                item
+                for item in current_single_groups[(subject, predicate)]
+                if str(item["relation_id"]) != row_id
+                and _normalize_signal_text(str(item["object"])) != obj
+            ]
+        updates[row_id] = {
+            "document_id": str(row["document_id"]),
+            "support_count": len(same_status_rows),
+            "contradiction_count": len(contradictory_rows),
+            "last_confirmed_at": _latest_timestamp(item["last_seen_at"] for item in same_status_rows),
+            "last_contradicted_at": _latest_timestamp(
+                item["last_seen_at"] for item in contradictory_rows
+            ),
+        }
+    return updates
+
+
+def _aggregate_document_truth_updates(
+    *,
+    fact_updates: dict[str, dict[str, Any]],
+    relation_updates: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    updates: dict[str, dict[str, Any]] = {}
+    for item in tuple(fact_updates.values()) + tuple(relation_updates.values()):
+        document_id = str(item["document_id"])
+        current = updates.setdefault(
+            document_id,
+            {
+                "support_count": 0,
+                "contradiction_count": 0,
+                "last_confirmed_at": None,
+                "last_contradicted_at": None,
+            },
+        )
+        current["support_count"] += int(item["support_count"])
+        current["contradiction_count"] += int(item["contradiction_count"])
+        current["last_confirmed_at"] = _latest_timestamp(
+            (current["last_confirmed_at"], item["last_confirmed_at"])
+        )
+        current["last_contradicted_at"] = _latest_timestamp(
+            (current["last_contradicted_at"], item["last_contradicted_at"])
+        )
+    return updates
+
+
+def _normalize_signal_text(value: str) -> str:
+    return " ".join(value.lower().strip().split())
+
+
+def _fact_status_conflicts(left: str, right: str) -> bool:
+    statuses = {left, right}
+    return "current" in statuses and bool(statuses.intersection({"past", "uncertain", "superseded"}))
+
+
+def _latest_timestamp(values: Any) -> str | None:
+    normalized = [str(value).strip() for value in values if value is not None and str(value).strip()]
+    return max(normalized) if normalized else None
+
+
+def _decode_embedding_blob(value: Any) -> list[float]:
+    if value is None:
+        return []
+    try:
+        decoded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [float(item) for item in decoded]
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if math.isclose(left_norm, 0.0) or math.isclose(right_norm, 0.0):
+        return 0.0
+    similarity = sum(a * b for a, b in zip(left, right, strict=True)) / (left_norm * right_norm)
+    return max(0.0, min(1.0, similarity))

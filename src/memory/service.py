@@ -1152,6 +1152,7 @@ class MemoryService:
                         allow_locked=False,
                         existing_document=document,
                     )
+        self._index_db.refresh_truth_signals()
 
     async def _integrity_check_dicts(self) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []

@@ -180,6 +180,11 @@ class SearchCandidate:
     review_after: str | None = None
     expires_at: str | None = None
     archived_at: str | None = None
+    truth_status: FactStatus | None = None
+    support_count: int = 0
+    contradiction_count: int = 0
+    last_confirmed_at: str | None = None
+    last_contradicted_at: str | None = None
     lexical_raw_score: float | None = None
     lexical_score: float = 0.0
     semantic_distance: float | None = None
