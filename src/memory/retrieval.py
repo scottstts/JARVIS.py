@@ -219,6 +219,10 @@ class MemoryRetriever:
                 _fuse_candidates(candidates.values(), query=query, settings=self._settings),
                 settings=self._settings,
             )[:final_limit]
+            if not final and candidates:
+                warnings.append(
+                    "memory retrieval found only weak low-confidence candidates and returned no matches"
+                )
 
         return MemorySearchResponse(
             results=tuple(
@@ -272,7 +276,7 @@ class MemoryRetriever:
                     lexical_variant_rows.append((variant, rows))
 
         semantic_requested = mode in {"semantic", "hybrid"}
-        semantic_disabled = not semantic_requested
+        semantic_disabled = False
         semantic_ready = False
         semantic_reason: str | None = None
         if semantic_requested:
@@ -295,6 +299,12 @@ class MemoryRetriever:
                         daily_lookback_days=daily_lookback_days,
                         limit=self._settings.semantic_candidate_count,
                     )
+                    semantic_rows = [
+                        row
+                        for row in semantic_rows
+                        if _optional_float(row.get("semantic_similarity")) is not None
+                        and float(row["semantic_similarity"]) >= self._settings.semantic_score_floor
+                    ]
             except Exception as exc:
                 semantic_disabled = True
                 semantic_rows = []
@@ -884,25 +894,36 @@ def _prune_weak_semantic_tail(
 ) -> list[SearchCandidate]:
     if not candidates:
         return []
+    top_window = candidates[:3]
+    if top_window and all(
+        _is_weak_semantic_candidate(item, settings=settings)
+        for item in top_window
+    ):
+        return [
+            item
+            for item in candidates
+            if not _is_weak_semantic_candidate(item, settings=settings)
+        ]
     has_anchor_result = any(
         item.fused_score >= settings.weak_result_score_threshold
         and (_has_non_semantic_support(item) or item.semantic_score >= settings.semantic_only_score_floor)
-        for item in candidates[:3]
+        for item in top_window
     )
     if not has_anchor_result:
-        return candidates
+        return [
+            item
+            for item in candidates
+            if not _is_weak_semantic_candidate(item, settings=settings)
+        ]
     return [
         item
         for item in candidates
         if not (
-            item.support_count <= 0
-            and item.fused_score < settings.weak_result_score_threshold
-            and (
-                (
-                    _is_semantic_only(item)
-                    and item.semantic_score < settings.semantic_only_score_floor
-                )
-                or (
+            _is_weak_semantic_candidate(item, settings=settings)
+            or (
+                item.support_count <= 0
+                and item.fused_score < settings.weak_result_score_threshold
+                and (
                     item.lexical_score <= 0.0
                     and item.graph_score <= 0.0
                     and item.semantic_score < settings.semantic_score_floor
@@ -955,6 +976,19 @@ def _has_non_semantic_support(candidate: SearchCandidate) -> bool:
 
 def _is_semantic_only(candidate: SearchCandidate) -> bool:
     return candidate.semantic_score > 0.0 and candidate.lexical_score <= 0.0 and candidate.graph_score <= 0.0
+
+
+def _is_weak_semantic_candidate(
+    candidate: SearchCandidate,
+    *,
+    settings: MemorySettings,
+) -> bool:
+    return (
+        _is_semantic_only(candidate)
+        and candidate.support_count <= 0
+        and candidate.fused_score < settings.weak_result_score_threshold
+        and candidate.semantic_score < settings.semantic_only_score_floor
+    )
 
 
 def _truth_status_modifier(status: str | None, *, present_state_query: bool) -> float:

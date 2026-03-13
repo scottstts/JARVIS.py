@@ -248,16 +248,24 @@ class ToolSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.web_search_result_count, 7)
 
-    def test_memory_write_tool_describes_superseding_rewrite_contract(self) -> None:
+    def test_memory_write_tool_describes_superseding_rewrite_and_truth_contracts(self) -> None:
         tool = build_memory_write_tool()
 
         self.assertIn("rewrite the memory content", tool.definition.description.lower())
+        self.assertIn("explicit durable fact", tool.definition.description.lower())
+        self.assertIn("subject-predicate-object", tool.definition.description.lower())
         operation_description = tool.definition.input_schema["properties"]["operation"]["description"].lower()
         summary_description = tool.definition.input_schema["properties"]["summary"]["description"].lower()
+        facts_description = tool.definition.input_schema["properties"]["facts"]["description"].lower()
+        relations_description = tool.definition.input_schema["properties"]["relations"]["description"].lower()
         body_description = tool.definition.input_schema["properties"]["body_sections"]["description"].lower()
         close_reason_description = tool.definition.input_schema["properties"]["close_reason"]["description"].lower()
 
         self.assertIn("close and archive are superseding transitions", operation_description)
+        self.assertIn("durable fact", facts_description)
+        self.assertIn("summary/body text", facts_description)
+        self.assertIn("subject-predicate-object claims", relations_description)
+        self.assertIn("preferences", relations_description)
         self.assertIn("rewritten terminal summary", summary_description)
         self.assertIn("rewritten terminal body", body_description)
         self.assertIn("not a substitute", close_reason_description)

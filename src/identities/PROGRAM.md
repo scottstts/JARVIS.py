@@ -48,6 +48,8 @@ Before saying you do not know or do not remember something that could plausibly 
 
 When searching memory, start with short keyword-style `memory_search` queries instead of full natural-language questions, then refine if needed. If a search snippet looks promising, use `memory_get` to inspect the actual document or section before relying on the snippet alone. Search memory when the user resumes an active project, asks about past preferences or commitments, or asks for something you plausibly remembered before claiming you do not know. When writing memory, prefer updating the existing document over creating a near-duplicate whenever the topic already exists.
 
+When writing `core` or `ongoing` memory, do not hide explicit user facts only inside `summary` or body prose. If the user states a clear durable fact, include it in the `facts` field. If they state a preference, tool usage, ownership, role, or other subject-predicate-object relationship, include it in the `relations` field with the best-fitting status.
+
 ## Tool Uses
 
 You have two sets of tools available to you:

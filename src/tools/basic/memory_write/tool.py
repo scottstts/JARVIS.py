@@ -91,6 +91,8 @@ def build_memory_write_tool() -> RegisteredTool:
                 "Create or update canonical memory documents through validated structured operations. "
                 "Prefer this over generic file editing for normal memory mutations. "
                 "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary. "
+                "When the user states an explicit durable fact, pass it in facts; when they state a structured relationship, "
+                "current preference, tool usage, ownership, or other subject-predicate-object claim, pass it in relations. "
                 "When superseding memory through close or archive, first rewrite the memory content to the new terminal truth "
                 "using summary and body_sections, then let the operation flip status/archive state. "
                 "If you omit that rewrite, the system will apply a generic fallback terminal stamp."
@@ -129,8 +131,22 @@ def build_memory_write_tool() -> RegisteredTool:
                     "expires_at": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}},
-                    "facts": {"type": "array", "items": {"type": "object"}},
-                    "relations": {"type": "array", "items": {"type": "object"}},
+                    "facts": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "Explicit fact statements to track as structured memory. "
+                            "Use this when the user gives a durable fact directly instead of burying that fact only in summary/body text."
+                        ),
+                    },
+                    "relations": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": (
+                            "Structured subject-predicate-object claims. "
+                            "Use this for stated preferences, current tools or stacks, ownership, responsibilities, and other truth-tracked relationships."
+                        ),
+                    },
                     "body_sections": {
                         "type": "object",
                         "additionalProperties": {"type": "string"},

@@ -120,6 +120,27 @@ class _FallbackPlanningLLM(_FakeEmbeddingReflectionLLM):
         return [0.0, 0.0, 1.0]
 
 
+class _WeakSemanticLeakLLM(_FakeEmbeddingReflectionLLM):
+    async def embed(self, request: EmbeddingRequest):
+        inputs = request.inputs if isinstance(request.inputs, list) else [request.inputs]
+        embeddings = [self._embed_text(str(item)) for item in inputs]
+        return EmbeddingResponse(
+            provider="fake",
+            model="weak-semantic-leak",
+            embeddings=embeddings,
+            usage=LLMUsage(input_tokens=4, output_tokens=0, total_tokens=4),
+        )
+
+    @staticmethod
+    def _embed_text(text: str) -> list[float]:
+        normalized = " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+        if any(token in normalized for token in ("threejs", "webgpu", "shader", "playground")):
+            return [1.0, 0.0]
+        if "breakfast" in normalized and any(token in normalized for token in ("hike", "hiking")):
+            return [0.08, 1.0]
+        return [0.0, 1.0]
+
+
 class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_natural_language_lexical_query_is_planned_for_recall(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -635,6 +656,28 @@ class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(float(row["distance"]) > 0.0 for row in rows[1:]))
             self.assertFalse(hybrid_response.semantic_disabled)
 
+    async def test_lexical_search_does_not_report_semantic_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(settings=MemorySettings.from_workspace_dir(workspace_dir), llm_service=None)
+
+            await service.write(
+                operation="create",
+                target_kind="core",
+                title="Backend Preferences",
+                summary="Scott prefers Python for backend APIs.",
+            )
+
+            response = await service.search(
+                query="python backend",
+                mode="lexical",
+                scopes=("core",),
+            )
+
+            self.assertTrue(response.results)
+            self.assertFalse(response.semantic_disabled)
+
     async def test_truth_signals_are_populated_for_supported_and_conflicting_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -836,3 +879,27 @@ class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response.results)
             self.assertEqual(response.results[0].document_id, target.document_id)
             self.assertIn("retrieval_fallback", response.results[0].match_reasons)
+
+    async def test_hybrid_search_drops_weak_semantic_only_junk_hit(self) -> None:
+        fake_llm = _WeakSemanticLeakLLM()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(settings=MemorySettings.from_workspace_dir(workspace_dir), llm_service=fake_llm)
+
+            await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Visual Pipeline Project",
+                summary="Build a threejs webgpu tsl shader playground.",
+            )
+
+            response = await service.search(
+                query="breakfast hiking",
+                mode="hybrid",
+                scopes=("core", "ongoing"),
+                top_k=5,
+            )
+
+            self.assertFalse(response.results)
+            self.assertFalse(response.semantic_disabled)
