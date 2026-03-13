@@ -736,6 +736,7 @@ class MemoryIndexDB:
                     bm25(document_chunks_fts) as bm25_score,
                     d.path,
                     d.kind,
+                    d.title,
                     d.updated_at,
                     d.status,
                     d.pinned,
@@ -782,10 +783,14 @@ class MemoryIndexDB:
         with self._connect_embeddings(load_vec=True) as embeddings_conn:
             rows = embeddings_conn.execute(
                 """
-                select item.rowid as embedding_id, item.*
+                select
+                    vec.rowid as embedding_id,
+                    distance,
+                    item.*
                 from embedding_items_vec vec
                 join embedding_items item on item.embedding_id = vec.rowid
                 where vec.embedding match ? and k = ?
+                order by distance asc
                 """,
                 (query_vector, limit),
             ).fetchall()
@@ -797,7 +802,7 @@ class MemoryIndexDB:
             document_rows = conn.execute(
                 f"""
                 select
-                    d.document_id, d.path, d.kind, d.updated_at, d.status, d.pinned, d.priority,
+                    d.document_id, d.path, d.kind, d.title, d.updated_at, d.status, d.pinned, d.priority,
                     d.summary, d.review_after, d.expires_at, d.archived_at
                 from documents d
                 where d.document_id in ({placeholders}) and {clause}
@@ -813,13 +818,18 @@ class MemoryIndexDB:
             source_ref_ids = json.loads(str(row["source_ref_ids_json"]))
             candidates.append(
                 {
-                    "chunk_id": str(row["item_key"]),
+                    "chunk_id": (
+                        str(row["target_id"])
+                        if str(row["item_type"]) == "chunk"
+                        else str(row["item_key"])
+                    ),
                     "document_id": str(row["document_id"]),
                     "section_path": str(row["section_path"]),
                     "snippet": str(row["text"]),
-                    "distance": 0.0,
+                    "distance": float(row["distance"]),
                     "path": document["path"],
                     "kind": document["kind"],
+                    "title": document["title"],
                     "updated_at": document["updated_at"],
                     "status": document["status"],
                     "pinned": document["pinned"],
@@ -874,8 +884,14 @@ class MemoryIndexDB:
                     r.valid_to,
                     d.path,
                     d.kind,
+                    d.title,
                     d.updated_at,
                     d.status as document_status,
+                    d.pinned,
+                    d.priority,
+                    d.review_after,
+                    d.expires_at,
+                    d.archived_at,
                     coalesce((
                         select json_group_array(source_ref_id)
                         from relation_source_refs rs

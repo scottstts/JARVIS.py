@@ -32,8 +32,10 @@ class MemoryGetToolExecutor:
                 document_id=_optional_string(arguments.get("document_id")),
                 path=_optional_string(arguments.get("path")),
                 section_path=_optional_string(arguments.get("section_path")),
-                include_frontmatter=bool(arguments.get("include_frontmatter", True)),
+                include_frontmatter=bool(arguments.get("include_frontmatter", False)),
                 include_sources=bool(arguments.get("include_sources", False)),
+                route_id=context.route_id,
+                session_id=context.session_id,
             )
         except Exception as exc:
             return ToolExecutionResult(
@@ -83,4 +85,3 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
-

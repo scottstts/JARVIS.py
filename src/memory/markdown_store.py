@@ -113,13 +113,20 @@ class MarkdownMemoryStore:
     def read_all_documents(self) -> tuple[MemoryDocument, ...]:
         return tuple(self.read_document(path) for path in self.list_markdown_paths())
 
-    def write_document(self, document: MemoryDocument) -> MemoryDocument:
+    def write_document(
+        self,
+        document: MemoryDocument,
+        *,
+        previous_path: Path | None = None,
+    ) -> MemoryDocument:
         rendered = render_memory_document(document)
         target_path = document.path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = target_path.with_suffix(".tmp")
         tmp_path.write_text(rendered, encoding="utf-8", newline="\n")
         tmp_path.replace(target_path)
+        if previous_path is not None and previous_path != target_path and previous_path.exists():
+            previous_path.unlink()
         return self.read_document(target_path)
 
     def archive_document(self, document: MemoryDocument) -> MemoryDocument:
@@ -130,26 +137,40 @@ class MarkdownMemoryStore:
             path=destination,
             status=archived_status,
         )
-        self.write_document(archived)
+        self.write_document(archived, previous_path=document.path)
         if document.path != destination and document.path.exists():
             document.path.unlink()
         return self.read_document(destination)
 
     def archive_path_for(self, document: MemoryDocument) -> Path:
-        if document.kind == "core":
-            return self._settings.archive_core_dir / document.path.name
-        if document.kind == "ongoing":
-            return self._settings.archive_ongoing_dir / document.path.name
-        return self._settings.archive_daily_dir / document.path.name
+        return self.canonical_path_for(
+            kind=document.kind,
+            title=document.title,
+            date=document.date,
+            archived=True,
+        )
 
     def active_path_for(self, *, kind: str, title: str, date: str | None = None) -> Path:
+        return self.canonical_path_for(kind=kind, title=title, date=date, archived=False)
+
+    def canonical_path_for(
+        self,
+        *,
+        kind: str,
+        title: str,
+        date: str | None = None,
+        archived: bool,
+    ) -> Path:
         if kind == "core":
-            return self._settings.core_dir / f"{slugify(title)}.md"
+            directory = self._settings.archive_core_dir if archived else self._settings.core_dir
+            return directory / f"{slugify(title)}.md"
         if kind == "ongoing":
-            return self._settings.ongoing_dir / f"{slugify(title)}.md"
+            directory = self._settings.archive_ongoing_dir if archived else self._settings.ongoing_dir
+            return directory / f"{slugify(title)}.md"
         if date is None:
             raise ValueError("Daily documents require a date.")
-        return self._settings.daily_dir / f"{date}.md"
+        directory = self._settings.archive_daily_dir if archived else self._settings.daily_dir
+        return directory / f"{date}.md"
 
 
 def slugify(value: str) -> str:

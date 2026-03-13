@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from .config import MemorySettings
 from .types import MaintenanceRunResult, MemoryDocument
@@ -46,11 +47,31 @@ class MemoryMaintenanceManager:
         return tuple(results)
 
     async def daily_rollover(self) -> MaintenanceRunResult:
+        local_now = datetime.now(ZoneInfo(self._settings.default_timezone))
+        today = local_now.date().isoformat()
+        closed_documents = 0
+        for document in self._context.list_documents():
+            if document.kind != "daily" or document.archived or document.status != "active":
+                continue
+            if document.date == today:
+                continue
+            await self._context.refresh_document(
+                replace(
+                    document,
+                    status="closed",
+                    updated_at=local_now.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                )
+            )
+            closed_documents += 1
         document = await self._context.ensure_daily_for_today()
         return MaintenanceRunResult(
             job_name="daily_rollover",
             status="ok",
-            summary={"path": str(document.path), "document_id": document.document_id},
+            summary={
+                "path": str(document.path),
+                "document_id": document.document_id,
+                "closed_documents": closed_documents,
+            },
         )
 
     async def expire_due_ongoing(self) -> MaintenanceRunResult:
@@ -58,6 +79,8 @@ class MemoryMaintenanceManager:
         changed = 0
         for document in self._context.list_documents():
             if document.kind != "ongoing" or document.status != "active":
+                continue
+            if document.locked:
                 continue
             if document.expires_at is None:
                 continue
@@ -84,6 +107,8 @@ class MemoryMaintenanceManager:
         for document in self._context.list_documents():
             if document.kind != "ongoing" or document.status != "closed" or document.archived:
                 continue
+            if document.locked:
+                continue
             await self._context.archive_document(document)
             changed += 1
         return MaintenanceRunResult(
@@ -93,11 +118,10 @@ class MemoryMaintenanceManager:
         )
 
     async def recompute_priority_from_usage(self) -> MaintenanceRunResult:
-        changed = await self._context.recompute_priorities()
         return MaintenanceRunResult(
             job_name="recompute_priority_from_usage",
-            status="ok",
-            summary={"changed_documents": changed},
+            status="skipped",
+            summary={"reason": "disabled_in_pass_2", "changed_documents": 0},
         )
 
     async def cold_archive_sweep(self) -> MaintenanceRunResult:

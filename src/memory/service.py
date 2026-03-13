@@ -28,12 +28,14 @@ from .markdown_store import MarkdownMemoryStore, slugify
 from .retrieval import MemoryRetriever
 from .types import (
     DirtyDocument,
+    EntityReference,
     Fact,
     IntegrityIssue,
     MaintenanceRunResult,
     MemoryDocument,
     MemorySearchResponse,
     MemoryWriteResult,
+    ReflectionAction,
     Relation,
     SourceReference,
 )
@@ -55,7 +57,11 @@ class MemoryService:
         self._llm_service = llm_service
         self._store = MarkdownMemoryStore(self._settings)
         self._index_db = MemoryIndexDB(self._settings)
-        self._retriever = MemoryRetriever(index_db=self._index_db, llm_service=llm_service)
+        self._retriever = MemoryRetriever(
+            index_db=self._index_db,
+            llm_service=llm_service,
+            settings=self._settings,
+        )
         self._maintenance = MemoryMaintenanceManager(
             settings=self._settings,
             context=MaintenanceContext(
@@ -129,7 +135,7 @@ class MemoryService:
             results=[
                 {
                     "document_id": result.document_id,
-                    "chunk_id": result.section_path,
+                    "chunk_id": result.chunk_id,
                     "score": result.score,
                 }
                 for result in response.results
@@ -143,24 +149,50 @@ class MemoryService:
         document_id: str | None = None,
         path: str | None = None,
         section_path: str | None = None,
-        include_frontmatter: bool = True,
+        include_frontmatter: bool = False,
         include_sources: bool = False,
+        route_id: str | None = None,
+        session_id: str | None = None,
+        tool_name: str = "memory_get",
     ) -> str:
         await self.ensure_index_synced()
         row = self._index_db.document_for_id_or_path(document_id=document_id, path=path)
         if row is None:
             raise ValueError("Memory document not found.")
         document = self._store.read_document(Path(str(row["path"])))
-        rendered = document.raw_markdown if include_frontmatter else document.body_markdown
+        rendered: str
+        accessed_chunk_id: str
+        source_ref_ids: tuple[str, ...]
         if section_path:
-            if section_path not in document.sections:
-                raise ValueError(f"Section '{section_path}' not found in memory document.")
-            rendered = f"## {section_path}\n{document.sections[section_path].rstrip()}\n"
-        if include_sources and document.source_refs:
-            rendered = rendered.rstrip() + "\n\n## Sources\n" + "\n".join(
-                f"- {source_ref.source_type}:{source_ref.source_ref_id}"
-                for source_ref in document.source_refs
-            ) + "\n"
+            rendered, accessed_chunk_id, source_ref_ids = _render_document_section(
+                document=document,
+                section_path=section_path,
+            )
+        else:
+            rendered = document.raw_markdown if include_frontmatter else document.body_markdown
+            accessed_chunk_id = f"document:{document.document_id}"
+            source_ref_ids = tuple(source_ref.source_ref_id for source_ref in document.source_refs)
+        if include_sources:
+            rendered = _append_sources(
+                rendered=rendered,
+                document=document,
+                source_ref_ids=source_ref_ids,
+            )
+        self._index_db.record_accesses(
+            occurred_at=_utc_now_iso(),
+            route_id=route_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            query=section_path or document_id or path,
+            mode="get_section" if section_path else "get_document",
+            results=[
+                {
+                    "document_id": document.document_id,
+                    "chunk_id": accessed_chunk_id,
+                    "score": 1.0,
+                }
+            ],
+        )
         return rendered
 
     async def write(
@@ -176,15 +208,20 @@ class MemoryService:
         locked: bool | None = None,
         review_after: str | None = None,
         expires_at: str | None = None,
+        tags: list[str] | None = None,
+        aliases: list[str] | None = None,
         facts: list[dict[str, Any]] | None = None,
         relations: list[dict[str, Any]] | None = None,
         body_sections: dict[str, str] | None = None,
         source_refs: list[dict[str, Any]] | None = None,
+        entity_refs: list[dict[str, Any]] | None = None,
+        completion_criteria: list[str] | None = None,
         route_id: str | None = None,
         session_id: str | None = None,
         date: str | None = None,
         timezone_name: str | None = None,
         close_reason: str | None = None,
+        allow_locked: bool = True,
     ) -> MemoryWriteResult:
         await self.ensure_index_synced()
         if operation == "append_daily":
@@ -209,7 +246,8 @@ class MemoryService:
         if operation == "archive":
             if current is None:
                 raise ValueError("Cannot archive a missing memory document.")
-            archived = await self._archive_document(current)
+            _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
+            archived = await self._archive_document(current, allow_locked=allow_locked)
             return MemoryWriteResult(
                 operation="archive",
                 document_id=archived.document_id,
@@ -222,13 +260,14 @@ class MemoryService:
                 raise ValueError("Cannot close a missing memory document.")
             if current.kind != "ongoing":
                 raise ValueError("Only ongoing memory documents can be closed.")
+            _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
             updated = replace(
                 current,
                 status="closed",
                 close_reason=close_reason or current.close_reason,
                 updated_at=_utc_now_iso(),
             )
-            persisted = await self._archive_document(updated)
+            persisted = await self._archive_document(updated, allow_locked=allow_locked)
             return MemoryWriteResult(
                 operation="close",
                 document_id=persisted.document_id,
@@ -240,7 +279,13 @@ class MemoryService:
         if operation in {"promote", "demote"}:
             if current is None:
                 raise ValueError(f"Cannot {operation} a missing memory document.")
-            promoted = await self._migrate_document(current=current, target_kind=target_kind, operation=operation)
+            _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
+            promoted = await self._migrate_document(
+                current=current,
+                target_kind=target_kind,
+                operation=operation,
+                allow_locked=allow_locked,
+            )
             return MemoryWriteResult(
                 operation=operation,  # type: ignore[arg-type]
                 document_id=promoted.document_id,
@@ -251,6 +296,8 @@ class MemoryService:
 
         if operation not in {"create", "upsert"}:
             raise ValueError(f"Unsupported memory write operation: {operation}")
+        if current is not None:
+            _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
 
         now = _utc_now_iso()
         base_document = current or self._build_new_document(
@@ -267,24 +314,35 @@ class MemoryService:
             route_id=route_id,
             session_id=session_id,
         )
+        resolved_title = title or base_document.title
+        resolved_path = self._store.canonical_path_for(
+            kind=target_kind,
+            title=resolved_title,
+            date=date or base_document.date,
+            archived=base_document.archived,
+        )
         resolved_sections = _merge_sections(base_document=base_document, overrides=body_sections or {})
         resolved_summary = summary if summary is not None else base_document.summary
         if target_kind != "daily":
-            resolved_sections = _seed_summary_section(
+            resolved_sections = _reconcile_summary_section(
                 sections=resolved_sections,
                 summary=resolved_summary,
+                explicit_summary_section=(body_sections or {}).get("Summary"),
             )
         if resolved_summary is None and "Summary" in resolved_sections and resolved_sections["Summary"].strip():
             resolved_summary = _first_paragraph(resolved_sections["Summary"])
         updated_document = replace(
             base_document,
-            title=title or base_document.title,
+            path=resolved_path,
+            title=resolved_title,
             summary=resolved_summary if target_kind != "daily" else None,
             priority=priority if priority is not None else base_document.priority,
             pinned=pinned if pinned is not None else base_document.pinned,
             locked=locked if locked is not None else base_document.locked,
             review_after=review_after if review_after is not None else base_document.review_after,
             expires_at=expires_at if expires_at is not None else base_document.expires_at,
+            tags=_normalize_string_list(tags, existing=base_document.tags),
+            aliases=_normalize_string_list(aliases, existing=base_document.aliases),
             updated_at=now,
             sections=resolved_sections,
             facts=_normalize_facts(
@@ -302,17 +360,38 @@ class MemoryService:
             if target_kind != "daily"
             else (),
             source_refs=resolved_source_refs if target_kind != "daily" else base_document.source_refs,
+            entity_refs=_normalize_entity_refs(
+                payloads=entity_refs,
+                existing=base_document.entity_refs,
+            )
+            if target_kind != "daily"
+            else (),
+            completion_criteria=_normalize_string_list(
+                completion_criteria,
+                existing=base_document.completion_criteria,
+            )
+            if target_kind == "ongoing"
+            else (),
             route_ids=tuple(dict.fromkeys(base_document.route_ids + ((route_id,) if route_id else ()))),
             session_ids=tuple(dict.fromkeys(base_document.session_ids + ((session_id,) if session_id else ()))),
             close_reason=close_reason if close_reason is not None else base_document.close_reason,
         )
-        persisted = await self._persist_document(updated_document)
+        persisted = await self._persist_document(
+            updated_document,
+            allow_locked=allow_locked,
+            existing_document=current,
+        )
+        changed_paths = (
+            (current.path, persisted.path)
+            if current is not None and current.path != persisted.path
+            else (persisted.path,)
+        )
         return MemoryWriteResult(
             operation=operation,  # type: ignore[arg-type]
             document_id=persisted.document_id,
             path=persisted.path,
             summary=f"{operation.title()}d {persisted.kind} memory '{persisted.title}'.",
-            changed_paths=(persisted.path,),
+            changed_paths=changed_paths,
         )
 
     async def render_bootstrap_messages(self) -> tuple[str, str]:
@@ -343,8 +422,10 @@ class MemoryService:
 
         core_cache_key = "core_bootstrap"
         ongoing_cache_key = "ongoing_bootstrap"
-        core_bundle = checksum_bundle_for_documents(core_documents)
-        ongoing_bundle = checksum_bundle_for_documents(ongoing_documents)
+        reference_time = datetime.now(timezone.utc).replace(microsecond=0)
+        freshness_bucket = reference_time.strftime("%Y-%m-%dT%H")
+        core_bundle = checksum_bundle_for_documents(core_documents) + f"|freshness:{freshness_bucket}"
+        ongoing_bundle = checksum_bundle_for_documents(ongoing_documents) + f"|freshness:{freshness_bucket}"
 
         core_cached = self._index_db.render_bootstrap_cache_get(core_cache_key)
         ongoing_cached = self._index_db.render_bootstrap_cache_get(ongoing_cache_key)
@@ -355,6 +436,7 @@ class MemoryService:
             core_text = render_core_bootstrap(
                 core_documents,
                 token_budget=self._settings.core_bootstrap_max_tokens,
+                reference_time=reference_time,
             )
             self._index_db.render_bootstrap_cache_set(
                 cache_key=core_cache_key,
@@ -370,6 +452,7 @@ class MemoryService:
             ongoing_text = render_ongoing_bootstrap(
                 ongoing_documents,
                 token_budget=self._settings.ongoing_bootstrap_max_tokens,
+                reference_time=reference_time,
             )
             self._index_db.render_bootstrap_cache_set(
                 cache_key=ongoing_cache_key,
@@ -410,8 +493,9 @@ class MemoryService:
                 continue
             self._index_db.remove_document(path=indexed_path)
         for document in documents:
-            await self._persist_document(document, run_dirty_scan=False)
+            await self._index_document(document)
             indexed_paths.append(document.path)
+        await self._apply_relation_conflicts()
         self._index_db.clear_dirty_documents(tuple(item.path for item in existing_dirty))
         return tuple(indexed_paths)
 
@@ -509,20 +593,32 @@ class MemoryService:
             return ()
 
         planner = MemoryReflectionPlanner(settings=self._settings, llm_service=self._llm_service)
-        active_documents = self._store.read_all_documents()
-        core_titles = tuple(document.title for document in active_documents if document.kind == "core" and not document.archived)
-        ongoing_titles = tuple(
-            document.title for document in active_documents if document.kind == "ongoing" and document.status == "active" and not document.archived
+        active_documents = tuple(
+            document
+            for document in self._store.read_all_documents()
+            if document.kind in {"core", "ongoing"} and not document.archived and document.status == "active"
+        )
+        active_memory_context = tuple(
+            {
+                "document_id": document.document_id,
+                "title": document.title,
+                "summary": document.summary or _first_paragraph(document.sections.get("Summary", "")),
+                "kind": document.kind,
+            }
+            for document in active_documents
         )
         plan = await planner.plan_turn(
             route_id=route_id,
             session_id=session_id,
             records=records,
-            active_core_titles=core_titles,
-            active_ongoing_titles=ongoing_titles,
+            active_memories=active_memory_context,
+        )
+        normalized_actions = _normalize_reflection_actions(
+            actions=plan.actions,
+            active_documents=active_documents,
         )
         applied: list[MemoryWriteResult] = []
-        for action in plan.actions:
+        for action in normalized_actions:
             if action.action == "ignore":
                 continue
             if action.action == "append_daily":
@@ -541,6 +637,13 @@ class MemoryService:
                 if action.confidence == "low" or not self._settings.enable_auto_apply_ongoing:
                     continue
                 payload = action.payload
+                target_document = _resolve_reflection_target(
+                    action=action,
+                    active_documents=active_documents,
+                    target_kind="ongoing",
+                )
+                if target_document is not None and target_document.locked:
+                    continue
                 applied.append(
                     await self.write(
                         operation="create" if action.action == "create_ongoing" else "upsert",
@@ -557,8 +660,13 @@ class MemoryService:
                         relations=_coerce_list_of_dicts(payload.get("relations")),
                         body_sections=_coerce_body_sections(payload.get("body_sections")),
                         source_refs=_coerce_list_of_dicts(payload.get("source_refs")),
+                        tags=_coerce_list_of_strings(payload.get("tags")),
+                        aliases=_coerce_list_of_strings(payload.get("aliases")),
+                        entity_refs=_coerce_list_of_dicts(payload.get("entity_refs")),
+                        completion_criteria=_coerce_list_of_strings(payload.get("completion_criteria")),
                         route_id=route_id,
                         session_id=session_id,
+                        allow_locked=False,
                     )
                 )
                 continue
@@ -568,6 +676,13 @@ class MemoryService:
                 payload = action.payload
                 explicit_request = bool(payload.get("explicit_user_request"))
                 if not explicit_request:
+                    continue
+                target_document = _resolve_reflection_target(
+                    action=action,
+                    active_documents=active_documents,
+                    target_kind="core",
+                )
+                if target_document is not None and target_document.locked:
                     continue
                 applied.append(
                     await self.write(
@@ -585,13 +700,24 @@ class MemoryService:
                         relations=_coerce_list_of_dicts(payload.get("relations")),
                         body_sections=_coerce_body_sections(payload.get("body_sections")),
                         source_refs=_coerce_list_of_dicts(payload.get("source_refs")),
+                        tags=_coerce_list_of_strings(payload.get("tags")),
+                        aliases=_coerce_list_of_strings(payload.get("aliases")),
+                        entity_refs=_coerce_list_of_dicts(payload.get("entity_refs")),
                         route_id=route_id,
                         session_id=session_id,
+                        allow_locked=False,
                     )
                 )
                 continue
             if action.action == "close_ongoing":
                 payload = action.payload
+                target_document = _resolve_reflection_target(
+                    action=action,
+                    active_documents=active_documents,
+                    target_kind="ongoing",
+                )
+                if target_document is not None and target_document.locked:
+                    continue
                 try:
                     applied.append(
                         await self.write(
@@ -600,6 +726,7 @@ class MemoryService:
                             document_id=_optional_str(payload.get("document_id")),
                             title=_optional_str(payload.get("title")),
                             close_reason=_optional_str(payload.get("close_reason")),
+                            allow_locked=False,
                         )
                     )
                 except Exception:
@@ -645,21 +772,7 @@ class MemoryService:
         return await self._persist_document(document)
 
     async def recompute_priorities(self) -> int:
-        changed = 0
-        for document in self._store.read_all_documents():
-            if document.kind not in {"core", "ongoing"} or document.priority is None:
-                continue
-            access_score = 0
-            if document.pinned:
-                access_score += 10
-            if document.kind == "core":
-                access_score += 5
-            next_priority = max(0, min(100, document.priority + access_score))
-            if next_priority == document.priority:
-                continue
-            await self._persist_document(replace(document, priority=next_priority, updated_at=_utc_now_iso()))
-            changed += 1
-        return changed
+        return 0
 
     async def _reconcile_dirty_documents(self, dirty_documents: tuple[DirtyDocument, ...]) -> None:
         processed_paths: list[Path] = []
@@ -673,37 +786,68 @@ class MemoryService:
             except (FileNotFoundError, MemoryValidationError, ValueError):
                 LOGGER.exception("Failed reconciling memory document: %s", dirty.path)
                 continue
-            await self._persist_document(document, run_dirty_scan=False)
+            await self._index_document(document)
             processed_paths.append(dirty.path)
+        await self._apply_relation_conflicts()
         self._index_db.clear_dirty_documents(tuple(processed_paths))
 
-    async def _persist_document(self, document: MemoryDocument, *, run_dirty_scan: bool = True) -> MemoryDocument:
-        persisted = self._store.write_document(document)
-        chunks = chunk_document(persisted)
-        self._index_db.upsert_document(persisted, chunks)
+    async def _index_document(self, document: MemoryDocument) -> MemoryDocument:
+        chunks = chunk_document(document)
+        self._index_db.upsert_document(document, chunks)
         await self._index_db.upsert_embeddings_for_document(
-            document=persisted,
+            document=document,
             chunks=chunks,
             llm_service=self._llm_service,
         )
+        return document
+
+    async def _persist_document(
+        self,
+        document: MemoryDocument,
+        *,
+        run_dirty_scan: bool = True,
+        allow_locked: bool = False,
+        existing_document: MemoryDocument | None = None,
+    ) -> MemoryDocument:
+        if existing_document is not None and bool(existing_document.locked) and not allow_locked:
+            raise PermissionError(f"Locked memory '{existing_document.title}' cannot be auto-mutated.")
+        previous_path = existing_document.path if existing_document is not None else None
+        self._assert_document_path_available(
+            document=document,
+            target_path=document.path,
+            current_path=previous_path,
+        )
+        persisted = self._store.write_document(document, previous_path=previous_path)
+        await self._index_document(persisted)
         await self._apply_relation_conflicts()
         if run_dirty_scan:
             await self.ensure_index_synced()
         return self._store.read_document(persisted.path)
 
     async def _refresh_document(self, document: MemoryDocument) -> MemoryDocument:
-        return await self._persist_document(document, run_dirty_scan=False)
+        return await self._persist_document(
+            document,
+            run_dirty_scan=False,
+            allow_locked=False,
+            existing_document=document,
+        )
 
-    async def _archive_document(self, document: MemoryDocument) -> MemoryDocument:
+    async def _archive_document(
+        self,
+        document: MemoryDocument,
+        *,
+        allow_locked: bool = False,
+    ) -> MemoryDocument:
+        if bool(document.locked) and not allow_locked:
+            raise PermissionError(f"Locked memory '{document.title}' cannot be auto-archived.")
+        self._assert_document_path_available(
+            document=document,
+            target_path=self._store.archive_path_for(document),
+            current_path=document.path,
+        )
         archived = self._store.archive_document(document)
         self._index_db.remove_document(path=document.path, document_id=document.document_id)
-        chunks = chunk_document(archived)
-        self._index_db.upsert_document(archived, chunks)
-        await self._index_db.upsert_embeddings_for_document(
-            document=archived,
-            chunks=chunks,
-            llm_service=self._llm_service,
-        )
+        await self._index_document(archived)
         return archived
 
     async def _resolve_existing_document(
@@ -870,6 +1014,7 @@ class MemoryService:
         current: MemoryDocument,
         target_kind: str,
         operation: str,
+        allow_locked: bool,
     ) -> MemoryDocument:
         new_document = self._build_new_document(
             kind=target_kind,
@@ -887,17 +1032,27 @@ class MemoryService:
                 pinned=current.pinned if current.pinned is not None else False,
                 locked=current.locked if current.locked is not None else False,
                 confidence=current.confidence or "medium",
-                review_after=current.review_after if target_kind == "ongoing" else None,
+                review_after=(
+                    current.review_after or _utc_now_iso()
+                    if target_kind == "ongoing"
+                    else None
+                ),
                 expires_at=current.expires_at if target_kind == "ongoing" else None,
+                tags=current.tags,
+                aliases=current.aliases,
                 facts=current.facts,
                 relations=current.relations,
                 source_refs=current.source_refs,
                 entity_refs=current.entity_refs,
+                completion_criteria=current.completion_criteria if target_kind == "ongoing" else (),
                 sections=_mapped_sections_for_kind(current, target_kind),
             )
-        persisted = await self._persist_document(new_document)
-        if operation == "promote":
-            await self._archive_document(replace(current, status="archived", updated_at=_utc_now_iso()))
+        persisted = await self._persist_document(new_document, allow_locked=allow_locked)
+        if operation in {"promote", "demote"}:
+            await self._archive_document(
+                replace(current, status="archived", updated_at=_utc_now_iso()),
+                allow_locked=allow_locked,
+            )
         return persisted
 
     async def _apply_relation_conflicts(self) -> None:
@@ -915,6 +1070,8 @@ class MemoryService:
             entries.sort(key=lambda item: item[0].updated_at)
             winner_document, winner_relation = entries[-1]
             for document, relation in entries[:-1]:
+                if document.locked:
+                    continue
                 if relation.object == winner_relation.object:
                     continue
                 next_relations = []
@@ -940,13 +1097,15 @@ class MemoryService:
                             updated_at=_utc_now_iso(),
                         ),
                         run_dirty_scan=False,
+                        allow_locked=False,
+                        existing_document=document,
                     )
 
     async def _integrity_check_dicts(self) -> list[dict[str, Any]]:
         issues: list[dict[str, Any]] = []
         for path in self._store.list_markdown_paths():
             try:
-                self._store.read_document(path)
+                document = self._store.read_document(path)
             except Exception as exc:
                 issues.append(
                     {
@@ -956,6 +1115,8 @@ class MemoryService:
                         "message": str(exc),
                     }
                 )
+                continue
+            issues.extend(self._document_integrity_issues(document))
         main_checks, embeddings_checks = self._index_db.sqlite_integrity()
         if main_checks != ("ok",):
             issues.append(
@@ -977,6 +1138,88 @@ class MemoryService:
             )
         return issues
 
+    def _assert_document_path_available(
+        self,
+        *,
+        document: MemoryDocument,
+        target_path: Path,
+        current_path: Path | None,
+    ) -> None:
+        if current_path is not None and target_path == current_path:
+            return
+        row = self._index_db.document_for_id_or_path(path=str(target_path))
+        if row is not None and str(row["document_id"]) != document.document_id:
+            raise ValueError(
+                f"Cannot write memory '{document.title}' because path '{target_path}' is already used by another memory."
+            )
+        if not target_path.exists():
+            return
+        try:
+            existing_document = self._store.read_document(target_path)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot write memory '{document.title}' because target path '{target_path}' already exists."
+            ) from exc
+        if existing_document.document_id != document.document_id:
+            raise ValueError(
+                f"Cannot write memory '{document.title}' because path '{target_path}' already belongs to '{existing_document.title}'."
+            )
+
+    def _document_integrity_issues(self, document: MemoryDocument) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        expected_path = self._store.canonical_path_for(
+            kind=document.kind,
+            title=document.title,
+            date=document.date,
+            archived=document.archived,
+        )
+        if document.path != expected_path:
+            issues.append(
+                {
+                    "path": str(document.path),
+                    "severity": "warning",
+                    "code": "title_path_mismatch",
+                    "message": (
+                        f"Document title '{document.title}' expects canonical path '{expected_path.name}', "
+                        f"but the file is stored as '{document.path.name}'."
+                    ),
+                }
+            )
+        if document.kind == "daily":
+            return issues
+        summary = (document.summary or "").strip()
+        summary_section = document.sections.get("Summary", "").strip()
+        if summary and not summary_section:
+            issues.append(
+                {
+                    "path": str(document.path),
+                    "severity": "warning",
+                    "code": "summary_section_empty",
+                    "message": "Frontmatter summary is populated, but the canonical 'Summary' section is empty.",
+                }
+            )
+            return issues
+        if summary_section and not summary:
+            issues.append(
+                {
+                    "path": str(document.path),
+                    "severity": "warning",
+                    "code": "summary_frontmatter_missing",
+                    "message": "Canonical 'Summary' section has content, but frontmatter summary is missing.",
+                }
+            )
+            return issues
+        if summary and summary_section and _first_paragraph(summary_section) != summary:
+            issues.append(
+                {
+                    "path": str(document.path),
+                    "severity": "warning",
+                    "code": "summary_section_mismatch",
+                    "message": "Frontmatter summary and canonical 'Summary' section disagree.",
+                }
+            )
+        return issues
+
 
 def summary_placeholder(kind: str) -> str:
     return "" if kind == "ongoing" else ""
@@ -991,14 +1234,17 @@ def _merge_sections(*, base_document: MemoryDocument, overrides: dict[str, str])
     return sections
 
 
-def _seed_summary_section(
+def _reconcile_summary_section(
     *,
     sections: OrderedDict[str, str],
     summary: str | None,
+    explicit_summary_section: str | None,
 ) -> OrderedDict[str, str]:
     if summary is None or not summary.strip():
         return sections
-    if "Summary" not in sections or sections["Summary"].strip():
+    if "Summary" not in sections:
+        return sections
+    if explicit_summary_section is not None and explicit_summary_section.strip():
         return sections
     seeded = OrderedDict(sections)
     seeded["Summary"] = summary.strip()
@@ -1167,6 +1413,205 @@ def _first_paragraph(value: str) -> str:
     return paragraphs[0] if paragraphs else ""
 
 
+def _normalize_string_list(
+    value: list[str] | None,
+    *,
+    existing: tuple[str, ...],
+) -> tuple[str, ...]:
+    if value is None:
+        return existing
+    normalized = [str(item).strip() for item in value if str(item).strip()]
+    return tuple(dict.fromkeys(normalized))
+
+
+def _normalize_entity_refs(
+    *,
+    payloads: list[dict[str, Any]] | None,
+    existing: tuple[EntityReference, ...],
+) -> tuple[EntityReference, ...]:
+    if payloads is None:
+        return existing
+    entity_refs: list[EntityReference] = []
+    for payload in payloads:
+        name = _optional_str(payload.get("name"))
+        if name is None:
+            continue
+        aliases = _coerce_list_of_strings(payload.get("aliases")) or []
+        entity_refs.append(
+            EntityReference(
+                entity_id=_optional_str(payload.get("entity_id")) or _entity_id_for_name(name),
+                name=name,
+                entity_type=_optional_str(payload.get("entity_type")) or "unknown",
+                aliases=tuple(dict.fromkeys(aliases)),
+            )
+        )
+    return tuple(entity_refs)
+
+
+def _render_document_section(
+    *,
+    document: MemoryDocument,
+    section_path: str,
+) -> tuple[str, str, tuple[str, ...]]:
+    if section_path == "facts":
+        if not document.facts:
+            raise ValueError("Section 'facts' not found in memory document.")
+        lines = [f"# {document.title}", "", "## Facts"]
+        source_ref_ids: list[str] = []
+        for fact in document.facts:
+            lines.append(_render_fact_line(fact))
+            source_ref_ids.extend(fact.source_ref_ids)
+        return (
+            "\n".join(lines).rstrip() + "\n",
+            f"facts:{document.document_id}",
+            tuple(dict.fromkeys(source_ref_ids)),
+        )
+    if section_path == "relations":
+        if not document.relations:
+            raise ValueError("Section 'relations' not found in memory document.")
+        lines = [f"# {document.title}", "", "## Relations"]
+        source_ref_ids: list[str] = []
+        for relation in document.relations:
+            lines.append(_render_relation_line(relation))
+            source_ref_ids.extend(relation.source_ref_ids)
+        return (
+            "\n".join(lines).rstrip() + "\n",
+            f"relations:{document.document_id}",
+            tuple(dict.fromkeys(source_ref_ids)),
+        )
+    if section_path in document.sections:
+        matching_chunks = [
+            chunk
+            for chunk in chunk_document(document)
+            if chunk.section_path == section_path or chunk.section_path.startswith(f"{section_path}/")
+        ]
+        access_chunk_id = (
+            matching_chunks[0].chunk_id
+            if len(matching_chunks) == 1 and matching_chunks[0].section_path == section_path
+            else f"section:{document.document_id}:{section_path}"
+        )
+        return (
+            f"# {document.title}\n\n## {section_path}\n{document.sections[section_path].rstrip()}\n",
+            access_chunk_id,
+            tuple(source_ref.source_ref_id for source_ref in document.source_refs),
+        )
+    for chunk in chunk_document(document):
+        if chunk.section_path != section_path:
+            continue
+        heading = section_path.split("/", 1)[0]
+        return (
+            f"# {document.title}\n\n## {section_path}\n{_chunk_body(chunk.text, document.title, heading)}\n",
+            chunk.chunk_id,
+            tuple(source_ref.source_ref_id for source_ref in document.source_refs),
+        )
+    raise ValueError(f"Section '{section_path}' not found in memory document.")
+
+
+def _render_fact_line(fact: Fact) -> str:
+    metadata: list[str] = []
+    if fact.status != "current":
+        metadata.append(f"status={fact.status}")
+    if fact.confidence != "medium":
+        metadata.append(f"confidence={fact.confidence}")
+    suffix = f" ({', '.join(metadata)})" if metadata else ""
+    return f"- {fact.text}{suffix}"
+
+
+def _render_relation_line(relation: Relation) -> str:
+    metadata: list[str] = []
+    if relation.status != "current":
+        metadata.append(f"status={relation.status}")
+    if relation.confidence != "medium":
+        metadata.append(f"confidence={relation.confidence}")
+    suffix = f" ({', '.join(metadata)})" if metadata else ""
+    return f"- {relation.textualization}{suffix}"
+
+
+def _chunk_body(chunk_text: str, title: str, heading: str) -> str:
+    lines = chunk_text.splitlines()
+    if len(lines) >= 3 and lines[0].strip() == title and lines[1].strip() == heading:
+        return "\n".join(lines[2:]).strip()
+    return chunk_text.strip()
+
+
+def _append_sources(
+    *,
+    rendered: str,
+    document: MemoryDocument,
+    source_ref_ids: tuple[str, ...],
+) -> str:
+    if not document.source_refs:
+        return rendered
+    selected = (
+        [source_ref for source_ref in document.source_refs if source_ref.source_ref_id in set(source_ref_ids)]
+        if source_ref_ids
+        else list(document.source_refs)
+    )
+    if not selected:
+        selected = list(document.source_refs)
+    return rendered.rstrip() + "\n\n## Sources\n" + "\n".join(
+        f"- {source_ref.source_type}:{source_ref.source_ref_id}"
+        for source_ref in selected
+    ) + "\n"
+
+
+def _normalize_reflection_actions(
+    *,
+    actions: tuple[ReflectionAction, ...],
+    active_documents: tuple[MemoryDocument, ...],
+) -> tuple[ReflectionAction, ...]:
+    normalized: list[ReflectionAction] = []
+    for action in actions:
+        if action.action not in {"create_ongoing", "create_core"}:
+            normalized.append(action)
+            continue
+        target_kind = "ongoing" if action.action == "create_ongoing" else "core"
+        target_document = _resolve_reflection_target(
+            action=action,
+            active_documents=active_documents,
+            target_kind=target_kind,
+        )
+        if target_document is None:
+            normalized.append(action)
+            continue
+        payload = dict(action.payload)
+        payload["document_id"] = target_document.document_id
+        normalized.append(
+            ReflectionAction(
+                action="update_ongoing" if target_kind == "ongoing" else "update_core",
+                confidence=action.confidence,
+                payload=payload,
+                rationale=action.rationale,
+            )
+        )
+    return tuple(normalized)
+
+
+def _resolve_reflection_target(
+    *,
+    action: ReflectionAction,
+    active_documents: tuple[MemoryDocument, ...],
+    target_kind: str,
+) -> MemoryDocument | None:
+    payload = action.payload
+    document_id = _optional_str(payload.get("document_id"))
+    if document_id is not None:
+        for document in active_documents:
+            if document.kind == target_kind and document.document_id == document_id:
+                return document
+    title = _optional_str(payload.get("title"))
+    if title is not None:
+        normalized_title = _normalize_lookup(title)
+        for document in active_documents:
+            if document.kind == target_kind and _normalize_lookup(document.title) == normalized_title:
+                return document
+    return None
+
+
+def _normalize_lookup(value: str) -> str:
+    return " ".join(value.lower().strip().split())
+
+
 def _coerce_body_sections(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -1187,6 +1632,12 @@ def _coerce_list_of_dicts(value: Any) -> list[dict[str, Any]] | None:
         if isinstance(item, dict):
             result.append(dict(item))
     return result
+
+
+def _coerce_list_of_strings(value: Any) -> list[str] | None:
+    if value is None or not isinstance(value, list):
+        return None
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _optional_str(value: Any) -> str | None:
@@ -1220,6 +1671,22 @@ def _optional_bool(value: Any) -> bool | None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _entity_id_for_name(name: str) -> str:
+    return "entity_" + "".join(character.lower() if character.isalnum() else "_" for character in name).strip("_")
+
+
+def _assert_locked_write_allowed(
+    *,
+    current: MemoryDocument,
+    allow_locked: bool,
+    operation: str,
+) -> None:
+    if current.locked and not allow_locked:
+        raise PermissionError(
+            f"Locked memory '{current.title}' cannot be auto-mutated during {operation}."
+        )
 
 
 def _parse_iso(value: str) -> datetime | None:

@@ -79,6 +79,14 @@ class MemorySettings:
             raise ValueError("graph_default_expand must be one of: 0, 1, 2.")
         if self.maintenance_max_output_tokens <= 0:
             raise ValueError("maintenance_max_output_tokens must be > 0.")
+        if self.lexical_candidate_count <= 0:
+            raise ValueError("lexical_candidate_count must be > 0.")
+        if self.semantic_candidate_count <= 0:
+            raise ValueError("semantic_candidate_count must be > 0.")
+        if self.graph_candidate_count <= 0:
+            raise ValueError("graph_candidate_count must be > 0.")
+        if self.hybrid_result_count <= 0:
+            raise ValueError("hybrid_result_count must be > 0.")
         if not self.maintenance_provider.strip():
             raise ValueError("maintenance_provider cannot be empty.")
         if not self.maintenance_model.strip():
@@ -160,6 +168,22 @@ class MemorySettings:
             graph_default_expand=_parse_int_env(
                 "JARVIS_MEMORY_GRAPH_DEFAULT_EXPAND",
                 app_settings.JARVIS_MEMORY_GRAPH_DEFAULT_EXPAND,
+            ),
+            lexical_candidate_count=_parse_int_env(
+                "JARVIS_MEMORY_LEXICAL_CANDIDATE_COUNT",
+                app_settings.JARVIS_MEMORY_LEXICAL_CANDIDATE_COUNT,
+            ),
+            semantic_candidate_count=_parse_int_env(
+                "JARVIS_MEMORY_SEMANTIC_CANDIDATE_COUNT",
+                app_settings.JARVIS_MEMORY_SEMANTIC_CANDIDATE_COUNT,
+            ),
+            graph_candidate_count=_parse_int_env(
+                "JARVIS_MEMORY_GRAPH_CANDIDATE_COUNT",
+                app_settings.JARVIS_MEMORY_GRAPH_CANDIDATE_COUNT,
+            ),
+            hybrid_result_count=_parse_int_env(
+                "JARVIS_MEMORY_HYBRID_RESULT_COUNT",
+                app_settings.JARVIS_MEMORY_HYBRID_RESULT_COUNT,
             ),
         )
 

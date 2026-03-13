@@ -39,10 +39,14 @@ class MemoryWriteToolExecutor:
                 locked=_optional_bool(arguments.get("locked")),
                 review_after=_optional_string(arguments.get("review_after")),
                 expires_at=_optional_string(arguments.get("expires_at")),
+                tags=_coerce_list_of_strings(arguments.get("tags")),
+                aliases=_coerce_list_of_strings(arguments.get("aliases")),
                 facts=_coerce_list_of_dicts(arguments.get("facts")),
                 relations=_coerce_list_of_dicts(arguments.get("relations")),
                 body_sections=_coerce_dict(arguments.get("body_sections")),
                 source_refs=_coerce_list_of_dicts(arguments.get("source_refs")),
+                entity_refs=_coerce_list_of_dicts(arguments.get("entity_refs")),
+                completion_criteria=_coerce_list_of_strings(arguments.get("completion_criteria")),
                 route_id=context.route_id,
                 session_id=context.session_id,
                 date=_optional_string(arguments.get("date")),
@@ -117,6 +121,8 @@ def build_memory_write_tool() -> RegisteredTool:
                     "locked": {"type": "boolean"},
                     "review_after": {"type": "string"},
                     "expires_at": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
                     "facts": {"type": "array", "items": {"type": "object"}},
                     "relations": {"type": "array", "items": {"type": "object"}},
                     "body_sections": {
@@ -128,6 +134,8 @@ def build_memory_write_tool() -> RegisteredTool:
                         ),
                     },
                     "source_refs": {"type": "array", "items": {"type": "object"}},
+                    "entity_refs": {"type": "array", "items": {"type": "object"}},
+                    "completion_criteria": {"type": "array", "items": {"type": "string"}},
                     "date": {"type": "string"},
                     "timezone": {"type": "string"},
                     "close_reason": {"type": "string"},
@@ -155,6 +163,12 @@ def _coerce_dict(value: Any) -> dict[str, str] | None:
     if value is None or not isinstance(value, dict):
         return None
     return {str(key): str(item) for key, item in value.items()}
+
+
+def _coerce_list_of_strings(value: Any) -> list[str] | None:
+    if value is None or not isinstance(value, list):
+        return None
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _optional_string(value: Any) -> str | None:

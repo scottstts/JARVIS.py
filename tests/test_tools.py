@@ -304,6 +304,32 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertIn("semantic_disabled: true", rendered)
         self.assertIn("sys_warning: semantic search was skipped because the embedding vector table is missing; used lexical+graph fallback", rendered)
 
+    def test_memory_search_result_includes_title_and_memory_get_hint(self) -> None:
+        rendered = _format_memory_search_result(
+            query="backend preference",
+            results=[
+                {
+                    "document_id": "core_backend_pref",
+                    "title": "Backend Preference",
+                    "path": "/workspace/memory/core/backend-preference.md",
+                    "kind": "core",
+                    "chunk_id": "chunk_123",
+                    "section_path": "facts",
+                    "score": 0.98,
+                    "snippet": "Scott prefers Python for backend work.",
+                    "match_reasons": ["semantic_match", "graph_entity_match"],
+                    "source_ref_ids": [],
+                    "semantic_disabled": False,
+                }
+            ],
+            warnings=[],
+            semantic_disabled=False,
+        )
+
+        self.assertIn("title: Backend Preference", rendered)
+        self.assertIn("section: facts (synthetic)", rendered)
+        self.assertIn("next_step: use memory_get(document_id=..., section_path=...)", rendered)
+
     def test_default_registry_exposes_basic_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"

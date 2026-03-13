@@ -61,8 +61,10 @@ class MemorySearchToolExecutor:
             "results": [
                 {
                     "document_id": result.document_id,
+                    "title": result.title,
                     "path": str(result.path),
                     "kind": result.kind,
+                    "chunk_id": result.chunk_id,
                     "section_path": result.section_path,
                     "score": result.score,
                     "snippet": result.snippet,
@@ -145,17 +147,24 @@ def _format_memory_search_result(
         lines.append("No memory matched.")
         return "\n".join(lines)
     for index, result in enumerate(results, start=1):
+        section_label = (
+            f"{result['section_path']} (synthetic)"
+            if result["section_path"] in {"facts", "relations"}
+            else result["section_path"]
+        )
         lines.extend(
             [
                 f"{index}. {result['document_id']}",
+                f"title: {result['title']}",
                 f"path: {result['path']}",
                 f"kind: {result['kind']}",
-                f"section: {result['section_path']}",
+                f"section: {section_label}",
                 f"score: {result['score']:.4f}",
                 f"match_reasons: {', '.join(result['match_reasons'])}",
                 f"snippet: {result['snippet']}",
             ]
         )
+    lines.append("next_step: use memory_get(document_id=..., section_path=...) before relying on a snippet")
     return "\n".join(lines)
 
 

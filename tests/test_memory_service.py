@@ -105,6 +105,44 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             document_text = await service.get_document(document_id=created.document_id)
             self.assertIn("Scott is currently developing Jarvis as the best AI assistant.", document_text)
 
+    async def test_upsert_summary_only_retitled_memory_updates_summary_section_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="User routine: morning run",
+                summary="Scott runs in the morning.",
+            )
+
+            updated = await service.write(
+                operation="upsert",
+                target_kind="ongoing",
+                document_id=created.document_id,
+                title="User routine: evening run",
+                summary="Scott runs in the evening.",
+            )
+
+            updated_document = service._store.read_document(updated.path)
+
+            self.assertFalse(created.path.exists())
+            self.assertTrue(updated.path.exists())
+            self.assertEqual(updated.changed_paths, (created.path, updated.path))
+            self.assertEqual(updated.path.name, "user-routine-evening-run.md")
+            self.assertEqual(updated_document.title, "User routine: evening run")
+            self.assertEqual(updated_document.summary, "Scott runs in the evening.")
+            self.assertEqual(updated_document.sections["Summary"], "Scott runs in the evening.")
+
+            document_text = await service.get_document(document_id=created.document_id)
+            self.assertIn("Scott runs in the evening.", document_text)
+            self.assertNotIn("Scott runs in the morning.", document_text)
+
     async def test_search_repairs_stale_summary_only_index_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -176,6 +214,50 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.results[0].document_id, created.document_id)
             reconciled_text = await service.get_document(document_id=created.document_id)
             self.assertIn("blunt review findings", reconciled_text)
+
+    async def test_integrity_check_warns_on_summary_and_title_path_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="core",
+                title="User routine: morning run",
+                summary="Scott runs in the morning.",
+            )
+
+            drifted_text = created.path.read_text(encoding="utf-8")
+            drifted_text = drifted_text.replace(
+                "title: 'User routine: morning run'",
+                "title: 'User routine: evening run'",
+                1,
+            ).replace(
+                "# User routine: morning run",
+                "# User routine: evening run",
+                1,
+            ).replace(
+                "summary: Scott runs in the morning.",
+                "summary: Scott runs in the evening.",
+                1,
+            )
+            created.path.write_text(drifted_text, encoding="utf-8")
+
+            issues = await service.integrity_check()
+            issue_codes = {issue.code for issue in issues}
+
+            self.assertIn("title_path_mismatch", issue_codes)
+            self.assertIn("summary_section_mismatch", issue_codes)
+
+            runs = await service.run_due_maintenance()
+            integrity_run = next(run for run in runs if run.job_name == "integrity_check")
+
+            self.assertEqual(integrity_run.status, "warning")
+            self.assertGreaterEqual(integrity_run.summary["issue_count"], 2)
 
     async def test_bootstrap_preview_includes_core_and_ongoing_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -609,6 +609,7 @@ Problem:
 
 - Semantic retrieval is now expected to be live in the current container/runtime path.
 - The next pass should treat semantic search as an active retrieval channel to measure and tune, not as missing infrastructure.
+- Reminder from end-to-end transcript review: hybrid search can still surface semantic-only junk hits for weak or no-match queries. Concrete examples seen in the transcript: a morning-run query returned unrelated hike/Jarvis-improvement memories, and a Three.js project query returned daily-log and run-routine memories. Phase 4 should treat this as an explicit tuning target rather than assuming current semantic recall quality is acceptable.
 
 Implementation intent:
 
@@ -619,6 +620,7 @@ Implementation intent:
   - semantic candidates carry real distance/similarity values
   - semantic search materially improves recall when lexical overlap is weak
 - Only if that verification fails should the next agent investigate the `sqlite-vec` override build path or embedding initialization path.
+- This is also the place to add bounded weak-result suppression, such as minimum semantic-score thresholds or down-ranking semantic-only hits when lexical and graph support are both absent.
 
 Files likely involved:
 

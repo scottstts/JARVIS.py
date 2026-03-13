@@ -166,12 +166,23 @@ class DirtyDocument:
 @dataclass(slots=True, frozen=True)
 class SearchCandidate:
     document_id: str
+    title: str
     path: Path
     kind: MemoryKind
+    chunk_id: str
     section_path: str
     snippet: str
     source_ref_ids: tuple[str, ...]
+    updated_at: str
+    status: str
+    pinned: bool = False
+    priority: int | None = None
+    review_after: str | None = None
+    expires_at: str | None = None
+    archived_at: str | None = None
+    lexical_raw_score: float | None = None
     lexical_score: float = 0.0
+    semantic_distance: float | None = None
     semantic_score: float = 0.0
     graph_score: float = 0.0
     recency_score: float = 0.0
@@ -182,8 +193,10 @@ class SearchCandidate:
 @dataclass(slots=True, frozen=True)
 class MemorySearchResult:
     document_id: str
+    title: str
     path: Path
     kind: MemoryKind
+    chunk_id: str
     section_path: str
     score: float
     snippet: str
@@ -232,8 +245,6 @@ class ReflectionAction:
         "close_ongoing",
         "create_core",
         "update_core",
-        "add_relation",
-        "supersede_relation",
         "ignore",
     ]
     confidence: ConfidenceLevel
