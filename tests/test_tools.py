@@ -6,6 +6,7 @@ from base64 import b64decode, b64encode
 from dataclasses import dataclass
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -2119,6 +2120,123 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("You are helping another agent", captured["config"].system_instruction)
         self.assertIn(custom_objectives, captured["config"].system_instruction)
         self.assertIn("release date", result.content)
+
+    async def test_youtube_executes_transcript_mode_with_defuddle(self) -> None:
+        captured_commands: list[list[str]] = []
+
+        def _fake_curl_run(*args, **kwargs):
+            command = args[0]
+            captured_commands.append(command)
+            self.assertEqual(
+                command[:5],
+                ["curl", "--fail", "--silent", "--show-error", "--location"],
+            )
+            self.assertTrue(command[5].startswith("https://defuddle.md/"))
+            self.assertTrue(kwargs["capture_output"])
+            self.assertTrue(kwargs["text"])
+            self.assertEqual(kwargs["encoding"], "utf-8")
+            self.assertFalse(kwargs["check"])
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="# Transcript\n\nThe speaker confirms the launch date.\n",
+                stderr="",
+            )
+
+        class _FailIfCalledGeminiClient:
+            def __init__(self, *, api_key: str) -> None:
+                _ = api_key
+                raise AssertionError(
+                    "Gemini client should not be created in transcript mode."
+                )
+
+        with patch(
+            "tools.discoverable.youtube.tool.subprocess.run",
+            side_effect=_fake_curl_run,
+        ):
+            with patch(
+                "tools.discoverable.youtube.tool.genai.Client",
+                _FailIfCalledGeminiClient,
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_youtube_transcript",
+                        name="youtube",
+                        arguments={
+                            "video_urls": [
+                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                "https://youtu.be/3JZ_D3ELwOQ?t=43",
+                            ],
+                            "objectives": "Only summarize release timing.",
+                            "transcript": True,
+                        },
+                        raw_arguments=(
+                            '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ",'
+                            '"https://youtu.be/3JZ_D3ELwOQ?t=43"],'
+                            '"objectives":"Only summarize release timing.",'
+                            '"transcript":true}'
+                        ),
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["provider"], "defuddle")
+        self.assertEqual(result.metadata["mode"], "transcript")
+        self.assertTrue(result.metadata["transcript_requested"])
+        self.assertTrue(result.metadata["objectives_ignored"])
+        self.assertEqual(result.metadata["video_count"], 2)
+        self.assertEqual(len(captured_commands), 2)
+        self.assertEqual(
+            captured_commands[0][5],
+            "https://defuddle.md/https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ",
+        )
+        self.assertEqual(
+            captured_commands[1][5],
+            "https://defuddle.md/https%3A%2F%2Fyoutu.be%2F3JZ_D3ELwOQ%3Ft%3D43",
+        )
+        self.assertIn("YouTube transcript retrieval completed", result.content)
+        self.assertIn("objectives_ignored: yes", result.content)
+        self.assertIn("# Transcript", result.content)
+
+    async def test_youtube_transcript_mode_reports_curl_failure(self) -> None:
+        def _fake_curl_run(*args, **kwargs):
+            _ = kwargs
+            return subprocess.CompletedProcess(
+                args=args[0],
+                returncode=22,
+                stdout="",
+                stderr="HTTP 502 from defuddle",
+            )
+
+        with patch(
+            "tools.discoverable.youtube.tool.subprocess.run",
+            side_effect=_fake_curl_run,
+        ):
+            result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_youtube_transcript_failure",
+                    name="youtube",
+                    arguments={
+                        "video_urls": [
+                            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        ],
+                        "transcript": True,
+                    },
+                    raw_arguments=(
+                        '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],'
+                        '"transcript":true}'
+                    ),
+                ),
+                context=self.context,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.metadata["provider"], "defuddle")
+        self.assertEqual(result.metadata["mode"], "transcript")
+        self.assertTrue(result.metadata["transcript_requested"])
+        self.assertIn("YouTube transcript retrieval failed", result.content)
+        self.assertIn("HTTP 502 from defuddle", result.content)
 
     async def test_youtube_invalid_urls_fail_before_execution(self) -> None:
         result = await self.runtime.execute(

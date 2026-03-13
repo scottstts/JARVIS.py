@@ -807,17 +807,21 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 - `video_urls: string[]` required; list of one or more valid YouTube video URLs
 - `objectives: string` optional; replaces the default summary task while preserving the tool's shared system instruction when provided
+- `transcript: boolean` optional; defaults to `false`; when `true`, ignores `objectives` and returns transcript text for each video via Defuddle instead of running Gemini
 
 #### Executor Behavior
 
 - stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
-- uses Gemini model `gemini-3-flash-preview`
-- sends each public YouTube URL to Gemini as a video input part and appends a short text prompt after the video parts, following the current Gemini video-understanding guidance
-- always keeps a built-in shared system instruction with universal context and guidelines
-- uses a built-in summary-oriented task objective by default
-- replaces only that default task objective when `objectives` is provided
+- when `transcript=false`, uses Gemini model `gemini-3-flash-preview`
+- when `transcript=false`, sends each public YouTube URL to Gemini as a video input part and appends a short text prompt after the video parts, following the current Gemini video-understanding guidance
+- when `transcript=false`, always keeps a built-in shared system instruction with universal context and guidelines
+- when `transcript=false`, uses a built-in summary-oriented task objective by default
+- when `transcript=false`, replaces only that default task objective when `objectives` is provided
+- when `transcript=true`, ignores `objectives` and internally runs `curl` against `https://defuddle.md/<encoded-youtube-url>` for each provided URL, returning the transcript text as the tool result
+- use `transcript=true` when exact dialogue or narration wording matters
+- use `transcript=false` when the agent wants overview, focused question answering, or analysis that depends on visual content or broader audio cues beyond the transcript
 - validates all `video_urls` before execution and returns an indexed invalid-URL error instead of making the Gemini call when any URL is malformed
-- returns normalized metadata including provider, model, video count, objectives source, response size, and usage metadata when Gemini returns it
+- returns normalized metadata including provider, mode, video count, and response size; Gemini mode additionally records model, objectives source, and usage metadata when available
 
 #### Policy
 
@@ -828,8 +832,8 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 #### Current Limitations
 
 - v1 only does simple regex validation; it does not verify that a valid-looking YouTube URL is actually reachable, public, or still available
-- the tool is text-output only; it does not expose structured extraction or timestamp-specific controls beyond what the caller writes into the task-specific `objectives`
-- the tool relies on `GOOGLE_API_KEY` at runtime and does not currently support alternate providers
+- the tool is text-output only; transcript mode returns raw Defuddle text and Gemini mode does not expose structured extraction or timestamp-specific controls beyond what the caller writes into `objectives`
+- Gemini analysis mode relies on `GOOGLE_API_KEY`; transcript mode instead depends on local `curl` plus Defuddle service availability
 
 ### `ffmpeg_cli`
 
