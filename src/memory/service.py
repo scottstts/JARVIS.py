@@ -526,7 +526,7 @@ class MemoryService:
         for document in documents:
             await self._index_document(document)
             indexed_paths.append(document.path)
-        await self._apply_relation_conflicts()
+        self._refresh_truth_signals()
         self._index_db.clear_dirty_documents(tuple(item.path for item in existing_dirty))
         return tuple(indexed_paths)
 
@@ -856,7 +856,7 @@ class MemoryService:
                 continue
             await self._index_document(document)
             processed_paths.append(dirty.path)
-        await self._apply_relation_conflicts()
+        self._refresh_truth_signals()
         self._index_db.clear_dirty_documents(tuple(processed_paths))
 
     async def _index_document(self, document: MemoryDocument) -> MemoryDocument:
@@ -887,7 +887,7 @@ class MemoryService:
         )
         persisted = self._store.write_document(document, previous_path=previous_path)
         await self._index_document(persisted)
-        await self._apply_relation_conflicts()
+        self._refresh_truth_signals()
         if run_dirty_scan:
             await self.ensure_index_synced()
         return self._store.read_document(persisted.path)
@@ -1107,51 +1107,7 @@ class MemoryService:
             )
         return persisted
 
-    async def _apply_relation_conflicts(self) -> None:
-        documents = [document for document in self._store.read_all_documents() if document.kind in {"core", "ongoing"} and not document.archived]
-        groups: dict[tuple[str, str], list[tuple[MemoryDocument, Relation]]] = {}
-        for document in documents:
-            for relation in document.relations:
-                if relation.status != "current" or relation.cardinality != "single":
-                    continue
-                groups.setdefault((relation.subject, relation.predicate), []).append((document, relation))
-
-        for _key, entries in groups.items():
-            if len({relation.object for _document, relation in entries}) <= 1:
-                continue
-            entries.sort(key=lambda item: item[0].updated_at)
-            winner_document, winner_relation = entries[-1]
-            for document, relation in entries[:-1]:
-                if document.locked:
-                    continue
-                if relation.object == winner_relation.object:
-                    continue
-                next_relations = []
-                changed = False
-                for existing in document.relations:
-                    if existing.relation_id != relation.relation_id:
-                        next_relations.append(existing)
-                        continue
-                    next_relations.append(
-                        replace(
-                            existing,
-                            status="superseded",
-                            valid_to=winner_document.updated_at,
-                            last_seen_at=winner_document.updated_at,
-                        )
-                    )
-                    changed = True
-                if changed:
-                    await self._persist_document(
-                        replace(
-                            document,
-                            relations=tuple(next_relations),
-                            updated_at=_utc_now_iso(),
-                        ),
-                        run_dirty_scan=False,
-                        allow_locked=False,
-                        existing_document=document,
-                    )
+    def _refresh_truth_signals(self) -> None:
         self._index_db.refresh_truth_signals()
 
     async def _integrity_check_dicts(self) -> list[dict[str, Any]]:

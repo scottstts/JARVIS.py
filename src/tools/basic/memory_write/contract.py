@@ -19,6 +19,10 @@ RELATION_EXAMPLE = (
 BODY_SECTIONS_EXAMPLE = (
     '{"Overview":"Scott is building a Three.js/WebGPU/TSL shader playground."}'
 )
+FACTS_USAGE_GUIDANCE = (
+    'Prefer real fact objects in facts whenever the user states an explicit durable fact; '
+    'use the literal string "None" only when there is genuinely no worthwhile fact to store.'
+)
 MEMORY_WRITE_EXAMPLE = (
     f"facts={FACT_EXAMPLE}; relations={RELATION_EXAMPLE}; "
     f"body_sections={BODY_SECTIONS_EXAMPLE}"
@@ -103,7 +107,8 @@ def format_memory_write_contract_error(
     if operation in {"create", "upsert"} and target_kind in {"core", "ongoing"}:
         prefix = (
             "Invalid memory_write payload. For core/ongoing create and upsert, facts and relations "
-            'are explicit-decision fields, and summary is not a substitute.'
+            "are explicit-decision fields, and summary is not a substitute. "
+            f"{FACTS_USAGE_GUIDANCE}"
         )
     return (
         f"{prefix} Fix all of these before retrying: {'; '.join(errors)}. "

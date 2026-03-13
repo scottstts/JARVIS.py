@@ -256,6 +256,7 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("rewrite the memory content", tool.definition.description.lower())
         self.assertIn("facts and relations are explicit-decision fields", tool.definition.description.lower())
         self.assertIn("explicit durable fact", tool.definition.description.lower())
+        self.assertIn("prefer real fact objects in facts whenever the user states an explicit durable fact", tool.definition.description.lower())
         self.assertIn("subject-predicate-object", tool.definition.description.lower())
         self.assertIn("minimal valid shapes", tool.definition.description.lower())
         self.assertIn("example payload pieces", tool.definition.description.lower())
@@ -268,6 +269,8 @@ class ToolSettingsTests(unittest.TestCase):
 
         self.assertIn("close and archive are superseding transitions", operation_description)
         self.assertIn("durable fact", facts_description)
+        self.assertIn("prefer using real fact objects here whenever the user states an explicit durable fact", facts_description)
+        self.assertIn("genuinely no worthwhile fact to store", facts_description)
         self.assertIn("summary/body text", facts_description)
         self.assertIn('literal string "none"', facts_description)
         self.assertIn('{"text":"..."}', facts_description)
@@ -647,6 +650,10 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertIn("facts and relations", decision.reason or "")
         self.assertIn('literal string "None"', decision.reason or "")
         self.assertIn("summary is not a substitute", decision.reason or "")
+        self.assertIn(
+            "prefer real fact objects in facts whenever the user states an explicit durable fact",
+            (decision.reason or "").lower(),
+        )
 
     def test_memory_write_policy_denies_empty_truth_arrays(self) -> None:
         decision = self.policy.authorize(
@@ -1457,6 +1464,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("Tool execution denied by policy", result.content)
         self.assertIn("summary is not a substitute", result.content)
+        self.assertIn(
+            "prefer real fact objects in facts whenever the user states an explicit durable fact",
+            result.content.lower(),
+        )
 
     async def test_memory_write_runtime_accepts_explicit_none_truth_decision(self) -> None:
         memory_service = MemoryService(

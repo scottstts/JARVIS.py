@@ -10,6 +10,7 @@ from .contract import (
     BODY_SECTIONS_SCHEMA,
     FACT_EXAMPLE,
     FACT_ITEM_SCHEMA,
+    FACTS_USAGE_GUIDANCE,
     MEMORY_WRITE_EXAMPLE,
     RELATION_EXAMPLE,
     RELATION_ITEM_SCHEMA,
@@ -123,6 +124,7 @@ def build_memory_write_tool() -> RegisteredTool:
                 "For core and ongoing create/upsert operations, facts and relations are explicit-decision fields: always set both. "
                 "When the user states an explicit durable fact, pass it in facts; when they state a structured relationship, "
                 "current preference, tool usage, ownership, or other subject-predicate-object claim, pass it in relations. "
+                f"{FACTS_USAGE_GUIDANCE} "
                 'If there is genuinely no structured truth worth storing for one field, pass the literal string "None". '
                 "summary is not a substitute for facts or relations. "
                 "Minimal valid shapes: fact items use text/status, relation items use subject/predicate/object/status/cardinality, "
@@ -157,6 +159,7 @@ def build_memory_write_tool() -> RegisteredTool:
                             "Short summary text. For append_daily, summary-only writes are recorded "
                             "under Notable Events when body_sections are omitted. "
                             "For core/ongoing create and upsert, summary is not a substitute for facts or relations; "
+                            "if summary states an explicit durable fact, mirror that into facts instead of defaulting to None. "
                             'you must still explicitly provide both fields as structured arrays or the literal string "None". '
                             "For close/archive superseding transitions, provide the rewritten terminal summary here instead of leaving the old active wording."
                         ),
@@ -189,6 +192,8 @@ def build_memory_write_tool() -> RegisteredTool:
                         "description": (
                             "Explicit fact statements to track as structured memory. "
                             "Use this when the user gives a durable fact directly instead of burying that fact only in summary/body text. "
+                            "Prefer using real fact objects here whenever the user states an explicit durable fact. "
+                            'Use the literal string "None" only when there is genuinely no worthwhile fact to store. '
                             'Each fact object should use at least {"text":"..."} and may also include status/currentness fields. '
                             f"Minimal example: {FACT_EXAMPLE}. "
                             'For core/ongoing create and upsert, this field is an explicit-decision field: pass a non-empty structured array or the literal string "None".'

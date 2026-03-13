@@ -11,8 +11,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from llm import EmbeddingRequest, EmbeddingResponse, LLMResponse, LLMUsage
-from memory import MemoryService, MemorySettings
+from memory import MemoryService, MemorySettings, SearchCandidate
 from memory.bootstrap import render_core_bootstrap, render_ongoing_bootstrap
+from memory.retrieval import _fuse_candidates
 from storage.types import ConversationRecord
 
 
@@ -811,6 +812,209 @@ class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(row["last_contradicted_at"] for row in conflict_rows))
             self.assertTrue(all(int(row["contradiction_count"]) >= 1 for row in conflicting_document_rows))
             self.assertTrue(all(row["last_contradicted_at"] for row in conflicting_document_rows))
+
+    async def test_active_conflicts_remain_canonical_and_populate_truth_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(settings=MemorySettings.from_workspace_dir(workspace_dir), llm_service=None)
+
+            supporting_one = await service.write(
+                operation="create",
+                target_kind="core",
+                title="Backend Preference A",
+                summary="Scott prefers Python for backend APIs.",
+                facts=[{"text": "Scott prefers Python for backend APIs."}],
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "prefers_for",
+                        "object": "Python backend APIs",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "single",
+                    }
+                ],
+            )
+            supporting_two = await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Backend Preference B",
+                summary="Scott still prefers Python for backend APIs.",
+                facts=[{"text": "Scott prefers Python for backend APIs."}],
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "prefers_for",
+                        "object": "Python backend APIs",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "single",
+                    }
+                ],
+            )
+            conflicting = await service.write(
+                operation="create",
+                target_kind="ongoing",
+                title="Backend Preference Conflict",
+                summary="Scott currently prefers Go for backend APIs.",
+                facts=[{"text": "Scott currently prefers Go for backend APIs."}],
+                relations=[
+                    {
+                        "subject": "Scott",
+                        "predicate": "prefers_for",
+                        "object": "Go backend APIs",
+                        "status": "current",
+                        "confidence": "high",
+                        "cardinality": "single",
+                    }
+                ],
+            )
+
+            persisted_supporting_one = service._store.read_document(supporting_one.path)
+            persisted_supporting_two = service._store.read_document(supporting_two.path)
+            persisted_conflicting = service._store.read_document(conflicting.path)
+
+            for document in (persisted_supporting_one, persisted_supporting_two, persisted_conflicting):
+                self.assertTrue(all(fact.status == "current" for fact in document.facts))
+                self.assertTrue(all(relation.status == "current" for relation in document.relations))
+            self.assertIn("Python", persisted_supporting_one.summary or "")
+            self.assertIn("Python", persisted_supporting_two.summary or "")
+            self.assertIn("Go", persisted_conflicting.summary or "")
+
+            with service._index_db._connect_main() as conn:
+                relation_rows = conn.execute(
+                    """
+                    select
+                        document_id,
+                        status,
+                        support_count,
+                        contradiction_count,
+                        last_confirmed_at,
+                        last_contradicted_at
+                    from relations
+                    where document_id in (?, ?, ?)
+                      and predicate = 'prefers_for'
+                    order by document_id asc
+                    """,
+                    (
+                        supporting_one.document_id,
+                        supporting_two.document_id,
+                        conflicting.document_id,
+                    ),
+                ).fetchall()
+                document_rows = conn.execute(
+                    """
+                    select
+                        document_id,
+                        support_count,
+                        contradiction_count,
+                        last_confirmed_at,
+                        last_contradicted_at
+                    from documents
+                    where document_id in (?, ?, ?)
+                    order by document_id asc
+                    """,
+                    (
+                        supporting_one.document_id,
+                        supporting_two.document_id,
+                        conflicting.document_id,
+                    ),
+                ).fetchall()
+
+            relation_map = {str(row["document_id"]): dict(row) for row in relation_rows}
+            document_map = {str(row["document_id"]): dict(row) for row in document_rows}
+
+            self.assertEqual(relation_map[supporting_one.document_id]["status"], "current")
+            self.assertEqual(relation_map[supporting_two.document_id]["status"], "current")
+            self.assertEqual(relation_map[conflicting.document_id]["status"], "current")
+            self.assertEqual(int(relation_map[supporting_one.document_id]["support_count"]), 1)
+            self.assertEqual(int(relation_map[supporting_two.document_id]["support_count"]), 1)
+            self.assertEqual(int(relation_map[conflicting.document_id]["support_count"]), 0)
+            self.assertEqual(int(relation_map[supporting_one.document_id]["contradiction_count"]), 1)
+            self.assertEqual(int(relation_map[supporting_two.document_id]["contradiction_count"]), 1)
+            self.assertEqual(int(relation_map[conflicting.document_id]["contradiction_count"]), 2)
+            self.assertTrue(relation_map[supporting_one.document_id]["last_confirmed_at"])
+            self.assertTrue(relation_map[supporting_two.document_id]["last_confirmed_at"])
+            self.assertIsNone(relation_map[conflicting.document_id]["last_confirmed_at"])
+            self.assertTrue(relation_map[supporting_one.document_id]["last_contradicted_at"])
+            self.assertTrue(relation_map[supporting_two.document_id]["last_contradicted_at"])
+            self.assertTrue(relation_map[conflicting.document_id]["last_contradicted_at"])
+
+            self.assertEqual(int(document_map[supporting_one.document_id]["support_count"]), 2)
+            self.assertEqual(int(document_map[supporting_two.document_id]["support_count"]), 2)
+            self.assertEqual(int(document_map[conflicting.document_id]["support_count"]), 0)
+            self.assertEqual(int(document_map[supporting_one.document_id]["contradiction_count"]), 1)
+            self.assertEqual(int(document_map[supporting_two.document_id]["contradiction_count"]), 1)
+            self.assertEqual(int(document_map[conflicting.document_id]["contradiction_count"]), 2)
+            self.assertTrue(document_map[supporting_one.document_id]["last_confirmed_at"])
+            self.assertTrue(document_map[supporting_two.document_id]["last_confirmed_at"])
+            self.assertIsNone(document_map[conflicting.document_id]["last_confirmed_at"])
+            self.assertTrue(document_map[supporting_one.document_id]["last_contradicted_at"])
+            self.assertTrue(document_map[supporting_two.document_id]["last_contradicted_at"])
+            self.assertTrue(document_map[conflicting.document_id]["last_contradicted_at"])
+
+    async def test_hybrid_fusion_penalizes_recent_contradictions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = MemorySettings.from_workspace_dir(workspace_dir)
+            updated_at = "2026-03-13T12:00:00+00:00"
+            confirmed_at = "2026-03-13T11:30:00+00:00"
+            contradicted_at = "2026-03-13T11:45:00+00:00"
+
+            candidates = (
+                SearchCandidate(
+                    document_id="doc_clean",
+                    title="Supported Preference",
+                    path=Path("/tmp/doc_clean.md"),
+                    kind="core",
+                    chunk_id="document:doc_clean",
+                    section_path="Summary",
+                    snippet="Scott prefers Python for backend APIs.",
+                    source_ref_ids=(),
+                    updated_at=updated_at,
+                    status="active",
+                    truth_status="current",
+                    support_count=1,
+                    contradiction_count=0,
+                    last_confirmed_at=confirmed_at,
+                    lexical_score=0.72,
+                    semantic_score=0.0,
+                    graph_score=0.0,
+                    match_reasons=("lexical_keywords",),
+                ),
+                SearchCandidate(
+                    document_id="doc_conflicted",
+                    title="Conflicted Preference",
+                    path=Path("/tmp/doc_conflicted.md"),
+                    kind="core",
+                    chunk_id="document:doc_conflicted",
+                    section_path="Summary",
+                    snippet="Scott prefers Go for backend APIs.",
+                    source_ref_ids=(),
+                    updated_at=updated_at,
+                    status="active",
+                    truth_status="current",
+                    support_count=1,
+                    contradiction_count=2,
+                    last_confirmed_at=confirmed_at,
+                    last_contradicted_at=contradicted_at,
+                    lexical_score=0.72,
+                    semantic_score=0.0,
+                    graph_score=0.0,
+                    match_reasons=("lexical_keywords",),
+                ),
+            )
+
+            fused = _fuse_candidates(
+                candidates,
+                query="What do I currently prefer for backend APIs?",
+                settings=settings,
+            )
+
+            self.assertEqual([item.document_id for item in fused], ["doc_clean", "doc_conflicted"])
+            self.assertGreater(fused[0].fused_score, fused[1].fused_score)
 
     async def test_hybrid_search_keeps_strong_semantic_hit_and_suppresses_weak_tail(self) -> None:
         fake_llm = _SemanticTuningLLM()
