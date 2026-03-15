@@ -1,26 +1,19 @@
-# Dockerfile.dev
 FROM python:3.12-slim
 
-# Basic utilities + agent bash-tool command dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash git curl ca-certificates tini \
-    bubblewrap \
-    file gcc libc6-dev libsqlite3-dev ripgrep zip unzip \
-    ffmpeg \
+    bash \
+    ca-certificates \
+    gcc \
+    libc6-dev \
+    libsqlite3-dev \
+    tini \
   && rm -rf /var/lib/apt/lists/*
 
-# Install uv (Astral's installer)
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-  && ln -s /root/.local/bin/uv /usr/local/bin/uv
-
-# Install ruff (Astral's installer)
-RUN curl -LsSf https://astral.sh/ruff/install.sh | sh \
-  && ln -s /root/.local/bin/ruff /usr/local/bin/ruff
+RUN python -m pip install --no-cache-dir uv ruff
 
 # (Optional but handy) common python dev env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    JARVIS_TOOL_PYTHON_INTERPRETER_VENV=/opt/jarvis-python-tool-venv \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     SQLITE_VEC_VENDOR_VERSION=v0.1.7-alpha.10 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
@@ -31,9 +24,6 @@ COPY pyproject.toml uv.lock ./
 COPY src/settings.py ./src/settings.py
 COPY vendor/sqlite-vec ./vendor/sqlite-vec
 
-# Install locked Python dependencies into an image-level venv so the bind-mounted repo
-# does not hide them at runtime, pre-download Chromium for Playwright fallback,
-# and prepare the dedicated sandboxed interpreter venv for the future tool.
 RUN mkdir -p /opt/sqlite-vec \
   && gcc -O3 -fPIC -shared \
        "/tmp/jarvis-deps/vendor/sqlite-vec/${SQLITE_VEC_VENDOR_VERSION}/amalgamation/sqlite-vec.c" \
@@ -42,11 +32,7 @@ RUN mkdir -p /opt/sqlite-vec \
   && python -c "import os, sqlite3; conn = sqlite3.connect(':memory:'); conn.enable_load_extension(True); conn.load_extension('/opt/sqlite-vec/vec0'); conn.enable_load_extension(False); version = conn.execute('select vec_version()').fetchone()[0]; expected = os.environ['SQLITE_VEC_VENDOR_VERSION']; assert version == expected, (version, expected)" \
   && uv sync --frozen --no-install-project \
   && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" pytest \
-  && python -m playwright install --with-deps chromium \
-  && python -m venv "${JARVIS_TOOL_PYTHON_INTERPRETER_VENV}" \
-  && export JARVIS_PYTHON_TOOL_PACKAGES="$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('jarvis_settings', 'src/settings.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(' '.join(module.JARVIS_TOOL_PYTHON_INTERPRETER_ALLOWED_PACKAGES))")" \
-  && uv pip install --python "${JARVIS_TOOL_PYTHON_INTERPRETER_VENV}/bin/python" \
-       ${JARVIS_PYTHON_TOOL_PACKAGES}
+  && python -m playwright install --with-deps chromium
 
 # Work in the mounted workspace by default
 WORKDIR /workspace

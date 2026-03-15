@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 from core.config import ContextPolicySettings, CoreSettings
@@ -15,6 +17,10 @@ def build_core_settings(
     compact_reserve_output_tokens: int = 16_000,
     compact_reserve_overhead_tokens: int = 10_000,
 ) -> CoreSettings:
+    if os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"):
+        shared_root_dir = Path(tempfile.mkdtemp(prefix="jarvis-test-", dir="/workspace"))
+        root_dir = shared_root_dir
+
     identities_dir = root_dir / "identities"
     workspace_dir = root_dir / "workspace"
     identities_dir.mkdir(parents=True, exist_ok=True)

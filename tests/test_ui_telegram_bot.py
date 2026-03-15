@@ -737,6 +737,65 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_approval_status_edit_preserves_original_html_formatting(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayApprovalRequestEvent(
+                    session_id="session",
+                    approval_id="approval_1",
+                    kind="bash_command",
+                    summary="Install a CLI.",
+                    details="I want to install a CLI for this task.",
+                    command="curl https://example.com/install.sh | sh",
+                    tool_name="bash",
+                    inspection_url="https://example.com",
+                ),
+                GatewayTurnDoneEvent(
+                    session_id="session",
+                    response_text="",
+                    interrupted=True,
+                ),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        await bridge.handle_approval_callback(
+            IncomingTelegramApprovalCallback(
+                update_id=2,
+                callback_query_id="callback_1",
+                chat_id=777,
+                message_id=1,
+                sender_user_id=777,
+                approval_id="approval_1",
+                approved=True,
+                message_text="Approval required\nsummary: Install a CLI.",
+            )
+        )
+
+        self.assertEqual(gateway.approval_calls, [("tg_777", "approval_1", True)])
+        self.assertEqual(len(telegram.edited_messages), 1)
+        self.assertEqual(telegram.edited_messages[0].parse_mode, "HTML")
+        self.assertEqual(
+            telegram.edited_messages[0].text,
+            "<b>Approval required</b>\n"
+            "<b>summary:</b> Install a CLI.\n"
+            "<b>details:</b> I want to install a CLI for this task.\n"
+            "<b>tool_name:</b> bash\n"
+            "<b>command:</b>\n"
+            "<pre>curl https://example.com/install.sh | sh</pre>\n"
+            "<b>inspect:</b> https://example.com\n\n"
+            "<b>Status:</b> Approved",
+        )
+
     async def test_handle_message_preserves_tool_notice_when_tool_event_arrives_first(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(

@@ -4,6 +4,11 @@
 
 This document defines the implementation plan for runtime tool registration and approval-gated tool installation/building in Jarvis.
 
+Status note:
+
+- The active execution topology for `bash` and `python_interpreter` is now the isolated sibling `tool_runtime` container described in `dev_docs/tool_runtime_isolation_plan.md`.
+- Read this document together with that isolation plan; where this document still mentions the old in-app sandbox shape, the isolation plan and current code take precedence.
+
 The target outcome is:
 
 - the agent can install or build tools at runtime, mostly through `bash`

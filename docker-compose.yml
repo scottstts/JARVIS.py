@@ -4,15 +4,17 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     container_name: jarvis
-    cap_add:
-      - SYS_ADMIN
+    depends_on:
+      - tool_runtime
     shm_size: 512m
-    security_opt:
-      - seccomp:unconfined
     volumes:
       - ./:/repo
       - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace
       - uv_cache:/root/.cache/uv
+    environment:
+      JARVIS_TOOL_RUNTIME_BASE_URL: http://tool_runtime:8081
+      JARVIS_TOOL_RUNTIME_TIMEOUT_SECONDS: 45
+      JARVIS_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS: 5
     secrets:
       - OPENAI_API_KEY
       - ANTHROPIC_API_KEY
@@ -34,8 +36,43 @@ services:
     tty: true
     stdin_open: true
 
+  tool_runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile.tool_runtime
+    container_name: jarvis_tool_runtime
+    cap_add:
+      - SYS_ADMIN
+    shm_size: 512m
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ${AGENT_ROOT:-${HOME}/.jarvis/workspace}:/workspace
+      - tool_runtime_uv_cache:/root/.cache/uv
+    environment:
+      JARVIS_TOOL_RUNTIME_SERVICE_HOST: 0.0.0.0
+      JARVIS_TOOL_RUNTIME_SERVICE_PORT: 8081
+    working_dir: /workspace
+    command:
+      - python
+      - -m
+      - tool_runtime_service
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=5)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   uv_cache:
+  tool_runtime_uv_cache:
 
 secrets:
   OPENAI_API_KEY:

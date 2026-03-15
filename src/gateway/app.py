@@ -25,6 +25,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
+from tools.config import ToolSettings
+from tools.remote_runtime_client import ensure_remote_tool_runtime_healthy
 
 from .config import GatewaySettings
 from .protocol import (
@@ -71,14 +73,19 @@ def create_app(
 ) -> Starlette:
     resolved_gateway_settings = gateway_settings or GatewaySettings.from_env()
     resolved_llm_service = llm_service
+    resolved_tool_settings: ToolSettings | None = None
     owns_llm_service = False
     if router is None:
+        resolved_core_settings = core_settings or CoreSettings.from_env()
         if resolved_llm_service is None:
             resolved_llm_service = LLMService()
             owns_llm_service = True
         resolved_router = _build_default_router(
-            core_settings=core_settings,
+            core_settings=resolved_core_settings,
             llm_service=resolved_llm_service,
+        )
+        resolved_tool_settings = ToolSettings.from_workspace_dir(
+            resolved_core_settings.workspace_dir
         )
     else:
         resolved_router = router
@@ -86,6 +93,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         try:
+            if resolved_tool_settings is not None:
+                await ensure_remote_tool_runtime_healthy(resolved_tool_settings)
             yield
         finally:
             if owns_llm_service and resolved_llm_service is not None:

@@ -14,8 +14,6 @@ _INSTALL_KEYWORDS = (
     "apt-get update",
     "pip install",
     "pip3 install",
-    "python -m pip install",
-    "python3 -m pip install",
     "uv tool install",
     "uv pip install",
     "npm install -g",
@@ -30,13 +28,77 @@ _INSTALL_KEYWORDS = (
     "pipx install",
     "poetry add",
 )
+_COMMAND_PREFIX = r"(?:^|[;&|()]\s*|\n\s*)"
+_OPTIONAL_SUDO = r"(?:sudo\s+)?"
+_OPTIONAL_ENV_WRAPPER = r"(?:env\s+)?"
+_OPTIONAL_ENV_ASSIGNMENTS = r"(?:[a-z_][a-z0-9_]*=[^\s;&|()]+\s+)*"
+_PYTHON_EXECUTABLE = r"(?:python(?:\d+(?:\.\d+)*)?|/(?:[\w.-]+/)*python(?:\d+(?:\.\d+)*)?)"
+_HARD_DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            _COMMAND_PREFIX
+            + _OPTIONAL_SUDO
+            + _OPTIONAL_ENV_WRAPPER
+            + _OPTIONAL_ENV_ASSIGNMENTS
+            + _PYTHON_EXECUTABLE
+            + r"\b"
+        ),
+        "Direct Python execution via bash is denied; use python_interpreter instead.",
+    ),
+    (
+        re.compile(
+            _COMMAND_PREFIX
+            + _OPTIONAL_SUDO
+            + _OPTIONAL_ENV_WRAPPER
+            + _OPTIONAL_ENV_ASSIGNMENTS
+            + r"uv\s+run(?:\s+[^\n;&|()]+)*\s+python(?:\d+(?:\.\d+)*)?\b"
+        ),
+        "Direct Python execution via bash is denied; use python_interpreter instead.",
+    ),
+    (
+        re.compile(
+            _COMMAND_PREFIX
+            + _OPTIONAL_SUDO
+            + r"apt(?:-get)?\s+(?:[^;&|()\n]+\s+)?(?:upgrade|full-upgrade|dist-upgrade)\b"
+        ),
+        "tool_runtime OS upgrade commands are denied.",
+    ),
+    (
+        re.compile(_COMMAND_PREFIX + _OPTIONAL_SUDO + r"do-release-upgrade\b"),
+        "tool_runtime OS upgrade commands are denied.",
+    ),
+    (
+        re.compile(
+            _COMMAND_PREFIX
+            + _OPTIONAL_SUDO
+            + r"(?:systemctl|service|init|telinit|reboot|shutdown|poweroff|halt)\b"
+        ),
+        "tool_runtime service and init control commands are denied.",
+    ),
+    (
+        re.compile(
+            _COMMAND_PREFIX
+            + _OPTIONAL_SUDO
+            + r"(?:mount|umount|swapon|swapoff|modprobe|insmod)\b"
+        ),
+        "tool_runtime mount, kernel, and low-level admin commands are denied.",
+    ),
+    (
+        re.compile(_COMMAND_PREFIX + _OPTIONAL_SUDO + r"sysctl\s+-w\b"),
+        "tool_runtime mount, kernel, and low-level admin commands are denied.",
+    ),
+    (
+        re.compile(_COMMAND_PREFIX + _OPTIONAL_SUDO + r"(?:docker|podman|nerdctl)\b"),
+        "tool_runtime container-runtime recursion is denied.",
+    ),
+)
 _SYSTEM_DESTINATION_PATTERN = re.compile(
     r"\b(?:install|cp|mv|ln|chmod|chown)\b[^\n]*\s"
-    r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*)\s*$"
+    r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*|/var/\S*|/root/\S*)\s*$"
 )
 _SYSTEM_REDIRECT_PATTERN = re.compile(
     r"(?:^|[;&|])[^#\n]*(?:>|>>)\s*"
-    r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*)"
+    r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*|/var/\S*|/root/\S*)"
 )
 
 
@@ -63,6 +125,10 @@ class BashCommandPolicy:
                 reason="bash command cannot contain null bytes.",
             )
 
+        hard_deny_reason = _hard_deny_reason(command)
+        if hard_deny_reason is not None:
+            return ToolPolicyDecision(allowed=False, reason=hard_deny_reason)
+
         if self._settings.bash_dangerously_skip_permission:
             return ToolPolicyDecision(allowed=True)
 
@@ -81,11 +147,12 @@ class BashCommandPolicy:
         details = str(arguments.get("approval_details", "")).strip()
         inspection_url = str(arguments.get("inspection_url", "")).strip()
         if not summary:
-            summary = "Run a bash command that changes the system or installs tooling."
+            summary = "Run a bash command that mutates the isolated tool_runtime container."
         if not details:
             details = (
                 "I want to run a bash command that appears to install, build, or modify "
-                "system-level tooling. Review the exact command before approving."
+                "system-level tooling inside the isolated tool_runtime container. "
+                "Review the exact command before approving."
             )
 
         return ToolPolicyDecision(
@@ -98,8 +165,18 @@ class BashCommandPolicy:
                 "inspection_url": inspection_url or None,
                 "command": command,
                 "detector_reason": detector_reason,
+                "target_runtime": "tool_runtime",
+                "runtime_location": "tool_runtime_container",
             },
         )
+
+
+def _hard_deny_reason(command: str) -> str | None:
+    lowered = command.lower()
+    for pattern, reason in _HARD_DENY_PATTERNS:
+        if pattern.search(lowered):
+            return reason
+    return None
 
 
 def _approval_detector_reason(command: str) -> str | None:
@@ -108,7 +185,7 @@ def _approval_detector_reason(command: str) -> str | None:
         return None
 
     if any(keyword in lowered for keyword in _INSTALL_KEYWORDS):
-        return "matched install or package-manager command pattern"
+        return "matched install or package-manager mutation pattern for tool_runtime"
 
     if ("curl " in lowered or "wget " in lowered) and (
         "| sh" in lowered
@@ -117,12 +194,12 @@ def _approval_detector_reason(command: str) -> str | None:
         or "| python" in lowered
         or "| python3" in lowered
     ):
-        return "matched remote installer pipeline pattern"
+        return "matched remote installer pipeline pattern for tool_runtime"
 
     if _SYSTEM_DESTINATION_PATTERN.search(lowered):
-        return "matched system-path mutation pattern"
+        return "matched non-workspace system-path mutation pattern in tool_runtime"
 
     if _SYSTEM_REDIRECT_PATTERN.search(lowered):
-        return "matched system-path mutation pattern"
+        return "matched non-workspace system-path mutation pattern in tool_runtime"
 
     return None

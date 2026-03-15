@@ -199,6 +199,7 @@ class TelegramGatewayBridge:
         self._draft_min_interval_by_chat: dict[int, float] = {}
         self._chat_queues: dict[int, asyncio.Queue[IncomingTelegramMessage]] = {}
         self._chat_workers: dict[int, asyncio.Task[None]] = {}
+        self._approval_message_html_by_key: dict[tuple[int, int], str] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -288,13 +289,21 @@ class TelegramGatewayBridge:
             callback_query_id=callback.callback_query_id,
             text=decision_text,
         )
-        base_text = callback.message_text or "Approval request"
-        updated_text = f"{base_text}\n\nStatus: {decision_text}"
+        message_key = (callback.chat_id, callback.message_id)
+        stored_html = self._approval_message_html_by_key.pop(message_key, None)
+        if stored_html is not None:
+            updated_text = f"{stored_html}\n\n<b>Status:</b> {html.escape(decision_text)}"
+            parse_mode = "HTML"
+        else:
+            base_text = callback.message_text or "Approval request"
+            updated_text = f"{base_text}\n\nStatus: {decision_text}"
+            parse_mode = None
         try:
             await self._telegram.edit_message_text(
                 chat_id=callback.chat_id,
                 message_id=callback.message_id,
                 text=updated_text,
+                parse_mode=parse_mode,
             )
         except TelegramAPIError:
             LOGGER.exception("Failed to edit Telegram approval message status.")
@@ -743,12 +752,15 @@ class TelegramGatewayBridge:
                 ]
             ]
         }
-        await self._telegram.send_message(
+        response = await self._telegram.send_message(
             chat_id=chat_id,
             text=message_text,
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
+        message_id = response.get("message_id")
+        if isinstance(message_id, int):
+            self._approval_message_html_by_key[(chat_id, message_id)] = message_text
 
     def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
         if exc.retry_after_seconds is None:

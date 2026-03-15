@@ -49,6 +49,9 @@ class ToolSettings:
     """Runtime settings for tool registration and execution."""
 
     workspace_dir: Path
+    tool_runtime_base_url: str | None
+    tool_runtime_timeout_seconds: float
+    tool_runtime_healthcheck_timeout_seconds: float
     bash_executable: str
     bash_default_timeout_seconds: float
     bash_max_timeout_seconds: float
@@ -73,6 +76,12 @@ class ToolSettings:
     web_fetch_max_markdown_chars: int
 
     def __post_init__(self) -> None:
+        if self.tool_runtime_base_url is not None and not self.tool_runtime_base_url.strip():
+            raise ValueError("tool_runtime_base_url cannot be blank when configured.")
+        if self.tool_runtime_timeout_seconds <= 0:
+            raise ValueError("tool_runtime_timeout_seconds must be > 0.")
+        if self.tool_runtime_healthcheck_timeout_seconds <= 0:
+            raise ValueError("tool_runtime_healthcheck_timeout_seconds must be > 0.")
         if not self.bash_executable:
             raise ValueError("ToolSettings.bash_executable cannot be empty.")
         if self.bash_default_timeout_seconds <= 0:
@@ -138,8 +147,24 @@ class ToolSettings:
 
     @classmethod
     def from_workspace_dir(cls, workspace_dir: Path) -> "ToolSettings":
+        tool_runtime_base_url = (
+            _optional_env("JARVIS_TOOL_RUNTIME_BASE_URL")
+            or app_settings.JARVIS_TOOL_RUNTIME_BASE_URL
+        )
+        if tool_runtime_base_url is not None:
+            tool_runtime_base_url = tool_runtime_base_url.rstrip("/")
+
         return cls(
             workspace_dir=workspace_dir.expanduser(),
+            tool_runtime_base_url=tool_runtime_base_url,
+            tool_runtime_timeout_seconds=_parse_float_env(
+                "JARVIS_TOOL_RUNTIME_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_RUNTIME_TIMEOUT_SECONDS,
+            ),
+            tool_runtime_healthcheck_timeout_seconds=_parse_float_env(
+                "JARVIS_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS,
+            ),
             bash_executable=(
                 _optional_env("JARVIS_TOOL_BASH_EXECUTABLE")
                 or app_settings.JARVIS_TOOL_BASH_EXECUTABLE

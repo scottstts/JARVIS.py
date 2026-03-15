@@ -11,7 +11,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-
 from jsonschema import Draft202012Validator
 from llm import ToolCall, ToolDefinition
 from memory import MemoryService, MemorySettings
@@ -24,6 +23,7 @@ from tools import (
     ToolRuntime,
     ToolSettings,
 )
+from tools.remote_runtime_client import RemoteToolRuntimeClient, RemoteToolRuntimeError
 from tools.basic.memory_write.tool import build_memory_write_tool
 from tools.basic.tool_search import build_tool_search_tool
 from tools.basic.memory_search.tool import _format_memory_search_result
@@ -33,6 +33,14 @@ from tools.runtime_tool_manifest import (
     validate_runtime_tool_manifest_payload,
 )
 from tools.runtime_tools import load_runtime_tool_catalog
+from tools.basic.bash.local_executor import (
+    _build_scrubbed_environment,
+    format_bash_tool_description,
+)
+from tools.basic.python_interpreter.local_executor import (
+    SandboxedPythonInterpreterToolExecutor,
+    build_python_interpreter_description,
+)
 from tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     HTTPFetchResult,
@@ -42,13 +50,20 @@ from tools.basic.web_fetch.tool import (
     _validate_browser_request_url,
 )
 
-_PYTHON_INTERPRETER_VENV = Path("/opt/jarvis-python-tool-venv/bin/python")
-_BASH_SANDBOX_RUNTIME_AVAILABLE = shutil.which("bwrap") is not None
+_REMOTE_TOOL_RUNTIME_CONFIGURED = bool(os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"))
+_PYTHON_INTERPRETER_VENV = Path("/opt/venv/bin/python")
+_BASH_SANDBOX_RUNTIME_AVAILABLE = (
+    _REMOTE_TOOL_RUNTIME_CONFIGURED
+    or Path("/bin/bash").exists()
+    or shutil.which("bash") is not None
+)
 _FFMPEG_BASH_RUNTIME_AVAILABLE = (
-    _BASH_SANDBOX_RUNTIME_AVAILABLE and shutil.which("ffmpeg") is not None
+    _REMOTE_TOOL_RUNTIME_CONFIGURED
+    or (_BASH_SANDBOX_RUNTIME_AVAILABLE and shutil.which("ffmpeg") is not None)
 )
 _PYTHON_INTERPRETER_RUNTIME_AVAILABLE = (
-    shutil.which("bwrap") is not None and _PYTHON_INTERPRETER_VENV.exists()
+    _REMOTE_TOOL_RUNTIME_CONFIGURED
+    or (shutil.which("bwrap") is not None and _PYTHON_INTERPRETER_VENV.exists())
 )
 _SAMPLE_JPEG_BASE64 = (
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
@@ -182,6 +197,24 @@ class _FakePlaywrightManager:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         _ = exc_type, exc, tb
+
+
+class _FakeAsyncHTTPResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        payload: dict[str, object] | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self) -> dict[str, object]:
+        if self._payload is None:
+            raise ValueError("No JSON payload configured.")
+        return self._payload
 
 
 def _build_http_fetch_result(
@@ -395,12 +428,20 @@ class ToolSettingsTests(unittest.TestCase):
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
 
-            settings = ToolSettings.from_workspace_dir(workspace_dir)
+            with patch.dict(
+                os.environ,
+                {"JARVIS_TOOL_RUNTIME_BASE_URL": ""},
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
 
         self.assertEqual(
             settings.python_interpreter_venv,
-            Path("/opt/jarvis-python-tool-venv"),
+            Path("/opt/venv"),
         )
+        self.assertIsNone(settings.tool_runtime_base_url)
+        self.assertEqual(settings.tool_runtime_timeout_seconds, 45.0)
+        self.assertEqual(settings.tool_runtime_healthcheck_timeout_seconds, 5.0)
         self.assertEqual(
             settings.python_interpreter_allowed_packages,
             (
@@ -421,6 +462,226 @@ class ToolSettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.python_interpreter_default_timeout_seconds, 10.0)
         self.assertEqual(settings.python_interpreter_max_timeout_seconds, 30.0)
+
+    def test_bash_scrubbed_environment_targets_python_tool_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False):
+            environment = _build_scrubbed_environment(settings)
+
+        self.assertEqual(environment["VIRTUAL_ENV"], "/opt/venv")
+        self.assertEqual(environment["UV_PROJECT_ENVIRONMENT"], "/opt/venv")
+        self.assertEqual(environment["PIP_REQUIRE_VIRTUALENV"], "1")
+        self.assertEqual(environment["PATH"], "/opt/venv/bin:/usr/bin:/bin")
+
+    def test_bash_description_directs_python_execution_to_python_interpreter(self) -> None:
+        description = format_bash_tool_description().lower()
+
+        self.assertIn("do not use this tool to run code through an interpreter", description)
+        self.assertIn("dedicated interpreter tool", description)
+        self.assertIn("/opt/venv", description)
+
+    def test_python_interpreter_description_explicitly_claims_python_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        description = build_python_interpreter_description(settings).lower()
+
+        self.assertIn("always use this tool whenever you need to execute python code", description)
+        self.assertIn("rather than the shell tool", description)
+        self.assertIn("execute python code or a python script", description)
+
+
+class PythonInterpreterExecutorTests(unittest.TestCase):
+    def test_bwrap_command_execs_venv_python_and_binds_symlink_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            workspace_dir = temp_root / "workspace"
+            venv_dir = temp_root / "venv"
+            runtime_dir = temp_root / "runtime"
+            runner_config_path = temp_root / "runner-config.json"
+            workspace_dir.mkdir()
+            (venv_dir / "bin").mkdir(parents=True)
+            (runtime_dir / "bin").mkdir(parents=True)
+            (runtime_dir / "lib").mkdir(parents=True)
+            (runtime_dir / "bin" / "python3.12").write_text("", encoding="utf-8")
+            (runtime_dir / "bin" / "python3").symlink_to(runtime_dir / "bin" / "python3.12")
+            (venv_dir / "bin" / "python").symlink_to(runtime_dir / "bin" / "python3")
+            runner_config_path.write_text("{}", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"JARVIS_TOOL_PYTHON_INTERPRETER_VENV": str(venv_dir)},
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = SandboxedPythonInterpreterToolExecutor(
+                settings,
+                target_runtime="tool_runtime",
+                runtime_location="tool_runtime_container",
+                runtime_transport="http",
+                container_mutation_boundary="isolated_from_app_runtime",
+            )
+            command = executor._build_bwrap_command(
+                interpreter_path=venv_dir / "bin" / "python",
+                workspace_source_dir=workspace_dir,
+                runner_config_path=runner_config_path,
+                inline_script_path=None,
+            )
+
+        ro_bind_pairs = [
+            (command[index + 1], command[index + 2])
+            for index, token in enumerate(command)
+            if token == "--ro-bind"
+        ]
+
+        self.assertEqual(
+            command[-3:],
+            [
+                str(venv_dir / "bin" / "python"),
+                "/jarvis-python-runner.py",
+                "/jarvis-python-runner-config.json",
+            ],
+        )
+        self.assertIn(
+            (
+                str(runtime_dir / "bin" / "python3"),
+                str(runtime_dir / "bin" / "python3"),
+            ),
+            ro_bind_pairs,
+        )
+        self.assertIn(
+            (
+                str(runtime_dir / "bin" / "python3.12"),
+                str(runtime_dir / "bin" / "python3.12"),
+            ),
+            ro_bind_pairs,
+        )
+
+
+class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_serializes_request_and_parses_result(self) -> None:
+        captured_requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+        class _FakeAsyncClient:
+            def __init__(self, *, base_url: str, timeout: float) -> None:
+                self.base_url = base_url
+                self.timeout = timeout
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                _ = exc_type, exc, tb
+
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+            ) -> _FakeAsyncHTTPResponse:
+                captured_requests.append(("POST", url, json))
+                return _FakeAsyncHTTPResponse(
+                    status_code=200,
+                    payload={
+                        "call_id": "call_1",
+                        "name": "bash",
+                        "ok": True,
+                        "content": "Bash execution result",
+                        "metadata": {"runtime_location": "tool_runtime_container"},
+                    },
+                )
+
+        with patch.dict(
+            os.environ,
+            {"JARVIS_TOOL_RUNTIME_BASE_URL": "http://tool_runtime:8081"},
+            clear=False,
+        ):
+            settings = ToolSettings.from_workspace_dir(Path("/workspace"))
+
+        client = RemoteToolRuntimeClient(settings)
+        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+            result = await client.execute(
+                tool_name="bash",
+                call_id="call_1",
+                arguments={"command": "pwd"},
+                context=ToolExecutionContext(
+                    workspace_dir=Path("/workspace"),
+                    route_id="tg_123",
+                    session_id="session_9",
+                ),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.name, "bash")
+        self.assertEqual(
+            captured_requests,
+            [
+                (
+                    "POST",
+                    "/tools/bash/execute",
+                    {
+                        "call_id": "call_1",
+                        "arguments": {"command": "pwd"},
+                        "workspace_dir": "/workspace",
+                        "session_id": "session_9",
+                        "route_id": "tg_123",
+                    },
+                )
+            ],
+        )
+
+    async def test_execute_raises_for_malformed_response_payload(self) -> None:
+        class _FakeAsyncClient:
+            def __init__(self, *, base_url: str, timeout: float) -> None:
+                _ = base_url, timeout
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                _ = exc_type, exc, tb
+
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+            ) -> _FakeAsyncHTTPResponse:
+                _ = url, json
+                return _FakeAsyncHTTPResponse(
+                    status_code=200,
+                    payload={
+                        "call_id": "wrong_call",
+                        "name": "bash",
+                        "ok": True,
+                        "content": "bad",
+                        "metadata": {},
+                    },
+                )
+
+        with patch.dict(
+            os.environ,
+            {"JARVIS_TOOL_RUNTIME_BASE_URL": "http://tool_runtime:8081"},
+            clear=False,
+        ):
+            settings = ToolSettings.from_workspace_dir(Path("/workspace"))
+
+        client = RemoteToolRuntimeClient(settings)
+        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+            with self.assertRaises(RemoteToolRuntimeError):
+                await client.execute(
+                    tool_name="bash",
+                    call_id="call_1",
+                    arguments={"command": "pwd"},
+                    context=ToolExecutionContext(workspace_dir=Path("/workspace")),
+                )
 
 
 class RuntimeToolManifestTests(unittest.TestCase):
@@ -733,6 +994,73 @@ class ToolPolicyTests(unittest.TestCase):
             self.fail("Expected approval request metadata.")
         self.assertEqual(decision.approval_request["kind"], "bash_command")
         self.assertEqual(decision.approval_request["command"], command)
+        self.assertEqual(decision.approval_request["target_runtime"], "tool_runtime")
+
+    def test_bash_policy_hard_denies_os_upgrade_commands(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "apt-get upgrade -y"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "tool_runtime OS upgrade commands are denied.")
+
+    def test_bash_policy_hard_denies_service_control_commands(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "systemctl restart nginx"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(
+            decision.reason,
+            "tool_runtime service and init control commands are denied.",
+        )
+
+    def test_bash_policy_hard_denies_direct_python_execution(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "python -c 'print(1)'"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(
+            decision.reason,
+            "Direct Python execution via bash is denied; use python_interpreter instead.",
+        )
+
+    def test_bash_policy_hard_denies_uv_run_python_execution(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "uv run python script.py"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(
+            decision.reason,
+            "Direct Python execution via bash is denied; use python_interpreter instead.",
+        )
+
+    def test_bash_policy_requires_approval_for_uv_pip_install(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "uv pip install requests"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "bash command requires explicit approval.")
+        self.assertIsNotNone(decision.approval_request)
+        if decision.approval_request is None:
+            self.fail("Expected approval request metadata.")
+        self.assertEqual(
+            decision.approval_request["detector_reason"],
+            "matched install or package-manager mutation pattern for tool_runtime",
+        )
 
     def test_bash_policy_allows_exactly_approved_system_write_command(self) -> None:
         command = "printf 'jarvis' > /etc/jarvis-bash-test"
@@ -1250,7 +1578,10 @@ class ToolPolicyTests(unittest.TestCase):
 
 class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        temp_dir_kwargs: dict[str, str] = {}
+        if _REMOTE_TOOL_RUNTIME_CONFIGURED:
+            temp_dir_kwargs["dir"] = "/workspace"
+        self._tmp = tempfile.TemporaryDirectory(**temp_dir_kwargs)
         self.addAsyncCleanup(self._cleanup_tmpdir)
         self.workspace_dir = Path(self._tmp.name) / "workspace"
         self.workspace_dir.mkdir()

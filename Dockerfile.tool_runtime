@@ -1,0 +1,44 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    bubblewrap \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    file \
+    gcc \
+    git \
+    g++ \
+    libc6-dev \
+    libsqlite3-dev \
+    make \
+    ripgrep \
+    tini \
+    unzip \
+    zip \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir uv ruff
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /tmp/jarvis-deps
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+RUN uv sync --frozen --no-install-project \
+  && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" pytest \
+  && export JARVIS_PYTHON_TOOL_PACKAGES="$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('jarvis_settings', 'src/settings.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(' '.join(module.JARVIS_TOOL_PYTHON_INTERPRETER_ALLOWED_PACKAGES))")" \
+  && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" ${JARVIS_PYTHON_TOOL_PACKAGES}
+
+WORKDIR /app
+COPY src ./src
+
+ENV PYTHONPATH=/app/src
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "tool_runtime_service"]

@@ -247,7 +247,8 @@ Structure:
 
 Current active policy:
 
-- `bash` uses a broad-access blacklist sandbox, still scrubs the environment, hides `/repo`, masks `/run/secrets`, and enforces a moderately aggressive approval detector for install/build/system-mutation commands unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
+- `bash` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it scrubs the environment, shares only `/workspace`, enforces approval for install/build/system-mutation commands, and hard-denies pointless or harmful container-admin commands even inside `tool_runtime` unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
+- `python_interpreter` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it keeps the workspace-only script-path model, subprocess blocking, and no-network sandbox behavior
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
 - `tool_register` always requires exact-action approval and binds approval to the manifest payload hash
@@ -303,7 +304,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - Status: implemented
 - Exposure: `basic`
 - Package: `src/tools/basic/bash/`
-- Purpose: run bash commands inside a real sandbox with workspace-only user data access
+- Purpose: run bash commands inside the isolated `tool_runtime` container with `/workspace` as the shared handoff boundary
 
 #### Input Schema
 
@@ -312,14 +313,14 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 #### Executor Behavior
 
-- runs inside `bubblewrap`
-- mounts the real workspace at `/workspace`
-- binds `/tmp` to a workspace-owned internal temp directory
-- mounts `/usr` and the full system `/etc` read-only so dynamically linked CLI tools can resolve loader config, alternatives, certificates, and other runtime metadata
-- does not mount `/repo` or `/run/secrets`
+- policy is evaluated in `dev`, but execution happens in the sibling `tool_runtime` container over internal HTTP
+- runs directly in the `tool_runtime` container rather than inside a second inner sandbox layer
+- mounts the shared workspace at `/workspace`
+- the project repo is not mounted there, so `/repo` is absent by construction
+- no app secrets are mounted in `tool_runtime`
 - runs bash with `--noprofile --norc`
 - clears the environment and sets only a minimal runtime env (`PATH`, `HOME`, `PWD`, `TMPDIR`, `LANG`, `LC_ALL`)
-- keeps the container network available so tools like `curl` can still work
+- keeps the `tool_runtime` container network available so tools like `curl` can still work
 - `set -o pipefail` is enabled
 - default timeout is `10s`
 - max timeout is `30s`
@@ -331,14 +332,13 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 - rejects empty commands
 - rejects commands containing null bytes
-- all filesystem boundary enforcement is delegated to the `bubblewrap` sandbox rather than command parsing
+- requires approval for install/build/system-mutation commands targeting the isolated `tool_runtime` container
+- hard-denies upgrade, service/init-control, mount/kernel-admin, and container-runtime-recursion commands even inside `tool_runtime`
 
 #### Current Limitations
 
-- not a full general-purpose container shell: user-controlled data access is limited to `/workspace`
-- system runtime paths such as `/usr`, `/etc`, and `/dev` are present, but `/etc` is mounted read-only and user-writable data is still limited to `/workspace`
+- only `/workspace` is shared back to the app; if the command writes elsewhere, those changes stay local to the long-lived `tool_runtime` container
 - command availability depends on what is installed in the runtime image
-- requires `bubblewrap` to be installed in the runtime environment
 
 ### `python_interpreter`
 
@@ -358,11 +358,12 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 #### Executor Behavior
 
-- runs inside `bubblewrap` with a dedicated interpreter venv created at container build time
+- policy is evaluated in `dev`, but execution happens in the sibling `tool_runtime` container over internal HTTP
+- still runs inside `bubblewrap` in `tool_runtime` so network stays disabled and writes stay constrained to `/workspace`
 - mounts the real workspace directly at `/workspace`
 - only `/workspace` is writable; writes outside `/workspace` are denied by the sandbox
 - disables network with `--unshare-net`
-- only mounts the minimal Python runtime roots needed for the interpreter plus the dedicated venv
+- only mounts the minimal Python runtime roots needed for the interpreter plus the tool-runtime Python environment
 - executes through an internal runner that applies resource limits, blocks process-spawn APIs, and enforces a low-interference import trust model
 - supports inline code and stored scripts under `/workspace`
 - captures both `stdout` and `stderr`
@@ -395,7 +396,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 
 - intentionally one-shot and stateless; no persistent kernel/session memory across tool calls
 - `read_paths` and `write_paths` are deprecated compatibility fields and no longer control filesystem access
-- third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the dedicated venv
+- third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the tool-runtime Python environment
 - workspace imports are intended for normal pure-Python helper modules; importing arbitrary native extensions from `/workspace` is intentionally disallowed
 
 ### `file_patch`

@@ -16,9 +16,20 @@ So treat this document as a helper doc hinting you what has been built and what 
 ### Core rule
 
 - **Edit code on macOS (the project repo: ~/Documents/Projects/Python/Jarvis/).**
-- **Run anything “runtime-related” inside the Docker container** (install deps, run the app, run tests, run linters/formatters if they depend on the venv).
+- **Run anything “runtime-related” inside Docker** (install deps, run the app, run tests, run linters/formatters if they depend on the venv).
 
-The repo is **bind-mounted** into the container (`Javis/` on macOS ↔ `/repo` in the container), so changes are bidirectional. Treat `/repo` as the same project folder, just viewed from Linux.
+The runtime is now split across two sibling containers in the same compose project:
+
+- `dev`
+  - runs the Jarvis app
+  - mounts the repo at `/repo`
+  - mounts the shared workspace at `/workspace`
+- `tool_runtime`
+  - runs the internal HTTP service for `bash` and `python_interpreter`
+  - mounts the shared workspace at `/workspace`
+  - does **not** mount `/repo`
+
+The repo is still bind-mounted into `dev` (`Jarvis/` on macOS ↔ `/repo` in the container), so changes are bidirectional. Treat `/repo` as the same project folder, just viewed from Linux.
 
 ### Where to do what
 
@@ -31,6 +42,10 @@ The repo is **bind-mounted** into the container (`Javis/` on macOS ↔ `/repo` i
 - `uv venv`, `uv pip install ...`, `uv run ...`
 - Run the agent program, tests, scripts, etc.
 - Anything that needs the Linux runtime environment.
+
+Tool note:
+
+- `bash` and `python_interpreter` no longer execute inside `dev`; they are remotely executed in the isolated `tool_runtime` container through the app.
 
 ### Standard commands (run from macOS terminal)
 

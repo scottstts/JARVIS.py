@@ -94,3 +94,4 @@
 - `memory_write` close/archive should be treated as rewrite-plus-transition operations: the agent should rewrite summary/body first, and the service only provides a generic fallback stamp if that rewrite is omitted.
 - Design pivot: prefer a dedicated sibling `tool_runtime` container for `bash` and `python_interpreter` over the larger host-app/macOS refactor when the goal is stronger tool isolation without destabilizing the app runtime.
 - Image split rule: the `dev` container should only keep packages needed to run the Jarvis app, while agent-facing utilities like `rg`, `curl`, `zip`, `unzip`, and `ffmpeg` belong in `tool_runtime`.
+- `bash` now executes directly in the isolated `tool_runtime` container over internal HTTP, while `python_interpreter` also routes there but keeps its bubblewrap no-network/subprocess-blocked sandbox.
