@@ -1,4 +1,4 @@
-"""ffmpeg_cli discoverable entry."""
+"""ffmpeg discoverable entry."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ _USAGE = (
 )
 
 
-def build_ffmpeg_cli_discoverable() -> DiscoverableTool:
-    """Build the discoverable catalog entry for ffmpeg_cli."""
+def build_ffmpeg_discoverable() -> DiscoverableTool:
+    """Build the discoverable catalog entry for ffmpeg."""
 
     return DiscoverableTool(
-        name="ffmpeg_cli",
+        name="ffmpeg",
         aliases=("ffmpeg", "ffprobe", "media_convert"),
         purpose=(
             "Use the installed ffmpeg or ffprobe CLI through bash for audio or video "

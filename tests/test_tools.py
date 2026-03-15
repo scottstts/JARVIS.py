@@ -503,7 +503,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search_discoverable("archive"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("")],
-                ["ffmpeg_cli", "generate_edit_image", "memory_admin", "transcribe", "youtube"],
+                ["ffmpeg", "generate_edit_image", "memory_admin", "transcribe", "youtube"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("edit image")],
@@ -519,7 +519,7 @@ class ToolRegistryTests(unittest.TestCase):
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("ffmpeg")],
-                ["ffmpeg_cli"],
+                ["ffmpeg"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("youtube")],
@@ -528,7 +528,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 [
                     tool.name
-                    for tool in registry.resolve_discoverable_tool_definitions(["ffmpeg_cli"])
+                    for tool in registry.resolve_discoverable_tool_definitions(["ffmpeg"])
                 ],
                 [],
             )
@@ -2921,12 +2921,12 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ["archive"],
         )
 
-    async def test_tool_search_high_verbosity_ffmpeg_cli_is_docs_only_and_not_activated(
+    async def test_tool_search_high_verbosity_ffmpeg_is_docs_only_and_not_activated(
         self,
     ) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
-                call_id="call_tool_search_ffmpeg_cli",
+                call_id="call_tool_search_ffmpeg",
                 name="tool_search",
                 arguments={"query": "ffmpeg", "verbosity": "high"},
                 raw_arguments='{"query":"ffmpeg","verbosity":"high"}',
@@ -2935,12 +2935,12 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertIn("ffmpeg_cli", result.content)
+        self.assertIn("ffmpeg", result.content)
         self.assertIn("Use the basic `bash` tool", result.content)
         self.assertEqual(result.metadata["activated_discoverable_tool_names"], [])
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],
-            ["ffmpeg_cli"],
+            ["ffmpeg"],
         )
 
     async def test_tool_search_high_verbosity_transcribe_activates_tool(self) -> None:

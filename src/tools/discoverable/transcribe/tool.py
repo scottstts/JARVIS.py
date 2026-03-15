@@ -296,7 +296,7 @@ def build_transcribe_discoverable() -> DiscoverableTool:
                 f"Supported formats: {', '.join(SUPPORTED_AUDIO_FORMATS)}.",
                 "Files larger than 25 MB are rejected before upload.",
                 "For files larger than 25 MB, split the source into smaller chunks first.",
-                "Use ffmpeg_cli if you need to convert or extract audio first.",
+                "Use ffmpeg if you need to convert or extract audio first.",
             ],
         },
         metadata={

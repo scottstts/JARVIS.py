@@ -793,7 +793,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 #### Current Limitations
 
 - v1 exposes only a single `audio_path` argument; it does not expose optional language, prompt, timestamp, or diarization controls
-- files larger than `25 MB` must be trimmed, split, or converted first, typically via `ffmpeg_cli`
+- files larger than `25 MB` must be trimmed, split, or converted first, typically via `ffmpeg`
 - the tool relies on `OPENAI_API_KEY` at runtime and does not currently support alternate transcription providers
 
 ### `youtube`
@@ -835,16 +835,16 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - the tool is text-output only; transcript mode returns raw Defuddle text and Gemini mode does not expose structured extraction or timestamp-specific controls beyond what the caller writes into `objectives`
 - Gemini analysis mode relies on `GOOGLE_API_KEY`; transcript mode instead depends on local `curl` plus Defuddle service availability
 
-### `ffmpeg_cli`
+### `ffmpeg`
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/ffmpeg_cli/`
+- Package: `src/tools/discoverable/ffmpeg/`
 - Purpose: help the agent discover that ffmpeg and ffprobe are already installed and should be used through the basic `bash` tool
 
 #### Discoverable Entry
 
-- Name: `ffmpeg_cli`
+- Name: `ffmpeg`
 - Aliases: `ffmpeg`, `ffprobe`, `media_convert`
 - Purpose: use the installed ffmpeg or ffprobe CLI through bash for audio or video conversion, trimming, muxing, probing, and stream extraction
 - Detailed Description: this is a docs-only discoverable entry with no separate runtime; after discovery, invoke `ffmpeg` or `ffprobe` through the basic `bash` tool
@@ -879,4 +879,4 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 - Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
 - Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `ffmpeg_cli` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented discoverable tools: `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`

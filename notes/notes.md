@@ -71,8 +71,8 @@
 - `generate_edit_image` exposes provider-specific fidelity knobs but should usually leave them unset: OpenAI defaults `quality` to `medium`, while Gemini defaults `resolution` to `1K`.
 - `generate_edit_image` no longer uses a fixed output directory; the agent must pass `output_path`, and the tool auto-creates missing parent directories before writing.
 - Gemini image generation now explicitly requests image-only output with `response_modalities=['Image']` to reduce intermittent text-only responses from `gemini-3.1-flash-image-preview`.
-- `ffmpeg_cli` is a docs-only discoverable catalog entry with no backing runtime; agents should use the installed `ffmpeg` or `ffprobe` binaries through the basic `bash` tool.
-- `transcribe` is now a discoverable OpenAI-backed tool using `gpt-4o-mini-transcribe`; it accepts only `audio_path`, validates supported extensions plus the 25 MB limit before upload, and pairs with `ffmpeg_cli` for conversion/splitting prep.
+- `ffmpeg` is a docs-only discoverable catalog entry with no backing runtime; agents should use the installed `ffmpeg` or `ffprobe` binaries through the basic `bash` tool.
+- `transcribe` is now a discoverable OpenAI-backed tool using `gpt-4o-mini-transcribe`; it accepts only `audio_path`, validates supported extensions plus the 25 MB limit before upload, and pairs with `ffmpeg` for conversion/splitting prep.
 - `youtube` is now a discoverable Gemini-backed tool using public YouTube URLs as `file_data.file_uri` inputs; custom `objectives` replace only the default task objective while a shared system instruction stays in place.
 - `youtube` also supports `transcript=true`, which skips Gemini, ignores `objectives`, and internally runs `curl` against Defuddle for each valid YouTube URL to return transcript text.
 - The `bash` sandbox now mounts the full host `/etc` read-only so dynamically linked CLI tools can follow loader config and `/etc/alternatives` symlink chains without exposing writable system state.
