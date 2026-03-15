@@ -32,6 +32,30 @@ class GatewayProtocolTests(unittest.TestCase):
         )
         self.assertEqual(type(parsed).__name__, "ClientStopTurn")
 
+    def test_parse_approval_response_success(self) -> None:
+        parsed = parse_client_event(
+            {"type": "approval_response", "approval_id": "approval_1", "approved": True},
+            max_message_chars=100,
+        )
+        self.assertEqual(type(parsed).__name__, "ClientApprovalResponse")
+        self.assertEqual(parsed.approval_id, "approval_1")
+        self.assertTrue(parsed.approved)
+
+    def test_parse_approval_response_validates_payload(self) -> None:
+        with self.assertRaises(ProtocolError) as missing_id:
+            parse_client_event(
+                {"type": "approval_response", "approval_id": "", "approved": True},
+                max_message_chars=100,
+            )
+        self.assertEqual(missing_id.exception.code, "invalid_approval_id")
+
+        with self.assertRaises(ProtocolError) as invalid_decision:
+            parse_client_event(
+                {"type": "approval_response", "approval_id": "approval_1", "approved": "yes"},
+                max_message_chars=100,
+            )
+        self.assertEqual(invalid_decision.exception.code, "invalid_approval_decision")
+
     def test_text_must_be_non_empty_string(self) -> None:
         with self.assertRaises(ProtocolError) as non_string:
             parse_client_event({"type": "user_message", "text": 123}, max_message_chars=100)

@@ -40,6 +40,19 @@ class GatewayToolCallEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class GatewayApprovalRequestEvent:
+    session_id: str
+    approval_id: str
+    kind: str
+    summary: str
+    details: str
+    command: str | None = None
+    tool_name: str | None = None
+    inspection_url: str | None = None
+    type: str = "approval_request"
+
+
+@dataclass(slots=True, frozen=True)
 class GatewayTurnDoneEvent:
     session_id: str
     response_text: str
@@ -53,6 +66,7 @@ GatewayTurnEvent = (
     GatewayDeltaEvent
     | GatewayMessageEvent
     | GatewayToolCallEvent
+    | GatewayApprovalRequestEvent
     | GatewayTurnDoneEvent
 )
 
@@ -129,6 +143,30 @@ class GatewayWebSocketClient:
                             tool_names=tuple(tool_names),
                         )
                         continue
+                    if event_type == "approval_request":
+                        yield GatewayApprovalRequestEvent(
+                            session_id=str(payload.get("session_id", "")),
+                            approval_id=str(payload.get("approval_id", "")),
+                            kind=str(payload.get("kind", "")),
+                            summary=str(payload.get("summary", "")),
+                            details=str(payload.get("details", "")),
+                            command=(
+                                str(payload["command"])
+                                if payload.get("command") is not None
+                                else None
+                            ),
+                            tool_name=(
+                                str(payload["tool_name"])
+                                if payload.get("tool_name") is not None
+                                else None
+                            ),
+                            inspection_url=(
+                                str(payload["inspection_url"])
+                                if payload.get("inspection_url") is not None
+                                else None
+                            ),
+                        )
+                        continue
                     if event_type == "turn_done":
                         yield GatewayTurnDoneEvent(
                             session_id=str(payload.get("session_id", "")),
@@ -191,6 +229,66 @@ class GatewayWebSocketClient:
                 raise GatewayBridgeError(
                     code="invalid_stop_ack",
                     message="Gateway did not send a stop acknowledgement.",
+                )
+        except GatewayBridgeError:
+            raise
+        except Exception:  # pragma: no cover - exception types depend on websocket lib
+            raise GatewayBridgeError(
+                code="gateway_unavailable",
+                message="Could not communicate with the gateway websocket.",
+            ) from None
+
+    async def submit_approval(
+        self,
+        *,
+        route_id: str,
+        approval_id: str,
+        approved: bool,
+    ) -> bool:
+        websocket_url = f"{self._websocket_base_url}/{route_id}"
+        connect = _resolve_websocket_connect()
+
+        try:
+            async with connect(
+                websocket_url,
+                open_timeout=self._connect_timeout_seconds,
+                close_timeout=self._connect_timeout_seconds,
+            ) as socket:
+                ready_payload = await _recv_json(socket)
+                ready_type = ready_payload.get("type")
+                if ready_type == "error":
+                    raise GatewayBridgeError(
+                        code=str(ready_payload.get("code", "gateway_error")),
+                        message=str(ready_payload.get("message", "Gateway returned an error.")),
+                    )
+                if ready_type != "ready":
+                    raise GatewayBridgeError(
+                        code="invalid_ready_event",
+                        message="Gateway did not send a ready event.",
+                    )
+
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "approval_response",
+                            "approval_id": approval_id,
+                            "approved": approved,
+                        }
+                    )
+                )
+
+                payload = await _recv_json(socket)
+                event_type = payload.get("type")
+                if event_type == "approval_ack":
+                    return bool(payload.get("resolved", False))
+                if event_type == "error":
+                    raise GatewayBridgeError(
+                        code=str(payload.get("code", "gateway_error")),
+                        message=str(payload.get("message", "Gateway returned an error.")),
+                    )
+                raise GatewayBridgeError(
+                    code="invalid_approval_ack",
+                    message="Gateway did not send an approval acknowledgement.",
                 )
         except GatewayBridgeError:
             raise

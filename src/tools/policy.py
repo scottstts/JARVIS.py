@@ -9,6 +9,7 @@ from .basic.memory_search import MemorySearchPolicy
 from .basic.memory_write import MemoryWritePolicy
 from .basic.python_interpreter import PythonInterpreterPolicy
 from .basic.send_file import SendFilePolicy
+from .basic.tool_register import ToolRegisterPolicy
 from .basic.tool_search import ToolSearchPolicy
 from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
@@ -36,7 +37,12 @@ class ToolPolicy:
             if not command:
                 return ToolPolicyDecision(allowed=False, reason="bash command cannot be empty.")
 
-            return BashCommandPolicy().authorize(command=command, context=context)
+            settings = ToolSettings.from_workspace_dir(context.workspace_dir)
+            return BashCommandPolicy(settings).authorize(
+                command=command,
+                arguments=arguments,
+                context=context,
+            )
 
         if tool_name == "view_image":
             path = str(arguments.get("path", "")).strip()
@@ -101,6 +107,12 @@ class ToolPolicy:
                 context=context,
             )
 
+        if tool_name == "tool_register":
+            return ToolRegisterPolicy().authorize(
+                arguments=arguments,
+                context=context,
+            )
+
         if tool_name == "generate_edit_image":
             return GenerateEditImagePolicy().authorize(
                 arguments=arguments,
@@ -135,6 +147,7 @@ class ToolPolicy:
             "view_image",
             "send_file",
             "tool_search",
+            "tool_register",
             "generate_edit_image",
             "memory_admin",
             "transcribe",

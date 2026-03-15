@@ -2,6 +2,7 @@
 
 from .agent_loop import (
     AgentAssistantMessageEvent,
+    AgentApprovalRequestEvent,
     AgentLoop,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
@@ -14,6 +15,7 @@ from .errors import ContextBudgetError, CoreConfigurationError, CoreError
 
 __all__ = [
     "AgentAssistantMessageEvent",
+    "AgentApprovalRequestEvent",
     "AgentLoop",
     "AgentTextDeltaEvent",
     "AgentToolCallEvent",

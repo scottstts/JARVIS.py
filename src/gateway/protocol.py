@@ -25,11 +25,17 @@ class ClientStopTurn:
     pass
 
 
+@dataclass(slots=True, frozen=True)
+class ClientApprovalResponse:
+    approval_id: str
+    approved: bool
+
+
 def parse_client_event(
     payload: Any,
     *,
     max_message_chars: int,
-) -> ClientUserMessage | ClientStopTurn:
+) -> ClientUserMessage | ClientStopTurn | ClientApprovalResponse:
     if not isinstance(payload, dict):
         raise ProtocolError(
             code="invalid_payload",
@@ -39,10 +45,29 @@ def parse_client_event(
     event_type = payload.get("type")
     if event_type == "stop_turn":
         return ClientStopTurn()
+    if event_type == "approval_response":
+        raw_approval_id = payload.get("approval_id")
+        if not isinstance(raw_approval_id, str) or not raw_approval_id.strip():
+            raise ProtocolError(
+                code="invalid_approval_id",
+                message="'approval_id' must be a non-empty string.",
+            )
+        approved = payload.get("approved")
+        if not isinstance(approved, bool):
+            raise ProtocolError(
+                code="invalid_approval_decision",
+                message="'approved' must be a boolean.",
+            )
+        return ClientApprovalResponse(
+            approval_id=raw_approval_id.strip(),
+            approved=approved,
+        )
     if event_type != "user_message":
         raise ProtocolError(
             code="unsupported_event_type",
-            message="Only 'user_message' and 'stop_turn' events are supported.",
+            message=(
+                "Only 'user_message', 'stop_turn', and 'approval_response' events are supported."
+            ),
         )
 
     raw_text = payload.get("text")
@@ -97,6 +122,30 @@ def build_tool_call_event(
     }
 
 
+def build_approval_request_event(
+    *,
+    session_id: str,
+    approval_id: str,
+    kind: str,
+    summary: str,
+    details: str,
+    command: str | None,
+    tool_name: str | None,
+    inspection_url: str | None,
+) -> dict[str, Any]:
+    return {
+        "type": "approval_request",
+        "session_id": session_id,
+        "approval_id": approval_id,
+        "kind": kind,
+        "summary": summary,
+        "details": details,
+        "command": command,
+        "tool_name": tool_name,
+        "inspection_url": inspection_url,
+    }
+
+
 def build_assistant_delta_event(*, session_id: str, delta: str) -> dict[str, Any]:
     return {
         "type": "assistant_delta",
@@ -127,6 +176,13 @@ def build_stop_ack_event(*, stop_requested: bool) -> dict[str, Any]:
     return {
         "type": "stop_ack",
         "stop_requested": stop_requested,
+    }
+
+
+def build_approval_ack_event(*, resolved: bool) -> dict[str, Any]:
+    return {
+        "type": "approval_ack",
+        "resolved": resolved,
     }
 
 

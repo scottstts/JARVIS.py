@@ -33,6 +33,9 @@ class AgentLoopLike(Protocol):
     def request_stop(self) -> bool:
         """Request cooperative stop for the active turn, if any."""
 
+    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
+        """Resolve one pending approval request for the active route."""
+
 
 def validate_route_id(route_id: str) -> str:
     normalized = route_id.strip()
@@ -74,6 +77,10 @@ class SessionRouter:
     def request_stop(self, route_id: str) -> bool:
         context = self.get_or_create(route_id)
         return context.agent_loop.request_stop()
+
+    def resolve_approval(self, route_id: str, approval_id: str, approved: bool) -> bool:
+        context = self.get_or_create(route_id)
+        return context.agent_loop.resolve_approval(approval_id, approved)
 
     async def run_turn(self, route_id: str, user_text: str) -> AgentTurnResult:
         context = self.get_or_create(route_id)

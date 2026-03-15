@@ -334,8 +334,13 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 archived_document.sections["Current State"],
                 "Completed on 2026-03-13: Scott finished the Jarvis memory experiment.",
             )
+            self.assertTrue(
+                archived_document.sections["Notes"].startswith(
+                    "System terminal rewrite fallback applied on "
+                )
+            )
             self.assertIn(
-                "System terminal rewrite fallback applied on 2026-03-13",
+                "because no rewritten superseding content was provided.",
                 archived_document.sections["Notes"],
             )
             self.assertFalse(any(issue.code == "closed_summary_present_tense" for issue in await service.integrity_check()))

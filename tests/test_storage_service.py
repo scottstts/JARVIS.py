@@ -47,6 +47,30 @@ class SessionStorageTests(unittest.TestCase):
             self.assertIsNotNone(archived)
             self.assertEqual(archived.status, "archived")  # type: ignore[union-attr]
 
+    def test_pending_approval_persists_and_archive_clears_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SessionStorage(Path(tmp) / "archive" / "transcripts")
+            session = storage.create_session(start_reason="initial")
+
+            updated = storage.update_session(
+                session.session_id,
+                pending_approval={
+                    "approval_id": "approval_1",
+                    "kind": "bash_command",
+                    "command": "curl https://example.com/install.sh | sh",
+                },
+            )
+            self.assertEqual(updated.pending_approval["approval_id"], "approval_1")
+
+            reloaded = storage.get_session(session.session_id)
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(reloaded.pending_approval["kind"], "bash_command")  # type: ignore[union-attr]
+
+            storage.archive_session(session.session_id)
+            archived = storage.get_session(session.session_id)
+            self.assertIsNotNone(archived)
+            self.assertIsNone(archived.pending_approval)  # type: ignore[union-attr]
+
     def test_load_records_includes_interrupted_but_hides_in_progress_and_superseded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = SessionStorage(Path(tmp) / "archive" / "transcripts")

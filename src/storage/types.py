@@ -23,6 +23,7 @@ class SessionMetadata:
     status: SessionStatus = "active"
     pending_reactive_compaction: bool = False
     pending_interruption_notice: bool = False
+    pending_approval: dict[str, Any] | None = None
     compaction_count: int = 0
     last_input_tokens: int | None = None
     last_output_tokens: int | None = None
@@ -40,6 +41,11 @@ class SessionMetadata:
             "status": self.status,
             "pending_reactive_compaction": self.pending_reactive_compaction,
             "pending_interruption_notice": self.pending_interruption_notice,
+            "pending_approval": (
+                dict(self.pending_approval)
+                if isinstance(self.pending_approval, dict)
+                else None
+            ),
             "compaction_count": self.compaction_count,
             "last_input_tokens": self.last_input_tokens,
             "last_output_tokens": self.last_output_tokens,
@@ -59,6 +65,11 @@ class SessionMetadata:
             status="archived" if data.get("status") == "archived" else "active",
             pending_reactive_compaction=bool(data.get("pending_reactive_compaction", False)),
             pending_interruption_notice=bool(data.get("pending_interruption_notice", False)),
+            pending_approval=(
+                dict(data["pending_approval"])
+                if isinstance(data.get("pending_approval"), dict)
+                else None
+            ),
             compaction_count=int(data.get("compaction_count", 0)),
             last_input_tokens=_optional_int(data.get("last_input_tokens")),
             last_output_tokens=_optional_int(data.get("last_output_tokens")),

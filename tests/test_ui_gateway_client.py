@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from ui.telegram.gateway_client import (
+    GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
@@ -98,6 +99,76 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stop_requested)
         outbound = json.loads(socket.sent[0])
         self.assertEqual(outbound, {"type": "stop_turn"})
+
+    async def test_stream_turn_maps_approval_request_events(self) -> None:
+        socket = _FakeSocket(
+            incoming=[
+                json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
+                json.dumps(
+                    {
+                        "type": "approval_request",
+                        "session_id": "s1",
+                        "approval_id": "approval_1",
+                        "kind": "bash_command",
+                        "summary": "Install a CLI.",
+                        "details": "Need to install a CLI for this task.",
+                        "command": "curl https://example.com/install.sh | sh",
+                        "tool_name": "bash",
+                        "inspection_url": "https://example.com",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn_done",
+                        "session_id": "s1",
+                        "response_text": "",
+                    }
+                ),
+            ]
+        )
+        client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
+
+        with patch(
+            "ui.telegram.gateway_client._resolve_websocket_connect",
+            return_value=lambda *args, **kwargs: _FakeConnection(socket),
+        ):
+            events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
+
+        self.assertEqual(len(events), 2)
+        self.assertIsInstance(events[0], GatewayApprovalRequestEvent)
+        self.assertEqual(events[0].approval_id, "approval_1")
+        self.assertEqual(events[0].tool_name, "bash")
+        self.assertEqual(events[1].response_text, "")
+
+    async def test_submit_approval_returns_acknowledged_state(self) -> None:
+        socket = _FakeSocket(
+            incoming=[
+                json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
+                json.dumps({"type": "approval_ack", "resolved": True}),
+            ]
+        )
+        client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
+
+        with patch(
+            "ui.telegram.gateway_client._resolve_websocket_connect",
+            return_value=lambda *args, **kwargs: _FakeConnection(socket),
+        ):
+            resolved = await client.submit_approval(
+                route_id="tg_1",
+                approval_id="approval_1",
+                approved=False,
+            )
+
+        self.assertTrue(resolved)
+        outbound = json.loads(socket.sent[0])
+        self.assertEqual(
+            outbound,
+            {
+                "type": "approval_response",
+                "approval_id": "approval_1",
+                "approved": False,
+            },
+        )
 
     async def test_stream_turn_raises_on_gateway_error_event(self) -> None:
         socket = _FakeSocket(

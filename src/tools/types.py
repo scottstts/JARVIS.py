@@ -22,6 +22,7 @@ class ToolExecutionContext:
     route_id: str | None = None
     session_id: str | None = None
     memory_service: "MemoryService | None" = None
+    approved_action: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -41,6 +42,7 @@ class ToolPolicyDecision:
 
     allowed: bool
     reason: str | None = None
+    approval_request: dict[str, Any] | None = None
 
 
 class ToolExecutor(Protocol):

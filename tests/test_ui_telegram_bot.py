@@ -12,12 +12,14 @@ from typing import Any
 
 from ui.telegram.api import DraftMessage, TelegramAPIError, TelegramRemoteFile
 from ui.telegram.bot import (
+    IncomingTelegramApprovalCallback,
     IncomingTelegramFile,
     IncomingTextMessage,
     TelegramGatewayBridge,
     _should_flush_draft,
     _clear_directory_contents,
     chat_id_for_route_id,
+    parse_incoming_approval_callback,
     parse_incoming_message,
     parse_incoming_text_message,
     route_id_for_chat,
@@ -25,6 +27,7 @@ from ui.telegram.bot import (
 )
 from ui.telegram.config import UISettings
 from ui.telegram.gateway_client import (
+    GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
@@ -38,6 +41,7 @@ class _SentMessage:
     chat_id: int
     text: str
     parse_mode: str | None
+    reply_markup: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +65,22 @@ class _SentDocument:
     filename: str | None
 
 
+@dataclass(slots=True)
+class _EditedMessage:
+    chat_id: int
+    message_id: int
+    text: str
+    parse_mode: str | None
+    reply_markup: dict[str, Any] | None
+
+
+@dataclass(slots=True)
+class _AnsweredCallback:
+    callback_query_id: str
+    text: str | None
+    show_alert: bool
+
+
 class _FakeTelegramClient:
     def __init__(
         self,
@@ -80,6 +100,8 @@ class _FakeTelegramClient:
         self.sent_drafts: list[_SentDraft] = []
         self.downloaded_files: list[_DownloadedFile] = []
         self.sent_documents: list[_SentDocument] = []
+        self.edited_messages: list[_EditedMessage] = []
+        self.answered_callbacks: list[_AnsweredCallback] = []
         self.message_attempts = 0
         self.draft_attempts = 0
         self.closed = False
@@ -125,6 +147,7 @@ class _FakeTelegramClient:
         chat_id: int,
         text: str,
         parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.message_attempts += 1
         if not text.strip():
@@ -135,9 +158,50 @@ class _FakeTelegramClient:
         if self._message_errors:
             raise self._message_errors.pop(0)
         self.sent_messages.append(
-            _SentMessage(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            _SentMessage(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
         )
         return {"message_id": len(self.sent_messages)}
+
+    async def edit_message_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.edited_messages.append(
+            _EditedMessage(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        )
+        return {"message_id": message_id}
+
+    async def answer_callback_query(
+        self,
+        *,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        self.answered_callbacks.append(
+            _AnsweredCallback(
+                callback_query_id=callback_query_id,
+                text=text,
+                show_alert=show_alert,
+            )
+        )
+        return True
 
     async def send_message_draft(
         self,
@@ -181,16 +245,23 @@ class _FakeGatewayClient:
         self,
         *,
         events: list[
-            GatewayDeltaEvent | GatewayMessageEvent | GatewayToolCallEvent | GatewayTurnDoneEvent
+            GatewayDeltaEvent
+            | GatewayMessageEvent
+            | GatewayToolCallEvent
+            | GatewayApprovalRequestEvent
+            | GatewayTurnDoneEvent
         ] | None = None,
         error: GatewayBridgeError | None = None,
         stop_requested: bool = False,
+        approval_resolved: bool = True,
     ) -> None:
         self._events = events or []
         self._error = error
         self._stop_requested = stop_requested
+        self._approval_resolved = approval_resolved
         self.calls: list[tuple[str, str]] = []
         self.stop_calls: list[str] = []
+        self.approval_calls: list[tuple[str, str, bool]] = []
 
     async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[Any]:
         self.calls.append((route_id, user_text))
@@ -203,11 +274,22 @@ class _FakeGatewayClient:
         self.stop_calls.append(route_id)
         return self._stop_requested
 
+    async def submit_approval(
+        self,
+        *,
+        route_id: str,
+        approval_id: str,
+        approved: bool,
+    ) -> bool:
+        self.approval_calls.append((route_id, approval_id, approved))
+        return self._approval_resolved
+
 
 class _BlockingGatewayClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.stop_calls: list[str] = []
+        self.approval_calls: list[tuple[str, str, bool]] = []
         self.stream_started = asyncio.Event()
         self.release_turn = asyncio.Event()
 
@@ -223,6 +305,16 @@ class _BlockingGatewayClient:
 
     async def request_stop(self, *, route_id: str) -> bool:
         self.stop_calls.append(route_id)
+        return True
+
+    async def submit_approval(
+        self,
+        *,
+        route_id: str,
+        approval_id: str,
+        approved: bool,
+    ) -> bool:
+        self.approval_calls.append((route_id, approval_id, approved))
         return True
 
 
@@ -398,6 +490,34 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.calls, [])
         self.assertEqual(telegram.sent_messages, [])
 
+    async def test_handle_approval_callback_submits_decision_and_updates_message(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(approval_resolved=True)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_approval_callback(
+            IncomingTelegramApprovalCallback(
+                update_id=1,
+                callback_query_id="callback_1",
+                chat_id=777,
+                message_id=42,
+                sender_user_id=777,
+                approval_id="approval_1",
+                approved=True,
+                message_text="Approval required\nsummary: Install a CLI.",
+            )
+        )
+
+        self.assertEqual(gateway.approval_calls, [("tg_777", "approval_1", True)])
+        self.assertEqual(len(telegram.answered_callbacks), 1)
+        self.assertEqual(telegram.answered_callbacks[0].text, "Approved")
+        self.assertEqual(len(telegram.edited_messages), 1)
+        self.assertIn("Status: Approved", telegram.edited_messages[0].text)
+
     async def test_handle_message_streams_drafts_then_final_message(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
@@ -553,6 +673,68 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             ["Working on it.", "🔧 Used <b>bash</b> tool.", "Done."],
+        )
+
+    async def test_handle_message_sends_approval_request_with_inline_keyboard(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayApprovalRequestEvent(
+                    session_id="session",
+                    approval_id="approval_1",
+                    kind="bash_command",
+                    summary="Install a CLI.",
+                    details="I want to install a CLI for this task.",
+                    command="curl https://example.com/install.sh | sh",
+                    tool_name="bash",
+                    inspection_url="https://example.com",
+                ),
+                GatewayTurnDoneEvent(
+                    session_id="session",
+                    response_text="",
+                    interrupted=True,
+                ),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(len(telegram.sent_messages), 1)
+        approval_message = telegram.sent_messages[0]
+        self.assertEqual(approval_message.parse_mode, "HTML")
+        self.assertEqual(
+            approval_message.text,
+            "<b>Approval required</b>\n"
+            "<b>summary:</b> Install a CLI.\n"
+            "<b>details:</b> I want to install a CLI for this task.\n"
+            "<b>tool_name:</b> bash\n"
+            "<b>command:</b>\n"
+            "<pre>curl https://example.com/install.sh | sh</pre>\n"
+            "<b>inspect:</b> https://example.com",
+        )
+        self.assertEqual(
+            approval_message.reply_markup,
+            {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Approve",
+                            "callback_data": "appr:1:approval_1",
+                        },
+                        {
+                            "text": "Reject",
+                            "callback_data": "appr:0:approval_1",
+                        },
+                    ]
+                ]
+            },
         )
 
     async def test_handle_message_preserves_tool_notice_when_tool_event_arrives_first(self) -> None:
@@ -1106,6 +1288,32 @@ class TelegramBotHelpersTests(unittest.TestCase):
             }
         )
         self.assertIsNone(parsed)
+
+    def test_parse_incoming_approval_callback(self) -> None:
+        parsed = parse_incoming_approval_callback(
+            {
+                "update_id": 18,
+                "callback_query": {
+                    "id": "callback_1",
+                    "from": {"id": 777, "is_bot": False},
+                    "data": "appr:0:approval_1",
+                    "message": {
+                        "message_id": 42,
+                        "chat": {"id": 777, "type": "private"},
+                        "text": "Approval required\nsummary: Install a CLI.",
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(parsed)
+        if parsed is None:
+            self.fail("Expected parsed approval callback.")
+        self.assertEqual(parsed.callback_query_id, "callback_1")
+        self.assertEqual(parsed.chat_id, 777)
+        self.assertEqual(parsed.message_id, 42)
+        self.assertEqual(parsed.approval_id, "approval_1")
+        self.assertFalse(parsed.approved)
 
     def test_clear_directory_contents_removes_files_and_subdirectories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

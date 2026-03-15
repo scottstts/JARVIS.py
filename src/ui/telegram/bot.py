@@ -25,6 +25,7 @@ from .api import (
 from .config import UIConfigurationError, UISettings
 from .formatting import render_markdown_to_telegram_html
 from .gateway_client import (
+    GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
@@ -38,6 +39,8 @@ _GENERIC_ERROR_REPLY = "I hit an internal error while processing that message."
 _FILE_DOWNLOAD_ERROR_REPLY = "I couldn't download that file from Telegram."
 _FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_APPROVAL_CALLBACK_PREFIX = "appr"
+_APPROVAL_COMMAND_PREVIEW_CHARS = 1500
 
 
 class GatewayClientLike(Protocol):
@@ -46,6 +49,15 @@ class GatewayClientLike(Protocol):
 
     async def request_stop(self, *, route_id: str) -> bool:
         """Requests cooperative stop for the active turn on the given route."""
+
+    async def submit_approval(
+        self,
+        *,
+        route_id: str,
+        approval_id: str,
+        approved: bool,
+    ) -> bool:
+        """Resolves one pending approval request for the active route."""
 
 
 class TelegramClientLike(Protocol):
@@ -78,8 +90,29 @@ class TelegramClientLike(Protocol):
         chat_id: int,
         text: str,
         parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Sends a standard Telegram message."""
+
+    async def edit_message_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Edits an existing Telegram message."""
+
+    async def answer_callback_query(
+        self,
+        *,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        """Acknowledges a Telegram callback query."""
 
     async def send_message_draft(
         self,
@@ -128,6 +161,18 @@ class IncomingTelegramMessage:
 
 
 IncomingTextMessage = IncomingTelegramMessage
+
+
+@dataclass(slots=True, frozen=True)
+class IncomingTelegramApprovalCallback:
+    update_id: int
+    callback_query_id: str
+    chat_id: int
+    message_id: int
+    sender_user_id: int
+    approval_id: str
+    approved: bool
+    message_text: str | None = None
 
 
 class TelegramGatewayBridge:
@@ -196,11 +241,63 @@ class TelegramGatewayBridge:
                 update_id = update.get("update_id")
                 if isinstance(update_id, int):
                     next_offset = max(next_offset or 0, update_id + 1)
+            callback = parse_incoming_approval_callback(update)
+            if callback is not None:
+                await self.handle_approval_callback(callback)
+                continue
             message = parse_incoming_message(update)
             if message is None:
                 continue
             await self.dispatch_message(message)
         return next_offset
+
+    async def handle_approval_callback(
+        self,
+        callback: IncomingTelegramApprovalCallback,
+    ) -> None:
+        if self._settings.telegram_allowed_user_id != callback.sender_user_id:
+            LOGGER.warning("Ignoring unauthorized Telegram approval callback.")
+            return
+
+        route_id = route_id_for_chat(callback.chat_id)
+        try:
+            resolved = await self._gateway.submit_approval(
+                route_id=route_id,
+                approval_id=callback.approval_id,
+                approved=callback.approved,
+            )
+        except GatewayBridgeError:
+            LOGGER.exception("Failed to submit approval callback to the gateway.")
+            await self._telegram.answer_callback_query(
+                callback_query_id=callback.callback_query_id,
+                text="Could not contact the gateway.",
+                show_alert=True,
+            )
+            return
+
+        if not resolved:
+            await self._telegram.answer_callback_query(
+                callback_query_id=callback.callback_query_id,
+                text="This approval request is no longer pending.",
+                show_alert=True,
+            )
+            return
+
+        decision_text = "Approved" if callback.approved else "Rejected"
+        await self._telegram.answer_callback_query(
+            callback_query_id=callback.callback_query_id,
+            text=decision_text,
+        )
+        base_text = callback.message_text or "Approval request"
+        updated_text = f"{base_text}\n\nStatus: {decision_text}"
+        try:
+            await self._telegram.edit_message_text(
+                chat_id=callback.chat_id,
+                message_id=callback.message_id,
+                text=updated_text,
+            )
+        except TelegramAPIError:
+            LOGGER.exception("Failed to edit Telegram approval message status.")
 
     async def dispatch_message(self, message: IncomingTelegramMessage) -> None:
         if message.chat_type != "private":
@@ -371,6 +468,26 @@ class TelegramGatewayBridge:
                             html_text=_format_tool_usage_notice(tool_name),
                         )
                         delivered_any_segment = True
+                    accumulated_text = ""
+                    last_draft_text = ""
+                    last_draft_at = 0.0
+                    segment_started_at = time.monotonic()
+                    current_draft_id = self._next_draft_id_for_chat(message.chat_id)
+                    continue
+
+                if isinstance(event, GatewayApprovalRequestEvent):
+                    flushed_text = _coalesce_visible_text(accumulated_text)
+                    if flushed_text is not None:
+                        await self._send_final_text(
+                            chat_id=message.chat_id,
+                            text=flushed_text,
+                        )
+                        delivered_any_segment = True
+                        pending_finalized_text_for_dedup = flushed_text
+                    await self._send_approval_request_message(
+                        chat_id=message.chat_id,
+                        approval=event,
+                    )
                     accumulated_text = ""
                     last_draft_text = ""
                     last_draft_at = 0.0
@@ -599,6 +716,40 @@ class TelegramGatewayBridge:
             return
         await self._telegram.send_message(chat_id=chat_id, text=plain_text)
 
+    async def _send_approval_request_message(
+        self,
+        *,
+        chat_id: int,
+        approval: GatewayApprovalRequestEvent,
+    ) -> None:
+        message_text = _format_approval_request_message(approval)
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Approve",
+                        "callback_data": _build_approval_callback_data(
+                            approval_id=approval.approval_id,
+                            approved=True,
+                        ),
+                    },
+                    {
+                        "text": "Reject",
+                        "callback_data": _build_approval_callback_data(
+                            approval_id=approval.approval_id,
+                            approved=False,
+                        ),
+                    },
+                ]
+            ]
+        }
+        await self._telegram.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
     def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
         if exc.retry_after_seconds is None:
             return
@@ -701,6 +852,68 @@ def parse_incoming_text_message(update: dict[str, Any]) -> IncomingTextMessage |
     return parse_incoming_message(update)
 
 
+def parse_incoming_approval_callback(
+    update: dict[str, Any],
+) -> IncomingTelegramApprovalCallback | None:
+    if not isinstance(update, dict):
+        return None
+    update_id = update.get("update_id")
+    if not isinstance(update_id, int):
+        return None
+
+    callback_query = update.get("callback_query")
+    if not isinstance(callback_query, dict):
+        return None
+
+    callback_query_id = callback_query.get("id")
+    if not isinstance(callback_query_id, str) or not callback_query_id.strip():
+        return None
+
+    from_user = callback_query.get("from")
+    if not isinstance(from_user, dict):
+        return None
+    sender_user_id = from_user.get("id")
+    if not isinstance(sender_user_id, int):
+        return None
+
+    message = callback_query.get("message")
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    chat_id = chat.get("id")
+    if not isinstance(chat_id, int):
+        return None
+    message_id = message.get("message_id")
+    if not isinstance(message_id, int):
+        return None
+
+    raw_callback_data = callback_query.get("data")
+    if not isinstance(raw_callback_data, str):
+        return None
+    parsed = _parse_approval_callback_data(raw_callback_data)
+    if parsed is None:
+        return None
+    approved, approval_id = parsed
+
+    message_text = None
+    raw_text = message.get("text")
+    if isinstance(raw_text, str):
+        message_text = raw_text
+
+    return IncomingTelegramApprovalCallback(
+        update_id=update_id,
+        callback_query_id=callback_query_id.strip(),
+        chat_id=chat_id,
+        message_id=message_id,
+        sender_user_id=sender_user_id,
+        approval_id=approval_id,
+        approved=approved,
+        message_text=message_text,
+    )
+
+
 def route_id_for_chat(chat_id: int) -> str:
     chat_segment = str(chat_id)
     if chat_segment.startswith("-"):
@@ -724,6 +937,56 @@ def chat_id_for_route_id(route_id: str) -> int | None:
     if chat_segment.isdigit():
         return int(chat_segment)
     return None
+
+
+def _build_approval_callback_data(*, approval_id: str, approved: bool) -> str:
+    decision = "1" if approved else "0"
+    return f"{_APPROVAL_CALLBACK_PREFIX}:{decision}:{approval_id}"
+
+
+def _parse_approval_callback_data(raw_value: str) -> tuple[bool, str] | None:
+    prefix = f"{_APPROVAL_CALLBACK_PREFIX}:"
+    if not raw_value.startswith(prefix):
+        return None
+    parts = raw_value.split(":", maxsplit=2)
+    if len(parts) != 3:
+        return None
+    decision, approval_id = parts[1], parts[2].strip()
+    if not approval_id:
+        return None
+    if decision == "1":
+        return True, approval_id
+    if decision == "0":
+        return False, approval_id
+    return None
+
+
+def _format_approval_request_message(approval: GatewayApprovalRequestEvent) -> str:
+    escaped_summary = html.escape(approval.summary.strip() or "Approval requested.")
+    lines = [
+        "<b>Approval required</b>",
+        f"<b>summary:</b> {escaped_summary}",
+    ]
+    details = approval.details.strip()
+    if details:
+        lines.append(f"<b>details:</b> {html.escape(details)}")
+    tool_name = (approval.tool_name or "").strip()
+    if tool_name:
+        lines.append(f"<b>tool_name:</b> {html.escape(tool_name)}")
+    command = (approval.command or "").strip()
+    if command:
+        lines.append("<b>command:</b>")
+        lines.append(f"<pre>{html.escape(_truncate_approval_command(command))}</pre>")
+    inspection_url = (approval.inspection_url or "").strip()
+    if inspection_url:
+        lines.append(f"<b>inspect:</b> {html.escape(inspection_url)}")
+    return "\n".join(lines)
+
+
+def _truncate_approval_command(command: str) -> str:
+    if len(command) <= _APPROVAL_COMMAND_PREVIEW_CHARS:
+        return command
+    return command[: _APPROVAL_COMMAND_PREVIEW_CHARS - 15] + "\n...[truncated]..."
 
 
 def _extract_file_attachment(message: dict[str, Any]) -> IncomingTelegramFile | None:

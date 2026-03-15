@@ -16,6 +16,7 @@ class _TrackingLoop:
         self.active_calls = 0
         self.max_concurrency = 0
         self.stop_requests = 0
+        self.approval_resolutions: list[tuple[str, bool]] = []
 
     def active_session_id(self) -> str | None:
         return self._session_id
@@ -23,6 +24,10 @@ class _TrackingLoop:
     def request_stop(self) -> bool:
         self.stop_requests += 1
         return True
+
+    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
+        self.approval_resolutions.append((approval_id, approved))
+        return approval_id == "approval_1"
 
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         self.active_calls += 1
@@ -125,6 +130,15 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(stop_requested)
         self.assertEqual(loop.stop_requests, 1)
+
+    async def test_resolve_approval_delegates_to_route_loop(self) -> None:
+        loop = _TrackingLoop(session_id="alpha-session")
+        router = SessionRouter(lambda _route_id: loop)
+
+        resolved = router.resolve_approval("alpha", "approval_1", True)
+
+        self.assertTrue(resolved)
+        self.assertEqual(loop.approval_resolutions, [("approval_1", True)])
 
 
 class ValidateRouteIDTests(unittest.TestCase):

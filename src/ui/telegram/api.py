@@ -83,7 +83,7 @@ class TelegramBotAPIClient:
         payload: dict[str, Any] = {
             "timeout": timeout_seconds,
             "limit": limit,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -167,6 +167,7 @@ class TelegramBotAPIClient:
         chat_id: int,
         text: str,
         parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -174,6 +175,8 @@ class TelegramBotAPIClient:
         }
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         result = await self._call_method("sendMessage", payload=payload)
         if not isinstance(result, dict):
             raise TelegramAPIError(
@@ -181,6 +184,48 @@ class TelegramBotAPIClient:
                 message="Telegram sendMessage returned an unexpected payload shape.",
             )
         return result
+
+    async def edit_message_text(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        result = await self._call_method("editMessageText", payload=payload)
+        if not isinstance(result, dict):
+            raise TelegramAPIError(
+                code="invalid_telegram_response",
+                message="Telegram editMessageText returned an unexpected payload shape.",
+            )
+        return result
+
+    async def answer_callback_query(
+        self,
+        *,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text is not None:
+            payload["text"] = text
+        result = await self._call_method("answerCallbackQuery", payload=payload)
+        return bool(result)
 
     async def send_message_draft(
         self,

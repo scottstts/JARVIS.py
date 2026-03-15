@@ -7,6 +7,8 @@ from typing import Any, Protocol
 
 from llm import ToolDefinition
 
+from ...discoverable_search import search_discoverable_entries
+from ...runtime_tools import load_runtime_tool_catalog
 from ...types import (
     DiscoverableTool,
     RegisteredTool,
@@ -18,8 +20,14 @@ from ...types import (
 class ToolSearchCatalog(Protocol):
     """Minimal registry surface used by tool_search."""
 
-    def search_discoverable(self, query: str) -> tuple[DiscoverableTool, ...]:
-        """Return discoverable-tool matches for the query."""
+    def discoverable_entries(self) -> tuple[DiscoverableTool, ...]:
+        """Return built-in discoverable catalog entries."""
+
+    def get(self, name: str) -> RegisteredTool | None:
+        """Return a registered executable tool by name."""
+
+    def registered_tool_names(self) -> tuple[str, ...]:
+        """Return all registered executable tool names."""
 
 
 class ToolSearchToolExecutor:
@@ -35,10 +43,20 @@ class ToolSearchToolExecutor:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
-        _ = context
         query = _normalize_optional_string(arguments.get("query"))
         verbosity = _normalize_verbosity(arguments.get("verbosity"))
-        matches = self._catalog.search_discoverable(query or "")
+        built_in_entries = self._catalog.discoverable_entries()
+        reserved_names = {
+            entry.name
+            for entry in built_in_entries
+        }
+        reserved_names.update(self._catalog.registered_tool_names())
+        runtime_catalog = load_runtime_tool_catalog(
+            context.workspace_dir,
+            reserved_names=reserved_names,
+        )
+        merged_entries = tuple(built_in_entries) + runtime_catalog.entries
+        matches = search_discoverable_entries(merged_entries, query or "")
         activated_discoverable_tool_names = [
             entry.name
             for entry in matches
@@ -56,6 +74,7 @@ class ToolSearchToolExecutor:
             "match_count": len(matches),
             "matches": [_serialize_discoverable_entry(entry) for entry in matches],
             "activated_discoverable_tool_names": activated_discoverable_tool_names,
+            "runtime_tool_errors": list(runtime_catalog.errors),
         }
         return ToolExecutionResult(
             call_id=call_id,

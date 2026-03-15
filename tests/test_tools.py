@@ -27,6 +27,12 @@ from tools import (
 from tools.basic.memory_write.tool import build_memory_write_tool
 from tools.basic.tool_search import build_tool_search_tool
 from tools.basic.memory_search.tool import _format_memory_search_result
+from tools.runtime_tool_manifest import (
+    dump_runtime_tool_manifest,
+    runtime_tool_manifest_path,
+    validate_runtime_tool_manifest_payload,
+)
+from tools.runtime_tools import load_runtime_tool_catalog
 from tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     HTTPFetchResult,
@@ -202,6 +208,14 @@ def _build_http_fetch_result(
     )
 
 
+def _write_runtime_manifest(workspace_dir: Path, payload: dict[str, object]) -> Path:
+    manifest = validate_runtime_tool_manifest_payload(payload)
+    path = runtime_tool_manifest_path(workspace_dir, manifest.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dump_runtime_tool_manifest(manifest), encoding="utf-8")
+    return path
+
+
 class ToolSettingsTests(unittest.TestCase):
     def test_requires_agent_workspace_for_host_runs(self) -> None:
         with patch.dict(
@@ -249,6 +263,20 @@ class ToolSettingsTests(unittest.TestCase):
                 settings = ToolSettings.from_workspace_dir(workspace_dir)
 
         self.assertEqual(settings.web_search_result_count, 7)
+
+    def test_allows_bash_permission_skip_env_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {"BASH_DANGEROUSLY_SKIP_PERMISSION": "true"},
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        self.assertTrue(settings.bash_dangerously_skip_permission)
 
     def test_memory_write_tool_describes_superseding_rewrite_and_truth_contracts(self) -> None:
         tool = build_memory_write_tool()
@@ -395,6 +423,61 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertEqual(settings.python_interpreter_max_timeout_seconds, 30.0)
 
 
+class RuntimeToolManifestTests(unittest.TestCase):
+    def test_validate_runtime_tool_manifest_normalizes_aliases(self) -> None:
+        manifest = validate_runtime_tool_manifest_payload(
+            {
+                "name": "google_workspace_cli",
+                "purpose": "Use the Google Workspace CLI from bash.",
+                "operator": "bash",
+                "aliases": [" google ", "admin", "google", ""],
+                "invocation": {"command": "gws --help"},
+            }
+        )
+
+        self.assertEqual(manifest.name, "google_workspace_cli")
+        self.assertEqual(manifest.aliases, ("google", "admin"))
+        self.assertEqual(manifest.to_dict()["invocation"], {"command": "gws --help"})
+        self.assertRegex(manifest.manifest_hash(), r"^[0-9a-f]{64}$")
+
+    def test_load_runtime_tool_catalog_reads_valid_manifests_and_reports_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            _write_runtime_manifest(
+                workspace_dir,
+                {
+                    "name": "google_workspace_cli",
+                    "purpose": "Use the Google Workspace CLI from bash.",
+                    "operator": "bash",
+                    "invocation": {"command": "gws --help"},
+                },
+            )
+            runtime_dir = workspace_dir / "runtime_tools"
+            (runtime_dir / "bad.json").write_text("{bad json", encoding="utf-8")
+            _write_runtime_manifest(
+                workspace_dir,
+                {
+                    "name": "bash",
+                    "purpose": "Conflicting tool.",
+                    "operator": "bash",
+                },
+            )
+
+            loaded = load_runtime_tool_catalog(
+                workspace_dir,
+                reserved_names={"bash", "tool_search"},
+            )
+
+        self.assertEqual([entry.name for entry in loaded.entries], ["google_workspace_cli"])
+        self.assertEqual([manifest.name for manifest in loaded.manifests], ["google_workspace_cli"])
+        self.assertEqual(loaded.entries[0].metadata["source"], "runtime_tools")
+        self.assertEqual(loaded.entries[0].metadata["operator"], "bash")
+        self.assertEqual(len(loaded.errors), 2)
+        self.assertTrue(any("bad.json" in error for error in loaded.errors))
+        self.assertTrue(any("conflicts with a built-in tool" in error for error in loaded.errors))
+
+
 class ToolRegistryTests(unittest.TestCase):
     def test_memory_search_result_formats_sys_warning(self) -> None:
         rendered = _format_memory_search_result(
@@ -455,6 +538,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "view_image",
                     "send_file",
                     "tool_search",
+                    "tool_register",
                 ],
             )
             self.assertEqual(registry.search("bash"), ())
@@ -633,6 +717,95 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("null bytes", decision.reason or "")
+
+    def test_bash_policy_requires_approval_for_system_write_command(self) -> None:
+        command = "printf 'jarvis' > /etc/jarvis-bash-test"
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": command},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "bash command requires explicit approval.")
+        self.assertIsNotNone(decision.approval_request)
+        if decision.approval_request is None:
+            self.fail("Expected approval request metadata.")
+        self.assertEqual(decision.approval_request["kind"], "bash_command")
+        self.assertEqual(decision.approval_request["command"], command)
+
+    def test_bash_policy_allows_exactly_approved_system_write_command(self) -> None:
+        command = "printf 'jarvis' > /etc/jarvis-bash-test"
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": command},
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                approved_action={"kind": "bash_command", "command": command},
+            ),
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_bash_policy_skip_permission_env_bypasses_detector(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"BASH_DANGEROUSLY_SKIP_PERMISSION": "true"},
+            clear=False,
+        ):
+            decision = ToolPolicy().authorize(
+                tool_name="bash",
+                arguments={"command": "printf 'jarvis' > /etc/jarvis-bash-test"},
+                context=self.context,
+            )
+
+        self.assertTrue(decision.allowed)
+
+    def test_tool_register_requires_approval(self) -> None:
+        manifest = {
+            "name": "google_workspace_cli",
+            "purpose": "Use the Google Workspace CLI from bash.",
+            "operator": "bash",
+            "invocation": {"command": "gws --help"},
+        }
+
+        decision = self.policy.authorize(
+            tool_name="tool_register",
+            arguments={"manifest": manifest},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "tool_register requires explicit approval.")
+        self.assertIsNotNone(decision.approval_request)
+        if decision.approval_request is None:
+            self.fail("Expected approval request metadata.")
+        self.assertEqual(decision.approval_request["kind"], "register_runtime_tool")
+        self.assertEqual(decision.approval_request["tool_name"], "google_workspace_cli")
+
+    def test_tool_register_allows_exactly_approved_manifest(self) -> None:
+        manifest = {
+            "name": "google_workspace_cli",
+            "purpose": "Use the Google Workspace CLI from bash.",
+            "operator": "bash",
+            "invocation": {"command": "gws --help"},
+        }
+        validated = validate_runtime_tool_manifest_payload(manifest)
+
+        decision = self.policy.authorize(
+            tool_name="tool_register",
+            arguments={"manifest": manifest},
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                approved_action={
+                    "kind": "register_runtime_tool",
+                    "tool_name": validated.name,
+                    "manifest_hash": validated.manifest_hash(),
+                },
+            ),
+        )
+
+        self.assertTrue(decision.allowed)
 
     def test_memory_write_policy_denies_summary_only_core_create(self) -> None:
         decision = self.policy.authorize(
@@ -1153,7 +1326,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         _BASH_SANDBOX_RUNTIME_AVAILABLE,
         "bash sandbox runtime is only available when bubblewrap is installed",
     )
-    async def test_bash_mounts_etc_read_only(self) -> None:
+    async def test_bash_requires_approval_for_system_write_command(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_etc_read_only",
@@ -1165,9 +1338,15 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(result.ok)
-        self.assertTrue(
-            "Read-only file system" in result.content
-            or "Permission denied" in result.content
+        self.assertIn("Approval required", result.content)
+        self.assertTrue(result.metadata["approval_required"])
+        self.assertEqual(
+            result.metadata["approval_request"]["kind"],
+            "bash_command",
+        )
+        self.assertEqual(
+            result.metadata["approval_request"]["command"],
+            "printf 'jarvis' > /etc/jarvis-bash-test",
         )
 
     async def test_file_patch_creates_new_file_with_write_operation(self) -> None:
@@ -1365,7 +1544,130 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("/run/secrets", result.content)
-        self.assertIn("No such file", result.content)
+        self.assertTrue(
+            "No such file" in result.content
+            or "Permission denied" in result.content
+        )
+
+    async def test_tool_register_requires_approval_before_writing_manifest(self) -> None:
+        manifest = {
+            "name": "google_workspace_cli",
+            "purpose": "Use the Google Workspace CLI from bash.",
+            "operator": "bash",
+            "invocation": {"command": "gws --help"},
+        }
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_register_requires_approval",
+                name="tool_register",
+                arguments={"manifest": manifest},
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.metadata["approval_required"])
+        self.assertEqual(
+            result.metadata["approval_request"]["kind"],
+            "register_runtime_tool",
+        )
+        self.assertFalse(
+            (self.workspace_dir / "runtime_tools" / "google_workspace_cli.json").exists()
+        )
+
+    async def test_tool_register_writes_manifest_when_exact_approval_is_present(self) -> None:
+        manifest_payload = {
+            "name": "google_workspace_cli",
+            "purpose": "Use the Google Workspace CLI from bash.",
+            "operator": "bash",
+            "invocation": {"command": "gws --help"},
+        }
+        manifest = validate_runtime_tool_manifest_payload(manifest_payload)
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_register_approved",
+                name="tool_register",
+                arguments={"manifest": manifest_payload},
+                raw_arguments="{}",
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                approved_action={
+                    "kind": "register_runtime_tool",
+                    "tool_name": manifest.name,
+                    "manifest_hash": manifest.manifest_hash(),
+                },
+            ),
+        )
+
+        self.assertTrue(result.ok)
+        manifest_path = self.workspace_dir / "runtime_tools" / "google_workspace_cli.json"
+        self.assertTrue(manifest_path.exists())
+        self.assertIn("Runtime tool registered", result.content)
+        self.assertEqual(result.metadata["manifest_hash"], manifest.manifest_hash())
+        self.assertIn('"name": "google_workspace_cli"', manifest_path.read_text(encoding="utf-8"))
+
+    async def test_tool_search_includes_runtime_registered_tools_from_workspace(self) -> None:
+        _write_runtime_manifest(
+            self.workspace_dir,
+            {
+                "name": "google_workspace_cli",
+                "purpose": "Use the Google Workspace CLI from bash.",
+                "operator": "bash",
+                "invocation": {"command": "gws --help"},
+                "rebuild": {"check": "command -v gws"},
+            },
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_runtime",
+                name="tool_search",
+                arguments={"query": "google_workspace_cli", "verbosity": "high"},
+                raw_arguments='{"query":"google_workspace_cli","verbosity":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(result.metadata["match_count"], 1)
+        self.assertEqual(result.metadata["matches"][0]["name"], "google_workspace_cli")
+        self.assertNotIn(
+            "google_workspace_cli",
+            result.metadata["activated_discoverable_tool_names"],
+        )
+        self.assertEqual(
+            result.metadata["matches"][0]["metadata"]["source"],
+            "runtime_tools",
+        )
+        self.assertEqual(
+            result.metadata["matches"][0]["metadata"]["operator"],
+            "bash",
+        )
+        self.assertIn("google_workspace_cli", result.content)
+        self.assertIn('"operator": "bash"', result.content)
+
+    async def test_tool_search_reports_runtime_manifest_errors(self) -> None:
+        runtime_dir = self.workspace_dir / "runtime_tools"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        (runtime_dir / "broken.json").write_text("{bad json", encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_runtime_errors",
+                name="tool_search",
+                arguments={},
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.metadata["runtime_tool_errors"]), 1)
+        self.assertIn("broken.json", result.metadata["runtime_tool_errors"][0])
 
     @unittest.skipUnless(
         _BASH_SANDBOX_RUNTIME_AVAILABLE,

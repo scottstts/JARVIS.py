@@ -179,6 +179,29 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session.calls[0]["json"]["parse_mode"], "HTML")
 
+    async def test_send_message_includes_reply_markup(self) -> None:
+        session = _FakeSession(
+            post_responses=[
+                _FakeResponse(
+                    status_code=200,
+                    payload={"ok": True, "result": {"message_id": 1}},
+                )
+            ]
+        )
+        client = TelegramBotAPIClient(token="token")
+        client._session = session
+
+        await client.send_message(
+            chat_id=123,
+            text="approve?",
+            reply_markup={"inline_keyboard": [[{"text": "Approve", "callback_data": "x"}]]},
+        )
+
+        self.assertEqual(
+            session.calls[0]["json"]["reply_markup"],
+            {"inline_keyboard": [[{"text": "Approve", "callback_data": "x"}]]},
+        )
+
     async def test_send_message_draft_includes_parse_mode(self) -> None:
         session = _FakeSession(
             post_responses=[
@@ -195,6 +218,74 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(session.calls[0]["json"]["parse_mode"], "HTML")
+
+    async def test_get_updates_requests_callback_queries(self) -> None:
+        session = _FakeSession(
+            post_responses=[
+                _FakeResponse(
+                    status_code=200,
+                    payload={"ok": True, "result": []},
+                )
+            ]
+        )
+        client = TelegramBotAPIClient(token="token")
+        client._session = session
+
+        await client.get_updates(offset=None, timeout_seconds=30, limit=100)
+
+        self.assertEqual(
+            session.calls[0]["json"]["allowed_updates"],
+            ["message", "callback_query"],
+        )
+
+    async def test_edit_message_text_includes_reply_markup(self) -> None:
+        session = _FakeSession(
+            post_responses=[
+                _FakeResponse(
+                    status_code=200,
+                    payload={"ok": True, "result": {"message_id": 7}},
+                )
+            ]
+        )
+        client = TelegramBotAPIClient(token="token")
+        client._session = session
+
+        await client.edit_message_text(
+            chat_id=123,
+            message_id=7,
+            text="updated",
+            reply_markup={"inline_keyboard": [[{"text": "Approved", "callback_data": "done"}]]},
+        )
+
+        self.assertEqual(session.calls[0]["url"].split("/")[-1], "editMessageText")
+        self.assertEqual(session.calls[0]["json"]["message_id"], 7)
+        self.assertEqual(
+            session.calls[0]["json"]["reply_markup"],
+            {"inline_keyboard": [[{"text": "Approved", "callback_data": "done"}]]},
+        )
+
+    async def test_answer_callback_query_posts_expected_payload(self) -> None:
+        session = _FakeSession(
+            post_responses=[
+                _FakeResponse(
+                    status_code=200,
+                    payload={"ok": True, "result": True},
+                )
+            ]
+        )
+        client = TelegramBotAPIClient(token="token")
+        client._session = session
+
+        result = await client.answer_callback_query(
+            callback_query_id="callback_1",
+            text="Approved",
+            show_alert=False,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(session.calls[0]["url"].split("/")[-1], "answerCallbackQuery")
+        self.assertEqual(session.calls[0]["json"]["callback_query_id"], "callback_1")
+        self.assertEqual(session.calls[0]["json"]["text"], "Approved")
 
     async def test_get_file_returns_remote_file_metadata(self) -> None:
         session = _FakeSession(

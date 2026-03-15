@@ -72,6 +72,7 @@ class SessionStorage:
             session_id,
             status="archived",
             pending_reactive_compaction=False,
+            pending_approval=None,
         )
 
     def set_turn_status(

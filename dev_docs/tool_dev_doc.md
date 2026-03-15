@@ -169,6 +169,40 @@ Important:
 - this keeps initial tool lists small and avoids turning every discoverable capability into permanent context noise
 - low verbosity is intentionally non-activating so the agent can scout first and expand later
 
+### Runtime Tools
+
+Runtime tools are discoverable manifest entries loaded dynamically from `/workspace/runtime_tools/*.json`.
+
+Current runtime-tool rules:
+
+- runtime tools are not repo-defined executable tools
+- runtime tools are merged into `tool_search` results at execution time, not startup
+- runtime tools are usually used through existing operators such as `bash`
+- runtime tool registration happens through the basic `tool_register` tool
+- runtime tool manifests are validated by `src/tools/runtime_tool_manifest.py`
+- runtime tool loading is handled by `src/tools/runtime_tools.py`
+
+Current runtime manifest shape:
+
+- `name`
+- `purpose`
+- `aliases` optional
+- `detailed_description` optional
+- `usage` optional
+- `notes` optional
+- `operator`
+- `invocation` optional
+- `provisioning` optional
+- `artifacts` optional
+- `rebuild` optional
+- `safety` optional
+
+Important:
+
+- runtime tool manifests are data only and do not create new repo executors
+- `tool_search` should clearly label runtime entries with `source: runtime_tools`
+- the manifest should contain enough information for another agent to rebuild the capability
+
 ### Recommended Test Coverage For New Discoverable Tools
 
 When you add the first real discoverable executable tool, add tests for all of the following:
@@ -213,9 +247,10 @@ Structure:
 
 Current active policy:
 
-- `bash` only does thin validation up front; actual access control is enforced by a `bubblewrap` sandbox that mounts the workspace at `/workspace`, scrubs the environment, and omits `/repo` and `/run/secrets`
+- `bash` uses a broad-access blacklist sandbox, still scrubs the environment, hides `/repo`, masks `/run/secrets`, and enforces a moderately aggressive approval detector for install/build/system-mutation commands unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
+- `tool_register` always requires exact-action approval and binds approval to the manifest payload hash
 
 ### Transcript And Follow-Up Tool Rounds
 
@@ -223,6 +258,7 @@ Current standard:
 
 - assistant tool calls are stored as structured records plus metadata
 - tool results are stored as structured records plus metadata
+- approval requests and approval decisions are stored as structured records plus metadata
 - internal tool-call payloads are not sent to user-facing Telegram output
 - follow-up tool rounds are rebuilt into provider-native request shapes inside `src/llm/`
 - `tool_search` may attach discoverable-activation metadata to its tool result

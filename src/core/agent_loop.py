@@ -1,6 +1,7 @@
 """Core agentic loop with sessioning and context compaction policies."""
 
 from __future__ import annotations
+import asyncio
 import base64
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -64,6 +65,7 @@ _FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT = (
 _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
     "Follow-up retry aborted: compacted request still overflowed the provider context limit."
 )
+_APPROVAL_REJECTED_TEXT = "Approval request was rejected. I did not execute the action."
 _PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
 _TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
 LOGGER = logging.getLogger(__name__)
@@ -100,6 +102,19 @@ class AgentToolCallEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class AgentApprovalRequestEvent:
+    session_id: str
+    approval_id: str
+    kind: str
+    summary: str
+    details: str
+    command: str | None = None
+    tool_name: str | None = None
+    inspection_url: str | None = None
+    type: Literal["approval_request"] = "approval_request"
+
+
+@dataclass(slots=True, frozen=True)
 class AgentTurnDoneEvent:
     session_id: str
     response_text: str
@@ -122,8 +137,15 @@ AgentTurnStreamEvent = (
     AgentTextDeltaEvent
     | AgentAssistantMessageEvent
     | AgentToolCallEvent
+    | AgentApprovalRequestEvent
     | AgentTurnDoneEvent
 )
+
+
+@dataclass(slots=True, frozen=True)
+class _ToolExecutionOutcome:
+    approval_rejected: bool = False
+    interrupted: bool = False
 
 
 class AgentLoop:
@@ -165,6 +187,9 @@ class AgentLoop:
         )
         self._active_turn_id: str | None = None
         self._stop_requested_turn_id: str | None = None
+        self._pending_approval_future: asyncio.Future[bool] | None = None
+        self._pending_approval_id: str | None = None
+        self._pending_approval_turn_id: str | None = None
 
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         command = parse_user_command(user_text)
@@ -196,6 +221,18 @@ class AgentLoop:
         if active_turn_id is None:
             return False
         self._stop_requested_turn_id = active_turn_id
+        return True
+
+    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
+        normalized = approval_id.strip()
+        if not normalized:
+            return False
+        pending_future = self._pending_approval_future
+        if pending_future is None or pending_future.done():
+            return False
+        if self._pending_approval_id != normalized:
+            return False
+        pending_future.set_result(bool(approved))
         return True
 
     async def _handle_new_command(self, command: ParsedCommand) -> AgentTurnResult:
@@ -424,30 +461,73 @@ class AgentLoop:
         pending_records: list[ConversationRecord],
         current_response: LLMResponse,
         turn_id: str,
-    ) -> None:
+    ) -> _ToolExecutionOutcome:
         transient_records: list[ConversationRecord] = []
         for tool_call in current_response.tool_calls:
-            tool_result = await self._tool_runtime.execute(
-                tool_call=tool_call,
-                context=replace(self._tool_context, session_id=session_id),
-            )
-            self._append_turn_record(
-                session_id=session_id,
-                pending_records=pending_records,
-                record=self._build_tool_record(
-                    session_id,
-                    tool_result,
-                    turn_id=turn_id,
-                ),
-            )
-            transient_records.extend(
-                self._build_transient_records_from_tool_result(
-                    session_id,
-                    tool_result,
+            tool_context = replace(self._tool_context, session_id=session_id)
+            while True:
+                tool_result = await self._tool_runtime.execute(
+                    tool_call=tool_call,
+                    context=tool_context,
                 )
-            )
+                pending_approval = self._build_pending_approval(
+                    tool_result=tool_result,
+                    tool_name=tool_call.name,
+                )
+                if pending_approval is None:
+                    self._append_turn_record(
+                        session_id=session_id,
+                        pending_records=pending_records,
+                        record=self._build_tool_record(
+                            session_id,
+                            tool_result,
+                            turn_id=turn_id,
+                        ),
+                    )
+                    transient_records.extend(
+                        self._build_transient_records_from_tool_result(
+                            session_id,
+                            tool_result,
+                        )
+                    )
+                    break
+
+                self._append_turn_record(
+                    session_id=session_id,
+                    pending_records=pending_records,
+                    record=self._build_tool_record(
+                        session_id,
+                        tool_result,
+                        metadata_overrides={
+                            "approval_required": True,
+                            "approval_request": pending_approval,
+                        },
+                        turn_id=turn_id,
+                    ),
+                )
+                approved = await self._wait_for_approval(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    approval=pending_approval,
+                )
+                if approved is None:
+                    return _ToolExecutionOutcome(interrupted=True)
+                self._append_turn_record(
+                    session_id=session_id,
+                    pending_records=pending_records,
+                    record=self._build_approval_record(
+                        session_id=session_id,
+                        approval=pending_approval,
+                        approved=approved,
+                        turn_id=turn_id,
+                    ),
+                )
+                if not approved:
+                    return _ToolExecutionOutcome(approval_rejected=True)
+                tool_context = replace(tool_context, approved_action=pending_approval)
 
         pending_records.extend(transient_records)
+        return _ToolExecutionOutcome()
 
     def _build_followup_request(
         self,
@@ -868,12 +948,119 @@ class AgentLoop:
 
                 followup_compaction_attempted = False
                 try:
-                    await self._execute_tool_calls(
-                        session_id=session.session_id,
-                        pending_records=pending_records,
-                        current_response=current_response,
-                        turn_id=turn_id,
-                    )
+                    transient_records: list[ConversationRecord] = []
+                    approval_rejected = False
+                    for tool_call in current_response.tool_calls:
+                        tool_context = replace(
+                            self._tool_context,
+                            session_id=session.session_id,
+                        )
+                        while True:
+                            tool_result = await self._tool_runtime.execute(
+                                tool_call=tool_call,
+                                context=tool_context,
+                            )
+                            pending_approval = self._build_pending_approval(
+                                tool_result=tool_result,
+                                tool_name=tool_call.name,
+                            )
+                            if pending_approval is None:
+                                self._append_turn_record(
+                                    session_id=session.session_id,
+                                    pending_records=pending_records,
+                                    record=self._build_tool_record(
+                                        session.session_id,
+                                        tool_result,
+                                        turn_id=turn_id,
+                                    ),
+                                )
+                                transient_records.extend(
+                                    self._build_transient_records_from_tool_result(
+                                        session.session_id,
+                                        tool_result,
+                                    )
+                                )
+                                break
+
+                            self._append_turn_record(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                record=self._build_tool_record(
+                                    session.session_id,
+                                    tool_result,
+                                    metadata_overrides={
+                                        "approval_required": True,
+                                        "approval_request": pending_approval,
+                                    },
+                                    turn_id=turn_id,
+                                ),
+                            )
+                            yield self._build_approval_request_event(
+                                session_id=session.session_id,
+                                approval=pending_approval,
+                            )
+                            approved = await self._wait_for_approval(
+                                session_id=session.session_id,
+                                turn_id=turn_id,
+                                approval=pending_approval,
+                            )
+                            if approved is None:
+                                interrupted = self._interrupt_turn(
+                                    session_id=session.session_id,
+                                    turn_id=turn_id,
+                                    command=command_override,
+                                    compaction_performed=did_compaction,
+                                    response_text=current_response.text,
+                                )
+                                yield AgentTurnDoneEvent(
+                                    session_id=interrupted.session_id,
+                                    response_text=interrupted.response_text,
+                                    command=interrupted.command,
+                                    compaction_performed=interrupted.compaction_performed,
+                                    interrupted=True,
+                                )
+                                return
+                            self._append_turn_record(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                record=self._build_approval_record(
+                                    session_id=session.session_id,
+                                    approval=pending_approval,
+                                    approved=approved,
+                                    turn_id=turn_id,
+                                ),
+                            )
+                            if not approved:
+                                approval_rejected = True
+                                current_response = replace(
+                                    current_response,
+                                    text=_APPROVAL_REJECTED_TEXT,
+                                    tool_calls=[],
+                                    finish_reason="stop",
+                                )
+                                self._append_turn_record(
+                                    session_id=session.session_id,
+                                    pending_records=pending_records,
+                                    record=self._build_message_record(
+                                        session_id=session.session_id,
+                                        role="assistant",
+                                        content=_APPROVAL_REJECTED_TEXT,
+                                        metadata={"approval_rejected": True},
+                                        turn_id=turn_id,
+                                    ),
+                                )
+                                break
+                            tool_context = replace(
+                                tool_context,
+                                approved_action=pending_approval,
+                            )
+
+                        if approval_rejected:
+                            break
+
+                    pending_records.extend(transient_records)
+                    if approval_rejected:
+                        break
                     if self._stop_requested(turn_id):
                         interrupted = self._interrupt_turn(
                             session_id=session.session_id,
@@ -1289,12 +1476,39 @@ class AgentLoop:
 
             followup_compaction_attempted = False
             try:
-                await self._execute_tool_calls(
+                tool_execution_outcome = await self._execute_tool_calls(
                     session_id=current_session.session_id,
                     pending_records=pending_records,
                     current_response=current_response,
                     turn_id=turn_id,
                 )
+                if tool_execution_outcome.interrupted:
+                    return (
+                        current_session,
+                        current_response,
+                        current_estimated_input_tokens,
+                        did_compaction,
+                        True,
+                    )
+                if tool_execution_outcome.approval_rejected:
+                    current_response = replace(
+                        current_response,
+                        text=_APPROVAL_REJECTED_TEXT,
+                        tool_calls=[],
+                        finish_reason="stop",
+                    )
+                    self._append_turn_record(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        record=self._build_message_record(
+                            session_id=current_session.session_id,
+                            role="assistant",
+                            content=_APPROVAL_REJECTED_TEXT,
+                            metadata={"approval_rejected": True},
+                            turn_id=turn_id,
+                        ),
+                    )
+                    break
                 if self._stop_requested(turn_id):
                     return (
                         current_session,
@@ -1718,9 +1932,12 @@ class AgentLoop:
         session_id: str,
         result: ToolExecutionResult,
         *,
+        metadata_overrides: dict[str, Any] | None = None,
         turn_id: str | None = None,
     ) -> ConversationRecord:
         metadata = dict(result.metadata)
+        if metadata_overrides is not None:
+            metadata.update(metadata_overrides)
         metadata.update(
             {
                 "tool_name": result.name,
@@ -1855,6 +2072,121 @@ class AgentLoop:
             self._active_turn_id = None
         if self._stop_requested_turn_id == turn_id:
             self._stop_requested_turn_id = None
+        if self._pending_approval_turn_id == turn_id:
+            future = self._pending_approval_future
+            if future is not None and not future.done():
+                future.cancel()
+            self._pending_approval_future = None
+            self._pending_approval_id = None
+            self._pending_approval_turn_id = None
+
+    def _build_approval_request_event(
+        self,
+        *,
+        session_id: str,
+        approval: dict[str, Any],
+    ) -> AgentApprovalRequestEvent:
+        return AgentApprovalRequestEvent(
+            session_id=session_id,
+            approval_id=str(approval["approval_id"]),
+            kind=str(approval.get("kind", "approval")).strip() or "approval",
+            summary=str(approval.get("summary", "")).strip(),
+            details=str(approval.get("details", "")).strip(),
+            command=(
+                str(approval["command"])
+                if approval.get("command") is not None
+                else None
+            ),
+            tool_name=(
+                str(approval["tool_name"])
+                if approval.get("tool_name") is not None
+                else None
+            ),
+            inspection_url=(
+                str(approval["inspection_url"])
+                if approval.get("inspection_url") is not None
+                else None
+            ),
+        )
+
+    def _build_approval_record(
+        self,
+        *,
+        session_id: str,
+        approval: dict[str, Any],
+        approved: bool,
+        turn_id: str,
+    ) -> ConversationRecord:
+        status = "approved" if approved else "rejected"
+        lines = [
+            f"Approval {status}",
+            f"approval_id: {approval['approval_id']}",
+        ]
+        tool_name = str(approval.get("tool_name", "")).strip()
+        if tool_name:
+            lines.append(f"tool_name: {tool_name}")
+        command = str(approval.get("command", "")).strip()
+        if command:
+            lines.append(f"command: {command}")
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content="\n".join(lines),
+            metadata={
+                "approval_event": True,
+                "approval_id": approval["approval_id"],
+                "approved": approved,
+                "tool_name": tool_name or None,
+                "command": command or None,
+            },
+            turn_id=turn_id,
+        )
+
+    def _build_pending_approval(
+        self,
+        *,
+        tool_result: ToolExecutionResult,
+        tool_name: str,
+    ) -> dict[str, Any] | None:
+        raw_request = tool_result.metadata.get("approval_request")
+        if not isinstance(raw_request, dict):
+            return None
+        pending = dict(raw_request)
+        pending["approval_id"] = uuid4().hex
+        pending["tool_name"] = str(pending.get("tool_name", "")).strip() or tool_name
+        return pending
+
+    async def _wait_for_approval(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        approval: dict[str, Any],
+    ) -> bool | None:
+        if self._pending_approval_future is not None and not self._pending_approval_future.done():
+            raise RuntimeError("An approval request is already pending for this route.")
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_approval_future = future
+        self._pending_approval_id = str(approval["approval_id"])
+        self._pending_approval_turn_id = turn_id
+        self._storage.update_session(session_id, pending_approval=dict(approval))
+
+        try:
+            while True:
+                if self._stop_requested(turn_id):
+                    return None
+                try:
+                    return bool(
+                        await asyncio.wait_for(asyncio.shield(future), timeout=0.2)
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            self._storage.update_session(session_id, pending_approval=None)
+            self._pending_approval_future = None
+            self._pending_approval_id = None
+            self._pending_approval_turn_id = None
 
     def _append_turn_record(
         self,

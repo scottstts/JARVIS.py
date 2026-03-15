@@ -32,6 +32,18 @@ def _parse_int_env(name: str, default: int) -> int:
     return int(raw)
 
 
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got: {raw}")
+
+
 @dataclass(slots=True, frozen=True)
 class ToolSettings:
     """Runtime settings for tool registration and execution."""
@@ -41,6 +53,7 @@ class ToolSettings:
     bash_default_timeout_seconds: float
     bash_max_timeout_seconds: float
     bash_max_output_chars: int
+    bash_dangerously_skip_permission: bool
     python_interpreter_venv: Path
     python_interpreter_allowed_packages: tuple[str, ...]
     python_interpreter_default_timeout_seconds: float
@@ -72,6 +85,8 @@ class ToolSettings:
             )
         if self.bash_max_output_chars <= 0:
             raise ValueError("bash_max_output_chars must be > 0.")
+        if not isinstance(self.bash_dangerously_skip_permission, bool):
+            raise ValueError("bash_dangerously_skip_permission must be a boolean.")
         if not str(self.python_interpreter_venv).strip():
             raise ValueError("python_interpreter_venv cannot be empty.")
         if not self.python_interpreter_allowed_packages:
@@ -140,6 +155,10 @@ class ToolSettings:
             bash_max_output_chars=_parse_int_env(
                 "JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS",
                 app_settings.JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS,
+            ),
+            bash_dangerously_skip_permission=_parse_bool_env(
+                "BASH_DANGEROUSLY_SKIP_PERMISSION",
+                app_settings.BASH_DANGEROUSLY_SKIP_PERMISSION,
             ),
             python_interpreter_venv=Path(
                 _optional_env("JARVIS_TOOL_PYTHON_INTERPRETER_VENV")

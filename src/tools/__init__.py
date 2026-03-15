@@ -12,6 +12,7 @@ from .basic.python_interpreter import PythonInterpreterPolicy
 from .registry import ToolRegistry
 from .runtime import ToolRuntime
 from .basic.send_file import SendFilePolicy
+from .basic.tool_register import ToolRegisterPolicy
 from .basic.tool_search import ToolSearchPolicy
 from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
@@ -40,6 +41,7 @@ __all__ = [
     "PythonInterpreterPolicy",
     "RegisteredTool",
     "SendFilePolicy",
+    "ToolRegisterPolicy",
     "TranscribePolicy",
     "YouTubePolicy",
     "ToolExecutionContext",

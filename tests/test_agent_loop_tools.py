@@ -11,7 +11,13 @@ from unittest.mock import patch
 
 import settings as app_settings
 
-from core import AgentAssistantMessageEvent, AgentLoop, AgentToolCallEvent, AgentTurnDoneEvent
+from core import (
+    AgentApprovalRequestEvent,
+    AgentAssistantMessageEvent,
+    AgentLoop,
+    AgentToolCallEvent,
+    AgentTurnDoneEvent,
+)
 from llm import (
     DoneEvent,
     ImagePart,
@@ -51,6 +57,7 @@ _EXPECTED_BASIC_TOOL_NAMES = [
     "view_image",
     "send_file",
     "tool_search",
+    "tool_register",
 ]
 
 
@@ -619,6 +626,67 @@ class _FakeToolSearchActivationLLMService:
 
     async def stream_generate(self, request: LLMRequest):
         raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeToolRegisterApprovalLLMService:
+    def __init__(self) -> None:
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if self.stream_calls == 1:
+            if names != _EXPECTED_BASIC_TOOL_NAMES:
+                raise AssertionError(
+                    f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+                )
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="tool_register_1",
+                            name="tool_register",
+                            arguments={
+                                "manifest": {
+                                    "name": "google_workspace_cli",
+                                    "purpose": "Use the Google Workspace CLI from bash.",
+                                    "operator": "bash",
+                                    "invocation": {"command": "gws --help"},
+                                },
+                                "approval_summary": "Register google_workspace_cli.",
+                                "approval_details": (
+                                    "I want to register the tool so future tool_search "
+                                    "calls can discover it."
+                                ),
+                            },
+                            raw_arguments="{}",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+        tool_message = request.messages[-1]
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+        tool_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if "Runtime tool registered" not in tool_parts[0].content:
+            raise AssertionError("Expected approved tool_register result content.")
+
+        yield DoneEvent(response=_build_response("Registered runtime tool."))
 
 
 class _FakeToolRoundLimitLLMService:
@@ -1910,4 +1978,111 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 message_records[-2].metadata["activated_discoverable_tool_names"],
                 ["archive"],
+            )
+
+    async def test_stream_user_input_emits_approval_request_and_resumes_after_tool_register_approval(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeToolRegisterApprovalLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            events: list[object] = []
+
+            async def _collect_events() -> None:
+                async for event in loop.stream_user_input("Register a runtime tool."):
+                    events.append(event)
+
+            collector = asyncio.create_task(_collect_events())
+            approval_event: AgentApprovalRequestEvent | None = None
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                approval_event = next(
+                    (
+                        event
+                        for event in events
+                        if isinstance(event, AgentApprovalRequestEvent)
+                    ),
+                    None,
+                )
+                if approval_event is not None:
+                    break
+
+            self.assertIsNotNone(approval_event)
+            if approval_event is None:
+                self.fail("Expected approval request event before stream completion.")
+            self.assertTrue(loop.resolve_approval(approval_event.approval_id, True))
+            await asyncio.wait_for(collector, timeout=2.0)
+
+            self.assertIsInstance(events[-1], AgentTurnDoneEvent)
+            final_event = events[-1]
+            if not isinstance(final_event, AgentTurnDoneEvent):
+                self.fail("Expected streamed turn to finish with AgentTurnDoneEvent.")
+            self.assertEqual(final_event.response_text, "Registered runtime tool.")
+            self.assertTrue(
+                (
+                    settings.workspace_dir
+                    / "runtime_tools"
+                    / "google_workspace_cli.json"
+                ).exists()
+            )
+
+    async def test_stream_user_input_returns_rejection_text_when_tool_register_approval_is_denied(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeToolRegisterApprovalLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            events: list[object] = []
+
+            async def _collect_events() -> None:
+                async for event in loop.stream_user_input("Register a runtime tool."):
+                    events.append(event)
+
+            collector = asyncio.create_task(_collect_events())
+            approval_event: AgentApprovalRequestEvent | None = None
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                approval_event = next(
+                    (
+                        event
+                        for event in events
+                        if isinstance(event, AgentApprovalRequestEvent)
+                    ),
+                    None,
+                )
+                if approval_event is not None:
+                    break
+
+            self.assertIsNotNone(approval_event)
+            if approval_event is None:
+                self.fail("Expected approval request event before stream completion.")
+            self.assertTrue(loop.resolve_approval(approval_event.approval_id, False))
+            await asyncio.wait_for(collector, timeout=2.0)
+
+            self.assertIsInstance(events[-1], AgentTurnDoneEvent)
+            final_event = events[-1]
+            if not isinstance(final_event, AgentTurnDoneEvent):
+                self.fail("Expected streamed turn to finish with AgentTurnDoneEvent.")
+            self.assertEqual(
+                final_event.response_text,
+                "Approval request was rejected. I did not execute the action.",
+            )
+            self.assertFalse(
+                (
+                    settings.workspace_dir
+                    / "runtime_tools"
+                    / "google_workspace_cli.json"
+                ).exists()
             )

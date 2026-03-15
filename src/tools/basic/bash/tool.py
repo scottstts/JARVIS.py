@@ -19,7 +19,21 @@ _BWRAP_EXECUTABLE = "bwrap"
 _SANDBOX_WORKSPACE = "/workspace"
 _SANDBOX_TMPDIR = "/tmp"
 _SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin"
-_RUNTIME_ETC = Path("/etc")
+_BIND_RW_TOP_LEVEL_PATHS = (
+    Path("/usr"),
+    Path("/etc"),
+    Path("/opt"),
+    Path("/var"),
+    Path("/root"),
+    Path("/run"),
+    Path("/home"),
+    Path("/srv"),
+    Path("/mnt"),
+    Path("/media"),
+)
+_MASKED_DIRECTORIES = (
+    Path("/run/secrets"),
+)
 
 
 class BashToolSetupError(RuntimeError):
@@ -117,8 +131,9 @@ class BashToolExecutor:
             "cwd": _SANDBOX_WORKSPACE,
             "workspace_source_dir": str(context.workspace_dir),
             "sandbox": "bubblewrap",
-            "filesystem_scope": "workspace_only",
+            "filesystem_scope": "blacklist",
             "environment_scrubbed": True,
+            "approval_consumed": bool(context.approved_action),
             "exit_code": exit_code,
             "timed_out": timed_out,
             "timeout_seconds": timeout_seconds,
@@ -190,7 +205,7 @@ class BashToolExecutor:
             "--setenv",
             "LC_ALL",
             "C",
-            "--ro-bind",
+            "--bind",
             "/usr",
             "/usr",
             "--symlink",
@@ -199,37 +214,57 @@ class BashToolExecutor:
             "--symlink",
             "usr/lib",
             "/lib",
+            "--dev",
+            "/dev",
         ]
 
         lib64_path = Path("/lib64")
         if lib64_path.exists():
             command_parts.extend(
                 [
-                    "--ro-bind",
+                    "--bind",
                     str(lib64_path),
                     str(lib64_path),
                 ]
             )
 
-        if _RUNTIME_ETC.exists():
+        for top_level_path in _BIND_RW_TOP_LEVEL_PATHS:
+            if top_level_path == Path("/usr"):
+                continue
+            if not top_level_path.exists():
+                continue
             command_parts.extend(
                 [
-                    "--ro-bind",
-                    str(_RUNTIME_ETC),
-                    str(_RUNTIME_ETC),
+                    "--bind",
+                    str(top_level_path),
+                    str(top_level_path),
                 ]
             )
 
         command_parts.extend(
             [
-                "--dev",
-                "/dev",
                 "--bind",
                 str(resolved_workspace),
                 _SANDBOX_WORKSPACE,
                 "--bind",
                 str(resolved_runtime_tmp),
                 _SANDBOX_TMPDIR,
+            ]
+        )
+
+        for masked_dir in _MASKED_DIRECTORIES:
+            command_parts.extend(
+                [
+                    "--tmpfs",
+                    str(masked_dir),
+                    "--chmod",
+                    "000",
+                    str(masked_dir),
+                ]
+            )
+
+        command_parts.extend(
+            [
                 "--chdir",
                 _SANDBOX_WORKSPACE,
                 str(bash_path),
@@ -261,16 +296,16 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
         exposure="basic",
         definition=ToolDefinition(
             name="bash",
-            description=_build_bash_tool_description(settings),
+            description=_build_bash_tool_description(),
             input_schema={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
                         "description": (
-                            "Bash command to run inside a bubblewrap sandbox. "
-                            "The workspace is mounted at /workspace and is the only "
-                            "user-controlled filesystem tree available."
+                            "Bash command to run."
+                            "Use normal shell syntax, including pipes, redirects, "
+                            "command substitution, &&, ||, and multiline scripts."
                         ),
                     },
                     "timeout_seconds": {
@@ -282,6 +317,27 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                             "command may legitimately need more than the default."
                         ),
                     },
+                    "approval_summary": {
+                        "type": "string",
+                        "description": (
+                            "Optional short user-facing summary to show if this command "
+                            "needs approval. Say what you want to do and why."
+                        ),
+                    },
+                    "approval_details": {
+                        "type": "string",
+                        "description": (
+                            "Optional longer user-facing approval explanation. Use this "
+                            "for installs, builds, or other broader changes."
+                        ),
+                    },
+                    "inspection_url": {
+                        "type": "string",
+                        "description": (
+                            "Optional URL the user can inspect before approving the command, "
+                            "such as the tool website or install documentation."
+                        ),
+                    },
                 },
                 "required": ["command"],
                 "additionalProperties": False,
@@ -291,17 +347,14 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
     )
 
 
-def _build_bash_tool_description(settings: ToolSettings) -> str:
+def _build_bash_tool_description() -> str:
     return (
-        "Run a bash command inside a bubblewrap sandbox. "
-        "The sandbox mounts the real workspace at /workspace, scrubs the environment, "
-        "mounts system runtime paths like /usr and /etc read-only, skips shell startup files, "
-        "and does not expose /repo or /run/secrets. "
-        f"Default working directory is /workspace; the real workspace source is {settings.workspace_dir}. "
-        "Examples of available command-line tools in the current runtime include rg, grep, find, file, curl, zip, and unzip. "
-        "Use normal shell syntax, including pipes, redirects, command substitution, subshells, "
-        "&&, ||, and multiline scripts. "
-        "Installed command availability depends on what exists in the runtime."
+        "Run a bash command from /workspace. "
+        "Use this for shell commands, CLI tools, installs, builds, file inspection, and small scripts. "
+        "Use normal shell syntax, including pipes, redirects, command substitution, &&, ||, and multiline scripts. "
+        "Some commands may require user approval, so when that seems likely, provide clear approval context. "
+        "Available commands depend on what exists in the current runtime. "
+        "If you install or create a reusable tool, consider registering it with tool_register."
     )
 
 

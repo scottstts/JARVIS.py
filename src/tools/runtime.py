@@ -34,6 +34,22 @@ class ToolRuntime:
             context=context,
         )
         if not decision.allowed:
+            if isinstance(decision.approval_request, dict):
+                approval_request = dict(decision.approval_request)
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    ok=False,
+                    content=_format_approval_required_content(
+                        tool_name=tool_call.name,
+                        approval_request=approval_request,
+                    ),
+                    metadata={
+                        "approval_required": True,
+                        "approval_request": approval_request,
+                        "arguments": dict(tool_call.arguments),
+                    },
+                )
             reason = decision.reason or "Tool execution denied by policy."
             return ToolExecutionResult(
                 call_id=tool_call.call_id,
@@ -75,3 +91,26 @@ class ToolRuntime:
                     "arguments": dict(tool_call.arguments),
                 },
             )
+
+
+def _format_approval_required_content(
+    *,
+    tool_name: str,
+    approval_request: dict[str, object],
+) -> str:
+    summary = str(approval_request.get("summary", "")).strip() or "Approval required."
+    lines = [
+        "Approval required",
+        f"tool: {tool_name}",
+        f"summary: {summary}",
+    ]
+    details = str(approval_request.get("details", "")).strip()
+    if details:
+        lines.append(f"details: {details}")
+    command = str(approval_request.get("command", "")).strip()
+    if command:
+        lines.append(f"command: {command}")
+    tool_label = str(approval_request.get("tool_name", "")).strip()
+    if tool_label:
+        lines.append(f"tool_name: {tool_label}")
+    return "\n".join(lines)

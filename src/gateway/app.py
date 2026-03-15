@@ -11,6 +11,7 @@ from typing import Any
 
 from core import (
     AgentAssistantMessageEvent,
+    AgentApprovalRequestEvent,
     AgentLoop,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
@@ -28,7 +29,10 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from .config import GatewaySettings
 from .protocol import (
     ClientStopTurn,
+    ClientApprovalResponse,
     ProtocolError,
+    build_approval_ack_event,
+    build_approval_request_event,
     build_assistant_delta_event,
     build_assistant_message_event,
     build_error_event,
@@ -156,6 +160,20 @@ def create_app(
                     return
                 continue
 
+            if isinstance(event, ClientApprovalResponse):
+                if not await _send_json_if_open(
+                    websocket,
+                    build_approval_ack_event(
+                        resolved=resolved_router.resolve_approval(
+                            route_id,
+                            event.approval_id,
+                            event.approved,
+                        )
+                    ),
+                ):
+                    return
+                continue
+
             try:
                 async for turn_event in resolved_router.stream_turn(route_id, event.text):
                     if isinstance(turn_event, AgentTextDeltaEvent):
@@ -186,6 +204,23 @@ def create_app(
                             build_tool_call_event(
                                 session_id=turn_event.session_id,
                                 tool_names=turn_event.tool_names,
+                            )
+                        ):
+                            return
+                        continue
+
+                    if isinstance(turn_event, AgentApprovalRequestEvent):
+                        if not await _send_json_if_open(
+                            websocket,
+                            build_approval_request_event(
+                                session_id=turn_event.session_id,
+                                approval_id=turn_event.approval_id,
+                                kind=turn_event.kind,
+                                summary=turn_event.summary,
+                                details=turn_event.details,
+                                command=turn_event.command,
+                                tool_name=turn_event.tool_name,
+                                inspection_url=turn_event.inspection_url,
                             )
                         ):
                             return

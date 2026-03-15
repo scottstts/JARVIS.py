@@ -131,7 +131,6 @@ Expected input responsibilities:
 
 - full runtime tool manifest payload
 - user-facing approval context fields such as summary, details, and optional inspection URL
-- approval token or approval id tied to this exact registration request
 - optional replace/update mode for existing manifest names
 
 ## Internal Approval Subsystem
@@ -164,7 +163,6 @@ Recommended internal approval request payload:
 - `tool_name`
 - `inspection_url`
 - `manifest_hash`
-- `expires_in_seconds`
 
 This approval subsystem may live in `src/core/` or `src/tools/`, but it should not be directly model-callable as a separate tool.
 
@@ -176,24 +174,15 @@ Approval state should be explicit and persisted.
 
 Add session-level approval metadata in [src/storage/types.py](/Users/scott/Documents/Projects/Python/Jarvis/src/storage/types.py) and [src/storage/service.py](/Users/scott/Documents/Projects/Python/Jarvis/src/storage/service.py).
 
-Recommended persisted fields:
+Implemented persisted shape:
 
-- `pending_approval_id`
-- `pending_approval_kind`
-- `pending_approval_summary`
-- `pending_approval_details`
-- `pending_approval_command`
-- `pending_approval_tool_name`
-- `pending_approval_inspection_url`
-- `pending_approval_status`
+- a single `pending_approval` object on session metadata
 
-Recommended statuses:
+Current behavior:
 
-- `pending`
-- `approved`
-- `rejected`
-- `consumed`
-- `expired`
+- `pending_approval` is present only while a turn is actively waiting for approval
+- once approved, rejected, interrupted, or consumed, `pending_approval` is cleared from session metadata
+- approval requests and decisions are recorded in the transcript for auditability instead of being expanded into multiple parallel session fields
 
 The transcript should also record approval requests and outcomes so they remain auditable.
 
@@ -382,7 +371,6 @@ New gateway protocol events:
 - `command`
 - `tool_name`
 - `inspection_url`
-- `resume_target`
 
 `approval_response` payload should include:
 
@@ -445,9 +433,10 @@ Planned UI behavior:
 
 The inline button callback payload should be compact and encode:
 
-- route id
 - approval id
 - approval decision
+
+Route resolution should be derived from the Telegram chat/message context rather than duplicated inside the callback payload.
 
 ## Policy Changes
 
@@ -485,7 +474,7 @@ Update:
 
 - [dev_docs/tool_dev_doc.md](/Users/scott/Documents/Projects/Python/Jarvis/dev_docs/tool_dev_doc.md)
 - [src/identities/PROGRAM.md](/Users/scott/Documents/Projects/Python/Jarvis/src/identities/PROGRAM.md)
-- [notes/notes.md](/Users/scott/Documents/Projects/Python/Jarvis/notes/notes.md) if implementation decisions become relevant memory for later agents
+- optionally [notes/notes.md](/Users/scott/Documents/Projects/Python/Jarvis/notes/notes.md) if implementation decisions become relevant memory for later agents
 
 Documentation changes should cover:
 
