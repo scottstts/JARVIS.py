@@ -95,3 +95,4 @@
 - Design pivot: prefer a dedicated sibling `tool_runtime` container for `bash` and `python_interpreter` over the larger host-app/macOS refactor when the goal is stronger tool isolation without destabilizing the app runtime.
 - Image split rule: the `dev` container should only keep packages needed to run the Jarvis app, while agent-facing utilities like `rg`, `curl`, `zip`, `unzip`, and `ffmpeg` belong in `tool_runtime`.
 - `bash` now executes directly in the isolated `tool_runtime` container over internal HTTP, while `python_interpreter` also routes there but keeps its bubblewrap no-network/subprocess-blocked sandbox.
+- Subagent design is now settled in `dev_docs/subagent_plan.md`: main-agent-only synthetic subagent primitives, no subagent memory access, separate `/workspace/archive/subagents/` storage, and a unified persistent route websocket for both normal turns and background subagent events.

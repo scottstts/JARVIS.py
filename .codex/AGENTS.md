@@ -86,13 +86,11 @@ Then run normally:
 docker compose exec dev bash -lc "cd /repo && uv run <...>"
 ```
 
-### Specific Doc for Agent Tools development
+### Specific Docs for Different System Development
 
-During the development of agent tools (src/tools/), you need to follow a dedicated tool dev doc: /dev_docs/tool_dev_doc.md.
+Inside dev_docs/ dir, there are docs for different system development for Jarvis. e.g., tool_dev_doc.md, runtime_tools_plan.md, tool_runtime_isolation_plan.md for agent tool related development; memory_design_doc.md, memory_pass_2.md for agent memory related dev.
 
-Here you'll see the basic protocol and structure of how tools are built, what tools have been built, what yet to be built.
-
-For tools listed as yet to be built, doesn't mean you'll just build them unprompted. ONLY build those I ask you to.
+Some of the docs are implementation plans, some are ad hoc documentations. All of them should be accurate reflection of the implmenented code. These docs can reveal underlying design choices and intentions beyond what the code can tell you. So whenever you are working on a specific system, check first if there are docs that you can read to understand more about the system you're about to work on.
 
 ## Dev Rules and Preferences
 
