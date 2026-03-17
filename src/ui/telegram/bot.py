@@ -28,7 +28,11 @@ from .gateway_client import (
     GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
+    GatewayErrorEvent,
     GatewayMessageEvent,
+    GatewayRouteEvent,
+    GatewayRouteSession,
+    GatewaySystemNoticeEvent,
     GatewayToolCallEvent,
     GatewayTurnDoneEvent,
     GatewayWebSocketClient,
@@ -44,20 +48,25 @@ _APPROVAL_COMMAND_PREVIEW_CHARS = 1500
 
 
 class GatewayClientLike(Protocol):
-    async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[Any]:
-        """Streams one gateway turn."""
+    async def connect_route(self, *, route_id: str) -> GatewayRouteSession:
+        """Connect a persistent route session."""
 
-    async def request_stop(self, *, route_id: str) -> bool:
-        """Requests cooperative stop for the active turn on the given route."""
 
-    async def submit_approval(
-        self,
-        *,
-        route_id: str,
-        approval_id: str,
-        approved: bool,
-    ) -> bool:
-        """Resolves one pending approval request for the active route."""
+class GatewayRouteSessionLike(Protocol):
+    async def send_user_message(self, *, text: str) -> None:
+        """Send one user message over the persistent route session."""
+
+    async def request_stop(self) -> bool:
+        """Request cooperative stop for the active main turn."""
+
+    async def submit_approval(self, *, approval_id: str, approved: bool) -> bool:
+        """Resolve one pending approval request."""
+
+    async def events(self) -> AsyncIterator[GatewayRouteEvent]:
+        """Yield route events from the gateway."""
+
+    async def aclose(self) -> None:
+        """Close the route session."""
 
 
 class TelegramClientLike(Protocol):
@@ -175,6 +184,77 @@ class IncomingTelegramApprovalCallback:
     message_text: str | None = None
 
 
+@dataclass(slots=True)
+class _ChatRouteSession:
+    session: GatewayRouteSessionLike
+    event_task: asyncio.Task[None]
+
+
+class _LegacyRouteSessionAdapter:
+    """Adapts the old one-shot gateway client shape to the new route-session API."""
+
+    def __init__(self, *, gateway_client: Any, route_id: str) -> None:
+        self._gateway_client = gateway_client
+        self._route_id = route_id
+        self._events: asyncio.Queue[GatewayRouteEvent] = asyncio.Queue()
+        self._turn_task: asyncio.Task[None] | None = None
+
+    async def send_user_message(self, *, text: str) -> None:
+        async def _collect() -> None:
+            try:
+                async for event in self._gateway_client.stream_turn(
+                    route_id=self._route_id,
+                    user_text=text,
+                ):
+                    await self._events.put(event)
+            except GatewayBridgeError as exc:
+                await self._events.put(
+                    GatewayErrorEvent(
+                        route_id=self._route_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        code=exc.code,
+                        message=exc.message,
+                    )
+                )
+            except Exception:
+                await self._events.put(
+                    GatewayErrorEvent(
+                        route_id=self._route_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        code="gateway_unavailable",
+                        message=_GENERIC_ERROR_REPLY,
+                    )
+                )
+
+        self._turn_task = asyncio.create_task(
+            _collect(),
+            name=f"jarvis-legacy-route-session-{self._route_id}",
+        )
+
+    async def request_stop(self) -> bool:
+        return await self._gateway_client.request_stop(route_id=self._route_id)
+
+    async def submit_approval(self, *, approval_id: str, approved: bool) -> bool:
+        return await self._gateway_client.submit_approval(
+            route_id=self._route_id,
+            approval_id=approval_id,
+            approved=approved,
+        )
+
+    async def events(self) -> AsyncIterator[GatewayRouteEvent]:
+        while True:
+            yield await self._events.get()
+
+    async def aclose(self) -> None:
+        task = self._turn_task
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
 class TelegramGatewayBridge:
     """Runs the Telegram->Gateway bridge loop."""
 
@@ -199,6 +279,8 @@ class TelegramGatewayBridge:
         self._draft_min_interval_by_chat: dict[int, float] = {}
         self._chat_queues: dict[int, asyncio.Queue[IncomingTelegramMessage]] = {}
         self._chat_workers: dict[int, asyncio.Task[None]] = {}
+        self._route_sessions: dict[int, _ChatRouteSession] = {}
+        self._pending_turn_events_by_chat: dict[int, asyncio.Queue[GatewayRouteEvent]] = {}
         self._approval_message_html_by_key: dict[tuple[int, int], str] = {}
 
     async def run_forever(self) -> None:
@@ -260,10 +342,9 @@ class TelegramGatewayBridge:
             LOGGER.warning("Ignoring unauthorized Telegram approval callback.")
             return
 
-        route_id = route_id_for_chat(callback.chat_id)
         try:
-            resolved = await self._gateway.submit_approval(
-                route_id=route_id,
+            route_session = await self._ensure_route_session(callback.chat_id)
+            resolved = await route_session.submit_approval(
                 approval_id=callback.approval_id,
                 approved=callback.approved,
             )
@@ -355,6 +436,145 @@ class TelegramGatewayBridge:
             if queue.empty():
                 self._chat_queues.pop(chat_id, None)
 
+    async def _ensure_route_session(self, chat_id: int) -> GatewayRouteSessionLike:
+        existing = self._route_sessions.get(chat_id)
+        if existing is not None and not existing.event_task.done():
+            return existing.session
+
+        route_id = route_id_for_chat(chat_id)
+        if hasattr(self._gateway, "connect_route"):
+            session = await self._gateway.connect_route(route_id=route_id)
+        else:
+            session = _LegacyRouteSessionAdapter(
+                gateway_client=self._gateway,
+                route_id=route_id,
+            )
+        event_task = asyncio.create_task(
+            self._route_event_worker(chat_id=chat_id, session=session),
+            name=f"jarvis-telegram-route-events-{chat_id}",
+        )
+        self._route_sessions[chat_id] = _ChatRouteSession(
+            session=session,
+            event_task=event_task,
+        )
+        return session
+
+    async def _route_event_worker(
+        self,
+        *,
+        chat_id: int,
+        session: GatewayRouteSessionLike,
+    ) -> None:
+        try:
+            async for event in session.events():
+                if self._route_event_belongs_to_active_main_turn(chat_id=chat_id, event=event):
+                    pending_queue = self._pending_turn_events_by_chat.get(chat_id)
+                    if pending_queue is not None:
+                        await pending_queue.put(event)
+                        continue
+                await self._handle_background_route_event(chat_id=chat_id, event=event)
+        except asyncio.CancelledError:
+            raise
+        except GatewayBridgeError as exc:
+            LOGGER.exception("Persistent gateway route session failed.")
+            pending_queue = self._pending_turn_events_by_chat.get(chat_id)
+            if pending_queue is not None:
+                await pending_queue.put(
+                    GatewayErrorEvent(
+                        event_id="",
+                        created_at="",
+                        route_id=route_id_for_chat(chat_id),
+                        session_id=None,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        subagent_id=None,
+                        code=exc.code,
+                        message=exc.message or _GENERIC_ERROR_REPLY,
+                    )
+                )
+        except Exception:
+            LOGGER.exception("Unexpected route event worker failure.")
+            pending_queue = self._pending_turn_events_by_chat.get(chat_id)
+            if pending_queue is not None:
+                await pending_queue.put(
+                    GatewayErrorEvent(
+                        event_id="",
+                        created_at="",
+                        route_id=route_id_for_chat(chat_id),
+                        session_id=None,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        subagent_id=None,
+                        code="gateway_unavailable",
+                        message=_GENERIC_ERROR_REPLY,
+                    )
+                )
+        finally:
+            tracked = self._route_sessions.get(chat_id)
+            current_task = asyncio.current_task()
+            if tracked is not None and tracked.event_task is current_task:
+                self._route_sessions.pop(chat_id, None)
+            await session.aclose()
+
+    @staticmethod
+    def _route_event_belongs_to_active_main_turn(
+        *,
+        chat_id: int,
+        event: GatewayRouteEvent,
+    ) -> bool:
+        if event.agent_kind != "main":
+            return False
+        return event.type in {
+            "assistant_delta",
+            "assistant_message",
+            "tool_call",
+            "approval_request",
+            "turn_done",
+            "error",
+        }
+
+    async def _handle_background_route_event(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayRouteEvent,
+    ) -> None:
+        if isinstance(event, GatewayToolCallEvent):
+            for tool_name in event.tool_names:
+                await self._send_html_message(
+                    chat_id=chat_id,
+                    html_text=_format_tool_usage_notice(event.agent_name, tool_name),
+                )
+            return
+        if isinstance(event, GatewayApprovalRequestEvent):
+            await self._send_approval_request_message(
+                chat_id=chat_id,
+                approval=event,
+            )
+            return
+        if isinstance(event, GatewaySystemNoticeEvent):
+            await self._send_html_message(
+                chat_id=chat_id,
+                html_text=_format_system_notice(event),
+            )
+            return
+        if isinstance(event, GatewayTurnDoneEvent):
+            if event.agent_kind != "main":
+                return
+            final_text = _coalesce_visible_text(event.response_text)
+            if final_text is None:
+                return
+            await self._send_final_text(
+                chat_id=chat_id,
+                text=final_text,
+            )
+            return
+        if isinstance(event, GatewayErrorEvent):
+            await self._send_final_text(
+                chat_id=chat_id,
+                text=event.message or _GENERIC_ERROR_REPLY,
+            )
+
     async def handle_message(self, message: IncomingTelegramMessage) -> None:
         if message.chat_type != "private":
             return
@@ -383,7 +603,7 @@ class TelegramGatewayBridge:
         if not user_text:
             return
 
-        route_id = route_id_for_chat(message.chat_id)
+        route_session = await self._ensure_route_session(message.chat_id)
         current_draft_id = self._next_draft_id_for_chat(message.chat_id)
 
         accumulated_text = ""
@@ -396,12 +616,19 @@ class TelegramGatewayBridge:
             time.monotonic()
             >= self._draft_retry_until_by_chat.get(message.chat_id, 0.0)
         )
+        pending_queue: asyncio.Queue[GatewayRouteEvent] = asyncio.Queue()
+        self._pending_turn_events_by_chat[message.chat_id] = pending_queue
 
         try:
-            async for event in self._gateway.stream_turn(
-                route_id=route_id,
-                user_text=user_text,
-            ):
+            await route_session.send_user_message(text=user_text)
+            while True:
+                event = await pending_queue.get()
+                if isinstance(event, GatewayErrorEvent):
+                    await self._send_final_text(
+                        chat_id=message.chat_id,
+                        text=event.message if event.message else _GENERIC_ERROR_REPLY,
+                    )
+                    return
                 if isinstance(event, GatewayDeltaEvent):
                     if not event.delta:
                         continue
@@ -474,7 +701,7 @@ class TelegramGatewayBridge:
                     for tool_name in event.tool_names:
                         await self._send_html_message(
                             chat_id=message.chat_id,
-                            html_text=_format_tool_usage_notice(tool_name),
+                            html_text=_format_tool_usage_notice(event.agent_name, tool_name),
                         )
                         delivered_any_segment = True
                     accumulated_text = ""
@@ -514,17 +741,12 @@ class TelegramGatewayBridge:
                                 accumulated_text,
                             )
                             or "(No response text.)"
-                        )
+                            )
                         await self._send_final_text(
                             chat_id=message.chat_id,
                             text=final_text,
                         )
                     return
-
-            await self._send_final_text(
-                chat_id=message.chat_id,
-                text=_GENERIC_ERROR_REPLY,
-            )
         except GatewayBridgeError as exc:
             LOGGER.exception("Gateway bridge failed.")
             await self._send_final_text(
@@ -542,15 +764,26 @@ class TelegramGatewayBridge:
                 )
             except TelegramAPIError:
                 LOGGER.exception("Failed to send fallback error text.")
+        finally:
+            self._pending_turn_events_by_chat.pop(message.chat_id, None)
 
     async def aclose(self) -> None:
-        for worker in self._chat_workers.values():
+        chat_workers = tuple(self._chat_workers.values())
+        for worker in chat_workers:
             worker.cancel()
-        for worker in self._chat_workers.values():
+        for worker in chat_workers:
             with suppress(asyncio.CancelledError):
                 await worker
         self._chat_workers.clear()
         self._chat_queues.clear()
+        route_sessions = tuple(self._route_sessions.values())
+        for route_session in route_sessions:
+            route_session.event_task.cancel()
+        for route_session in route_sessions:
+            with suppress(asyncio.CancelledError):
+                await route_session.event_task
+        self._route_sessions.clear()
+        self._pending_turn_events_by_chat.clear()
         await self._telegram.aclose()
 
     async def wait_for_chat_idle(self, chat_id: int) -> None:
@@ -562,9 +795,9 @@ class TelegramGatewayBridge:
             await worker
 
     async def _handle_stop_command(self, message: IncomingTelegramMessage) -> None:
-        route_id = route_id_for_chat(message.chat_id)
         try:
-            stop_requested = await self._gateway.request_stop(route_id=route_id)
+            route_session = await self._ensure_route_session(message.chat_id)
+            stop_requested = await route_session.request_stop()
         except GatewayBridgeError as exc:
             LOGGER.exception("Gateway stop request failed.")
             await self._send_final_text(
@@ -974,9 +1207,10 @@ def _parse_approval_callback_data(raw_value: str) -> tuple[bool, str] | None:
 
 
 def _format_approval_request_message(approval: GatewayApprovalRequestEvent) -> str:
+    actor = html.escape(approval.agent_name.strip() or "Jarvis")
     escaped_summary = html.escape(approval.summary.strip() or "Approval requested.")
     lines = [
-        "<b>Approval required</b>",
+        f"<b>{actor} requests approval</b>",
         f"<b>summary:</b> {escaped_summary}",
     ]
     details = approval.details.strip()
@@ -993,6 +1227,14 @@ def _format_approval_request_message(approval: GatewayApprovalRequestEvent) -> s
     if inspection_url:
         lines.append(f"<b>inspect:</b> {html.escape(inspection_url)}")
     return "\n".join(lines)
+
+
+def _format_system_notice(event: GatewaySystemNoticeEvent) -> str:
+    actor = html.escape(event.agent_name.strip() or "Jarvis")
+    message = html.escape(event.text.strip())
+    if message:
+        return f"⚙️ <b>System:</b> <b>{actor}</b> {message}"
+    return f"⚙️ <b>System:</b> <b>{actor}</b>"
 
 
 def _truncate_approval_command(command: str) -> str:
@@ -1269,9 +1511,10 @@ def _has_visible_telegram_text(text: str) -> bool:
     return _has_effective_text(_HTML_TAG_PATTERN.sub("", text))
 
 
-def _format_tool_usage_notice(tool_name: str) -> str:
+def _format_tool_usage_notice(agent_name: str, tool_name: str) -> str:
+    normalized_agent = html.escape(agent_name.strip() or "Jarvis")
     normalized_name = html.escape(tool_name.strip() or "unknown")
-    return f"🔧 Used <b>{normalized_name}</b> tool."
+    return f"🔧 <b>{normalized_agent}</b> used <b>{normalized_name}</b> tool."
 
 
 def _is_stop_command_text(text: str) -> bool:

@@ -1,7 +1,8 @@
-"""Starlette websocket gateway for routing user turns to agent sessions."""
+"""Starlette websocket gateway for persistent route-scoped agent sessions."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -10,9 +11,8 @@ from dataclasses import replace
 from typing import Any
 
 from core import (
-    AgentAssistantMessageEvent,
     AgentApprovalRequestEvent,
-    AgentLoop,
+    AgentAssistantMessageEvent,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
@@ -30,24 +30,19 @@ from tools.remote_runtime_client import ensure_remote_tool_runtime_healthy
 
 from .config import GatewaySettings
 from .protocol import (
-    ClientStopTurn,
     ClientApprovalResponse,
+    ClientStopTurn,
     ProtocolError,
     build_approval_ack_event,
-    build_approval_request_event,
-    build_assistant_delta_event,
-    build_assistant_message_event,
     build_error_event,
     build_ready_event,
+    build_route_event_payload,
     build_stop_ack_event,
-    build_tool_call_event,
-    build_turn_done_event,
     parse_client_event,
 )
+from .route_runtime import RouteRuntime
 from .session_router import InvalidRouteIDError, SessionRouter, validate_route_id
 
-_INTERNAL_ERROR_MESSAGE = "Internal error while processing message."
-_PROVIDER_TIMEOUT_MESSAGE = "The model timed out while processing that message."
 LOGGER = logging.getLogger(__name__)
 _WEBSOCKET_CLOSED_SEND_ERROR = 'Cannot call "send" once a close message has been sent.'
 
@@ -112,172 +107,124 @@ def create_app(
         except InvalidRouteIDError as exc:
             if not await _send_json_if_open(
                 websocket,
-                build_error_event(code="invalid_route_id", message=str(exc))
+                build_error_event(code="invalid_route_id", message=str(exc)),
             ):
                 return
             await websocket.close(code=1008)
             return
+
+        if not hasattr(resolved_router, "subscribe") or not hasattr(
+            resolved_router,
+            "enqueue_message",
+        ):
+            await _serve_legacy_router_connection(
+                websocket=websocket,
+                route_id=route_id,
+                router=resolved_router,
+                max_message_chars=resolved_gateway_settings.max_message_chars,
+            )
+            return
+
+        subscriber_id, event_queue = resolved_router.subscribe(route_id)
 
         if not await _send_json_if_open(
             websocket,
             build_ready_event(
                 route_id=route_id,
                 session_id=resolved_router.active_session_id(route_id),
-            )
+            ),
         ):
+            resolved_router.unsubscribe(route_id, subscriber_id)
             return
 
-        while True:
-            try:
-                raw_message = await websocket.receive_text()
-            except WebSocketDisconnect:
-                return
+        async def _reader() -> None:
+            while True:
+                try:
+                    raw_message = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    return
 
-            try:
-                payload = json.loads(raw_message)
-            except json.JSONDecodeError:
-                if not await _send_json_if_open(
-                    websocket,
-                    build_error_event(
-                        code="invalid_json",
-                        message="Message must be valid JSON.",
+                try:
+                    payload = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    if not await _send_json_if_open(
+                        websocket,
+                        build_error_event(
+                            code="invalid_json",
+                            message="Message must be valid JSON.",
+                        ),
+                    ):
+                        return
+                    continue
+
+                try:
+                    event = parse_client_event(
+                        payload,
+                        max_message_chars=resolved_gateway_settings.max_message_chars,
                     )
+                except ProtocolError as exc:
+                    if not await _send_json_if_open(
+                        websocket,
+                        build_error_event(code=exc.code, message=exc.message),
+                    ):
+                        return
+                    continue
+
+                if isinstance(event, ClientStopTurn):
+                    if not await _send_json_if_open(
+                        websocket,
+                        build_stop_ack_event(
+                            stop_requested=resolved_router.request_stop(route_id),
+                        ),
+                    ):
+                        return
+                    continue
+
+                if isinstance(event, ClientApprovalResponse):
+                    if not await _send_json_if_open(
+                        websocket,
+                        build_approval_ack_event(
+                            resolved=resolved_router.resolve_approval(
+                                route_id,
+                                event.approval_id,
+                                event.approved,
+                            )
+                        ),
+                    ):
+                        return
+                    continue
+
+                await resolved_router.enqueue_message(route_id, event.text)
+
+        async def _writer() -> None:
+            while True:
+                event = await event_queue.get()
+                if not event.public:
+                    continue
+                if not await _send_json_if_open(
+                    websocket,
+                    build_route_event_payload(event),
                 ):
                     return
-                continue
 
+        reader_task = asyncio.create_task(_reader(), name=f"gateway-reader-{route_id}")
+        writer_task = asyncio.create_task(_writer(), name=f"gateway-writer-{route_id}")
+        done, pending = await asyncio.wait(
+            {reader_task, writer_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        for task in pending:
             try:
-                event = parse_client_event(
-                    payload,
-                    max_message_chars=resolved_gateway_settings.max_message_chars,
-                )
-            except ProtocolError as exc:
-                if not await _send_json_if_open(
-                    websocket,
-                    build_error_event(code=exc.code, message=exc.message)
-                ):
-                    return
-                continue
-
-            if isinstance(event, ClientStopTurn):
-                if not await _send_json_if_open(
-                    websocket,
-                    build_stop_ack_event(
-                        stop_requested=resolved_router.request_stop(route_id)
-                    ),
-                ):
-                    return
-                continue
-
-            if isinstance(event, ClientApprovalResponse):
-                if not await _send_json_if_open(
-                    websocket,
-                    build_approval_ack_event(
-                        resolved=resolved_router.resolve_approval(
-                            route_id,
-                            event.approval_id,
-                            event.approved,
-                        )
-                    ),
-                ):
-                    return
-                continue
-
-            try:
-                async for turn_event in resolved_router.stream_turn(route_id, event.text):
-                    if isinstance(turn_event, AgentTextDeltaEvent):
-                        if not await _send_json_if_open(
-                            websocket,
-                            build_assistant_delta_event(
-                                session_id=turn_event.session_id,
-                                delta=turn_event.delta,
-                            )
-                        ):
-                            return
-                        continue
-
-                    if isinstance(turn_event, AgentAssistantMessageEvent):
-                        if not await _send_json_if_open(
-                            websocket,
-                            build_assistant_message_event(
-                                session_id=turn_event.session_id,
-                                text=turn_event.text,
-                            )
-                        ):
-                            return
-                        continue
-
-                    if isinstance(turn_event, AgentToolCallEvent):
-                        if not await _send_json_if_open(
-                            websocket,
-                            build_tool_call_event(
-                                session_id=turn_event.session_id,
-                                tool_names=turn_event.tool_names,
-                            )
-                        ):
-                            return
-                        continue
-
-                    if isinstance(turn_event, AgentApprovalRequestEvent):
-                        if not await _send_json_if_open(
-                            websocket,
-                            build_approval_request_event(
-                                session_id=turn_event.session_id,
-                                approval_id=turn_event.approval_id,
-                                kind=turn_event.kind,
-                                summary=turn_event.summary,
-                                details=turn_event.details,
-                                command=turn_event.command,
-                                tool_name=turn_event.tool_name,
-                                inspection_url=turn_event.inspection_url,
-                            )
-                        ):
-                            return
-                        continue
-
-                    if isinstance(turn_event, AgentTurnDoneEvent):
-                        if not await _send_json_if_open(
-                            websocket,
-                            build_turn_done_event(
-                                session_id=turn_event.session_id,
-                                response_text=turn_event.response_text,
-                                command=turn_event.command,
-                                compaction_performed=turn_event.compaction_performed,
-                                interrupted=turn_event.interrupted,
-                            )
-                        ):
-                            return
-            except ContextBudgetError as exc:
-                if not await _send_json_if_open(
-                    websocket,
-                    build_error_event(
-                        code="context_budget_exceeded",
-                        message=str(exc),
-                    )
-                ):
-                    return
-                continue
-            except ProviderTimeoutError:
-                if not await _send_json_if_open(
-                    websocket,
-                    build_error_event(
-                        code="provider_timeout",
-                        message=_PROVIDER_TIMEOUT_MESSAGE,
-                    )
-                ):
-                    return
-                continue
-            except Exception:
-                LOGGER.exception("Unhandled gateway turn error.")
-                if not await _send_json_if_open(
-                    websocket,
-                    build_error_event(
-                        code="internal_error",
-                        message=_INTERNAL_ERROR_MESSAGE,
-                    )
-                ):
-                    return
-                continue
+                await task
+            except asyncio.CancelledError:
+                pass
+        for task in done:
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+        resolved_router.unsubscribe(route_id, subscriber_id)
 
     return Starlette(
         debug=False,
@@ -305,16 +252,185 @@ def _build_default_router(
     resolved_llm_service = llm_service
     base_transcript_archive_dir = resolved_core_settings.transcript_archive_dir
 
-    def agent_loop_factory(route_id: str) -> AgentLoop:
+    def route_runtime_factory(route_id: str) -> RouteRuntime:
         route_transcript_archive_dir = base_transcript_archive_dir / route_id
         route_core_settings = replace(
             resolved_core_settings,
             transcript_archive_dir=route_transcript_archive_dir,
         )
-        return AgentLoop(
-            llm_service=resolved_llm_service,
-            settings=route_core_settings,
+        return RouteRuntime(
             route_id=route_id,
+            llm_service=resolved_llm_service,
+            core_settings=route_core_settings,
         )
 
-    return SessionRouter(agent_loop_factory)
+    return SessionRouter(route_runtime_factory)
+
+
+async def _serve_legacy_router_connection(
+    *,
+    websocket: WebSocket,
+    route_id: str,
+    router: Any,
+    max_message_chars: int,
+) -> None:
+    if not await _send_json_if_open(
+        websocket,
+        build_ready_event(
+            route_id=route_id,
+            session_id=router.active_session_id(route_id),
+        ),
+    ):
+        return
+
+    while True:
+        try:
+            raw_message = await websocket.receive_text()
+        except WebSocketDisconnect:
+            return
+
+        try:
+            payload = json.loads(raw_message)
+        except json.JSONDecodeError:
+            if not await _send_json_if_open(
+                websocket,
+                build_error_event(
+                    code="invalid_json",
+                    message="Message must be valid JSON.",
+                ),
+            ):
+                return
+            continue
+
+        try:
+            event = parse_client_event(
+                payload,
+                max_message_chars=max_message_chars,
+            )
+        except ProtocolError as exc:
+            if not await _send_json_if_open(
+                websocket,
+                build_error_event(code=exc.code, message=exc.message),
+            ):
+                return
+            continue
+
+        if isinstance(event, ClientStopTurn):
+            if not await _send_json_if_open(
+                websocket,
+                build_stop_ack_event(
+                    stop_requested=router.request_stop(route_id),
+                ),
+            ):
+                return
+            continue
+
+        if isinstance(event, ClientApprovalResponse):
+            if not await _send_json_if_open(
+                websocket,
+                build_approval_ack_event(
+                    resolved=router.resolve_approval(
+                        route_id,
+                        event.approval_id,
+                        event.approved,
+                    )
+                ),
+            ):
+                return
+            continue
+
+        try:
+            async for turn_event in router.stream_turn(route_id, event.text):
+                if isinstance(turn_event, AgentTextDeltaEvent):
+                    if not await _send_json_if_open(
+                        websocket,
+                        {
+                            "type": "assistant_delta",
+                            "session_id": turn_event.session_id,
+                            "delta": turn_event.delta,
+                        },
+                    ):
+                        return
+                    continue
+                if isinstance(turn_event, AgentAssistantMessageEvent):
+                    if not await _send_json_if_open(
+                        websocket,
+                        {
+                            "type": "assistant_message",
+                            "session_id": turn_event.session_id,
+                            "text": turn_event.text,
+                        },
+                    ):
+                        return
+                    continue
+                if isinstance(turn_event, AgentToolCallEvent):
+                    if not await _send_json_if_open(
+                        websocket,
+                        {
+                            "type": "tool_call",
+                            "session_id": turn_event.session_id,
+                            "tool_names": list(turn_event.tool_names),
+                        },
+                    ):
+                        return
+                    continue
+                if isinstance(turn_event, AgentApprovalRequestEvent):
+                    if not await _send_json_if_open(
+                        websocket,
+                        {
+                            "type": "approval_request",
+                            "session_id": turn_event.session_id,
+                            "approval_id": turn_event.approval_id,
+                            "kind": turn_event.kind,
+                            "summary": turn_event.summary,
+                            "details": turn_event.details,
+                            "command": turn_event.command,
+                            "tool_name": turn_event.tool_name,
+                            "inspection_url": turn_event.inspection_url,
+                        },
+                    ):
+                        return
+                    continue
+                if isinstance(turn_event, AgentTurnDoneEvent):
+                    if not await _send_json_if_open(
+                        websocket,
+                        {
+                            "type": "turn_done",
+                            "session_id": turn_event.session_id,
+                            "response_text": turn_event.response_text,
+                            "command": turn_event.command,
+                            "compaction_performed": turn_event.compaction_performed,
+                            "interrupted": turn_event.interrupted,
+                            "approval_rejected": turn_event.approval_rejected,
+                        },
+                    ):
+                        return
+        except ContextBudgetError as exc:
+            if not await _send_json_if_open(
+                websocket,
+                build_error_event(
+                    code="context_budget_exceeded",
+                    message=str(exc),
+                ),
+            ):
+                return
+            continue
+        except ProviderTimeoutError:
+            if not await _send_json_if_open(
+                websocket,
+                build_error_event(
+                    code="provider_timeout",
+                    message="The model timed out while processing that message.",
+                ),
+            ):
+                return
+            continue
+        except Exception:
+            if not await _send_json_if_open(
+                websocket,
+                build_error_event(
+                    code="internal_error",
+                    message="Internal error while processing message.",
+                ),
+            ):
+                return

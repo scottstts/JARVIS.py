@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 from core import AgentTurnResult, AgentTurnStreamEvent
+
+from .route_events import RouteEvent
 
 _ROUTE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
@@ -18,23 +19,38 @@ class InvalidRouteIDError(ValueError):
     """Raised when a route id is invalid."""
 
 
-class AgentLoopLike(Protocol):
+class RouteRuntimeLike(Protocol):
     """Minimal protocol expected by SessionRouter."""
 
-    async def handle_user_input(self, user_text: str) -> AgentTurnResult:
-        """Process one user turn and return assistant output."""
+    async def enqueue_user_message(self, user_text: str) -> None:
+        """Queue one user message for the persistent route runtime."""
 
-    async def stream_user_input(self, user_text: str) -> AsyncIterator[AgentTurnStreamEvent]:
-        """Process one user turn and stream delta/done events."""
+    async def run_turn(self, user_text: str) -> AgentTurnResult:
+        """Compatibility helper for one full main-agent turn."""
+
+    async def stream_turn(self, user_text: str) -> AsyncIterator[AgentTurnStreamEvent]:
+        """Compatibility helper for one streamed main-agent turn."""
 
     def active_session_id(self) -> str | None:
-        """Return active session id for this route."""
+        """Return active main session id for this route."""
 
     def request_stop(self) -> bool:
-        """Request cooperative stop for the active turn, if any."""
+        """Request cooperative stop for the active main turn, if any."""
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         """Resolve one pending approval request for the active route."""
+
+    def subscribe(self) -> tuple[str, asyncio.Queue[RouteEvent]]:
+        """Subscribe to route-scoped outbound events."""
+
+    def unsubscribe(self, subscriber_id: str) -> None:
+        """Remove one route-scoped outbound event subscription."""
+
+    async def handle_user_input(self, user_text: str) -> AgentTurnResult:
+        """Legacy compatibility helper for old fake loop tests."""
+
+    async def stream_user_input(self, user_text: str) -> AsyncIterator[AgentTurnStreamEvent]:
+        """Legacy compatibility helper for old fake loop tests."""
 
 
 def validate_route_id(route_id: str) -> str:
@@ -48,15 +64,15 @@ def validate_route_id(route_id: str) -> str:
 
 @dataclass(slots=True)
 class RouteContext:
-    agent_loop: AgentLoopLike
+    runtime: RouteRuntimeLike
     lock: asyncio.Lock
 
 
 class SessionRouter:
-    """Maps inbound route ids to dedicated AgentLoop instances."""
+    """Maps inbound route ids to dedicated route runtimes."""
 
-    def __init__(self, agent_loop_factory: Callable[[str], AgentLoopLike]) -> None:
-        self._agent_loop_factory = agent_loop_factory
+    def __init__(self, route_runtime_factory: Callable[[str], RouteRuntimeLike]) -> None:
+        self._route_runtime_factory = route_runtime_factory
         self._routes: dict[str, RouteContext] = {}
 
     def get_or_create(self, route_id: str) -> RouteContext:
@@ -64,28 +80,37 @@ class SessionRouter:
         context = self._routes.get(validated)
         if context is None:
             context = RouteContext(
-                agent_loop=self._agent_loop_factory(validated),
+                runtime=self._route_runtime_factory(validated),
                 lock=asyncio.Lock(),
             )
             self._routes[validated] = context
         return context
 
     def active_session_id(self, route_id: str) -> str | None:
-        context = self.get_or_create(route_id)
-        return context.agent_loop.active_session_id()
+        return self.get_or_create(route_id).runtime.active_session_id()
 
     def request_stop(self, route_id: str) -> bool:
-        context = self.get_or_create(route_id)
-        return context.agent_loop.request_stop()
+        return self.get_or_create(route_id).runtime.request_stop()
 
     def resolve_approval(self, route_id: str, approval_id: str, approved: bool) -> bool:
-        context = self.get_or_create(route_id)
-        return context.agent_loop.resolve_approval(approval_id, approved)
+        return self.get_or_create(route_id).runtime.resolve_approval(approval_id, approved)
+
+    def subscribe(self, route_id: str) -> tuple[str, asyncio.Queue[RouteEvent]]:
+        return self.get_or_create(route_id).runtime.subscribe()
+
+    def unsubscribe(self, route_id: str, subscriber_id: str) -> None:
+        self.get_or_create(route_id).runtime.unsubscribe(subscriber_id)
+
+    async def enqueue_message(self, route_id: str, user_text: str) -> None:
+        await self.get_or_create(route_id).runtime.enqueue_user_message(user_text)
 
     async def run_turn(self, route_id: str, user_text: str) -> AgentTurnResult:
         context = self.get_or_create(route_id)
         async with context.lock:
-            return await context.agent_loop.handle_user_input(user_text)
+            runtime = context.runtime
+            if hasattr(runtime, "run_turn"):
+                return await runtime.run_turn(user_text)
+            return await runtime.handle_user_input(user_text)
 
     async def stream_turn(
         self,
@@ -94,5 +119,10 @@ class SessionRouter:
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         context = self.get_or_create(route_id)
         async with context.lock:
-            async for event in context.agent_loop.stream_user_input(user_text):
+            runtime = context.runtime
+            if hasattr(runtime, "stream_turn"):
+                async for event in runtime.stream_turn(user_text):
+                    yield event
+                return
+            async for event in runtime.stream_user_input(user_text):
                 yield event

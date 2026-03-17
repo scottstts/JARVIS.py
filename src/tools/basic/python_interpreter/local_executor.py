@@ -359,7 +359,7 @@ def build_python_interpreter_description(settings: ToolSettings) -> str:
         "Workspace helper modules and curated runtime packages import normally; direct native FFI "
         "imports such as ctypes/cffi are blocked and subprocess spawning is blocked. "
         f"Curated third-party packages available: {packages}, "
-        "but you can install packages you need using `bash` tool. If approved, "
+        "but you can install packages you need using the shell tool. If approved, "
         "the packages will be installed in `python_interpreter`'s venv. " 
         "No network access is available in this tool."
     )

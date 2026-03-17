@@ -4,11 +4,11 @@ from __future__ import annotations
 import asyncio
 import base64
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol, Sequence
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -70,6 +70,40 @@ _PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user
 _TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
 LOGGER = logging.getLogger(__name__)
 
+AgentKind = Literal["main", "subagent"]
+
+
+class BootstrapMessageLoader(Protocol):
+    def load_bootstrap_messages(self) -> list[LLMMessage]:
+        """Return the starter context messages for a newly created session."""
+
+
+@dataclass(slots=True, frozen=True)
+class AgentRuntimeMessage:
+    role: Literal["system", "developer", "user", "assistant", "tool"]
+    content: str
+    transient: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class AgentIdentity:
+    kind: AgentKind
+    name: str
+    subagent_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentMemoryMode:
+    bootstrap: bool = True
+    maintenance: bool = True
+    reflection: bool = True
+
+
+ToolDefinitionsProvider = Callable[[Sequence[str]], tuple[ToolDefinition, ...]]
+ToolExecutorCallable = Callable[[ToolCall, ToolExecutionContext], Awaitable[ToolExecutionResult]]
+RuntimeMessagesProvider = Callable[[str], Sequence[AgentRuntimeMessage]]
+
 
 @dataclass(slots=True, frozen=True)
 class AgentTurnResult:
@@ -78,6 +112,7 @@ class AgentTurnResult:
     command: str | None = None
     compaction_performed: bool = False
     interrupted: bool = False
+    approval_rejected: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -121,6 +156,7 @@ class AgentTurnDoneEvent:
     command: str | None = None
     compaction_performed: bool = False
     interrupted: bool = False
+    approval_rejected: bool = False
     type: Literal["done"] = "done"
 
     def to_result(self) -> AgentTurnResult:
@@ -130,6 +166,7 @@ class AgentTurnDoneEvent:
             command=self.command,
             compaction_performed=self.compaction_performed,
             interrupted=self.interrupted,
+            approval_rejected=self.approval_rejected,
         )
 
 
@@ -160,18 +197,34 @@ class AgentLoop:
         tool_registry: ToolRegistry | None = None,
         tool_runtime: ToolRuntime | None = None,
         route_id: str | None = None,
+        bootstrap_loader: BootstrapMessageLoader | None = None,
+        identity: AgentIdentity | None = None,
+        memory_mode: AgentMemoryMode | None = None,
+        llm_provider: str | None = None,
+        tool_definitions_provider: ToolDefinitionsProvider | None = None,
+        tool_executor: ToolExecutorCallable | None = None,
+        runtime_messages_provider: RuntimeMessagesProvider | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
         self._storage = storage or SessionStorage(self._settings.transcript_archive_dir)
-        self._identity_loader = IdentityBootstrapLoader(self._settings)
+        self._identity = identity or AgentIdentity(kind="main", name="Jarvis")
+        self._memory_mode = memory_mode or AgentMemoryMode()
+        self._llm_provider = (
+            normalized
+            if (normalized := (llm_provider or "").strip().lower())
+            else None
+        )
+        self._identity_loader = bootstrap_loader or IdentityBootstrapLoader(self._settings)
+        self._runtime_messages_provider = runtime_messages_provider
         self._compactor = ContextCompactor(
             llm_service=self._llm_service,
             context_policy=self._settings.context_policy,
+            provider=self._llm_provider,
         )
         memory_settings = MemorySettings.from_workspace_dir(self._settings.workspace_dir)
         memory_llm_service = self._llm_service if isinstance(self._llm_service, LLMService) else None
-        if memory_llm_service is None:
+        if memory_llm_service is None or not self._memory_mode.reflection:
             memory_settings = replace(memory_settings, enable_reflection=False)
         self._memory_service = MemoryService(
             settings=memory_settings,
@@ -180,10 +233,25 @@ class AgentLoop:
         self._tool_settings = ToolSettings.from_workspace_dir(self._settings.workspace_dir)
         self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
+        self._tool_definitions_provider = tool_definitions_provider or self._default_tool_definitions
+        self._tool_executor = tool_executor or self._default_execute_tool_call
         self._tool_context = ToolExecutionContext(
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
-            memory_service=self._memory_service,
+            agent_kind=self._identity.kind,
+            agent_name=self._identity.name,
+            subagent_id=self._identity.subagent_id,
+            memory_service=(
+                self._memory_service
+                if any(
+                    (
+                        self._memory_mode.bootstrap,
+                        self._memory_mode.maintenance,
+                        self._memory_mode.reflection,
+                    )
+                )
+                else None
+            ),
         )
         self._active_turn_id: str | None = None
         self._stop_requested_turn_id: str | None = None
@@ -191,13 +259,25 @@ class AgentLoop:
         self._pending_approval_id: str | None = None
         self._pending_approval_turn_id: str | None = None
 
+    @property
+    def agent_kind(self) -> AgentKind:
+        return self._identity.kind
+
+    @property
+    def agent_name(self) -> str:
+        return self._identity.name
+
+    @property
+    def subagent_id(self) -> str | None:
+        return self._identity.subagent_id
+
     async def handle_user_input(self, user_text: str) -> AgentTurnResult:
         command = parse_user_command(user_text)
         if command.kind == "new":
             return await self._handle_new_command(command)
         if command.kind == "compact":
             return await self._handle_compact_command(command)
-        return await self._handle_message_turn(command.body)
+        return await self.handle_turn(user_text=command.body)
 
     async def stream_user_input(self, user_text: str) -> AsyncIterator[AgentTurnStreamEvent]:
         command = parse_user_command(user_text)
@@ -209,12 +289,51 @@ class AgentLoop:
             async for event in self._stream_compact_command(command):
                 yield event
             return
-        async for event in self._stream_message_turn(command.body):
+        async for event in self.stream_turn(user_text=command.body):
+            yield event
+
+    async def handle_turn(
+        self,
+        *,
+        user_text: str,
+        force_session_id: str | None = None,
+        command_override: str | None = None,
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
+    ) -> AgentTurnResult:
+        return await self._handle_message_turn(
+            user_text,
+            force_session_id=force_session_id,
+            command_override=command_override,
+            pre_turn_messages=pre_turn_messages,
+        )
+
+    async def stream_turn(
+        self,
+        *,
+        user_text: str,
+        force_session_id: str | None = None,
+        command_override: str | None = None,
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
+    ) -> AsyncIterator[AgentTurnStreamEvent]:
+        async for event in self._stream_message_turn(
+            user_text,
+            force_session_id=force_session_id,
+            command_override=command_override,
+            pre_turn_messages=pre_turn_messages,
+        ):
             yield event
 
     def active_session_id(self) -> str | None:
         active = self._storage.get_active_session()
         return active.session_id if active is not None else None
+
+    async def prepare_session(self, *, start_reason: str = "initial") -> str:
+        await self._ensure_memory_runtime_ready()
+        active = self._storage.get_active_session()
+        if active is not None:
+            return active.session_id
+        session = await self._start_session(start_reason=start_reason)
+        return session.session_id
 
     def request_stop(self) -> bool:
         active_turn_id = self._active_turn_id
@@ -239,7 +358,11 @@ class AgentLoop:
         await self._ensure_memory_runtime_ready()
         session = await self._start_session(start_reason="user_new")
         if command.body:
-            return await self._handle_message_turn(command.body, force_session_id=session.session_id)
+            return await self._handle_message_turn(
+                command.body,
+                force_session_id=session.session_id,
+                command_override="/new",
+            )
         return AgentTurnResult(
             session_id=session.session_id,
             response_text="Started a new session.",
@@ -314,33 +437,30 @@ class AgentLoop:
         user_text: str,
         *,
         force_session_id: str | None = None,
+        command_override: str | None = None,
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> AgentTurnResult:
         (
             session,
             base_records,
             turn_context_text,
             interruption_notice_text,
+            turn_runtime_messages,
             request,
             estimated_input_tokens,
             did_compaction,
         ) = await self._prepare_message_turn(
             user_text=user_text,
             force_session_id=force_session_id,
+            pre_turn_messages=pre_turn_messages,
         )
         turn_id = uuid4().hex
-        pending_records = [
-            self._build_turn_context_record(
-                session_id=session.session_id,
-                turn_context_text=turn_context_text,
-            )
-        ]
-        if interruption_notice_text is not None:
-            pending_records.append(
-                self._build_interruption_notice_record(
-                    session_id=session.session_id,
-                    text=interruption_notice_text,
-                )
-            )
+        pending_records = self._build_pending_turn_records(
+            session_id=session.session_id,
+            turn_context_text=turn_context_text,
+            interruption_notice_text=interruption_notice_text,
+            runtime_messages=turn_runtime_messages,
+        )
         user_record = self._build_message_record(
             session_id=session.session_id,
             role="user",
@@ -389,7 +509,7 @@ class AgentLoop:
                 return self._interrupt_turn(
                     session_id=session.session_id,
                     turn_id=turn_id,
-                    command=None,
+                    command=command_override,
                     compaction_performed=did_compaction,
                     response_text=response.text,
                 )
@@ -401,6 +521,7 @@ class AgentLoop:
                 final_estimated_input_tokens,
                 followup_compacted,
                 interrupted,
+                approval_rejected,
             ) = await self._execute_followup_tool_rounds(
                 session=session,
                 base_records=base_records,
@@ -415,7 +536,7 @@ class AgentLoop:
                 return self._interrupt_turn(
                     session_id=session.session_id,
                     turn_id=turn_id,
-                    command=None,
+                    command=command_override,
                     compaction_performed=did_compaction,
                     response_text=final_response.text,
                 )
@@ -449,7 +570,9 @@ class AgentLoop:
             return AgentTurnResult(
                 session_id=session.session_id,
                 response_text=final_response.text,
+                command=command_override,
                 compaction_performed=did_compaction,
+                approval_rejected=approval_rejected,
             )
         finally:
             self._clear_turn_control(turn_id)
@@ -464,12 +587,13 @@ class AgentLoop:
     ) -> _ToolExecutionOutcome:
         transient_records: list[ConversationRecord] = []
         for tool_call in current_response.tool_calls:
-            tool_context = replace(self._tool_context, session_id=session_id)
+            tool_context = replace(
+                self._tool_context,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
             while True:
-                tool_result = await self._tool_runtime.execute(
-                    tool_call=tool_call,
-                    context=tool_context,
-                )
+                tool_result = await self._tool_executor(tool_call, tool_context)
                 pending_approval = self._build_pending_approval(
                     tool_result=tool_result,
                     tool_name=tool_call.name,
@@ -584,6 +708,7 @@ class AgentLoop:
     ) -> LLMRequest:
         return LLMRequest(
             messages=_records_to_llm_messages(records),
+            provider=self._llm_provider,
             tools=(
                 self._compose_request_tools(activated_discoverable_tool_names)
                 if allow_tools
@@ -719,33 +844,29 @@ class AgentLoop:
         *,
         force_session_id: str | None = None,
         command_override: str | None = None,
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         (
             session,
             _base_records,
             turn_context_text,
             interruption_notice_text,
+            turn_runtime_messages,
             request,
             estimated_input_tokens,
             did_compaction,
         ) = await self._prepare_message_turn(
             user_text=user_text,
             force_session_id=force_session_id,
+            pre_turn_messages=pre_turn_messages,
         )
         turn_id = uuid4().hex
-        pending_records = [
-            self._build_turn_context_record(
-                session_id=session.session_id,
-                turn_context_text=turn_context_text,
-            )
-        ]
-        if interruption_notice_text is not None:
-            pending_records.append(
-                self._build_interruption_notice_record(
-                    session_id=session.session_id,
-                    text=interruption_notice_text,
-                )
-            )
+        pending_records = self._build_pending_turn_records(
+            session_id=session.session_id,
+            turn_context_text=turn_context_text,
+            interruption_notice_text=interruption_notice_text,
+            runtime_messages=turn_runtime_messages,
+        )
         user_record = self._build_message_record(
             session_id=session.session_id,
             role="user",
@@ -910,6 +1031,7 @@ class AgentLoop:
             base_records = self._storage.load_records(session.session_id)
             current_response = initial_response
             tool_rounds = 0
+            turn_approval_rejected = False
             while current_response.tool_calls:
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
@@ -954,12 +1076,10 @@ class AgentLoop:
                         tool_context = replace(
                             self._tool_context,
                             session_id=session.session_id,
+                            turn_id=turn_id,
                         )
                         while True:
-                            tool_result = await self._tool_runtime.execute(
-                                tool_call=tool_call,
-                                context=tool_context,
-                            )
+                            tool_result = await self._tool_executor(tool_call, tool_context)
                             pending_approval = self._build_pending_approval(
                                 tool_result=tool_result,
                                 tool_name=tool_call.name,
@@ -1032,6 +1152,7 @@ class AgentLoop:
                             )
                             if not approved:
                                 approval_rejected = True
+                                turn_approval_rejected = True
                                 current_response = replace(
                                     current_response,
                                     text=_APPROVAL_REJECTED_TEXT,
@@ -1267,6 +1388,7 @@ class AgentLoop:
                 response_text=final_response.text,
                 command=command_override,
                 compaction_performed=did_compaction,
+                approval_rejected=turn_approval_rejected,
             )
         finally:
             self._clear_turn_control(turn_id)
@@ -1276,7 +1398,17 @@ class AgentLoop:
         *,
         user_text: str,
         force_session_id: str | None = None,
-    ) -> tuple[SessionMetadata, list[ConversationRecord], str, str | None, LLMRequest, int, bool]:
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
+    ) -> tuple[
+        SessionMetadata,
+        list[ConversationRecord],
+        str,
+        str | None,
+        tuple[AgentRuntimeMessage, ...],
+        LLMRequest,
+        int,
+        bool,
+    ]:
         await self._ensure_memory_runtime_ready()
         turn_context_text = self._build_turn_context_text()
         session = self._storage.get_session(force_session_id) if force_session_id else None
@@ -1296,12 +1428,17 @@ class AgentLoop:
             if session.pending_interruption_notice
             else None
         )
+        turn_runtime_messages = self._build_turn_runtime_messages(
+            session_id=session.session_id,
+            pre_turn_messages=pre_turn_messages,
+        )
         request = self._build_turn_request(
             session_id=session.session_id,
             records=records,
             user_text=user_text,
             turn_context_text=turn_context_text,
             interruption_notice_text=interruption_notice_text,
+            runtime_messages=turn_runtime_messages,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -1322,6 +1459,7 @@ class AgentLoop:
                     user_text=user_text,
                     turn_context_text=turn_context_text,
                     interruption_notice_text=interruption_notice_text,
+                    runtime_messages=turn_runtime_messages,
                 )
                 estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -1335,6 +1473,7 @@ class AgentLoop:
             records,
             turn_context_text,
             interruption_notice_text,
+            turn_runtime_messages,
             request,
             estimated_input_tokens,
             did_compaction,
@@ -1401,16 +1540,7 @@ class AgentLoop:
         self,
         activated_discoverable_tool_names: Sequence[str],
     ) -> tuple[ToolDefinition, ...]:
-        tools = list(self._tool_registry.basic_definitions())
-        seen_names = {tool.name for tool in tools}
-        for tool in self._tool_registry.resolve_discoverable_tool_definitions(
-            activated_discoverable_tool_names
-        ):
-            if tool.name in seen_names:
-                continue
-            tools.append(tool)
-            seen_names.add(tool.name)
-        return tuple(tools)
+        return self._tool_definitions_provider(activated_discoverable_tool_names)
 
     def _build_turn_request(
         self,
@@ -1420,20 +1550,14 @@ class AgentLoop:
         user_text: str,
         turn_context_text: str,
         interruption_notice_text: str | None = None,
+        runtime_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> LLMRequest:
-        turn_records: list[ConversationRecord] = [
-            self._build_turn_context_record(
-                session_id=session_id,
-                turn_context_text=turn_context_text,
-            )
-        ]
-        if interruption_notice_text is not None:
-            turn_records.append(
-                self._build_interruption_notice_record(
-                    session_id=session_id,
-                    text=interruption_notice_text,
-                )
-            )
+        turn_records = self._build_pending_turn_records(
+            session_id=session_id,
+            turn_context_text=turn_context_text,
+            interruption_notice_text=interruption_notice_text,
+            runtime_messages=runtime_messages,
+        )
         turn_records.append(
             self._build_message_record(
                 session_id=session_id,
@@ -1442,6 +1566,49 @@ class AgentLoop:
             )
         )
         return self._build_request(list(records) + turn_records)
+
+    def _build_turn_runtime_messages(
+        self,
+        *,
+        session_id: str,
+        pre_turn_messages: Sequence[AgentRuntimeMessage],
+    ) -> tuple[AgentRuntimeMessage, ...]:
+        runtime_messages: list[AgentRuntimeMessage] = []
+        provider = self._runtime_messages_provider
+        if provider is not None:
+            runtime_messages.extend(provider(session_id))
+        runtime_messages.extend(pre_turn_messages)
+        return tuple(runtime_messages)
+
+    def _build_pending_turn_records(
+        self,
+        *,
+        session_id: str,
+        turn_context_text: str,
+        interruption_notice_text: str | None,
+        runtime_messages: Sequence[AgentRuntimeMessage],
+    ) -> list[ConversationRecord]:
+        pending_records = [
+            self._build_turn_context_record(
+                session_id=session_id,
+                turn_context_text=turn_context_text,
+            )
+        ]
+        for message in runtime_messages:
+            pending_records.append(
+                self._build_runtime_message_record(
+                    session_id=session_id,
+                    message=message,
+                )
+            )
+        if interruption_notice_text is not None:
+            pending_records.append(
+                self._build_interruption_notice_record(
+                    session_id=session_id,
+                    text=interruption_notice_text,
+                )
+            )
+        return pending_records
 
     async def _execute_followup_tool_rounds(
         self,
@@ -1452,15 +1619,23 @@ class AgentLoop:
         current_response: LLMResponse,
         current_estimated_input_tokens: int,
         turn_id: str,
-    ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool]:
+    ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool]:
         tool_rounds = 0
         did_compaction = False
+        approval_rejected = False
         current_session = session
         current_base_records = list(base_records)
 
         while current_response.tool_calls:
             if self._stop_requested(turn_id):
-                return current_session, current_response, current_estimated_input_tokens, did_compaction, True
+                return (
+                    current_session,
+                    current_response,
+                    current_estimated_input_tokens,
+                    did_compaction,
+                    True,
+                    approval_rejected,
+                )
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                 current_response, current_estimated_input_tokens = (
@@ -1489,8 +1664,10 @@ class AgentLoop:
                         current_estimated_input_tokens,
                         did_compaction,
                         True,
+                        approval_rejected,
                     )
                 if tool_execution_outcome.approval_rejected:
+                    approval_rejected = True
                     current_response = replace(
                         current_response,
                         text=_APPROVAL_REJECTED_TEXT,
@@ -1516,6 +1693,7 @@ class AgentLoop:
                         current_estimated_input_tokens,
                         did_compaction,
                         True,
+                        approval_rejected,
                     )
                 request, current_estimated_input_tokens = self._build_followup_request(
                     base_records=current_base_records,
@@ -1576,7 +1754,14 @@ class AgentLoop:
                 ),
             )
 
-        return current_session, current_response, current_estimated_input_tokens, did_compaction, False
+        return (
+            current_session,
+            current_response,
+            current_estimated_input_tokens,
+            did_compaction,
+            False,
+            approval_rejected,
+        )
 
     async def _compact_followup_and_rebuild_request(
         self,
@@ -1677,27 +1862,28 @@ class AgentLoop:
                 metadata={"bootstrap_identity": True},
             )
 
-        try:
-            core_memory_bootstrap, ongoing_memory_bootstrap = (
-                await self._memory_service.render_bootstrap_messages()
-            )
-        except Exception:
-            LOGGER.exception("Memory bootstrap rendering failed.")
-            core_memory_bootstrap, ongoing_memory_bootstrap = "", ""
-        if core_memory_bootstrap.strip():
-            self._append_message(
-                session_id=session.session_id,
-                role="developer",
-                content="Runtime core memory bootstrap:\n\n" + core_memory_bootstrap,
-                metadata={"memory_bootstrap": "core"},
-            )
-        if ongoing_memory_bootstrap.strip():
-            self._append_message(
-                session_id=session.session_id,
-                role="developer",
-                content="Runtime ongoing memory bootstrap:\n\n" + ongoing_memory_bootstrap,
-                metadata={"memory_bootstrap": "ongoing"},
-            )
+        if self._memory_mode.bootstrap:
+            try:
+                core_memory_bootstrap, ongoing_memory_bootstrap = (
+                    await self._memory_service.render_bootstrap_messages()
+                )
+            except Exception:
+                LOGGER.exception("Memory bootstrap rendering failed.")
+                core_memory_bootstrap, ongoing_memory_bootstrap = "", ""
+            if core_memory_bootstrap.strip():
+                self._append_message(
+                    session_id=session.session_id,
+                    role="developer",
+                    content="Runtime core memory bootstrap:\n\n" + core_memory_bootstrap,
+                    metadata={"memory_bootstrap": "core"},
+                )
+            if ongoing_memory_bootstrap.strip():
+                self._append_message(
+                    session_id=session.session_id,
+                    role="developer",
+                    content="Runtime ongoing memory bootstrap:\n\n" + ongoing_memory_bootstrap,
+                    metadata={"memory_bootstrap": "ongoing"},
+                )
         if summary_text:
             self._append_message(
                 session_id=session.session_id,
@@ -1731,14 +1917,15 @@ class AgentLoop:
             session.session_id,
             include_turn_ids=include_turn_ids,
         )
-        try:
-            await self._memory_service.flush_before_compaction(
-                route_id=self._tool_context.route_id,
-                session_id=session.session_id,
-                records=tuple(records),
-            )
-        except Exception:
-            LOGGER.exception("Memory pre-compaction flush failed.")
+        if self._memory_mode.maintenance:
+            try:
+                await self._memory_service.flush_before_compaction(
+                    route_id=self._tool_context.route_id,
+                    session_id=session.session_id,
+                    records=tuple(records),
+                )
+            except Exception:
+                LOGGER.exception("Memory pre-compaction flush failed.")
         compactable_records = [
             record
             for record in records
@@ -1773,6 +1960,8 @@ class AgentLoop:
         return self._storage.get_session(next_session.session_id) or next_session
 
     async def _ensure_memory_runtime_ready(self) -> None:
+        if not self._memory_mode.maintenance:
+            return
         try:
             await self._memory_service.ensure_index_synced()
             await self._memory_service.run_due_maintenance()
@@ -1785,6 +1974,8 @@ class AgentLoop:
         session_id: str,
         turn_id: str,
     ) -> None:
+        if not self._memory_mode.reflection:
+            return
         try:
             turn_records = tuple(
                 record
@@ -1983,6 +2174,47 @@ class AgentLoop:
                 _TRANSIENT_RECORD_METADATA_KEY: True,
                 _INTERRUPTION_NOTICE_METADATA_KEY: True,
             },
+        )
+
+    def _build_runtime_message_record(
+        self,
+        *,
+        session_id: str,
+        message: AgentRuntimeMessage,
+    ) -> ConversationRecord:
+        metadata = dict(message.metadata)
+        if message.transient:
+            metadata[_TRANSIENT_RECORD_METADATA_KEY] = True
+        return self._build_message_record(
+            session_id=session_id,
+            role=message.role,
+            content=message.content,
+            metadata=metadata,
+        )
+
+    def _default_tool_definitions(
+        self,
+        activated_discoverable_tool_names: Sequence[str],
+    ) -> tuple[ToolDefinition, ...]:
+        tools = list(self._tool_registry.basic_definitions())
+        seen_names = {tool.name for tool in tools}
+        for tool in self._tool_registry.resolve_discoverable_tool_definitions(
+            activated_discoverable_tool_names
+        ):
+            if tool.name in seen_names:
+                continue
+            tools.append(tool)
+            seen_names.add(tool.name)
+        return tuple(tools)
+
+    async def _default_execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        return await self._tool_runtime.execute(
+            tool_call=tool_call,
+            context=context,
         )
 
     def _build_transient_records_from_tool_result(

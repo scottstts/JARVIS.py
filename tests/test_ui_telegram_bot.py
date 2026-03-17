@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 from ui.telegram.api import DraftMessage, TelegramAPIError, TelegramRemoteFile
 from ui.telegram.bot import (
@@ -31,6 +32,7 @@ from ui.telegram.gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayMessageEvent,
+    GatewaySystemNoticeEvent,
     GatewayToolCallEvent,
     GatewayTurnDoneEvent,
 )
@@ -316,6 +318,14 @@ class _BlockingGatewayClient:
     ) -> bool:
         self.approval_calls.append((route_id, approval_id, approved))
         return True
+
+
+class _FakeClosableRouteSession:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def _settings(**overrides: object) -> UISettings:
@@ -612,7 +622,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["Working on it.", "🔧 Used <b>bash</b> tool.", "Done."],
+            ["Working on it.", "🔧 <b>Jarvis</b> used <b>bash</b> tool.", "Done."],
         )
 
     async def test_handle_message_preserves_underscores_in_tool_notice(self) -> None:
@@ -640,7 +650,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "🔧 Used <b>generate_edit_image</b> tool.",
+                "🔧 <b>Jarvis</b> used <b>generate_edit_image</b> tool.",
                 "Done.",
             ],
         )
@@ -672,7 +682,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["Working on it.", "🔧 Used <b>bash</b> tool.", "Done."],
+            ["Working on it.", "🔧 <b>Jarvis</b> used <b>bash</b> tool.", "Done."],
         )
 
     async def test_handle_message_sends_approval_request_with_inline_keyboard(self) -> None:
@@ -711,7 +721,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approval_message.parse_mode, "HTML")
         self.assertEqual(
             approval_message.text,
-            "<b>Approval required</b>\n"
+            "<b>Jarvis requests approval</b>\n"
             "<b>summary:</b> Install a CLI.\n"
             "<b>details:</b> I want to install a CLI for this task.\n"
             "<b>tool_name:</b> bash\n"
@@ -786,7 +796,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.edited_messages[0].parse_mode, "HTML")
         self.assertEqual(
             telegram.edited_messages[0].text,
-            "<b>Approval required</b>\n"
+            "<b>Jarvis requests approval</b>\n"
             "<b>summary:</b> Install a CLI.\n"
             "<b>details:</b> I want to install a CLI for this task.\n"
             "<b>tool_name:</b> bash\n"
@@ -818,7 +828,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["🔧 Used <b>bash</b> tool.", "Working on it."],
+            ["🔧 <b>Jarvis</b> used <b>bash</b> tool.", "Working on it."],
         )
 
     async def test_handle_message_skips_whitespace_only_draft_payloads(self) -> None:
@@ -1120,6 +1130,94 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             [message.text for message in telegram.sent_messages],
             ["stream-reply", "stream-reply"],
         )
+
+    async def test_background_subagent_system_notice_is_sent_to_chat(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+
+        await bridge._handle_background_route_event(
+            chat_id=777,
+            event=GatewaySystemNoticeEvent(
+                route_id="route_1",
+                session_id="session_1",
+                agent_kind="subagent",
+                agent_name="Ultron",
+                subagent_id="sub_1",
+                notice_kind="subagent_completed",
+                text="completed.",
+            ),
+        )
+
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(telegram.sent_messages[0].parse_mode, "HTML")
+        self.assertEqual(
+            telegram.sent_messages[0].text,
+            "⚙️ <b>System:</b> <b>Ultron</b> completed.",
+        )
+
+    async def test_background_main_turn_done_is_sent_to_chat(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+
+        await bridge._handle_background_route_event(
+            chat_id=777,
+            event=GatewayTurnDoneEvent(
+                route_id="route_1",
+                session_id="session_1",
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="Ultron finished. I verified the result and cleaned it up.",
+            ),
+        )
+
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(
+            telegram.sent_messages[0].text,
+            "Ultron finished. I verified the result and cleaned it up.",
+        )
+
+    async def test_aclose_tolerates_worker_tasks_removing_themselves_from_tracking_dicts(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+        fake_route_session = _FakeClosableRouteSession()
+
+        async def chat_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                bridge._chat_workers.pop(777, None)
+
+        async def route_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                bridge._route_sessions.pop(777, None)
+                await fake_route_session.aclose()
+
+        bridge._chat_workers[777] = asyncio.create_task(chat_worker())
+        bridge._route_sessions[777] = SimpleNamespace(
+            session=fake_route_session,
+            event_task=asyncio.create_task(route_worker()),
+        )
+
+        await bridge.aclose()
+
+        self.assertEqual(bridge._chat_workers, {})
+        self.assertEqual(bridge._route_sessions, {})
+        self.assertTrue(fake_route_session.closed)
+        self.assertTrue(telegram.closed)
 
     async def test_final_message_renders_markdown_as_html(self) -> None:
         telegram = _FakeTelegramClient()

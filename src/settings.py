@@ -25,6 +25,9 @@ JARVIS_MEMORY_DIR: Final[str | None] = (
 JARVIS_MEMORY_INDEX_DIR: Final[str | None] = (
     f"{AGENT_WORKSPACE}/memory/.index" if AGENT_WORKSPACE is not None else None
 )
+JARVIS_SUBAGENT_ARCHIVE_DIR: Final[str | None] = (
+    f"{AGENT_WORKSPACE}/archive/subagents" if AGENT_WORKSPACE is not None else None
+)
 
 # Tool runtime defaults.
 JARVIS_TOOL_RUNTIME_BASE_URL: Final[str | None] = None
@@ -126,6 +129,26 @@ JARVIS_MEMORY_SEMANTIC_SCORE_FLOOR: Final = 0.30
 JARVIS_MEMORY_SEMANTIC_ONLY_SCORE_FLOOR: Final = 0.55
 JARVIS_MEMORY_WEAK_RESULT_SCORE_THRESHOLD: Final = 0.45
 JARVIS_MEMORY_RETRIEVAL_FALLBACK_MAX_QUERIES: Final = 2
+
+# Subagent runtime defaults.
+JARVIS_SUBAGENT_PROVIDER: Final[str | None] = "openai"
+JARVIS_SUBAGENT_MAX_ACTIVE: Final = 7
+JARVIS_SUBAGENT_CODENAME_POOL: Final[tuple[str, ...]] = (
+    "Friday",
+    "Edith",
+    "Karen",
+    "Jocasta",
+    "Tadashi",
+    "Homer",
+    "Ultron",
+)
+JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST: Final[tuple[str, ...]] = (
+    "memory_search",
+    "memory_get",
+    "memory_write",
+    "memory_admin",
+)
+JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT: Final = 8
 
 # OpenAI provider defaults.
 JARVIS_OPENAI_CHAT_MODEL: Final = "gpt-5.4-2026-03-05"

@@ -34,9 +34,11 @@ class ContextCompactor:
         *,
         llm_service: LLMService,
         context_policy: ContextPolicySettings,
+        provider: str | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._context_policy = context_policy
+        self._provider = provider
 
     async def compact(
         self,
@@ -59,6 +61,7 @@ class ContextCompactor:
                 LLMMessage.text("system", _COMPACTION_SYSTEM_PROMPT),
                 LLMMessage.text("user", user_prompt),
             ),
+            provider=self._provider,
             max_output_tokens=self._context_policy.compact_reserve_output_tokens,
         )
         response = await self._llm_service.generate(request)

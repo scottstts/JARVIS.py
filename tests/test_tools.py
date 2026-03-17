@@ -823,7 +823,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search("python"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("python", include_basic=True)],
-                ["python_interpreter"],
+                ["bash", "python_interpreter"],
             )
             self.assertEqual(registry.search("web_search"), ())
             self.assertEqual(
@@ -838,7 +838,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search("view_image"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("image", include_basic=True)],
-                ["python_interpreter", "view_image", "generate_edit_image"],
+                ["view_image", "generate_edit_image"],
             )
             self.assertEqual(registry.search("send"), ())
             self.assertEqual(
@@ -927,6 +927,84 @@ class ToolRegistryTests(unittest.TestCase):
             [tool.name for tool in registry.resolve_discoverable_tool_definitions(["archive"])],
             ["archive"],
         )
+
+
+class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subagent_filtered_view_hides_blocked_memory_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+            subagent_view = registry.filtered_view(
+                agent_kind="subagent",
+                hidden_tool_names=(
+                    "memory_search",
+                    "memory_get",
+                    "memory_write",
+                    "memory_admin",
+                ),
+            )
+
+            self.assertNotIn(
+                "memory_search",
+                [tool.name for tool in subagent_view.basic_definitions()],
+            )
+            self.assertNotIn(
+                "memory_get",
+                [tool.name for tool in subagent_view.basic_definitions()],
+            )
+            self.assertNotIn(
+                "memory_write",
+                [tool.name for tool in subagent_view.basic_definitions()],
+            )
+            self.assertEqual(
+                [tool.name for tool in subagent_view.search_discoverable("memory")],
+                [],
+            )
+
+    async def test_subagent_tool_search_keeps_runtime_manifests_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            _write_runtime_manifest(
+                workspace_dir,
+                {
+                    "name": "memory_helper_cli",
+                    "purpose": "Inspect exported memory reports through bash.",
+                    "operator": "bash",
+                    "invocation": {"command": "memory-helper --help"},
+                },
+            )
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+            subagent_view = registry.filtered_view(
+                agent_kind="subagent",
+                hidden_tool_names=(
+                    "memory_search",
+                    "memory_get",
+                    "memory_write",
+                    "memory_admin",
+                ),
+            )
+            tool_search = subagent_view.require("tool_search")
+
+            result = await tool_search.executor(
+                call_id="call_1",
+                arguments={"query": "memory", "verbosity": "high"},
+                context=ToolExecutionContext(
+                    workspace_dir=workspace_dir,
+                    agent_kind="subagent",
+                    agent_name="Friday",
+                ),
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                [match["name"] for match in result.metadata["matches"]],
+                ["memory_helper_cli"],
+            )
+            self.assertEqual(result.metadata["activated_discoverable_tool_names"], [])
 
 
 class ToolPolicyTests(unittest.TestCase):

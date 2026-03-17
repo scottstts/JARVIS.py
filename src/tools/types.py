@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from llm import ToolDefinition
 
 ToolExposure = Literal["basic", "discoverable"]
+AgentToolAccess = Literal["main", "subagent"]
 
 if TYPE_CHECKING:
     from memory import MemoryService
@@ -21,6 +22,10 @@ class ToolExecutionContext:
     workspace_dir: Path
     route_id: str | None = None
     session_id: str | None = None
+    turn_id: str | None = None
+    agent_kind: AgentToolAccess = "main"
+    agent_name: str = "Jarvis"
+    subagent_id: str | None = None
     memory_service: "MemoryService | None" = None
     approved_action: dict[str, Any] | None = None
 
@@ -64,6 +69,7 @@ class RegisteredTool:
     exposure: ToolExposure
     definition: ToolDefinition
     executor: ToolExecutor
+    allowed_agent_kinds: tuple[AgentToolAccess, ...] = ("main", "subagent")
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,6 +83,7 @@ class DiscoverableTool:
     usage: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
     backing_tool_name: str | None = None
+    allowed_agent_kinds: tuple[AgentToolAccess, ...] = ("main", "subagent")
 
     def __post_init__(self) -> None:
         if not self.name.strip():

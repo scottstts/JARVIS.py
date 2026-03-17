@@ -3,10 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from core import AgentAssistantMessageEvent, AgentTextDeltaEvent, AgentTurnDoneEvent, AgentTurnResult
+from core import (
+    AgentAssistantMessageEvent,
+    AgentRuntimeMessage,
+    AgentTextDeltaEvent,
+    AgentTurnDoneEvent,
+    AgentTurnResult,
+)
+from gateway.route_events import RouteAssistantMessageEvent, RouteSystemNoticeEvent
+from gateway.route_runtime import (
+    RouteEventBus,
+    RouteRuntime,
+    _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
+    _tool_result_for_payload,
+)
 from gateway.session_router import SessionRouter, validate_route_id
+from tests.helpers import build_core_settings
 
 
 class _TrackingLoop:
@@ -150,3 +167,88 @@ class ValidateRouteIDTests(unittest.TestCase):
             validate_route_id(" bad id ")
         with self.assertRaises(ValueError):
             validate_route_id("../escape")
+
+
+class RouteEventBusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subscriber_ids_do_not_collide_after_unsubscribe(self) -> None:
+        bus = RouteEventBus()
+
+        first_id, _first_queue = bus.subscribe()
+        second_id, second_queue = bus.subscribe()
+        bus.unsubscribe(first_id)
+        third_id, third_queue = bus.subscribe()
+
+        self.assertNotEqual(second_id, third_id)
+
+        event = RouteAssistantMessageEvent(
+            route_id="route_1",
+            agent_kind="main",
+            agent_name="Jarvis",
+            session_id="session_1",
+            text="hello",
+        )
+        await bus.publish(event)
+
+        self.assertEqual((await second_queue.get()).text, "hello")
+        self.assertEqual((await third_queue.get()).text, "hello")
+
+
+class RouteRuntimeToolResultTests(unittest.TestCase):
+    def test_subagent_tool_results_mark_control_metadata(self) -> None:
+        result = _tool_result_for_payload(
+            call_id="call_1",
+            name="subagent_invoke",
+            title="Subagent invoked",
+            payload={
+                "subagent_id": "sub_1",
+                "codename": "Friday",
+            },
+        )
+
+        self.assertTrue(result.metadata["subagent_control"])
+        self.assertEqual(result.metadata["subagent_action"], "invoke")
+        self.assertEqual(result.metadata["subagent_id"], "sub_1")
+        self.assertEqual(result.metadata["codename"], "Friday")
+
+
+class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_subagent_notice_enqueues_internal_main_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            followup_message = AgentRuntimeMessage(
+                role="developer",
+                content="Subagent finished and needs supervision.",
+            )
+
+            with patch.object(runtime, "_ensure_message_worker"):
+                with patch.object(
+                    runtime._subagent_manager,
+                    "main_followup_runtime_messages",
+                    return_value=(followup_message,),
+                ) as build_followup:
+                    await runtime.publish_event(
+                        RouteSystemNoticeEvent(
+                            route_id="route_1",
+                            agent_kind="subagent",
+                            agent_name="Ultron",
+                            subagent_id="sub_1",
+                            session_id="sub_session",
+                            notice_kind="subagent_completed",
+                            text="Ultron completed.",
+                        )
+                    )
+
+            queued = runtime._message_queue.get_nowait()
+            self.assertEqual(queued.user_text, _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT)
+            self.assertFalse(queued.parse_commands)
+            self.assertEqual(queued.pre_turn_messages, (followup_message,))
+            build_followup.assert_called_once_with(
+                agent="sub_1",
+                notice_kind="subagent_completed",
+                notice_text="Ultron completed.",
+            )

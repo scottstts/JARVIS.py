@@ -5,6 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .route_events import (
+    RouteApprovalRequestEvent,
+    RouteAssistantDeltaEvent,
+    RouteAssistantMessageEvent,
+    RouteErrorEvent,
+    RouteEvent,
+    RouteSystemNoticeEvent,
+    RouteToolCallEvent,
+    RouteTurnDoneEvent,
+)
+
 
 class ProtocolError(ValueError):
     """Raised when websocket payload violates protocol contract."""
@@ -192,3 +203,66 @@ def build_error_event(*, code: str, message: str) -> dict[str, Any]:
         "code": code,
         "message": message,
     }
+
+
+def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": event.type,
+        "event_id": event.event_id,
+        "created_at": event.created_at,
+        "route_id": event.route_id,
+        "session_id": event.session_id,
+        "agent_kind": event.agent_kind,
+        "agent_name": event.agent_name,
+        "subagent_id": event.subagent_id,
+    }
+    if isinstance(event, RouteAssistantDeltaEvent):
+        payload["delta"] = event.delta
+        return payload
+    if isinstance(event, RouteAssistantMessageEvent):
+        payload["text"] = event.text
+        return payload
+    if isinstance(event, RouteToolCallEvent):
+        payload["tool_names"] = list(event.tool_names)
+        return payload
+    if isinstance(event, RouteApprovalRequestEvent):
+        payload.update(
+            {
+                "approval_id": event.approval_id,
+                "kind": event.kind,
+                "summary": event.summary,
+                "details": event.details,
+                "command": event.command,
+                "tool_name": event.tool_name,
+                "inspection_url": event.inspection_url,
+            }
+        )
+        return payload
+    if isinstance(event, RouteTurnDoneEvent):
+        payload.update(
+            {
+                "response_text": event.response_text,
+                "command": event.command,
+                "compaction_performed": event.compaction_performed,
+                "interrupted": event.interrupted,
+                "approval_rejected": event.approval_rejected,
+            }
+        )
+        return payload
+    if isinstance(event, RouteSystemNoticeEvent):
+        payload.update(
+            {
+                "notice_kind": event.notice_kind,
+                "text": event.text,
+            }
+        )
+        return payload
+    if isinstance(event, RouteErrorEvent):
+        payload.update(
+            {
+                "code": event.code,
+                "message": event.message,
+            }
+        )
+        return payload
+    raise TypeError(f"Unsupported route event type: {type(event).__name__}")

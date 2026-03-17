@@ -158,7 +158,8 @@ def format_bash_tool_description() -> str:
     return (
         "Run a bash command from /workspace inside the isolated tool_runtime container. "
         "Use this for shell commands, CLI tools, installs, builds, file inspection, and small scripts. "
-        "Do not use bash tool to invoke Python in any form; use `python_interpreter` tool instead. "
+        "Do not use this tool to run code through an interpreter. "
+        "Do not use bash tool to invoke Python in any form; use the dedicated interpreter tool (`python_interpreter`) instead. "
         "You can directly install python packages using bash tool, use the virtualenv pip executable directly, "
         "e.g., `uv pip install --python /opt/venv/bin/python <package-name>`. Do NOT use `python -m pip install`. "
         "Use normal shell syntax, including pipes, redirects, command substitution, &&, ||, and multiline scripts. "

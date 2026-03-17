@@ -37,7 +37,166 @@ from .discoverable.youtube import (
     build_youtube_discoverable,
     build_youtube_tool,
 )
-from .types import DiscoverableTool, RegisteredTool
+from .types import AgentToolAccess, DiscoverableTool, RegisteredTool
+
+
+def _tool_visible_to_agent(
+    tool: RegisteredTool,
+    *,
+    agent_kind: AgentToolAccess | None,
+    hidden_tool_names: frozenset[str],
+) -> bool:
+    if tool.name in hidden_tool_names:
+        return False
+    if agent_kind is None:
+        return True
+    return agent_kind in tool.allowed_agent_kinds
+
+
+def _discoverable_visible_to_agent(
+    tool: DiscoverableTool,
+    *,
+    agent_kind: AgentToolAccess | None,
+    hidden_tool_names: frozenset[str],
+    visible_tool_names: frozenset[str],
+) -> bool:
+    if tool.name in hidden_tool_names:
+        return False
+    if agent_kind is not None and agent_kind not in tool.allowed_agent_kinds:
+        return False
+    backing_tool_name = tool.backing_tool_name
+    if backing_tool_name is None:
+        return True
+    return backing_tool_name in visible_tool_names
+
+
+class ToolRegistryView:
+    """Filtered registry facade used for agent-scoped tool visibility."""
+
+    def __init__(
+        self,
+        registry: "ToolRegistry",
+        *,
+        agent_kind: AgentToolAccess | None = None,
+        hidden_tool_names: Iterable[str] = (),
+    ) -> None:
+        self._registry = registry
+        self._agent_kind = agent_kind
+        self._hidden_tool_names = frozenset(
+            normalized
+            for raw_name in hidden_tool_names
+            if (normalized := str(raw_name).strip())
+        )
+
+    def get(self, name: str) -> RegisteredTool | None:
+        tool = self._registry.get(name)
+        if tool is None:
+            return None
+        if not _tool_visible_to_agent(
+            tool,
+            agent_kind=self._agent_kind,
+            hidden_tool_names=self._hidden_tool_names,
+        ):
+            return None
+        if name == "tool_search":
+            return build_tool_search_tool(self)
+        if name == "tool_register":
+            return build_tool_register_tool(self)
+        return tool
+
+    def registered_tool_names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._visible_tools()))
+
+    def require(self, name: str) -> RegisteredTool:
+        tool = self.get(name)
+        if tool is None:
+            raise KeyError(f"Tool '{name}' is not registered.")
+        return tool
+
+    def basic_definitions(self) -> tuple[ToolDefinition, ...]:
+        return tuple(
+            tool.definition
+            for tool in self._visible_tools().values()
+            if tool.exposure == "basic"
+        )
+
+    def discoverable_entries(self) -> tuple[DiscoverableTool, ...]:
+        visible_tool_names = frozenset(self._visible_tools())
+        return tuple(
+            tool
+            for name, tool in sorted(self._registry._discoverable_tools.items())
+            if _discoverable_visible_to_agent(
+                tool,
+                agent_kind=self._agent_kind,
+                hidden_tool_names=self._hidden_tool_names,
+                visible_tool_names=visible_tool_names,
+            )
+        )
+
+    def get_discoverable(self, name: str) -> DiscoverableTool | None:
+        visible_tool_names = frozenset(self._visible_tools())
+        tool = self._registry.get_discoverable(name)
+        if tool is None:
+            return None
+        if not _discoverable_visible_to_agent(
+            tool,
+            agent_kind=self._agent_kind,
+            hidden_tool_names=self._hidden_tool_names,
+            visible_tool_names=visible_tool_names,
+        ):
+            return None
+        return tool
+
+    def search(self, query: str, *, include_basic: bool = False) -> tuple[RegisteredTool, ...]:
+        normalized = query.strip().lower()
+        visible_tools = tuple(self._visible_tools().values())
+        if not normalized:
+            matches = visible_tools
+        else:
+            matches = tuple(
+                tool
+                for tool in visible_tools
+                if normalized in tool.name.lower()
+                or normalized in (tool.definition.description or "").lower()
+            )
+        if include_basic:
+            return matches
+        return tuple(tool for tool in matches if tool.exposure != "basic")
+
+    def search_discoverable(self, query: str) -> tuple[DiscoverableTool, ...]:
+        return search_discoverable_entries(self.discoverable_entries(), query)
+
+    def resolve_discoverable_tool_definitions(
+        self,
+        names: Iterable[str],
+    ) -> tuple[ToolDefinition, ...]:
+        definitions: list[ToolDefinition] = []
+        seen_backing_tools: set[str] = set()
+        for name in names:
+            entry = self.get_discoverable(str(name).strip())
+            if entry is None or entry.backing_tool_name is None:
+                continue
+            backing_tool_name = entry.backing_tool_name
+            if backing_tool_name in seen_backing_tools:
+                continue
+            registered = self.require(backing_tool_name)
+            definitions.append(registered.definition)
+            seen_backing_tools.add(backing_tool_name)
+        return tuple(definitions)
+
+    def _visible_tools(self) -> dict[str, RegisteredTool]:
+        visible: dict[str, RegisteredTool] = {}
+        for name, tool in self._registry._tools.items():
+            if not _tool_visible_to_agent(
+                tool,
+                agent_kind=self._agent_kind,
+                hidden_tool_names=self._hidden_tool_names,
+            ):
+                continue
+            resolved = self.get(name)
+            if resolved is not None:
+                visible[name] = resolved
+        return visible
 
 
 class ToolRegistry:
@@ -110,6 +269,18 @@ class ToolRegistry:
         if tool is None:
             raise KeyError(f"Tool '{name}' is not registered.")
         return tool
+
+    def filtered_view(
+        self,
+        *,
+        agent_kind: AgentToolAccess | None = None,
+        hidden_tool_names: Iterable[str] = (),
+    ) -> ToolRegistryView:
+        return ToolRegistryView(
+            self,
+            agent_kind=agent_kind,
+            hidden_tool_names=hidden_tool_names,
+        )
 
     def basic_definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(

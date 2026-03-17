@@ -21,6 +21,7 @@ Keep this doc structured and status-oriented. It is meant to be updated througho
 - Basic tools live in `src/tools/basic/<tool_name>/`
 - Discoverable executable tools live in `src/tools/discoverable/<tool_name>/`
 - Shared cross-tool interfaces stay at the top level of `src/tools/`
+- Synthetic core runtime primitives such as subagent control live outside `src/tools/`; they are defined under `src/subagent/` and injected by the route runtime rather than registered as normal tools
 - Current shared top-level modules:
   - `registry.py`
   - `runtime.py`
@@ -50,6 +51,8 @@ Current rule:
 - discoverable entries may be docs-only or may link to a backing executable tool
 - low-verbosity `tool_search` stays informational only
 - high-verbosity `tool_search` may transiently surface matched backed discoverable tools for the rest of the current turn
+- `ToolRegistry.filtered_view(...)` provides agent-scoped visibility so different actor types can share the same registry with different allowed tools
+- the current subagent filtered view hides the built-in memory tools by settings-backed blocklist while still allowing runtime manifest discoverables to remain visible through `tool_search`
 
 ### Discoverable Catalog
 

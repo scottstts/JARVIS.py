@@ -1,4 +1,4 @@
-"""Websocket bridge client for the gateway wire protocol."""
+"""Persistent websocket bridge client for the gateway wire protocol."""
 
 from __future__ import annotations
 
@@ -19,33 +19,40 @@ class GatewayBridgeError(RuntimeError):
 
 
 @dataclass(slots=True, frozen=True)
-class GatewayDeltaEvent:
-    session_id: str
-    delta: str
+class GatewayRouteEventBase:
+    event_id: str = ""
+    created_at: str = ""
+    route_id: str = ""
+    session_id: str | None = None
+    agent_kind: str = "main"
+    agent_name: str = "Jarvis"
+    subagent_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class GatewayDeltaEvent(GatewayRouteEventBase):
+    delta: str = ""
     type: str = "assistant_delta"
 
 
 @dataclass(slots=True, frozen=True)
-class GatewayMessageEvent:
-    session_id: str
-    text: str
+class GatewayMessageEvent(GatewayRouteEventBase):
+    text: str = ""
     type: str = "assistant_message"
 
 
 @dataclass(slots=True, frozen=True)
-class GatewayToolCallEvent:
-    session_id: str
-    tool_names: tuple[str, ...]
+class GatewayToolCallEvent(GatewayRouteEventBase):
+    tool_names: tuple[str, ...] = ()
     type: str = "tool_call"
 
 
 @dataclass(slots=True, frozen=True)
-class GatewayApprovalRequestEvent:
-    session_id: str
-    approval_id: str
-    kind: str
-    summary: str
-    details: str
+class GatewayApprovalRequestEvent(GatewayRouteEventBase):
+    approval_id: str = ""
+    kind: str = ""
+    summary: str = ""
+    details: str = ""
     command: str | None = None
     tool_name: str | None = None
     inspection_url: str | None = None
@@ -53,26 +60,242 @@ class GatewayApprovalRequestEvent:
 
 
 @dataclass(slots=True, frozen=True)
-class GatewayTurnDoneEvent:
-    session_id: str
-    response_text: str
+class GatewayTurnDoneEvent(GatewayRouteEventBase):
+    response_text: str = ""
     command: str | None = None
     compaction_performed: bool = False
     interrupted: bool = False
+    approval_rejected: bool = False
     type: str = "turn_done"
 
 
-GatewayTurnEvent = (
+@dataclass(slots=True, frozen=True)
+class GatewaySystemNoticeEvent(GatewayRouteEventBase):
+    notice_kind: str = ""
+    text: str = ""
+    type: str = "system_notice"
+
+
+@dataclass(slots=True, frozen=True)
+class GatewayErrorEvent(GatewayRouteEventBase):
+    code: str = ""
+    message: str = ""
+    type: str = "error"
+
+
+GatewayRouteEvent = (
     GatewayDeltaEvent
     | GatewayMessageEvent
     | GatewayToolCallEvent
     | GatewayApprovalRequestEvent
     | GatewayTurnDoneEvent
+    | GatewaySystemNoticeEvent
+    | GatewayErrorEvent
 )
 
 
+class GatewayRouteSession:
+    """Maintains one persistent websocket connection for a single route."""
+
+    def __init__(
+        self,
+        *,
+        route_id: str,
+        websocket_base_url: str,
+        connect_timeout_seconds: float,
+    ) -> None:
+        self.route_id = route_id
+        self._websocket_base_url = websocket_base_url.rstrip("/")
+        self._connect_timeout_seconds = connect_timeout_seconds
+        self._connection: Any | None = None
+        self._socket: Any | None = None
+        self._ready_session_id: str | None = None
+        self._events: asyncio.Queue[GatewayRouteEvent] = asyncio.Queue()
+        self._reader_task: asyncio.Task[None] | None = None
+        self._send_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
+        self._approval_lock = asyncio.Lock()
+        self._pending_stop_future: asyncio.Future[bool] | None = None
+        self._pending_approval_future: asyncio.Future[bool] | None = None
+
+    @property
+    def ready_session_id(self) -> str | None:
+        return self._ready_session_id
+
+    async def connect(self) -> None:
+        if self._socket is not None:
+            return
+        websocket_url = f"{self._websocket_base_url}/{self.route_id}"
+        connect = _resolve_websocket_connect()
+        try:
+            connection = connect(
+                websocket_url,
+                open_timeout=self._connect_timeout_seconds,
+                close_timeout=self._connect_timeout_seconds,
+            )
+            socket = await connection.__aenter__()
+        except Exception:
+            raise GatewayBridgeError(
+                code="gateway_unavailable",
+                message="Could not communicate with the gateway websocket.",
+            ) from None
+
+        ready_payload = await _recv_json(socket)
+        ready_type = ready_payload.get("type")
+        if ready_type == "error":
+            raise GatewayBridgeError(
+                code=str(ready_payload.get("code", "gateway_error")),
+                message=str(ready_payload.get("message", "Gateway returned an error.")),
+            )
+        if ready_type != "ready":
+            raise GatewayBridgeError(
+                code="invalid_ready_event",
+                message="Gateway did not send a ready event.",
+            )
+        self._connection = connection
+        self._ready_session_id = (
+            str(ready_payload["session_id"])
+            if ready_payload.get("session_id") is not None
+            else None
+        )
+        self._socket = socket
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(),
+            name=f"jarvis-gateway-route-session-{self.route_id}",
+        )
+
+    async def aclose(self) -> None:
+        reader_task = self._reader_task
+        if reader_task is not None:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
+        socket = self._socket
+        connection = self._connection
+        self._socket = None
+        self._connection = None
+        self._reader_task = None
+        if connection is not None:
+            try:
+                await connection.__aexit__(None, None, None)
+            except Exception:
+                pass
+        elif socket is not None:
+            try:
+                await socket.close()
+            except Exception:
+                pass
+
+    async def send_user_message(self, *, text: str) -> None:
+        await self._ensure_connected()
+        async with self._send_lock:
+            await self._socket.send(json.dumps({"type": "user_message", "text": text}))
+
+    async def request_stop(self) -> bool:
+        await self._ensure_connected()
+        async with self._stop_lock:
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._pending_stop_future = future
+            async with self._send_lock:
+                await self._socket.send(json.dumps({"type": "stop_turn"}))
+            return await future
+
+    async def submit_approval(self, *, approval_id: str, approved: bool) -> bool:
+        await self._ensure_connected()
+        async with self._approval_lock:
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._pending_approval_future = future
+            async with self._send_lock:
+                await self._socket.send(
+                    json.dumps(
+                        {
+                            "type": "approval_response",
+                            "approval_id": approval_id,
+                            "approved": approved,
+                        }
+                    )
+                )
+            return await future
+
+    async def events(self) -> AsyncIterator[GatewayRouteEvent]:
+        await self._ensure_connected()
+        while True:
+            yield await self._events.get()
+
+    async def _ensure_connected(self) -> None:
+        if self._socket is None:
+            await self.connect()
+
+    async def _reader_loop(self) -> None:
+        socket = self._socket
+        if socket is None:
+            return
+        try:
+            while True:
+                payload = await _recv_json(socket)
+                event_type = payload.get("type")
+                if event_type == "stop_ack":
+                    future = self._pending_stop_future
+                    self._pending_stop_future = None
+                    if future is not None and not future.done():
+                        future.set_result(bool(payload.get("stop_requested", False)))
+                    continue
+                if event_type == "approval_ack":
+                    future = self._pending_approval_future
+                    self._pending_approval_future = None
+                    if future is not None and not future.done():
+                        future.set_result(bool(payload.get("resolved", False)))
+                    continue
+                if event_type == "error" and payload.get("event_id") is None:
+                    raise GatewayBridgeError(
+                        code=str(payload.get("code", "gateway_error")),
+                        message=str(payload.get("message", "Gateway returned an error.")),
+                    )
+                await self._events.put(_parse_route_event(payload))
+        except asyncio.CancelledError:
+            raise
+        except GatewayBridgeError as exc:
+            if self._pending_stop_future is not None and not self._pending_stop_future.done():
+                self._pending_stop_future.set_result(False)
+            if self._pending_approval_future is not None and not self._pending_approval_future.done():
+                self._pending_approval_future.set_result(False)
+            await self._events.put(
+                GatewayErrorEvent(
+                    event_id="",
+                    created_at="",
+                    route_id=self.route_id,
+                    session_id=None,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    subagent_id=None,
+                    code=exc.code,
+                    message=exc.message,
+                )
+            )
+        except Exception:
+            if self._pending_stop_future is not None and not self._pending_stop_future.done():
+                self._pending_stop_future.set_result(False)
+            if self._pending_approval_future is not None and not self._pending_approval_future.done():
+                self._pending_approval_future.set_result(False)
+            await self._events.put(
+                GatewayErrorEvent(
+                    event_id="",
+                    created_at="",
+                    route_id=self.route_id,
+                    session_id=None,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    subagent_id=None,
+                    code="gateway_unavailable",
+                    message="Could not communicate with the gateway websocket.",
+                )
+            )
+
+
 class GatewayWebSocketClient:
-    """Minimal websocket client for one-turn gateway interactions."""
+    """Factory and compatibility wrapper for route-scoped gateway sessions."""
 
     def __init__(
         self,
@@ -83,160 +306,37 @@ class GatewayWebSocketClient:
         self._websocket_base_url = websocket_base_url.rstrip("/")
         self._connect_timeout_seconds = connect_timeout_seconds
 
-    async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[GatewayTurnEvent]:
-        websocket_url = f"{self._websocket_base_url}/{route_id}"
-        connect = _resolve_websocket_connect()
+    async def connect_route(self, *, route_id: str) -> GatewayRouteSession:
+        session = GatewayRouteSession(
+            route_id=route_id,
+            websocket_base_url=self._websocket_base_url,
+            connect_timeout_seconds=self._connect_timeout_seconds,
+        )
+        await session.connect()
+        return session
 
+    async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[GatewayRouteEvent]:
+        session = await self.connect_route(route_id=route_id)
         try:
-            async with connect(
-                websocket_url,
-                open_timeout=self._connect_timeout_seconds,
-                close_timeout=self._connect_timeout_seconds,
-            ) as socket:
-                ready_payload = await _recv_json(socket)
-                ready_type = ready_payload.get("type")
-                if ready_type == "error":
+            await session.send_user_message(text=user_text)
+            async for event in session.events():
+                if isinstance(event, GatewayErrorEvent):
                     raise GatewayBridgeError(
-                        code=str(ready_payload.get("code", "gateway_error")),
-                        message=str(ready_payload.get("message", "Gateway returned an error.")),
+                        code=event.code or "gateway_error",
+                        message=event.message or "Gateway returned an error.",
                     )
-                if ready_type != "ready":
-                    raise GatewayBridgeError(
-                        code="invalid_ready_event",
-                        message="Gateway did not send a ready event.",
-                    )
-
-                await socket.send(
-                    json.dumps(
-                        {
-                            "type": "user_message",
-                            "text": user_text,
-                        }
-                    )
-                )
-
-                while True:
-                    payload = await _recv_json(socket)
-                    event_type = payload.get("type")
-                    if event_type == "assistant_delta":
-                        yield GatewayDeltaEvent(
-                            session_id=str(payload.get("session_id", "")),
-                            delta=str(payload.get("delta", "")),
-                        )
-                        continue
-                    if event_type == "assistant_message":
-                        yield GatewayMessageEvent(
-                            session_id=str(payload.get("session_id", "")),
-                            text=str(payload.get("text", "")),
-                        )
-                        continue
-                    if event_type == "tool_call":
-                        raw_tool_names = payload.get("tool_names", [])
-                        tool_names: list[str] = []
-                        if isinstance(raw_tool_names, list):
-                            for raw_name in raw_tool_names:
-                                name = str(raw_name).strip()
-                                if name:
-                                    tool_names.append(name)
-                        yield GatewayToolCallEvent(
-                            session_id=str(payload.get("session_id", "")),
-                            tool_names=tuple(tool_names),
-                        )
-                        continue
-                    if event_type == "approval_request":
-                        yield GatewayApprovalRequestEvent(
-                            session_id=str(payload.get("session_id", "")),
-                            approval_id=str(payload.get("approval_id", "")),
-                            kind=str(payload.get("kind", "")),
-                            summary=str(payload.get("summary", "")),
-                            details=str(payload.get("details", "")),
-                            command=(
-                                str(payload["command"])
-                                if payload.get("command") is not None
-                                else None
-                            ),
-                            tool_name=(
-                                str(payload["tool_name"])
-                                if payload.get("tool_name") is not None
-                                else None
-                            ),
-                            inspection_url=(
-                                str(payload["inspection_url"])
-                                if payload.get("inspection_url") is not None
-                                else None
-                            ),
-                        )
-                        continue
-                    if event_type == "turn_done":
-                        yield GatewayTurnDoneEvent(
-                            session_id=str(payload.get("session_id", "")),
-                            response_text=str(payload.get("response_text", "")),
-                            command=(
-                                str(payload["command"])
-                                if payload.get("command") is not None
-                                else None
-                            ),
-                            compaction_performed=bool(payload.get("compaction_performed", False)),
-                            interrupted=bool(payload.get("interrupted", False)),
-                        )
-                        return
-                    if event_type == "error":
-                        raise GatewayBridgeError(
-                            code=str(payload.get("code", "gateway_error")),
-                            message=str(payload.get("message", "Gateway returned an error.")),
-                        )
-        except GatewayBridgeError:
-            raise
-        except Exception:  # pragma: no cover - exception types depend on websocket lib
-            raise GatewayBridgeError(
-                code="gateway_unavailable",
-                message="Could not communicate with the gateway websocket.",
-            ) from None
+                yield event
+                if isinstance(event, GatewayTurnDoneEvent):
+                    return
+        finally:
+            await session.aclose()
 
     async def request_stop(self, *, route_id: str) -> bool:
-        websocket_url = f"{self._websocket_base_url}/{route_id}"
-        connect = _resolve_websocket_connect()
-
+        session = await self.connect_route(route_id=route_id)
         try:
-            async with connect(
-                websocket_url,
-                open_timeout=self._connect_timeout_seconds,
-                close_timeout=self._connect_timeout_seconds,
-            ) as socket:
-                ready_payload = await _recv_json(socket)
-                ready_type = ready_payload.get("type")
-                if ready_type == "error":
-                    raise GatewayBridgeError(
-                        code=str(ready_payload.get("code", "gateway_error")),
-                        message=str(ready_payload.get("message", "Gateway returned an error.")),
-                    )
-                if ready_type != "ready":
-                    raise GatewayBridgeError(
-                        code="invalid_ready_event",
-                        message="Gateway did not send a ready event.",
-                    )
-
-                await socket.send(json.dumps({"type": "stop_turn"}))
-                payload = await _recv_json(socket)
-                event_type = payload.get("type")
-                if event_type == "stop_ack":
-                    return bool(payload.get("stop_requested", False))
-                if event_type == "error":
-                    raise GatewayBridgeError(
-                        code=str(payload.get("code", "gateway_error")),
-                        message=str(payload.get("message", "Gateway returned an error.")),
-                    )
-                raise GatewayBridgeError(
-                    code="invalid_stop_ack",
-                    message="Gateway did not send a stop acknowledgement.",
-                )
-        except GatewayBridgeError:
-            raise
-        except Exception:  # pragma: no cover - exception types depend on websocket lib
-            raise GatewayBridgeError(
-                code="gateway_unavailable",
-                message="Could not communicate with the gateway websocket.",
-            ) from None
+            return await session.request_stop()
+        finally:
+            await session.aclose()
 
     async def submit_approval(
         self,
@@ -245,58 +345,14 @@ class GatewayWebSocketClient:
         approval_id: str,
         approved: bool,
     ) -> bool:
-        websocket_url = f"{self._websocket_base_url}/{route_id}"
-        connect = _resolve_websocket_connect()
-
+        session = await self.connect_route(route_id=route_id)
         try:
-            async with connect(
-                websocket_url,
-                open_timeout=self._connect_timeout_seconds,
-                close_timeout=self._connect_timeout_seconds,
-            ) as socket:
-                ready_payload = await _recv_json(socket)
-                ready_type = ready_payload.get("type")
-                if ready_type == "error":
-                    raise GatewayBridgeError(
-                        code=str(ready_payload.get("code", "gateway_error")),
-                        message=str(ready_payload.get("message", "Gateway returned an error.")),
-                    )
-                if ready_type != "ready":
-                    raise GatewayBridgeError(
-                        code="invalid_ready_event",
-                        message="Gateway did not send a ready event.",
-                    )
-
-                await socket.send(
-                    json.dumps(
-                        {
-                            "type": "approval_response",
-                            "approval_id": approval_id,
-                            "approved": approved,
-                        }
-                    )
-                )
-
-                payload = await _recv_json(socket)
-                event_type = payload.get("type")
-                if event_type == "approval_ack":
-                    return bool(payload.get("resolved", False))
-                if event_type == "error":
-                    raise GatewayBridgeError(
-                        code=str(payload.get("code", "gateway_error")),
-                        message=str(payload.get("message", "Gateway returned an error.")),
-                    )
-                raise GatewayBridgeError(
-                    code="invalid_approval_ack",
-                    message="Gateway did not send an approval acknowledgement.",
-                )
-        except GatewayBridgeError:
-            raise
-        except Exception:  # pragma: no cover - exception types depend on websocket lib
-            raise GatewayBridgeError(
-                code="gateway_unavailable",
-                message="Could not communicate with the gateway websocket.",
-            ) from None
+            return await session.submit_approval(
+                approval_id=approval_id,
+                approved=approved,
+            )
+        finally:
+            await session.aclose()
 
 
 def _resolve_websocket_connect():
@@ -337,3 +393,89 @@ async def _recv_json(socket: Any) -> dict[str, Any]:
             message="Gateway payload must be a JSON object.",
         )
     return parsed
+
+
+def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
+    base_kwargs = {
+        "event_id": str(payload.get("event_id", "")),
+        "created_at": str(payload.get("created_at", "")),
+        "route_id": str(payload.get("route_id", "")),
+        "session_id": (
+            str(payload["session_id"])
+            if payload.get("session_id") is not None
+            else None
+        ),
+        "agent_kind": str(payload.get("agent_kind", "")),
+        "agent_name": str(payload.get("agent_name", "")),
+        "subagent_id": (
+            str(payload["subagent_id"])
+            if payload.get("subagent_id") is not None
+            else None
+        ),
+    }
+    event_type = str(payload.get("type", ""))
+    if event_type == "assistant_delta":
+        return GatewayDeltaEvent(**base_kwargs, delta=str(payload.get("delta", "")))
+    if event_type == "assistant_message":
+        return GatewayMessageEvent(**base_kwargs, text=str(payload.get("text", "")))
+    if event_type == "tool_call":
+        raw_tool_names = payload.get("tool_names", [])
+        tool_names: list[str] = []
+        if isinstance(raw_tool_names, list):
+            for raw_name in raw_tool_names:
+                name = str(raw_name).strip()
+                if name:
+                    tool_names.append(name)
+        return GatewayToolCallEvent(**base_kwargs, tool_names=tuple(tool_names))
+    if event_type == "approval_request":
+        return GatewayApprovalRequestEvent(
+            **base_kwargs,
+            approval_id=str(payload.get("approval_id", "")),
+            kind=str(payload.get("kind", "")),
+            summary=str(payload.get("summary", "")),
+            details=str(payload.get("details", "")),
+            command=(
+                str(payload["command"])
+                if payload.get("command") is not None
+                else None
+            ),
+            tool_name=(
+                str(payload["tool_name"])
+                if payload.get("tool_name") is not None
+                else None
+            ),
+            inspection_url=(
+                str(payload["inspection_url"])
+                if payload.get("inspection_url") is not None
+                else None
+            ),
+        )
+    if event_type == "turn_done":
+        return GatewayTurnDoneEvent(
+            **base_kwargs,
+            response_text=str(payload.get("response_text", "")),
+            command=(
+                str(payload["command"])
+                if payload.get("command") is not None
+                else None
+            ),
+            compaction_performed=bool(payload.get("compaction_performed", False)),
+            interrupted=bool(payload.get("interrupted", False)),
+            approval_rejected=bool(payload.get("approval_rejected", False)),
+        )
+    if event_type == "system_notice":
+        return GatewaySystemNoticeEvent(
+            **base_kwargs,
+            notice_kind=str(payload.get("notice_kind", "")),
+            text=str(payload.get("text", "")),
+        )
+    if event_type == "error":
+        return GatewayErrorEvent(
+            **base_kwargs,
+            code=str(payload.get("code", "gateway_error")),
+            message=str(payload.get("message", "Gateway returned an error.")),
+        )
+    raise GatewayBridgeError(
+        code="invalid_gateway_payload",
+        message=f"Unsupported gateway event type: {event_type}",
+    )
