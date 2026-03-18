@@ -19,6 +19,7 @@ from gateway.route_events import RouteAssistantMessageEvent, RouteSystemNoticeEv
 from gateway.route_runtime import (
     RouteEventBus,
     RouteRuntime,
+    _RouteTurnRequest,
     _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
     _tool_result_for_payload,
 )
@@ -212,6 +213,88 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_suppresses_new_terminal_subagent_followup_until_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(runtime._main_loop, "request_stop", return_value=True):
+                self.assertTrue(runtime.request_stop())
+
+            await runtime.publish_event(
+                RouteSystemNoticeEvent(
+                    route_id="route_1",
+                    agent_kind="subagent",
+                    agent_name="Ultron",
+                    subagent_id="sub_1",
+                    session_id="sub_session",
+                    notice_kind="subagent_completed",
+                    text="Ultron completed.",
+                )
+            )
+
+            self.assertTrue(runtime._message_queue.empty())
+
+    async def test_stop_discards_stale_internal_followups_before_next_user_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            observed_calls: list[tuple[str, str]] = []
+
+            async def _stream_user_input(user_text: str):
+                observed_calls.append(("user", user_text))
+                yield AgentTurnDoneEvent(
+                    session_id="main_session",
+                    response_text=f"user:{user_text}",
+                )
+
+            async def _stream_turn(
+                *,
+                user_text: str,
+                force_session_id: str | None = None,
+                pre_turn_messages=(),
+            ):
+                observed_calls.append(("internal", user_text))
+                yield AgentTurnDoneEvent(
+                    session_id=force_session_id or "main_session",
+                    response_text=f"internal:{user_text}",
+                )
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+            runtime._main_loop.stream_turn = _stream_turn  # type: ignore[method-assign]
+
+            await runtime._message_queue.put(
+                _RouteTurnRequest(
+                    user_text=_SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
+                    force_session_id="main_session",
+                    parse_commands=False,
+                    user_initiated=False,
+                    internal_generation=runtime._internal_followup_generation,
+                )
+            )
+
+            with patch.object(runtime._main_loop, "request_stop", return_value=True):
+                self.assertTrue(runtime.request_stop())
+
+            await runtime.enqueue_user_message("continue")
+            runtime._ensure_message_worker()
+            await asyncio.wait_for(runtime._message_queue.join(), timeout=1)
+
+            self.assertEqual(observed_calls, [("user", "continue")])
+
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
     async def test_terminal_subagent_notice_enqueues_internal_main_followup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(

@@ -61,6 +61,8 @@ class _RouteTurnRequest:
     force_session_id: str | None = None
     pre_turn_messages: tuple[AgentRuntimeMessage, ...] = ()
     parse_commands: bool = True
+    user_initiated: bool = True
+    internal_generation: int | None = None
 
 
 class RouteEventBus:
@@ -139,6 +141,8 @@ class RouteRuntime:
         self._approval_registry = RouteApprovalRegistry()
         self._message_queue: asyncio.Queue[_RouteTurnRequest] = asyncio.Queue()
         self._message_worker: asyncio.Task[None] | None = None
+        self._main_resume_requires_user_message = False
+        self._internal_followup_generation = 0
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
         self._subagent_manager = SubagentManager(
@@ -167,7 +171,11 @@ class RouteRuntime:
         return self._main_loop.active_session_id()
 
     def request_stop(self) -> bool:
-        return self._main_loop.request_stop()
+        stop_requested = self._main_loop.request_stop()
+        if stop_requested and not self._main_resume_requires_user_message:
+            self._main_resume_requires_user_message = True
+            self._internal_followup_generation += 1
+        return stop_requested
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._approval_registry.resolve(approval_id, approved)
@@ -177,6 +185,7 @@ class RouteRuntime:
             _RouteTurnRequest(
                 user_text=user_text,
                 parse_commands=True,
+                user_initiated=True,
             )
         )
         self._ensure_message_worker()
@@ -239,6 +248,14 @@ class RouteRuntime:
         while True:
             request = await self._message_queue.get()
             try:
+                if request.user_initiated:
+                    if self._main_resume_requires_user_message:
+                        self._main_resume_requires_user_message = False
+                else:
+                    if self._main_resume_requires_user_message:
+                        continue
+                    if request.internal_generation != self._internal_followup_generation:
+                        continue
                 event_stream = (
                     self._main_loop.stream_user_input(request.user_text)
                     if request.parse_commands
@@ -293,6 +310,8 @@ class RouteRuntime:
             return
         if event.notice_kind not in _SUBAGENT_TERMINAL_NOTICE_KINDS:
             return
+        if self._main_resume_requires_user_message:
+            return
         await self._message_queue.put(
             _RouteTurnRequest(
                 user_text=_SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
@@ -303,6 +322,8 @@ class RouteRuntime:
                     notice_text=event.text,
                 ),
                 parse_commands=False,
+                user_initiated=False,
+                internal_generation=self._internal_followup_generation,
             )
         )
         self._ensure_message_worker()
