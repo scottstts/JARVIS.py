@@ -1368,6 +1368,8 @@
               isBootstrap: false,
               turnId: null,
               toolCalls: [],
+              toolDefinitions: [],
+              toolBootstrapKind: null,
               toolName: null,
               toolNames: [],
               searchText: (`parse error ${line} ${error.message}`).toLowerCase()
@@ -1380,6 +1382,12 @@
 
       function enrichRecord(record, context) {
         const metadata = isPlainObject(record.metadata) ? record.metadata : {};
+        const toolDefinitions = Array.isArray(metadata.tool_definitions)
+          ? metadata.tool_definitions
+          : [];
+        const toolBootstrapKind = metadata.tool_bootstrap
+          ? String(metadata.tool_bootstrap)
+          : null;
         const toolCalls = Array.isArray(metadata.tool_calls)
           ? metadata.tool_calls.map((call, index) => ({
               id: call && (call.call_id || `call-${index + 1}`),
@@ -1417,9 +1425,11 @@
           content: typeof record.content === "string" ? record.content : stringifyJson(record.content),
           metadata,
           severity,
-          isBootstrap: Boolean(metadata.bootstrap_identity),
+          isBootstrap: Boolean(metadata.bootstrap_identity || toolBootstrapKind),
           turnId: metadata.turn_id || null,
           toolCalls,
+          toolDefinitions,
+          toolBootstrapKind,
           toolName: metadata.tool_name ? String(metadata.tool_name) : null,
           toolNames,
           searchText: buildSearchText(record, metadata, toolNames, toolCalls)
@@ -1818,6 +1828,7 @@
         badges.push(`<span class="badge subtle">Line ${record.fileLine}</span>`);
         if (record.turnId) badges.push(`<span class="badge subtle">Turn ${escapeHtml(shortId(record.turnId))}</span>`);
         if (record.metadata.model) badges.push(`<span class="badge subtle">${escapeHtml(record.metadata.model)}</span>`);
+        if (record.toolBootstrapKind) badges.push(`<span class="badge subtle">${escapeHtml(record.toolBootstrapKind)} tools</span>`);
         if (record.toolName) badges.push(`<span class="badge subtle">${escapeHtml(record.toolName)}</span>`);
         if (record.metadata.call_id) badges.push(`<span class="badge subtle">Call ${escapeHtml(shortId(record.metadata.call_id))}</span>`);
         if (record.metadata.exit_code === 0) badges.push(`<span class="badge ok">Exit 0</span>`);
@@ -1867,6 +1878,10 @@
           return `${record.toolCalls.length} tool call${record.toolCalls.length === 1 ? "" : "s"} requested`;
         }
 
+        if (record.toolDefinitions.length) {
+          return `${record.toolDefinitions.length} bootstrapped tool definition${record.toolDefinitions.length === 1 ? "" : "s"}`;
+        }
+
         if (record.role === "tool" && record.toolName) {
           if (record.toolName === "bash" && record.metadata.command) {
             return summarizeText(record.metadata.command, 120);
@@ -1907,6 +1922,25 @@
 
         const container = document.createElement("div");
         container.className = "meta-panel";
+
+        if (record.toolDefinitions.length) {
+          const strip = document.createElement("div");
+          strip.className = "status-strip";
+          strip.innerHTML = `
+            <span class="badge subtle">${record.toolDefinitions.length} tool${record.toolDefinitions.length === 1 ? "" : "s"}</span>
+            ${record.toolBootstrapKind ? `<span class="badge subtle">${escapeHtml(record.toolBootstrapKind)} bootstrap</span>` : ""}
+            ${record.metadata.transcript_only ? `<span class="badge subtle">transcript-only</span>` : ""}
+          `;
+          container.appendChild(strip);
+          container.appendChild(
+            renderExpandableCode(
+              "tool_definitions",
+              stringifyJson(record.toolDefinitions, 2),
+              false
+            )
+          );
+          return container;
+        }
 
         if (record.role === "assistant" && record.toolCalls.length) {
           const callGrid = document.createElement("div");
