@@ -1,0 +1,2429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jarvis Transcript Inspector</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --bg-deep: #e7ddcf;
+      --panel: rgba(255, 250, 243, 0.88);
+      --panel-strong: rgba(255, 248, 238, 0.96);
+      --line: rgba(76, 59, 38, 0.16);
+      --line-strong: rgba(76, 59, 38, 0.28);
+      --ink: #211a14;
+      --muted: #655648;
+      --soft: #8c7b6d;
+      --shadow: 0 18px 45px rgba(72, 49, 20, 0.12);
+      --system: #0f7c74;
+      --developer: #6b7a25;
+      --user: #1c4870;
+      --assistant: #a24f14;
+      --tool: #8c2f39;
+      --error: #aa2222;
+      --warning: #b26a00;
+      --ok: #28653d;
+      --code-bg: #201912;
+      --code-ink: #f8eddc;
+      --radius-xl: 22px;
+      --radius-lg: 16px;
+      --radius-md: 12px;
+      --radius-sm: 10px;
+      --mono: "SFMono-Regular", "SF Mono", "Roboto Mono", "Menlo", "Consolas", monospace;
+      --sans: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15, 124, 116, 0.11), transparent 28%),
+        radial-gradient(circle at top right, rgba(162, 79, 20, 0.12), transparent 24%),
+        linear-gradient(180deg, #f7f2ea 0%, #f0e7d9 100%);
+      font-family: var(--sans);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(33, 26, 20, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(33, 26, 20, 0.03) 1px, transparent 1px);
+      background-size: 24px 24px;
+      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.45), transparent 85%);
+    }
+
+    button,
+    input,
+    select,
+    textarea {
+      font: inherit;
+      color: inherit;
+    }
+
+    a {
+      color: #8b3200;
+      text-decoration-thickness: 1.5px;
+      text-underline-offset: 0.15em;
+    }
+
+    .app {
+      width: min(1480px, calc(100vw - 32px));
+      margin: 28px auto 48px;
+      display: grid;
+      gap: 22px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.95fr);
+      gap: 18px;
+      padding: 28px;
+      border: 1px solid rgba(76, 59, 38, 0.14);
+      border-radius: 28px;
+      background:
+        linear-gradient(135deg, rgba(255, 252, 247, 0.94), rgba(245, 234, 219, 0.82)),
+        linear-gradient(120deg, rgba(15, 124, 116, 0.16), transparent 55%);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -90px;
+      top: -80px;
+      width: 280px;
+      height: 280px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(140, 47, 57, 0.12), transparent 66%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(76, 59, 38, 0.13);
+      background: rgba(255, 255, 255, 0.5);
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+
+    .hero h1 {
+      margin: 14px 0 10px;
+      font-family: var(--serif);
+      font-size: clamp(2rem, 3.8vw, 3.5rem);
+      line-height: 0.98;
+      letter-spacing: -0.04em;
+      max-width: 12ch;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 66ch;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 1rem;
+    }
+
+    .hero-copy {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .load-panel,
+    .panel,
+    .record-card,
+    .group-card,
+    .empty-state,
+    .summary-card {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      border-radius: var(--radius-xl);
+      border: 1px solid rgba(76, 59, 38, 0.13);
+      background: var(--panel);
+      backdrop-filter: blur(18px);
+      box-shadow: var(--shadow);
+    }
+
+    .load-panel {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+      align-content: start;
+      background:
+        linear-gradient(180deg, rgba(255, 250, 243, 0.96), rgba(246, 236, 222, 0.94));
+    }
+
+    .dropzone {
+      position: relative;
+      display: grid;
+      gap: 8px;
+      align-items: center;
+      min-height: 182px;
+      padding: 18px;
+      border-radius: 18px;
+      border: 2px dashed rgba(76, 59, 38, 0.24);
+      background:
+        radial-gradient(circle at top, rgba(15, 124, 116, 0.08), transparent 64%),
+        rgba(255, 255, 255, 0.42);
+      transition: border-color 160ms ease, transform 160ms ease, background 160ms ease;
+      cursor: pointer;
+    }
+
+    .dropzone.dragover {
+      border-color: rgba(15, 124, 116, 0.7);
+      background:
+        radial-gradient(circle at top, rgba(15, 124, 116, 0.16), transparent 60%),
+        rgba(255, 255, 255, 0.7);
+      transform: translateY(-1px);
+    }
+
+    .dropzone input[type="file"] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    .dropzone-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .dropzone-copy {
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .mini-note {
+      color: var(--soft);
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+
+    .button-row,
+    .toggle-row,
+    .role-filter-row,
+    .meta-row,
+    .stats-grid,
+    .group-meta,
+    .call-grid,
+    .result-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .button-row {
+      align-items: center;
+    }
+
+    .btn,
+    .chip,
+    .toggle,
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(76, 59, 38, 0.18);
+      background: rgba(255, 255, 255, 0.74);
+      color: var(--ink);
+      min-height: 38px;
+      padding: 0 14px;
+      font-weight: 600;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+    }
+
+    .btn:hover,
+    .chip:hover,
+    .toggle:hover,
+    .role-chip:hover {
+      transform: translateY(-1px);
+      border-color: rgba(76, 59, 38, 0.34);
+    }
+
+    .btn.primary {
+      background: linear-gradient(180deg, rgba(162, 79, 20, 0.92), rgba(126, 56, 10, 0.96));
+      color: #fff5e9;
+      border-color: rgba(126, 56, 10, 0.72);
+    }
+
+    .btn.ghost {
+      background: rgba(255, 255, 255, 0.48);
+    }
+
+    .panel {
+      padding: 18px;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      gap: 20px;
+      align-items: start;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 18px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .panel h2,
+    .summary-card h2 {
+      margin: 0 0 12px;
+      font-size: 0.88rem;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--soft);
+    }
+
+    .panel h3,
+    .summary-card h3 {
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+    }
+
+    .field {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .field:last-child {
+      margin-bottom: 0;
+    }
+
+    .field label {
+      font-size: 0.85rem;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .field input[type="search"],
+    .field select,
+    .field textarea {
+      width: 100%;
+      border: 1px solid rgba(76, 59, 38, 0.18);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--ink);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+    }
+
+    .field textarea {
+      min-height: 180px;
+      resize: vertical;
+      font-family: var(--mono);
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+
+    .toggle-row {
+      gap: 12px;
+    }
+
+    .toggle {
+      padding: 8px 12px;
+      min-height: 0;
+      font-size: 0.92rem;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .toggle input {
+      margin: 0;
+      accent-color: #8b3200;
+    }
+
+    .role-filter-row {
+      gap: 8px;
+    }
+
+    .role-chip {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(76, 59, 38, 0.18);
+      background: rgba(255, 255, 255, 0.7);
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 700;
+      user-select: none;
+    }
+
+    .role-chip.inactive {
+      opacity: 0.45;
+      filter: grayscale(0.2);
+    }
+
+    .role-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.04);
+    }
+
+    .role-system { color: var(--system); }
+    .role-developer { color: var(--developer); }
+    .role-user { color: var(--user); }
+    .role-assistant { color: var(--assistant); }
+    .role-tool { color: var(--tool); }
+    .role-parse-error { color: var(--error); }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .stat {
+      padding: 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(76, 59, 38, 0.12);
+      background: rgba(255, 255, 255, 0.54);
+    }
+
+    .stat-label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--soft);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .stat-value {
+      display: block;
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .summary-card {
+      padding: 20px;
+      display: none;
+      gap: 12px;
+    }
+
+    .summary-card.visible {
+      display: grid;
+    }
+
+    .summary-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: start;
+      min-width: 0;
+    }
+
+    .summary-headline {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .session-id {
+      font-size: 1.35rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    .summary-meta {
+      color: var(--muted);
+      line-height: 1.55;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .main {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .empty-state {
+      padding: 36px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      min-height: 260px;
+      background:
+        radial-gradient(circle at top, rgba(15, 124, 116, 0.08), transparent 46%),
+        linear-gradient(180deg, rgba(255, 251, 246, 0.96), rgba(246, 235, 222, 0.94));
+    }
+
+    .empty-state h2 {
+      margin: 0 0 10px;
+      font-family: var(--serif);
+      font-size: 2rem;
+      letter-spacing: -0.04em;
+    }
+
+    .empty-state p {
+      max-width: 48ch;
+      margin: 0;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+
+    .timeline {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .group-card {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+      background:
+        linear-gradient(180deg, rgba(255, 250, 243, 0.95), rgba(250, 242, 231, 0.88));
+    }
+
+    .group-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(76, 59, 38, 0.1);
+      min-width: 0;
+    }
+
+    .group-title-wrap {
+      display: grid;
+      gap: 7px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .group-title {
+      margin: 0;
+      font-size: 1.12rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+    }
+
+    .group-subtitle {
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 80ch;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .group-records {
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .record-card {
+      position: relative;
+      padding: 16px 16px 14px;
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+      border-left: 6px solid var(--line-strong);
+      background: var(--panel-strong);
+    }
+
+    .record-card.role-system { border-left-color: color-mix(in srgb, var(--system) 74%, white); }
+    .record-card.role-developer { border-left-color: color-mix(in srgb, var(--developer) 74%, white); }
+    .record-card.role-user { border-left-color: color-mix(in srgb, var(--user) 74%, white); }
+    .record-card.role-assistant { border-left-color: color-mix(in srgb, var(--assistant) 74%, white); }
+    .record-card.role-tool { border-left-color: color-mix(in srgb, var(--tool) 74%, white); }
+    .record-card.role-parse-error { border-left-color: color-mix(in srgb, var(--error) 84%, white); }
+
+    .record-card.status-error {
+      box-shadow:
+        0 18px 42px rgba(72, 49, 20, 0.12),
+        0 0 0 1px rgba(170, 34, 34, 0.12);
+    }
+
+    .record-card.status-warning {
+      box-shadow:
+        0 18px 42px rgba(72, 49, 20, 0.12),
+        0 0 0 1px rgba(178, 106, 0, 0.11);
+    }
+
+    .record-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      min-width: 0;
+    }
+
+    .record-title {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .record-title-main {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      font-size: 1rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .record-time {
+      color: var(--soft);
+      text-align: right;
+      white-space: nowrap;
+      font-size: 0.92rem;
+    }
+
+    .record-summary {
+      color: var(--muted);
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+
+    .badge {
+      min-height: 0;
+      padding: 6px 10px;
+      font-size: 0.79rem;
+      font-weight: 700;
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .badge.subtle {
+      color: var(--muted);
+    }
+
+    .badge.issue {
+      border-color: rgba(170, 34, 34, 0.32);
+      background: rgba(255, 234, 234, 0.84);
+      color: var(--error);
+    }
+
+    .badge.warning {
+      border-color: rgba(178, 106, 0, 0.28);
+      background: rgba(255, 243, 221, 0.88);
+      color: var(--warning);
+    }
+
+    .badge.ok {
+      border-color: rgba(40, 101, 61, 0.26);
+      background: rgba(232, 247, 236, 0.88);
+      color: var(--ok);
+    }
+
+    .record-body {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .markdown,
+    .plain-content,
+    .result-card,
+    .code-frame,
+    .meta-panel,
+    .call-card,
+    .status-strip {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      border-radius: 16px;
+      border: 1px solid rgba(76, 59, 38, 0.12);
+      background: rgba(255, 255, 255, 0.56);
+    }
+
+    .markdown,
+    .plain-content,
+    .meta-panel {
+      padding: 14px 15px;
+    }
+
+    .markdown {
+      font-family: var(--serif);
+      font-size: 1.04rem;
+      line-height: 1.7;
+      overflow-wrap: anywhere;
+    }
+
+    .markdown > :first-child,
+    .plain-content > :first-child {
+      margin-top: 0;
+    }
+
+    .markdown > :last-child,
+    .plain-content > :last-child {
+      margin-bottom: 0;
+    }
+
+    .markdown h1,
+    .markdown h2,
+    .markdown h3,
+    .markdown h4 {
+      margin: 1.25em 0 0.45em;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+    }
+
+    .markdown h1 { font-size: 1.7rem; }
+    .markdown h2 { font-size: 1.38rem; }
+    .markdown h3 { font-size: 1.16rem; }
+    .markdown h4 { font-size: 1rem; }
+
+    .markdown p,
+    .markdown ul,
+    .markdown ol,
+    .markdown blockquote {
+      margin: 0.72em 0;
+    }
+
+    .markdown ul,
+    .markdown ol {
+      padding-left: 1.3em;
+    }
+
+    .markdown li + li {
+      margin-top: 0.28em;
+    }
+
+    .markdown blockquote {
+      margin-left: 0;
+      padding: 0.6em 0.9em;
+      border-left: 4px solid rgba(15, 124, 116, 0.33);
+      background: rgba(15, 124, 116, 0.07);
+      color: #3e4d4b;
+    }
+
+    .markdown code,
+    .plain-content code {
+      font-family: var(--mono);
+      padding: 0.15em 0.38em;
+      border-radius: 0.45em;
+      background: rgba(43, 32, 22, 0.09);
+      font-size: 0.9em;
+    }
+
+    .plain-content {
+      font-family: var(--mono);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      font-size: 0.91rem;
+      line-height: 1.52;
+    }
+
+    .code-frame {
+      overflow: hidden;
+      background: linear-gradient(180deg, #2c231a, #1f1812);
+      color: var(--code-ink);
+    }
+
+    .code-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+      color: rgba(248, 237, 220, 0.72);
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .code-frame pre {
+      margin: 0;
+      padding: 14px 15px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 0.9rem;
+      line-height: 1.55;
+    }
+
+    .call-grid {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .call-card,
+    .result-card,
+    .status-strip {
+      padding: 14px;
+    }
+
+    .call-head,
+    .result-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      margin-bottom: 10px;
+    }
+
+    .call-title,
+    .result-title {
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .result-list {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .result-item {
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(76, 59, 38, 0.1);
+      background: rgba(255, 255, 255, 0.5);
+    }
+
+    .result-item a {
+      font-weight: 700;
+    }
+
+    .result-snippet {
+      color: var(--muted);
+      line-height: 1.55;
+      margin-top: 6px;
+    }
+
+    .status-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      background: rgba(255, 255, 255, 0.6);
+    }
+
+    details {
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      border-radius: 15px;
+      border: 1px solid rgba(76, 59, 38, 0.12);
+      background: rgba(255, 255, 255, 0.5);
+      overflow: hidden;
+    }
+
+    details > summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 12px 14px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--ink);
+    }
+
+    details > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    details[open] > summary {
+      border-bottom: 1px solid rgba(76, 59, 38, 0.1);
+      background: rgba(255, 255, 255, 0.48);
+    }
+
+    .details-body {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .metadata-grid {
+      display: grid;
+      gap: 10px;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: minmax(88px, 132px) minmax(0, 1fr);
+      gap: 8px 12px;
+      align-items: start;
+    }
+
+    .kv dt {
+      margin: 0;
+      color: var(--soft);
+      font-size: 0.84rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .kv dd {
+      margin: 0;
+      word-break: break-word;
+    }
+
+    .meta-json {
+      max-height: 320px;
+      overflow: auto;
+      border-radius: 14px;
+      background: rgba(43, 32, 22, 0.94);
+      color: var(--code-ink);
+      padding: 14px;
+      font-family: var(--mono);
+      font-size: 0.88rem;
+      line-height: 1.52;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .pill-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(76, 59, 38, 0.16);
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 0.85rem;
+      font-weight: 700;
+    }
+
+    .paste-panel[hidden] {
+      display: none;
+    }
+
+    .drop-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      display: none;
+      place-items: center;
+      background: rgba(33, 26, 20, 0.16);
+      backdrop-filter: blur(5px);
+      pointer-events: none;
+    }
+
+    .drop-overlay.visible {
+      display: grid;
+    }
+
+    .drop-overlay-card {
+      padding: 28px 30px;
+      border-radius: 26px;
+      border: 2px dashed rgba(255, 255, 255, 0.55);
+      background: rgba(32, 25, 18, 0.84);
+      color: #fdf4e9;
+      text-align: center;
+      box-shadow: 0 26px 90px rgba(0, 0, 0, 0.26);
+      max-width: 440px;
+    }
+
+    .drop-overlay-card strong {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 1.22rem;
+      letter-spacing: -0.03em;
+    }
+
+    .summary-divider {
+      width: 1px;
+      min-height: 44px;
+      background: rgba(76, 59, 38, 0.12);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .footer-note {
+      color: var(--soft);
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1120px) {
+      .hero,
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .app {
+        width: min(100vw - 18px, 1480px);
+        margin-top: 10px;
+      }
+
+      .hero,
+      .panel,
+      .summary-card,
+      .group-card,
+      .record-card,
+      .empty-state {
+        border-radius: 18px;
+      }
+
+      .hero {
+        padding: 18px;
+      }
+
+      .group-header,
+      .record-top,
+      .summary-header,
+      .call-head,
+      .result-head {
+        flex-direction: column;
+      }
+
+      .record-time {
+        text-align: left;
+      }
+
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="drop-overlay" id="dropOverlay" aria-hidden="true">
+    <div class="drop-overlay-card">
+      <strong>Drop a transcript file</strong>
+      JSONL files load entirely in the browser. Nothing leaves this machine.
+    </div>
+  </div>
+
+  <div class="app">
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow">Jarvis Archive Utility</div>
+        <h1>Transcript Inspector</h1>
+        <p>
+          Load a Jarvis transcript and turn the raw JSONL into a readable timeline with turn grouping,
+          search, filters, tool-aware rendering, and an issue-focused view for failed commands or suspicious steps.
+        </p>
+        <p class="mini-note">
+          This is a standalone local HTML utility. Because browsers block arbitrary filesystem reads, the transcript must be
+          loaded via file picker, drag-and-drop, or pasted JSONL text.
+        </p>
+      </div>
+
+      <div class="load-panel">
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="fileInput" accept=".jsonl,.txt,application/json,text/plain">
+          <div class="dropzone-title">Choose or drop a transcript</div>
+          <div class="dropzone-copy">
+            Designed around Jarvis session JSONL archives, including assistant tool calls, tool outputs, model metadata,
+            bootstrap records, and turn IDs.
+          </div>
+          <div class="mini-note" id="loadedLabel">No transcript loaded</div>
+        </label>
+
+        <div class="button-row">
+          <button class="btn primary" id="togglePasteBtn" type="button">Paste JSONL Instead</button>
+          <button class="btn ghost hidden" id="clearBtn" type="button">Clear Transcript</button>
+        </div>
+
+        <div class="paste-panel" id="pastePanel" hidden>
+          <div class="field">
+            <label for="pasteInput">Paste transcript contents</label>
+            <textarea id="pasteInput" placeholder="Paste JSONL here. One JSON object per line."></textarea>
+          </div>
+          <div class="button-row">
+            <button class="btn primary" id="loadPasteBtn" type="button">Load Pasted Transcript</button>
+            <button class="btn ghost" id="closePasteBtn" type="button">Close</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="shell">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>Filters</h2>
+          <div class="field">
+            <label for="searchInput">Search transcript</label>
+            <input id="searchInput" type="search" placeholder="Search content, metadata, tool names, or IDs">
+          </div>
+
+          <div class="field">
+            <label>Roles</label>
+            <div class="role-filter-row" id="roleFilters"></div>
+          </div>
+
+          <div class="field">
+            <label for="toolFilter">Tool activity</label>
+            <select id="toolFilter">
+              <option value="all">All records</option>
+            </select>
+          </div>
+
+          <div class="toggle-row">
+            <label class="toggle"><input id="hideBootstrapToggle" type="checkbox"> Hide bootstrap</label>
+            <label class="toggle"><input id="groupToggle" type="checkbox" checked> Group by turn</label>
+            <label class="toggle"><input id="issuesToggle" type="checkbox"> Issues only</label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Stats</h2>
+          <div class="stats-grid" id="statsGrid">
+            <div class="stat">
+              <span class="stat-label">Records</span>
+              <span class="stat-value">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Visible</span>
+              <span class="stat-value">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Turns</span>
+              <span class="stat-value">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Issue Records</span>
+              <span class="stat-value">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Tools</span>
+              <span class="stat-value">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Time Span</span>
+              <span class="stat-value">0m</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Legend</h2>
+          <div class="role-filter-row">
+            <span class="badge subtle role-system"><span class="role-dot"></span>system</span>
+            <span class="badge subtle role-developer"><span class="role-dot"></span>developer</span>
+            <span class="badge subtle role-user"><span class="role-dot"></span>user</span>
+            <span class="badge subtle role-assistant"><span class="role-dot"></span>assistant</span>
+            <span class="badge subtle role-tool"><span class="role-dot"></span>tool</span>
+          </div>
+          <p class="footer-note">
+            Tool cards are rendered from metadata where possible, so failed bash calls, web search results,
+            model/tool-call boundaries, and large fetch outputs are easier to scan.
+          </p>
+        </section>
+      </aside>
+
+      <main class="main">
+        <section class="summary-card" id="summaryCard" aria-live="polite"></section>
+        <section class="empty-state" id="emptyState">
+          <div>
+            <h2>No transcript loaded</h2>
+            <p>
+              Start with the file picker, drag a transcript onto the page, or paste raw JSONL text.
+              Once loaded, the inspector will build a grouped timeline and surface any obvious trouble spots.
+            </p>
+          </div>
+        </section>
+        <section class="timeline hidden" id="timeline"></section>
+      </main>
+    </section>
+  </div>
+
+  <script>
+    (() => {
+      const BASE_ROLES = ["system", "developer", "user", "assistant", "tool", "parse-error"];
+
+      const state = {
+        sourceLabel: "",
+        rawText: "",
+        records: [],
+        activeRoles: new Set(BASE_ROLES.filter((role) => role !== "parse-error")),
+        search: "",
+        toolFilter: "all",
+        hideBootstrap: false,
+        groupByTurn: true,
+        issuesOnly: false
+      };
+
+      const els = {
+        fileInput: document.getElementById("fileInput"),
+        dropzone: document.getElementById("dropzone"),
+        dropOverlay: document.getElementById("dropOverlay"),
+        loadedLabel: document.getElementById("loadedLabel"),
+        togglePasteBtn: document.getElementById("togglePasteBtn"),
+        pastePanel: document.getElementById("pastePanel"),
+        pasteInput: document.getElementById("pasteInput"),
+        loadPasteBtn: document.getElementById("loadPasteBtn"),
+        closePasteBtn: document.getElementById("closePasteBtn"),
+        clearBtn: document.getElementById("clearBtn"),
+        searchInput: document.getElementById("searchInput"),
+        roleFilters: document.getElementById("roleFilters"),
+        toolFilter: document.getElementById("toolFilter"),
+        hideBootstrapToggle: document.getElementById("hideBootstrapToggle"),
+        groupToggle: document.getElementById("groupToggle"),
+        issuesToggle: document.getElementById("issuesToggle"),
+        statsGrid: document.getElementById("statsGrid"),
+        summaryCard: document.getElementById("summaryCard"),
+        emptyState: document.getElementById("emptyState"),
+        timeline: document.getElementById("timeline")
+      };
+
+      let dragDepth = 0;
+
+      attachEvents();
+      render();
+
+      function attachEvents() {
+        els.fileInput.addEventListener("change", async (event) => {
+          const file = event.target.files && event.target.files[0];
+          if (!file) return;
+          await loadFile(file);
+          event.target.value = "";
+        });
+
+        els.togglePasteBtn.addEventListener("click", () => {
+          const isHidden = els.pastePanel.hasAttribute("hidden");
+          if (isHidden) {
+            els.pastePanel.removeAttribute("hidden");
+            els.pasteInput.focus();
+          } else {
+            els.pastePanel.setAttribute("hidden", "");
+          }
+        });
+
+        els.closePasteBtn.addEventListener("click", () => {
+          els.pastePanel.setAttribute("hidden", "");
+        });
+
+        els.loadPasteBtn.addEventListener("click", () => {
+          const text = els.pasteInput.value.trim();
+          if (!text) return;
+          loadTranscript(text, "Pasted transcript");
+        });
+
+        els.clearBtn.addEventListener("click", () => {
+          state.sourceLabel = "";
+          state.rawText = "";
+          state.records = [];
+          els.pasteInput.value = "";
+          render();
+        });
+
+        els.searchInput.addEventListener("input", (event) => {
+          state.search = event.target.value.toLowerCase().trim();
+          render();
+        });
+
+        els.toolFilter.addEventListener("change", (event) => {
+          state.toolFilter = event.target.value;
+          render();
+        });
+
+        els.hideBootstrapToggle.addEventListener("change", (event) => {
+          state.hideBootstrap = event.target.checked;
+          render();
+        });
+
+        els.groupToggle.addEventListener("change", (event) => {
+          state.groupByTurn = event.target.checked;
+          render();
+        });
+
+        els.issuesToggle.addEventListener("change", (event) => {
+          state.issuesOnly = event.target.checked;
+          render();
+        });
+
+        ["dragenter", "dragover"].forEach((type) => {
+          window.addEventListener(type, (event) => {
+            event.preventDefault();
+            dragDepth += type === "dragenter" ? 1 : 0;
+            els.dropOverlay.classList.add("visible");
+            els.dropzone.classList.add("dragover");
+          });
+        });
+
+        ["dragleave", "drop"].forEach((type) => {
+          window.addEventListener(type, (event) => {
+            event.preventDefault();
+            dragDepth += type === "dragleave" ? -1 : 0;
+            if (type === "drop" || dragDepth <= 0) {
+              dragDepth = 0;
+              els.dropOverlay.classList.remove("visible");
+              els.dropzone.classList.remove("dragover");
+            }
+          });
+        });
+
+        window.addEventListener("drop", async (event) => {
+          const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+          if (!file) return;
+          await loadFile(file);
+        });
+
+        els.dropzone.addEventListener("dragenter", () => {
+          els.dropzone.classList.add("dragover");
+        });
+
+        els.dropzone.addEventListener("dragleave", () => {
+          els.dropzone.classList.remove("dragover");
+        });
+      }
+
+      async function loadFile(file) {
+        const text = await file.text();
+        loadTranscript(text, file.name);
+      }
+
+      function loadTranscript(text, label) {
+        state.sourceLabel = label;
+        state.rawText = text;
+        state.records = parseJsonl(text);
+        ensureRoleCoverage();
+        render();
+      }
+
+      function ensureRoleCoverage() {
+        const roles = new Set(state.records.map((record) => record.role));
+        const nextActiveRoles = new Set(state.activeRoles);
+        roles.forEach((role) => nextActiveRoles.add(role));
+        state.activeRoles = nextActiveRoles;
+      }
+
+      function parseJsonl(text) {
+        const lines = text.split(/\r?\n/);
+        const records = [];
+        let displayIndex = 0;
+
+        lines.forEach((line, index) => {
+          if (!line.trim()) return;
+          displayIndex += 1;
+
+          try {
+            const parsed = JSON.parse(line);
+            records.push(enrichRecord(parsed, {
+              fileLine: index + 1,
+              orderIndex: displayIndex
+            }));
+          } catch (error) {
+            records.push({
+              id: `parse-error-${index + 1}`,
+              role: "parse-error",
+              kind: "invalid_jsonl",
+              fileLine: index + 1,
+              orderIndex: displayIndex,
+              createdAt: null,
+              createdAtMs: null,
+              content: line,
+              metadata: {
+                parse_error: error.message
+              },
+              severity: "error",
+              isBootstrap: false,
+              turnId: null,
+              toolCalls: [],
+              toolName: null,
+              toolNames: [],
+              searchText: (`parse error ${line} ${error.message}`).toLowerCase()
+            });
+          }
+        });
+
+        return records;
+      }
+
+      function enrichRecord(record, context) {
+        const metadata = isPlainObject(record.metadata) ? record.metadata : {};
+        const toolCalls = Array.isArray(metadata.tool_calls)
+          ? metadata.tool_calls.map((call, index) => ({
+              id: call && (call.call_id || `call-${index + 1}`),
+              name: call && call.name ? String(call.name) : "unknown",
+              arguments: call && Object.prototype.hasOwnProperty.call(call, "arguments")
+                ? call.arguments
+                : call && Object.prototype.hasOwnProperty.call(call, "raw_arguments")
+                  ? call.raw_arguments
+                  : null,
+              rawArguments: call && Object.prototype.hasOwnProperty.call(call, "raw_arguments")
+                ? call.raw_arguments
+                : null
+            }))
+          : [];
+
+        const toolNames = [];
+        if (metadata.tool_name) toolNames.push(String(metadata.tool_name));
+        toolCalls.forEach((call) => {
+          if (call.name && !toolNames.includes(call.name)) toolNames.push(call.name);
+        });
+
+        const createdAt = record.created_at || null;
+        const createdAtMs = createdAt ? Date.parse(createdAt) : null;
+        const severity = computeSeverity(record.role, metadata, toolCalls);
+
+        const normalized = {
+          id: record.record_id || `${record.session_id || "session"}-${context.fileLine}`,
+          sessionId: record.session_id || "",
+          role: record.role || "unknown",
+          kind: record.kind || "",
+          fileLine: context.fileLine,
+          orderIndex: context.orderIndex,
+          createdAt,
+          createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : null,
+          content: typeof record.content === "string" ? record.content : stringifyJson(record.content),
+          metadata,
+          severity,
+          isBootstrap: Boolean(metadata.bootstrap_identity),
+          turnId: metadata.turn_id || null,
+          toolCalls,
+          toolName: metadata.tool_name ? String(metadata.tool_name) : null,
+          toolNames,
+          searchText: buildSearchText(record, metadata, toolNames, toolCalls)
+        };
+
+        return normalized;
+      }
+
+      function computeSeverity(role, metadata, toolCalls) {
+        if (role === "parse-error") return "error";
+
+        const warnings = Array.isArray(metadata.warnings) ? metadata.warnings.length : 0;
+        const hasStderr = typeof metadata.stderr === "string" && metadata.stderr.trim() && metadata.stderr.trim() !== "(empty)";
+        const exitFailed = typeof metadata.exit_code === "number" && metadata.exit_code !== 0;
+        const requestFailed = typeof metadata.status_code === "number" && metadata.status_code >= 400;
+        const okFalse = metadata.ok === false;
+        const timedOut = metadata.timed_out === true;
+        const finishReason = typeof metadata.finish_reason === "string" ? metadata.finish_reason : "";
+
+        if (okFalse || exitFailed || requestFailed || timedOut) return "error";
+        if (warnings || hasStderr) return "warning";
+        if (toolCalls.length || finishReason === "tool_calls") return "action";
+        return "normal";
+      }
+
+      function buildSearchText(record, metadata, toolNames, toolCalls) {
+        const pieces = [
+          record.role,
+          record.kind,
+          record.content,
+          record.record_id,
+          record.session_id,
+          record.created_at
+        ];
+
+        if (metadata.turn_id) pieces.push(metadata.turn_id);
+        if (metadata.model) pieces.push(metadata.model);
+        if (metadata.provider) pieces.push(metadata.provider);
+        if (metadata.call_id) pieces.push(metadata.call_id);
+        if (metadata.response_id) pieces.push(metadata.response_id);
+        if (metadata.command) pieces.push(metadata.command);
+        if (metadata.query) pieces.push(stringifyJson(metadata.query));
+
+        toolNames.forEach((name) => pieces.push(name));
+        toolCalls.forEach((call) => {
+          pieces.push(call.name, call.id, stringifyJson(call.arguments));
+        });
+
+        pieces.push(stringifyJson(metadata));
+        return pieces.filter(Boolean).join(" ").toLowerCase();
+      }
+
+      function render() {
+        updateRoleFilters();
+        updateToolFilter();
+
+        const filteredRecords = getFilteredRecords();
+        const summary = buildSummary(filteredRecords);
+
+        els.loadedLabel.textContent = state.sourceLabel
+          ? `${state.sourceLabel} · ${state.records.length} parsed records`
+          : "No transcript loaded";
+        els.clearBtn.classList.toggle("hidden", !state.records.length);
+
+        renderStats(summary);
+        renderSummary(summary);
+        renderTimeline(filteredRecords, summary);
+
+        const hasData = state.records.length > 0;
+        els.emptyState.classList.toggle("hidden", hasData);
+        els.timeline.classList.toggle("hidden", !hasData);
+      }
+
+      function updateRoleFilters() {
+        const counts = countByRole(state.records);
+        const fragment = document.createDocumentFragment();
+        const roles = Array.from(new Set([...BASE_ROLES, ...state.records.map((record) => record.role)]));
+
+        roles.forEach((role) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = `role-chip role-${sanitizeRoleClass(role)}${state.activeRoles.has(role) ? "" : " inactive"}`;
+          chip.innerHTML = `
+            <span class="role-dot"></span>
+            <span>${escapeHtml(role)}</span>
+            <span class="muted">${counts[role] || 0}</span>
+          `;
+          chip.addEventListener("click", () => {
+            if (state.activeRoles.has(role)) {
+              if (state.activeRoles.size === 1) return;
+              state.activeRoles.delete(role);
+            } else {
+              state.activeRoles.add(role);
+            }
+            render();
+          });
+          fragment.appendChild(chip);
+        });
+
+        els.roleFilters.replaceChildren(fragment);
+      }
+
+      function updateToolFilter() {
+        const currentValue = state.toolFilter;
+        const toolNames = Array.from(new Set(
+          state.records.flatMap((record) => record.toolNames)
+        )).sort((a, b) => a.localeCompare(b));
+
+        const options = [
+          { value: "all", label: "All records" },
+          { value: "__any__", label: "Any tool activity" },
+          ...toolNames.map((name) => ({ value: name, label: name }))
+        ];
+
+        els.toolFilter.replaceChildren(
+          ...options.map((option) => {
+            const node = document.createElement("option");
+            node.value = option.value;
+            node.textContent = option.label;
+            return node;
+          })
+        );
+
+        if (options.some((option) => option.value === currentValue)) {
+          els.toolFilter.value = currentValue;
+        } else {
+          state.toolFilter = "all";
+          els.toolFilter.value = "all";
+        }
+      }
+
+      function getFilteredRecords() {
+        return state.records.filter((record) => {
+          if (!state.activeRoles.has(record.role)) return false;
+          if (state.hideBootstrap && record.isBootstrap) return false;
+          if (state.issuesOnly && !["warning", "error"].includes(record.severity)) return false;
+
+          if (state.toolFilter === "__any__" && !record.toolNames.length) return false;
+          if (state.toolFilter !== "all" && state.toolFilter !== "__any__" && !record.toolNames.includes(state.toolFilter)) {
+            return false;
+          }
+
+          if (state.search && !record.searchText.includes(state.search)) return false;
+          return true;
+        });
+      }
+
+      function buildSummary(filteredRecords) {
+        const allRecords = state.records;
+        const sessionIds = Array.from(new Set(allRecords.map((record) => record.sessionId).filter(Boolean)));
+        const turnIds = Array.from(new Set(allRecords.map((record) => record.turnId).filter(Boolean)));
+        const filteredTurnIds = Array.from(new Set(filteredRecords.map((record) => record.turnId).filter(Boolean)));
+        const toolNames = Array.from(new Set(allRecords.flatMap((record) => record.toolNames)));
+        const issueCount = allRecords.filter((record) => ["warning", "error"].includes(record.severity)).length;
+        const visibleIssueCount = filteredRecords.filter((record) => ["warning", "error"].includes(record.severity)).length;
+        const createdRecords = allRecords.filter((record) => record.createdAtMs !== null);
+        const visibleCreated = filteredRecords.filter((record) => record.createdAtMs !== null);
+
+        return {
+          totalRecords: allRecords.length,
+          visibleRecords: filteredRecords.length,
+          totalTurns: turnIds.length,
+          visibleTurns: filteredTurnIds.length,
+          toolCount: toolNames.length,
+          issueCount,
+          visibleIssueCount,
+          sessionIds,
+          startMs: createdRecords.length ? Math.min(...createdRecords.map((record) => record.createdAtMs)) : null,
+          endMs: createdRecords.length ? Math.max(...createdRecords.map((record) => record.createdAtMs)) : null,
+          visibleStartMs: visibleCreated.length ? Math.min(...visibleCreated.map((record) => record.createdAtMs)) : null,
+          visibleEndMs: visibleCreated.length ? Math.max(...visibleCreated.map((record) => record.createdAtMs)) : null
+        };
+      }
+
+      function renderStats(summary) {
+        const values = [
+          summary.totalRecords,
+          summary.visibleRecords,
+          summary.totalTurns,
+          summary.issueCount,
+          summary.toolCount,
+          summary.startMs !== null && summary.endMs !== null
+            ? formatDuration(summary.endMs - summary.startMs)
+            : "0m"
+        ];
+
+        Array.from(els.statsGrid.querySelectorAll(".stat-value")).forEach((node, index) => {
+          node.textContent = values[index];
+        });
+      }
+
+      function renderSummary(summary) {
+        if (!state.records.length) {
+          els.summaryCard.classList.remove("visible");
+          els.summaryCard.innerHTML = "";
+          return;
+        }
+
+        const firstSession = summary.sessionIds[0] || "Unknown session";
+        const roleCounts = countByRole(state.records);
+        const visibleRoleCounts = countByRole(getFilteredRecords());
+        const roleSummary = Object.entries(roleCounts)
+          .filter(([, count]) => count > 0)
+          .map(([role, count]) => `${role}: ${count}`)
+          .join(" · ");
+        const visibleRoleSummary = Object.entries(visibleRoleCounts)
+          .filter(([, count]) => count > 0)
+          .map(([role, count]) => `${role}: ${count}`)
+          .join(" · ");
+
+        els.summaryCard.classList.add("visible");
+        els.summaryCard.innerHTML = `
+          <div class="summary-header">
+            <div class="summary-headline">
+              <h2>Session Summary</h2>
+              <div class="session-id">${escapeHtml(firstSession)}</div>
+              <div class="summary-meta">
+                ${state.sourceLabel ? `${escapeHtml(state.sourceLabel)}<br>` : ""}
+                ${summary.startMs !== null ? `${escapeHtml(formatDateTime(summary.startMs))} to ${escapeHtml(formatDateTime(summary.endMs))}` : "No timestamps available"}
+              </div>
+            </div>
+            <div class="summary-meta">
+              Visible: ${summary.visibleRecords} / ${summary.totalRecords} records<br>
+              Turns: ${summary.visibleTurns} visible / ${summary.totalTurns} total<br>
+              Issue records: ${summary.visibleIssueCount} visible / ${summary.issueCount} total
+            </div>
+          </div>
+          <div class="meta-row">
+            <span class="badge subtle">${escapeHtml(roleSummary || "No roles")}</span>
+            <span class="badge subtle">${escapeHtml(visibleRoleSummary || "No visible roles")}</span>
+          </div>
+        `;
+      }
+
+      function renderTimeline(filteredRecords, summary) {
+        if (!state.records.length) {
+          els.timeline.replaceChildren();
+          return;
+        }
+
+        const groups = state.groupByTurn ? buildGroups(filteredRecords) : buildUngrouped(filteredRecords);
+        const fragment = document.createDocumentFragment();
+
+        if (!filteredRecords.length) {
+          const message = document.createElement("section");
+          message.className = "group-card";
+          message.innerHTML = `
+            <div class="group-header">
+              <div class="group-title-wrap">
+                <h3 class="group-title">No records match the current filters</h3>
+                <div class="group-subtitle">Try widening the role selection, clearing the search box, or turning off issue-only mode.</div>
+              </div>
+            </div>
+          `;
+          fragment.appendChild(message);
+        } else {
+          groups.forEach((group) => {
+            fragment.appendChild(renderGroup(group));
+          });
+        }
+
+        els.timeline.replaceChildren(fragment);
+      }
+
+      function buildGroups(records) {
+        const groups = [];
+        const byKey = new Map();
+        let orphanIndex = 0;
+        let currentOrphanKey = null;
+
+        records.forEach((record) => {
+          let key;
+          let title;
+          let type;
+
+          if (record.isBootstrap) {
+            key = "bootstrap";
+            title = "Bootstrap";
+            type = "bootstrap";
+            currentOrphanKey = null;
+          } else if (record.turnId) {
+            key = `turn:${record.turnId}`;
+            title = `Turn ${shortId(record.turnId)}`;
+            type = "turn";
+            currentOrphanKey = null;
+          } else {
+            if (!currentOrphanKey) {
+              orphanIndex += 1;
+              currentOrphanKey = `orphan:${orphanIndex}`;
+            }
+            key = currentOrphanKey;
+            title = `Ungrouped Block ${orphanIndex}`;
+            type = "orphan";
+          }
+
+          let group = byKey.get(key);
+          if (!group) {
+            group = {
+              key,
+              title,
+              type,
+              records: []
+            };
+            byKey.set(key, group);
+            groups.push(group);
+          }
+
+          group.records.push(record);
+        });
+
+        return groups.map(finalizeGroup);
+      }
+
+      function buildUngrouped(records) {
+        return records.map((record) => finalizeGroup({
+          key: record.id,
+          title: `Record ${record.orderIndex}`,
+          type: "single",
+          records: [record]
+        }));
+      }
+
+      function finalizeGroup(group) {
+        const first = group.records[0];
+        const last = group.records[group.records.length - 1];
+        const firstUser = group.records.find((record) => record.role === "user");
+        const firstMeaningful = firstUser || group.records.find((record) => record.content.trim()) || first;
+        const toolNames = Array.from(new Set(group.records.flatMap((record) => record.toolNames)));
+        const issueCount = group.records.filter((record) => ["warning", "error"].includes(record.severity)).length;
+
+        return {
+          ...group,
+          subtitle: buildGroupSubtitle(group, firstMeaningful, toolNames, issueCount),
+          startMs: first.createdAtMs,
+          endMs: last.createdAtMs,
+          toolNames,
+          issueCount
+        };
+      }
+
+      function buildGroupSubtitle(group, record, toolNames, issueCount) {
+        const teaser = record && record.content ? summarizeText(record.content, 160) : "No content";
+        const parts = [];
+        if (group.type === "turn" && record && record.role === "user") {
+          parts.push(teaser);
+        } else if (group.type === "bootstrap") {
+          parts.push("Session bootstrap and identity context");
+        } else {
+          parts.push(teaser);
+        }
+        if (toolNames.length) parts.push(`Tools: ${toolNames.join(", ")}`);
+        if (issueCount) parts.push(`${issueCount} issue record${issueCount === 1 ? "" : "s"}`);
+        return parts.join(" · ");
+      }
+
+      function renderGroup(group) {
+        const section = document.createElement("section");
+        section.className = "group-card";
+
+        const recordContainer = document.createElement("div");
+        recordContainer.className = "group-records";
+        group.records.forEach((record) => {
+          recordContainer.appendChild(renderRecord(record));
+        });
+
+        const timeRange = group.startMs !== null && group.endMs !== null
+          ? group.startMs === group.endMs
+            ? formatDateTime(group.startMs)
+            : `${formatDateTime(group.startMs)} to ${formatDateTime(group.endMs)}`
+          : "No timestamps";
+
+        section.innerHTML = `
+          <div class="group-header">
+            <div class="group-title-wrap">
+              <h3 class="group-title">${escapeHtml(group.title)}</h3>
+              <div class="group-subtitle">${escapeHtml(group.subtitle)}</div>
+            </div>
+            <div class="group-meta">
+              <span class="badge subtle">${group.records.length} record${group.records.length === 1 ? "" : "s"}</span>
+              <span class="badge subtle">${escapeHtml(timeRange)}</span>
+              ${group.issueCount ? `<span class="badge issue">${group.issueCount} issue${group.issueCount === 1 ? "" : "s"}</span>` : ""}
+            </div>
+          </div>
+        `;
+        section.appendChild(recordContainer);
+        return section;
+      }
+
+      function renderRecord(record) {
+        const article = document.createElement("article");
+        article.className = `record-card role-${sanitizeRoleClass(record.role)} status-${record.severity === "normal" ? "ok" : record.severity}`;
+
+        const badges = [];
+        badges.push(`<span class="badge subtle role-${sanitizeRoleClass(record.role)}">${escapeHtml(record.role)}</span>`);
+        if (record.kind) badges.push(`<span class="badge subtle">${escapeHtml(record.kind)}</span>`);
+        badges.push(`<span class="badge subtle">Line ${record.fileLine}</span>`);
+        if (record.turnId) badges.push(`<span class="badge subtle">Turn ${escapeHtml(shortId(record.turnId))}</span>`);
+        if (record.metadata.model) badges.push(`<span class="badge subtle">${escapeHtml(record.metadata.model)}</span>`);
+        if (record.toolName) badges.push(`<span class="badge subtle">${escapeHtml(record.toolName)}</span>`);
+        if (record.metadata.call_id) badges.push(`<span class="badge subtle">Call ${escapeHtml(shortId(record.metadata.call_id))}</span>`);
+        if (record.metadata.exit_code === 0) badges.push(`<span class="badge ok">Exit 0</span>`);
+        if (typeof record.metadata.exit_code === "number" && record.metadata.exit_code !== 0) {
+          badges.push(`<span class="badge issue">Exit ${record.metadata.exit_code}</span>`);
+        }
+        if (typeof record.metadata.status_code === "number") {
+          const statusClass = record.metadata.status_code >= 400 ? "issue" : "ok";
+          badges.push(`<span class="badge ${statusClass}">HTTP ${record.metadata.status_code}</span>`);
+        }
+        if (record.metadata.finish_reason) {
+          const reasonClass = record.metadata.finish_reason === "stop" ? "ok" : "subtle";
+          badges.push(`<span class="badge ${reasonClass}">${escapeHtml(record.metadata.finish_reason)}</span>`);
+        }
+        if (record.severity === "warning") badges.push(`<span class="badge warning">Warning</span>`);
+        if (record.severity === "error") badges.push(`<span class="badge issue">Issue</span>`);
+
+        const summary = summarizeRecord(record);
+        const timestamp = record.createdAtMs !== null
+          ? formatDateTime(record.createdAtMs)
+          : "No timestamp";
+
+        article.innerHTML = `
+          <div class="record-top">
+            <div class="record-title">
+              <div class="record-title-main">${badges.join("")}</div>
+              ${summary ? `<div class="record-summary">${escapeHtml(summary)}</div>` : ""}
+            </div>
+            <div class="record-time">${escapeHtml(timestamp)}</div>
+          </div>
+        `;
+
+        const body = document.createElement("div");
+        body.className = "record-body";
+        body.appendChild(renderRecordBody(record));
+        body.appendChild(renderMetadataDetails(record));
+        article.appendChild(body);
+        return article;
+      }
+
+      function summarizeRecord(record) {
+        if (record.role === "parse-error") {
+          return record.metadata.parse_error || "Invalid JSON";
+        }
+
+        if (record.role === "assistant" && record.toolCalls.length) {
+          return `${record.toolCalls.length} tool call${record.toolCalls.length === 1 ? "" : "s"} requested`;
+        }
+
+        if (record.role === "tool" && record.toolName) {
+          if (record.toolName === "bash" && record.metadata.command) {
+            return summarizeText(record.metadata.command, 120);
+          }
+          if (record.toolName === "web_search") {
+            return `Query: ${summarizeText(extractQueryText(record.metadata.query), 120)}`;
+          }
+          if (record.toolName === "web_fetch" && record.metadata.requested_url) {
+            return summarizeText(record.metadata.requested_url, 120);
+          }
+          if (record.toolName === "tool_search") {
+            return `Query: ${extractQueryText(record.metadata.query) || "(all discoverable tools)"}`;
+          }
+        }
+
+        return summarizeText(record.content, 180);
+      }
+
+      function renderRecordBody(record) {
+        if (record.role === "parse-error") {
+          const wrapper = document.createElement("div");
+          wrapper.className = "result-card";
+          wrapper.innerHTML = `
+            <div class="result-head">
+              <div>
+                <div class="result-title">JSON parse error</div>
+                <div class="muted">${escapeHtml(record.metadata.parse_error || "Malformed line")}</div>
+              </div>
+            </div>
+          `;
+          wrapper.appendChild(renderCodeBlock("raw line", record.content));
+          return wrapper;
+        }
+
+        if (record.role === "tool") {
+          return renderToolBody(record);
+        }
+
+        const container = document.createElement("div");
+        container.className = "meta-panel";
+
+        if (record.role === "assistant" && record.toolCalls.length) {
+          const callGrid = document.createElement("div");
+          callGrid.className = "call-grid";
+          record.toolCalls.forEach((call) => {
+            const card = document.createElement("div");
+            card.className = "call-card";
+            card.innerHTML = `
+              <div class="call-head">
+                <div>
+                  <div class="call-title">${escapeHtml(call.name)}</div>
+                  <div class="muted">${escapeHtml(call.id || "No call ID")}</div>
+                </div>
+              </div>
+            `;
+            card.appendChild(renderJsonFrame("arguments", parseMaybeJson(call.arguments)));
+            callGrid.appendChild(card);
+          });
+          container.appendChild(callGrid);
+        }
+
+        if (record.content && record.content.trim()) {
+          container.appendChild(renderTextBlock(record.content, {
+            role: record.role,
+            collapseLong: record.isBootstrap
+          }));
+        } else if (!record.toolCalls.length) {
+          const empty = document.createElement("div");
+          empty.className = "muted";
+          empty.textContent = "No message content";
+          container.appendChild(empty);
+        }
+
+        return container;
+      }
+
+      function renderToolBody(record) {
+        const toolName = record.toolName || "tool";
+        const metadata = record.metadata;
+
+        if (toolName === "bash") {
+          const wrapper = document.createElement("div");
+          wrapper.className = "meta-panel";
+
+          const status = document.createElement("div");
+          status.className = "status-strip";
+          status.innerHTML = `
+            ${typeof metadata.exit_code === "number" ? `<span class="badge ${metadata.exit_code === 0 ? "ok" : "issue"}">Exit ${metadata.exit_code}</span>` : ""}
+            ${typeof metadata.duration_seconds === "number" ? `<span class="badge subtle">${metadata.duration_seconds.toFixed(3)}s</span>` : ""}
+            ${metadata.cwd ? `<span class="badge subtle">${escapeHtml(metadata.cwd)}</span>` : ""}
+            ${metadata.sandbox ? `<span class="badge subtle">${escapeHtml(metadata.sandbox)}</span>` : ""}
+          `;
+          wrapper.appendChild(status);
+
+          if (metadata.command) wrapper.appendChild(renderCodeBlock("command", metadata.command));
+          if (typeof metadata.stdout === "string" && metadata.stdout.trim()) {
+            wrapper.appendChild(renderExpandableCode("stdout", metadata.stdout, false));
+          }
+          if (typeof metadata.stderr === "string" && metadata.stderr.trim() && metadata.stderr.trim() !== "(empty)") {
+            wrapper.appendChild(renderExpandableCode("stderr", metadata.stderr, true));
+          }
+          if (!metadata.command && record.content.trim()) {
+            wrapper.appendChild(renderTextBlock(record.content, { role: "tool" }));
+          }
+          return wrapper;
+        }
+
+        if (toolName === "web_search") {
+          const wrapper = document.createElement("div");
+          wrapper.className = "meta-panel";
+
+          const query = extractQueryText(metadata.query);
+          if (query) {
+            const strip = document.createElement("div");
+            strip.className = "status-strip";
+            strip.innerHTML = `
+              <span class="badge subtle">${escapeHtml(query)}</span>
+              ${typeof metadata.result_count === "number" ? `<span class="badge subtle">${metadata.result_count} results</span>` : ""}
+              ${typeof metadata.status_code === "number" ? `<span class="badge ${metadata.status_code >= 400 ? "issue" : "ok"}">HTTP ${metadata.status_code}</span>` : ""}
+            `;
+            wrapper.appendChild(strip);
+          }
+
+          if (Array.isArray(metadata.results) && metadata.results.length) {
+            const list = document.createElement("div");
+            list.className = "result-list";
+            metadata.results.forEach((result, index) => {
+              const item = document.createElement("div");
+              item.className = "result-item";
+              item.innerHTML = `
+                <div><strong>${index + 1}.</strong> ${renderMaybeLink(result.title || result.url || "Untitled result", result.url)}</div>
+                ${result.source ? `<div class="mini-note">${escapeHtml(result.source)}</div>` : ""}
+                ${result.snippet ? `<div class="result-snippet">${escapeHtml(result.snippet)}</div>` : ""}
+              `;
+              list.appendChild(item);
+            });
+            wrapper.appendChild(list);
+          } else {
+            wrapper.appendChild(renderTextBlock(record.content, { role: "tool", collapseLong: true }));
+          }
+
+          return wrapper;
+        }
+
+        if (toolName === "web_fetch") {
+          const wrapper = document.createElement("div");
+          wrapper.className = "meta-panel";
+
+          const strip = document.createElement("div");
+          strip.className = "status-strip";
+          strip.innerHTML = `
+            ${metadata.requested_url ? renderPillLink(metadata.requested_url, "requested") : ""}
+            ${metadata.final_url && metadata.final_url !== metadata.requested_url ? renderPillLink(metadata.final_url, "final") : ""}
+            ${typeof metadata.status_code === "number" ? `<span class="badge ${metadata.status_code >= 400 ? "issue" : "ok"}">HTTP ${metadata.status_code}</span>` : ""}
+            ${metadata.markdown_source ? `<span class="badge subtle">${escapeHtml(metadata.markdown_source)}</span>` : ""}
+            ${metadata.markdown_truncated ? `<span class="badge warning">Truncated</span>` : ""}
+          `;
+          wrapper.appendChild(strip);
+
+          if (record.content.trim()) {
+            wrapper.appendChild(renderTextBlock(record.content, { role: "tool", collapseLong: true }));
+          }
+          return wrapper;
+        }
+
+        if (toolName === "tool_search") {
+          const wrapper = document.createElement("div");
+          wrapper.className = "meta-panel";
+
+          const strip = document.createElement("div");
+          strip.className = "status-strip";
+          strip.innerHTML = `
+            <span class="badge subtle">Query: ${escapeHtml(extractQueryText(metadata.query) || "(all discoverable tools)")}</span>
+            ${typeof metadata.match_count === "number" ? `<span class="badge subtle">${metadata.match_count} matches</span>` : ""}
+          `;
+          wrapper.appendChild(strip);
+
+          if (Array.isArray(metadata.matches) && metadata.matches.length) {
+            const list = document.createElement("div");
+            list.className = "result-list";
+            metadata.matches.forEach((match, index) => {
+              const item = document.createElement("div");
+              item.className = "result-item";
+              item.innerHTML = `
+                <div><strong>${index + 1}.</strong> ${escapeHtml(match.name || "Unnamed tool")}</div>
+                ${match.purpose ? `<div class="result-snippet">${escapeHtml(match.purpose)}</div>` : ""}
+              `;
+              list.appendChild(item);
+            });
+            wrapper.appendChild(list);
+          } else {
+            wrapper.appendChild(renderTextBlock(record.content, { role: "tool", collapseLong: true }));
+          }
+
+          return wrapper;
+        }
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "meta-panel";
+
+        if (record.content.trim()) {
+          wrapper.appendChild(renderTextBlock(record.content, {
+            role: "tool",
+            collapseLong: true
+          }));
+        } else {
+          wrapper.appendChild(renderJsonFrame("tool metadata", record.metadata));
+        }
+
+        return wrapper;
+      }
+
+      function renderMetadataDetails(record) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.innerHTML = `
+          <span>Raw metadata</span>
+          <span class="muted">${escapeHtml(record.metadata ? Object.keys(record.metadata).length + " fields" : "0 fields")}</span>
+        `;
+        details.appendChild(summary);
+
+        const body = document.createElement("div");
+        body.className = "details-body";
+
+        const dl = document.createElement("dl");
+        dl.className = "metadata-grid";
+
+        const rows = [];
+        rows.push(["record_id", record.id]);
+        if (record.sessionId) rows.push(["session_id", record.sessionId]);
+        if (record.turnId) rows.push(["turn_id", record.turnId]);
+        if (record.createdAt) rows.push(["created_at", record.createdAt]);
+        if (record.toolNames.length) rows.push(["tool_names", record.toolNames.join(", ")]);
+        if (record.metadata.response_id) rows.push(["response_id", record.metadata.response_id]);
+        if (record.metadata.call_id) rows.push(["call_id", record.metadata.call_id]);
+
+        rows.forEach(([key, value]) => {
+          const row = document.createElement("div");
+          row.className = "kv";
+          row.innerHTML = `
+            <dt>${escapeHtml(key)}</dt>
+            <dd>${escapeHtml(String(value))}</dd>
+          `;
+          dl.appendChild(row);
+        });
+
+        body.appendChild(dl);
+
+        const pre = document.createElement("pre");
+        pre.className = "meta-json";
+        pre.textContent = stringifyJson(record.metadata, 2);
+        body.appendChild(pre);
+
+        details.appendChild(body);
+        return details;
+      }
+
+      function renderTextBlock(text, options = {}) {
+        const normalized = text.replace(/\r\n/g, "\n").trim();
+        const long = isLongText(normalized);
+
+        if (options.collapseLong && long) {
+          const details = document.createElement("details");
+          if (options.role !== "tool") {
+            details.open = false;
+          }
+          const summary = document.createElement("summary");
+          summary.innerHTML = `
+            <span>${escapeHtml(previewLabel(normalized))}</span>
+            <span class="muted">Expand full content</span>
+          `;
+          details.appendChild(summary);
+
+          const body = document.createElement("div");
+          body.className = "details-body";
+          body.appendChild(createFormattedTextNode(normalized, options.role));
+          details.appendChild(body);
+          return details;
+        }
+
+        return createFormattedTextNode(normalized, options.role);
+      }
+
+      function createFormattedTextNode(text, role) {
+        if (role === "tool") {
+          const container = document.createElement("div");
+          container.className = "plain-content";
+          container.textContent = text;
+          return container;
+        }
+
+        const container = document.createElement("div");
+        container.className = "markdown";
+        container.innerHTML = renderMarkdownLite(text);
+        return container;
+      }
+
+      function renderExpandableCode(label, text, forceOpen) {
+        if (!isLongText(text)) return renderCodeBlock(label, text);
+
+        const details = document.createElement("details");
+        details.open = Boolean(forceOpen);
+        const summary = document.createElement("summary");
+        summary.innerHTML = `
+          <span>${escapeHtml(label)}</span>
+          <span class="muted">${escapeHtml(formatLineCount(text))}</span>
+        `;
+        details.appendChild(summary);
+
+        const body = document.createElement("div");
+        body.className = "details-body";
+        body.appendChild(renderCodeBlock(label, text));
+        details.appendChild(body);
+        return details;
+      }
+
+      function renderCodeBlock(label, text) {
+        const frame = document.createElement("div");
+        frame.className = "code-frame";
+        frame.innerHTML = `
+          <div class="code-head">
+            <span>${escapeHtml(label)}</span>
+            <span>${escapeHtml(formatLineCount(text))}</span>
+          </div>
+        `;
+        const pre = document.createElement("pre");
+        pre.textContent = text;
+        frame.appendChild(pre);
+        return frame;
+      }
+
+      function renderJsonFrame(label, value) {
+        return renderCodeBlock(label, stringifyJson(value, 2));
+      }
+
+      function renderMaybeLink(text, url) {
+        if (!url || !/^https?:\/\//i.test(url)) return escapeHtml(text);
+        return `<a href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">${escapeHtml(text)}</a>`;
+      }
+
+      function renderPillLink(url, label) {
+        if (!url || !/^https?:\/\//i.test(url)) return "";
+        return `<a class="pill-link" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
+      }
+
+      function renderMarkdownLite(text) {
+        const lines = text.split("\n");
+        let index = 0;
+        const html = [];
+
+        while (index < lines.length) {
+          const line = lines[index];
+
+          if (!line.trim()) {
+            index += 1;
+            continue;
+          }
+
+          const fenceMatch = line.match(/^```([\w-]+)?\s*$/);
+          if (fenceMatch) {
+            index += 1;
+            const codeLines = [];
+            while (index < lines.length && !lines[index].match(/^```/)) {
+              codeLines.push(lines[index]);
+              index += 1;
+            }
+            if (index < lines.length) index += 1;
+            html.push(renderMarkdownCodeBlock(fenceMatch[1] || "code", codeLines.join("\n")));
+            continue;
+          }
+
+          const headingMatch = line.match(/^(#{1,4})\s+(.*)$/);
+          if (headingMatch) {
+            const level = headingMatch[1].length;
+            html.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+            index += 1;
+            continue;
+          }
+
+          if (line.startsWith(">")) {
+            const quoteLines = [];
+            while (index < lines.length && lines[index].startsWith(">")) {
+              quoteLines.push(lines[index].replace(/^>\s?/, ""));
+              index += 1;
+            }
+            html.push(`<blockquote>${renderMarkdownLite(quoteLines.join("\n"))}</blockquote>`);
+            continue;
+          }
+
+          if (/^[-*+]\s+/.test(line)) {
+            const items = [];
+            while (index < lines.length && /^[-*+]\s+/.test(lines[index])) {
+              items.push(lines[index].replace(/^[-*+]\s+/, ""));
+              index += 1;
+            }
+            html.push(`<ul>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+            continue;
+          }
+
+          if (/^\d+\.\s+/.test(line)) {
+            const items = [];
+            while (index < lines.length && /^\d+\.\s+/.test(lines[index])) {
+              items.push(lines[index].replace(/^\d+\.\s+/, ""));
+              index += 1;
+            }
+            html.push(`<ol>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ol>`);
+            continue;
+          }
+
+          const paragraph = [];
+          while (index < lines.length) {
+            const candidate = lines[index];
+            if (!candidate.trim()) break;
+            if (
+              candidate.match(/^```/) ||
+              candidate.match(/^(#{1,4})\s+/) ||
+              candidate.startsWith(">") ||
+              candidate.match(/^[-*+]\s+/) ||
+              candidate.match(/^\d+\.\s+/)
+            ) {
+              break;
+            }
+            paragraph.push(candidate);
+            index += 1;
+          }
+          html.push(`<p>${paragraph.map((part) => renderInlineMarkdown(part)).join("<br>")}</p>`);
+        }
+
+        return html.join("");
+      }
+
+      function renderMarkdownCodeBlock(label, code) {
+        return `
+          <div class="code-frame">
+            <div class="code-head">
+              <span>${escapeHtml(label)}</span>
+              <span>${escapeHtml(formatLineCount(code))}</span>
+            </div>
+            <pre>${escapeHtml(code)}</pre>
+          </div>
+        `;
+      }
+
+      function renderInlineMarkdown(text) {
+        let html = escapeHtml(text);
+        html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+        html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+        html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+        html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+        html = html.replace(/(^|[\s(])(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noreferrer">$2</a>');
+        return html;
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function escapeAttribute(value) {
+        return escapeHtml(value);
+      }
+
+      function stringifyJson(value, indent = 0) {
+        try {
+          return JSON.stringify(value, null, indent) || "";
+        } catch (error) {
+          return String(value);
+        }
+      }
+
+      function parseMaybeJson(value) {
+        if (typeof value !== "string") return value;
+        const trimmed = value.trim();
+        if (!trimmed) return value;
+        try {
+          return JSON.parse(trimmed);
+        } catch {
+          return value;
+        }
+      }
+
+      function formatDateTime(valueMs) {
+        try {
+          return new Intl.DateTimeFormat(undefined, {
+            year: "numeric",
+            month: "short",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit"
+          }).format(new Date(valueMs));
+        } catch {
+          return new Date(valueMs).toISOString();
+        }
+      }
+
+      function formatDuration(durationMs) {
+        const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+
+        if (hours) return `${hours}h ${minutes}m`;
+        if (minutes) return `${minutes}m ${seconds}s`;
+        return `${seconds}s`;
+      }
+
+      function summarizeText(text, maxLength) {
+        const compact = text.replace(/\s+/g, " ").trim();
+        if (compact.length <= maxLength) return compact;
+        return `${compact.slice(0, maxLength - 1).trimEnd()}…`;
+      }
+
+      function previewLabel(text) {
+        return summarizeText(text.split("\n").find((line) => line.trim()) || "Content", 90);
+      }
+
+      function shortId(value) {
+        const text = String(value);
+        return text.length > 12 ? `${text.slice(0, 8)}…${text.slice(-4)}` : text;
+      }
+
+      function sanitizeRoleClass(role) {
+        return String(role).toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+      }
+
+      function countByRole(records) {
+        return records.reduce((acc, record) => {
+          acc[record.role] = (acc[record.role] || 0) + 1;
+          return acc;
+        }, {});
+      }
+
+      function extractQueryText(query) {
+        if (typeof query === "string") return query;
+        if (isPlainObject(query) && query.original) return String(query.original);
+        if (query === null || query === undefined) return "";
+        return stringifyJson(query);
+      }
+
+      function isLongText(text) {
+        return text.length > 1800 || text.split("\n").length > 28;
+      }
+
+      function formatLineCount(text) {
+        const lines = text ? text.split("\n").length : 0;
+        return `${lines} line${lines === 1 ? "" : "s"}`;
+      }
+
+      function isPlainObject(value) {
+        return value !== null && typeof value === "object" && !Array.isArray(value);
+      }
+    })();
+  </script>
+</body>
+</html>
