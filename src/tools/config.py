@@ -74,6 +74,15 @@ class ToolSettings:
     web_fetch_playwright_timeout_seconds: float
     web_fetch_max_response_bytes: int
     web_fetch_max_markdown_chars: int
+    email_smtp_host: str
+    email_smtp_port: int
+    email_smtp_security: str
+    email_timeout_seconds: float
+    email_sender_address: str | None
+    email_max_subject_chars: int
+    email_max_body_chars: int
+    email_max_attachment_count: int
+    email_max_total_attachment_bytes: int
 
     def __post_init__(self) -> None:
         if self.tool_runtime_base_url is not None and not self.tool_runtime_base_url.strip():
@@ -140,6 +149,26 @@ class ToolSettings:
             raise ValueError("web_fetch_max_response_bytes must be > 0.")
         if self.web_fetch_max_markdown_chars <= 0:
             raise ValueError("web_fetch_max_markdown_chars must be > 0.")
+        if not self.email_smtp_host.strip():
+            raise ValueError("email_smtp_host cannot be empty.")
+        if self.email_smtp_port <= 0:
+            raise ValueError("email_smtp_port must be > 0.")
+        if self.email_smtp_security not in {"ssl", "starttls", "none"}:
+            raise ValueError(
+                "email_smtp_security must be one of: ssl, starttls, none."
+            )
+        if self.email_timeout_seconds <= 0:
+            raise ValueError("email_timeout_seconds must be > 0.")
+        if self.email_sender_address is not None and not self.email_sender_address.strip():
+            raise ValueError("email_sender_address cannot be blank when configured.")
+        if self.email_max_subject_chars <= 0:
+            raise ValueError("email_max_subject_chars must be > 0.")
+        if self.email_max_body_chars <= 0:
+            raise ValueError("email_max_body_chars must be > 0.")
+        if self.email_max_attachment_count <= 0:
+            raise ValueError("email_max_attachment_count must be > 0.")
+        if self.email_max_total_attachment_bytes <= 0:
+            raise ValueError("email_max_total_attachment_bytes must be > 0.")
 
     @classmethod
     def from_env(cls) -> "ToolSettings":
@@ -251,5 +280,38 @@ class ToolSettings:
             web_fetch_max_markdown_chars=_parse_int_env(
                 "JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS",
                 app_settings.JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS,
+            ),
+            email_smtp_host=(
+                _optional_env("SMTP_HOST")
+                or app_settings.JARVIS_TOOL_EMAIL_SMTP_HOST
+            ),
+            email_smtp_port=_parse_int_env(
+                "SMTP_PORT",
+                app_settings.JARVIS_TOOL_EMAIL_SMTP_PORT,
+            ),
+            email_smtp_security=(
+                _optional_env("SMTP_SECURITY")
+                or app_settings.JARVIS_TOOL_EMAIL_SMTP_SECURITY
+            ).lower(),
+            email_timeout_seconds=_parse_float_env(
+                "SMTP_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_EMAIL_TIMEOUT_SECONDS,
+            ),
+            email_sender_address=_optional_env("SENDER_EMAIL_ADDRESS"),
+            email_max_subject_chars=_parse_int_env(
+                "JARVIS_TOOL_EMAIL_MAX_SUBJECT_CHARS",
+                app_settings.JARVIS_TOOL_EMAIL_MAX_SUBJECT_CHARS,
+            ),
+            email_max_body_chars=_parse_int_env(
+                "JARVIS_TOOL_EMAIL_MAX_BODY_CHARS",
+                app_settings.JARVIS_TOOL_EMAIL_MAX_BODY_CHARS,
+            ),
+            email_max_attachment_count=_parse_int_env(
+                "JARVIS_TOOL_EMAIL_MAX_ATTACHMENT_COUNT",
+                app_settings.JARVIS_TOOL_EMAIL_MAX_ATTACHMENT_COUNT,
+            ),
+            email_max_total_attachment_bytes=_parse_int_env(
+                "JARVIS_TOOL_EMAIL_MAX_TOTAL_ATTACHMENT_BYTES",
+                app_settings.JARVIS_TOOL_EMAIL_MAX_TOTAL_ATTACHMENT_BYTES,
             ),
         )

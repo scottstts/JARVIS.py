@@ -20,6 +20,7 @@ from .basic.web_search import build_web_search_tool
 from .basic.view_image import build_view_image_tool
 from .config import ToolSettings
 from .discoverable_search import search_discoverable_entries
+from .discoverable.email import build_email_discoverable, build_email_tool
 from .discoverable.ffmpeg import build_ffmpeg_discoverable
 from .discoverable.generate_edit_image import (
     build_generate_edit_image_discoverable,
@@ -229,12 +230,14 @@ class ToolRegistry:
         registry.register(build_web_fetch_tool(settings))
         registry.register(build_view_image_tool(settings))
         registry.register(build_send_file_tool(settings))
+        registry.register(build_email_tool(settings))
         registry.register(build_generate_edit_image_tool(settings))
         registry.register(build_memory_admin_tool())
         registry.register(build_transcribe_tool(settings))
         registry.register(build_youtube_tool(settings))
         registry.register(build_tool_search_tool(registry))
         registry.register(build_tool_register_tool(registry))
+        registry.register_discoverable(build_email_discoverable())
         registry.register_discoverable(build_ffmpeg_discoverable())
         registry.register_discoverable(build_generate_edit_image_discoverable())
         registry.register_discoverable(build_memory_admin_discoverable())

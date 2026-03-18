@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
+from email import policy as email_parser_policy
+from email.parser import BytesParser
 import os
 import shutil
 import subprocess
@@ -843,15 +845,22 @@ class ToolRegistryTests(unittest.TestCase):
                 [tool.name for tool in registry.search("image", include_basic=True)],
                 ["view_image", "generate_edit_image"],
             )
-            self.assertEqual(registry.search("send"), ())
+            self.assertEqual(
+                [tool.name for tool in registry.search("send")],
+                ["email"],
+            )
             self.assertEqual(
                 [tool.name for tool in registry.search("send", include_basic=True)],
-                ["send_file"],
+                ["send_file", "email"],
             )
             self.assertEqual(registry.search_discoverable("archive"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("")],
-                ["ffmpeg", "generate_edit_image", "memory_admin", "transcribe", "youtube"],
+                ["email", "ffmpeg", "generate_edit_image", "memory_admin", "transcribe", "youtube"],
+            )
+            self.assertEqual(
+                [tool.name for tool in registry.search_discoverable("email")],
+                ["email"],
             )
             self.assertEqual(
                 [tool.name for tool in registry.search_discoverable("edit image")],
@@ -889,6 +898,7 @@ class ToolRegistryTests(unittest.TestCase):
             registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
 
             for tool_name in (
+                "email",
                 "generate_edit_image",
                 "memory_admin",
                 "transcribe",
@@ -1570,6 +1580,81 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("inside", decision.reason or "")
 
+    def test_email_requires_approval_for_valid_send(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="email",
+            arguments={
+                "to_email": "user@example.com",
+                "subject": "Weekly update",
+                "body": "# Status\n\nAll tasks are complete.",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "email requires explicit approval.")
+        self.assertIsNotNone(decision.approval_request)
+        if decision.approval_request is None:
+            self.fail("Expected approval request metadata.")
+        self.assertEqual(decision.approval_request["kind"], "send_email")
+        self.assertEqual(decision.approval_request["to_email"], "user@example.com")
+        self.assertIn("Weekly update", decision.approval_request["summary"])
+
+    def test_email_allows_matching_approved_action(self) -> None:
+        arguments = {
+            "to_email": "user@example.com",
+            "subject": "Weekly update",
+            "body": "# Status\n\nAll tasks are complete.",
+        }
+        initial = self.policy.authorize(
+            tool_name="email",
+            arguments=arguments,
+            context=self.context,
+        )
+        self.assertFalse(initial.allowed)
+        if initial.approval_request is None:
+            self.fail("Expected approval request metadata.")
+
+        decision = self.policy.authorize(
+            tool_name="email",
+            arguments=arguments,
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                approved_action={
+                    "kind": "send_email",
+                    "request_hash": initial.approval_request["request_hash"],
+                },
+            ),
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_email_denies_invalid_to_email(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="email",
+            arguments={
+                "to_email": "not-an-email",
+                "subject": "Weekly update",
+                "body": "Hello there.",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("to_email", decision.reason or "")
+
+    def test_email_denies_attachment_path_escape(self) -> None:
+        outside = self.workspace_dir.parent / "outside.txt"
+        decision = self.policy.authorize(
+            tool_name="email",
+            arguments={
+                "to_email": "user@example.com",
+                "subject": "Weekly update",
+                "body": "Hello there.",
+                "attachment_paths": [str(outside)],
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("inside", decision.reason or "")
+
     def test_youtube_allows_valid_youtube_urls(self) -> None:
         decision = self.policy.authorize(
             tool_name="youtube",
@@ -2120,6 +2205,142 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(len(result.metadata["runtime_tool_errors"]), 1)
         self.assertIn("broken.json", result.metadata["runtime_tool_errors"][0])
+
+    async def test_email_requires_approval_before_sending(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_email_requires_approval",
+                name="email",
+                arguments={
+                    "to_email": "user@example.com",
+                    "subject": "Weekly update",
+                    "body": "Hello there.",
+                },
+                raw_arguments=(
+                    '{"to_email":"user@example.com","subject":"Weekly update",'
+                    '"body":"Hello there."}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.metadata["approval_required"])
+        self.assertEqual(
+            result.metadata["approval_request"]["kind"],
+            "send_email",
+        )
+        self.assertIn("user@example.com", result.metadata["approval_request"]["details"])
+
+    async def test_email_sends_with_html_footer_and_attachment_when_exact_approval_is_present(
+        self,
+    ) -> None:
+        attachment_path = self.workspace_dir / "exports" / "report.txt"
+        attachment_path.parent.mkdir(parents=True, exist_ok=True)
+        attachment_path.write_text("ship it\n", encoding="utf-8")
+        arguments = {
+            "to_email": "yourmainemail@example.com",
+            "subject": "Weekly update",
+            "body": "# Status\n\n**Ready** for review.\n\n- Ship build\n- Send update",
+            "attachment_paths": ["exports/report.txt"],
+        }
+        captured: dict[str, object] = {}
+
+        class _FakeSMTPSSL:
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                captured["host"] = host
+                captured["port"] = port
+                captured["timeout"] = timeout
+
+            def __enter__(self) -> "_FakeSMTPSSL":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = exc_type, exc, tb
+                captured["closed"] = True
+
+            def login(self, username: str, password: str) -> None:
+                captured["login"] = (username, password)
+
+            def send_message(self, message) -> None:
+                captured["raw_message"] = message.as_bytes()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SENDER_EMAIL_ADDRESS": "myagentalerts@gmail.com",
+                "SMTP_PASSWORD": "test-app-password",
+            },
+            clear=False,
+        ):
+            settings = ToolSettings.from_workspace_dir(self.workspace_dir)
+            runtime = ToolRuntime(registry=ToolRegistry.default(settings))
+            approval_result = await runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_email_approval_hash",
+                    name="email",
+                    arguments=arguments,
+                    raw_arguments="{}",
+                ),
+                context=ToolExecutionContext(workspace_dir=self.workspace_dir),
+            )
+
+            if not approval_result.metadata.get("approval_request"):
+                self.fail("Expected approval request metadata for email.")
+            request_hash = approval_result.metadata["approval_request"]["request_hash"]
+
+            with patch(
+                "tools.discoverable.email.tool.smtplib.SMTP_SSL",
+                _FakeSMTPSSL,
+            ):
+                result = await runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_email_send",
+                        name="email",
+                        arguments=arguments,
+                        raw_arguments="{}",
+                    ),
+                    context=ToolExecutionContext(
+                        workspace_dir=self.workspace_dir,
+                        approved_action={
+                            "kind": "send_email",
+                            "request_hash": request_hash,
+                        },
+                    ),
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["from_email"], "myagentalerts@gmail.com")
+        self.assertEqual(result.metadata["to_email"], "yourmainemail@example.com")
+        self.assertEqual(result.metadata["attachment_count"], 1)
+        self.assertEqual(
+            captured["login"],
+            ("myagentalerts@gmail.com", "test-app-password"),
+        )
+        self.assertEqual(captured["host"], "smtp.gmail.com")
+        self.assertEqual(captured["port"], 465)
+        self.assertTrue(captured["closed"])
+
+        message = BytesParser(policy=email_parser_policy.default).parsebytes(
+            captured["raw_message"]  # type: ignore[arg-type]
+        )
+        self.assertEqual(message["From"], "myagentalerts@gmail.com")
+        self.assertEqual(message["To"], "yourmainemail@example.com")
+        self.assertEqual(message["Subject"], "Weekly update")
+        plain_part = message.get_body(preferencelist=("plain",))
+        html_part = message.get_body(preferencelist=("html",))
+        self.assertIsNotNone(plain_part)
+        self.assertIsNotNone(html_part)
+        if plain_part is None or html_part is None:
+            self.fail("Expected both plain-text and HTML email bodies.")
+        self.assertIn("Sent by Jarvis", plain_part.get_content())
+        self.assertIn("Sent by Jarvis", html_part.get_content())
+        self.assertIn("<strong>Ready</strong>", html_part.get_content())
+        attachments = list(message.iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get_filename(), "report.txt")
+        self.assertEqual(attachments[0].get_content_type(), "text/plain")
+        self.assertEqual(attachments[0].get_content().strip(), "ship it")
 
     @unittest.skipUnless(
         _BASH_SANDBOX_RUNTIME_AVAILABLE,
@@ -3716,6 +3937,28 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],
             ["transcribe"],
+        )
+
+    async def test_tool_search_high_verbosity_email_activates_tool(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_tool_search_email",
+                name="tool_search",
+                arguments={"query": "email", "verbosity": "high"},
+                raw_arguments='{"query":"email","verbosity":"high"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("email", result.content)
+        self.assertIn("to_email", result.content)
+        self.assertIn("attachment_paths", result.content)
+        self.assertIn("SMTP", result.content)
+        self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["email"])
+        self.assertEqual(
+            [match["name"] for match in result.metadata["matches"]],
+            ["email"],
         )
 
     async def test_tool_search_high_verbosity_youtube_activates_tool(self) -> None:

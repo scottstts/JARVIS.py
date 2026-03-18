@@ -911,6 +911,45 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - the tool is text-output only; transcript mode returns raw Defuddle text and Gemini mode does not expose structured extraction or timestamp-specific controls beyond what the caller writes into `objectives`
 - Gemini analysis mode relies on `GOOGLE_API_KEY`; transcript mode instead depends on local `curl` plus Defuddle service availability
 
+### `email`
+
+- Status: implemented
+- Exposure: `discoverable`
+- Package: `src/tools/discoverable/email/`
+- Purpose: send one email through the configured SMTP account after discovery through `tool_search`
+
+#### Input Schema
+
+- `to_email: string` required; one recipient email address
+- `subject: string` required; one non-empty subject line
+- `body: string` required; markdown email body
+- `attachment_paths: string[]` optional; workspace file paths to attach
+
+#### Executor Behavior
+
+- stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
+- is main-agent-only; subagents cannot discover or execute it
+- authenticates and sends through the configured SMTP account using `SENDER_EMAIL_ADDRESS` as both the login username and the `From` address
+- renders the markdown `body` into HTML, also includes a plain-text alternative, and always appends a `Sent by Jarvis` footer to both variants
+- attaches any provided local workspace files and guesses attachment MIME types from their filenames
+- returns normalized metadata including SMTP host, port, security mode, sender, recipient, subject, attachment count, and message id
+
+#### Policy
+
+- every send requires explicit approval matched against an exact request hash
+- `to_email` must be a valid single email address
+- `subject` and `body` must be non-empty and stay within the configured hard caps
+- `attachment_paths`, when provided, must be explicit file paths inside `/workspace`
+- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected for attachments
+- `.env` files or paths inside `.env` directories are rejected as attachments
+- total attachment size and attachment count must stay within the configured hard caps
+
+#### Current Limitations
+
+- supports one `to_email` per call only; there is no `cc` or `bcc` surface yet
+- does not support inline images, remote URLs as attachments, or arbitrary custom SMTP identities per call
+- the built-in defaults target Gmail over SMTP SSL unless overridden by environment configuration
+
 ### `ffmpeg`
 
 - Status: implemented
@@ -953,6 +992,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
 - Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented discoverable tools: `email`, `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`

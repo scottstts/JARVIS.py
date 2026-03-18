@@ -15,6 +15,7 @@ from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
 from .basic.view_image import ViewImagePolicy
 from .config import ToolSettings
+from .discoverable.email import EmailPolicy
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .discoverable.memory_admin import MemoryAdminPolicy
 from .discoverable.transcribe import TranscribePolicy
@@ -119,6 +120,13 @@ class ToolPolicy:
                 context=context,
             )
 
+        if tool_name == "email":
+            settings = ToolSettings.from_workspace_dir(context.workspace_dir)
+            return EmailPolicy(settings).authorize(
+                arguments=arguments,
+                context=context,
+            )
+
         if tool_name == "memory_admin":
             action = str(arguments.get("action", "")).strip()
             return MemoryAdminPolicy().authorize(action=action, context=context)
@@ -148,6 +156,7 @@ class ToolPolicy:
             "send_file",
             "tool_search",
             "tool_register",
+            "email",
             "generate_edit_image",
             "memory_admin",
             "transcribe",

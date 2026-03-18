@@ -101,3 +101,4 @@
 - Telegram UI should never surface app-internal failure text to chat; gateway/websocket/bridge/download errors are log-only, and Telegram output must stay limited to normal app-flow messages.
 - Session transcripts now log the raw session-start basic `ToolDefinition` payloads as transcript-only developer records for audit, so the stored JSONL reflects the same basic tool schema/description data the agent received in `LLMRequest.tools`.
 - Built-in discoverable tool text is now intentionally minimal for model context: keep purpose/search cues strong, keep high-verbosity surfaces compact, and omit examples/metadata/repeated defaults unless they add unique operator value.
+- Added a main-agent-only discoverable `email` tool that sends through SMTP with per-send approval hashing, markdown-to-HTML rendering, optional workspace attachments, and a forced `Sent by Jarvis` footer.

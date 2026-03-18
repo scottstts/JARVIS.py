@@ -16,6 +16,7 @@ from .basic.tool_register import ToolRegisterPolicy
 from .basic.tool_search import ToolSearchPolicy
 from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
+from .discoverable.email import EmailPolicy
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .discoverable.memory_admin import MemoryAdminPolicy
 from .discoverable.transcribe import TranscribePolicy
@@ -32,6 +33,7 @@ from .basic.view_image import ViewImagePolicy
 __all__ = [
     "BashCommandPolicy",
     "DiscoverableTool",
+    "EmailPolicy",
     "FilePatchPolicy",
     "GenerateEditImagePolicy",
     "MemoryAdminPolicy",

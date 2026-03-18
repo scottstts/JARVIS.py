@@ -1,5 +1,10 @@
 """Discoverable tool packages."""
 
+from .email import (
+    EmailPolicy,
+    build_email_discoverable,
+    build_email_tool,
+)
 from .ffmpeg import build_ffmpeg_discoverable
 from .generate_edit_image import (
     GenerateEditImagePolicy,
@@ -18,6 +23,9 @@ from .youtube import (
 )
 
 __all__ = [
+    "EmailPolicy",
+    "build_email_discoverable",
+    "build_email_tool",
     "build_ffmpeg_discoverable",
     "GenerateEditImagePolicy",
     "TranscribePolicy",
