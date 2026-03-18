@@ -56,7 +56,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
 
                 records = storage.load_records(result.session_id)
                 message_records = [record for record in records if record.kind == "message"]
-                self.assertGreaterEqual(len(message_records), 6)
+                self.assertGreaterEqual(len(message_records), 7)
                 self.assertEqual(message_records[0].role, "system")
                 self.assertEqual(message_records[0].content, "PROGRAM PROMPT")
                 self.assertEqual(message_records[1].role, "system")
@@ -65,9 +65,19 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(message_records[2].content, "USER PROMPT")
                 self.assertEqual(message_records[3].role, "system")
                 self.assertEqual(message_records[3].content, "ARMOR PROMPT")
-                self.assertEqual(message_records[4].role, "user")
-                self.assertEqual(message_records[4].content, "Reply with ACK only.")
-                self.assertEqual(message_records[5].role, "assistant")
+                tool_bootstrap_records = [
+                    record
+                    for record in message_records
+                    if record.role == "developer" and record.metadata.get("tool_bootstrap") == "basic"
+                ]
+                self.assertEqual(len(tool_bootstrap_records), 1)
+                self.assertIn('"name": "bash"', tool_bootstrap_records[0].content)
+                user_record = next(record for record in message_records if record.role == "user")
+                self.assertEqual(user_record.content, "Reply with ACK only.")
+                assistant_record = next(
+                    record for record in reversed(message_records) if record.role == "assistant"
+                )
+                self.assertTrue(assistant_record.content.strip())
                 self.assertNotIn(
                     "README SHOULD NOT BE INJECTED",
                     "\n".join(record.content for record in message_records),
@@ -143,8 +153,14 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
 
                 new_records = storage.load_records(reset.session_id)
                 message_records = [record for record in new_records if record.kind == "message"]
+                tool_bootstrap_records = [
+                    record
+                    for record in message_records
+                    if record.role == "developer" and record.metadata.get("tool_bootstrap") == "basic"
+                ]
+                self.assertEqual(len(tool_bootstrap_records), 1)
                 self.assertEqual(
-                    [record.role for record in message_records],
+                    [record.role for record in message_records[:4]],
                     ["system", "system", "system", "system"],
                 )
                 self.assertFalse(any(record.metadata.get("summary_seed") for record in message_records))

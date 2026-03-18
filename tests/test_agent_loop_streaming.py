@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,6 +162,43 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
                     for record in persisted_records
                 )
             )
+
+    async def test_handle_user_input_logs_basic_tool_bootstrap_into_transcript_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _FakeTurnContextLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input("hello")
+
+            records = storage.load_records(result.session_id)
+            tool_bootstrap_records = [
+                record
+                for record in records
+                if record.role == "developer" and record.metadata.get("tool_bootstrap") == "basic"
+            ]
+            self.assertEqual(len(tool_bootstrap_records), 1)
+            serialized_tools = json.loads(tool_bootstrap_records[0].content)
+            self.assertIn("tool_definitions", tool_bootstrap_records[0].metadata)
+            self.assertEqual(serialized_tools, tool_bootstrap_records[0].metadata["tool_definitions"])
+            self.assertIn("bash", [tool["name"] for tool in serialized_tools])
+            self.assertIn("tool_search", [tool["name"] for tool in serialized_tools])
+
+            request = llm_service.requests[0]
+            request_text = "\n".join(
+                part.text
+                for message in request.messages
+                for part in message.parts
+                if isinstance(part, TextPart)
+            )
+            self.assertNotIn(tool_bootstrap_records[0].content, request_text)
+            self.assertIn("bash", [tool.name for tool in request.tools])
+            self.assertIn("tool_search", [tool.name for tool in request.tools])
 
     async def test_stream_user_input_interrupts_after_current_streamed_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

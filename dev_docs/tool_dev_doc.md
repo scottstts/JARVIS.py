@@ -47,6 +47,8 @@ Exposure classes:
 Current rule:
 
 - only `basic` tools are injected into the initial `LLMRequest`
+- the session transcript also logs the raw basic `ToolDefinition` payloads available at session start for auditability
+- that transcript-only tool-definition record is not replayed back into later `LLMRequest.messages`
 - discoverable entries live in a separate catalog inside `ToolRegistry`
 - discoverable entries may be docs-only or may link to a backing executable tool
 - low-verbosity `tool_search` stays informational only
@@ -80,7 +82,36 @@ Current catalog rules:
 - discoverable entries are not automatically callable just because they exist in the catalog
 - if `backing_tool_name` is set, it must point at a separately registered executable tool
 - `usage` is intentionally flexible and does not need to mirror `ToolDefinition.input_schema`
+- `usage` and `metadata` should be omitted by default when they do not add unique model-useful signal
 - `usage` and `metadata` are returned by `tool_search`, but current search indexing only uses `name`, `aliases`, `purpose`, and `detailed_description`
+
+### Discoverable Surface Simplification
+
+Current built-in discoverables were deliberately simplified to reduce prompt noise.
+
+Current baseline:
+
+- discoverable surfaces are activation hints for the model, not human-facing code docs
+- low verbosity should usually expose only name plus one-line `purpose`
+- high verbosity should stay compact enough that surfacing several discoverables in one turn does not materially bloat context
+- most backed discoverables now expose only `purpose`, a short alias set, one concise `detailed_description`, a minimal `usage.arguments` list, and `backing_tool_name`
+- `examples`, long `notes`, large `metadata` blobs, and repeated default or limit explanations were removed from built-in discoverables unless they carry unique operational value
+- docs-only discoverables may still put their primary operator instruction in `usage`, but that instruction should also stay compact
+
+### Discoverable Description Surface Rules
+
+Ethos for future discoverable-tool text:
+
+- optimize for model runtime, not human documentation
+- keep `purpose` to one search-friendly sentence
+- keep `detailed_description` to the minimum needed for activation choice or mode selection
+- for backed discoverables, `detailed_description` should normally reuse the executable `ToolDefinition.description`
+- keep `usage` minimal; it should add only what is not already obvious from the name, purpose, long description, or executable schema
+- do not include examples of obvious literals such as sample YouTube URLs, ordinary workspace paths, or trivial commands
+- do not repeat the same default, limit, or path rule more than twice across description, argument descriptions, notes, and metadata combined; once is preferred
+- if a detail matters for search ranking, put it in `purpose`, `aliases`, or `detailed_description`; `usage` and `metadata` are not indexed
+- treat `metadata` as exceptional, not standard; omit it unless it adds unique operational signal the model would otherwise miss
+- when deciding between adding another sentence and deleting text, bias toward deleting text
 
 ### How To Add A Discoverable Tool
 
@@ -105,6 +136,8 @@ Important:
 - the executable tool registration and the discoverable catalog registration are separate steps by design
 - if you forget step 7, the tool may appear in the follow-up request after `tool_search`, but runtime execution will still be denied by policy
 - the recommended convention is for discoverable `name` and executable tool name to match unless there is a strong reason not to
+- for backed discoverables, keep one long-form description source of truth by reusing the executable `ToolDefinition.description` text for the discoverable entry's `detailed_description` instead of maintaining two separate long descriptions
+- do not mirror the same defaults, limits, or path rules across `purpose`, `detailed_description`, `usage`, and `metadata`; keep each field doing distinct work
 
 Minimal mental model:
 
@@ -299,6 +332,9 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - `Usage`
 - `Metadata`
 - `Backing Tool`
+
+For backed discoverables, `Detailed Description` should normally mirror the executable tool's `ToolDefinition.description`; docs-only discoverables still define their own discoverable-only long description.
+`Usage` is compact operator guidance, not a miniature tutorial. `Metadata` is exceptional and should usually be omitted.
 
 ## Tools Implemented
 
@@ -592,7 +628,7 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 #### Executor Behavior
 
 - low verbosity returns only discoverable tool name and one-line purpose
-- high verbosity returns richer discovery docs including aliases, detailed description, flexible usage payload, metadata, and backing tool name when present
+- high verbosity returns the discoverable fields that are actually present on the entry; current built-in discoverables keep that surface intentionally sparse
 - search is simple deterministic text matching across discoverable `name`, `aliases`, `purpose`, and `detailed_description`
 - high-verbosity results add activation metadata so matched backed discoverable tools can be included in follow-up requests for the rest of the current turn
 - low-verbosity results do not activate discoverable tools, to avoid inflating the tool list too early
@@ -748,8 +784,8 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 - Name: `memory_admin`
 - Aliases: `memory maintenance`, `memory reindex`, `memory integrity`
 - Purpose: expose manual memory maintenance capabilities without permanently inflating the default tool list
-- Detailed Description: use only when the user explicitly requests memory administration, reindexing, embedding rebuilds, integrity checks, due maintenance, or a bootstrap preview
-- Usage: choose one of `reindex_all`, `reindex_dirty`, `rebuild_embeddings`, `run_due_maintenance`, `integrity_check`, or `render_bootstrap_preview`
+- Detailed Description: run explicit memory maintenance or inspection actions; use only when the user asks for memory admin work
+- Usage: choose one of `reindex_all`, `reindex_dirty`, `rebuild_embeddings`, `repair_canonical_drift`, `run_due_maintenance`, `integrity_check`, or `render_bootstrap_preview`
 - Metadata: none beyond the discoverable purpose/usage payload
 - Backing Tool: `memory_admin`
 
@@ -885,11 +921,11 @@ When documenting a discoverable entry or a discoverable-capable tool below, keep
 #### Discoverable Entry
 
 - Name: `ffmpeg`
-- Aliases: `ffmpeg`, `ffprobe`, `media_convert`
+- Aliases: `ffprobe`, `media convert`
 - Purpose: use the installed ffmpeg or ffprobe CLI through bash for audio or video conversion, trimming, muxing, probing, and stream extraction
-- Detailed Description: this is a docs-only discoverable entry with no separate runtime; after discovery, invoke `ffmpeg` or `ffprobe` through the basic `bash` tool
-- Usage: use the basic `bash` tool to run `ffmpeg` or `ffprobe` directly inside the container, for example `ffmpeg -i /workspace/input.mp4 /workspace/output.mp3`, and keep all input and output paths inside `/workspace`
-- Metadata: `operator=bash`, `commands=[ffmpeg, ffprobe]`, `runtime=docs_only_discoverable`
+- Detailed Description: docs-only entry; run `ffmpeg` or `ffprobe` through `bash`
+- Usage: use the basic `bash` tool to run `ffmpeg` or `ffprobe` on files in `/workspace`
+- Metadata: none
 - Backing Tool: none
 
 #### Current Limitations

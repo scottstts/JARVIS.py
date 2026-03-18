@@ -6,6 +6,7 @@ import base64
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol, Sequence
@@ -47,11 +48,13 @@ _OVERFLOW_ERROR_HINTS = (
     "exceeds the model",
 )
 _TRANSIENT_RECORD_METADATA_KEY = "transient"
+_TRANSCRIPT_ONLY_RECORD_METADATA_KEY = "transcript_only"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
 _TURN_CONTEXT_METADATA_KEY = "turn_context"
 _TURN_ID_METADATA_KEY = "turn_id"
 _INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
 _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
+_TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
     "Continue in a new turn if you want me to keep using tools."
@@ -1861,6 +1864,18 @@ class AgentLoop:
                 content=message.parts[0].text,
                 metadata={"bootstrap_identity": True},
             )
+        tool_bootstrap = self._serialize_basic_tool_bootstrap()
+        if tool_bootstrap is not None:
+            self._append_message(
+                session_id=session.session_id,
+                role="developer",
+                content=json.dumps(tool_bootstrap, ensure_ascii=False, indent=2),
+                metadata={
+                    _TOOL_BOOTSTRAP_METADATA_KEY: "basic",
+                    _TRANSCRIPT_ONLY_RECORD_METADATA_KEY: True,
+                    "tool_definitions": tool_bootstrap,
+                },
+            )
 
         if self._memory_mode.bootstrap:
             try:
@@ -1931,6 +1946,7 @@ class AgentLoop:
             for record in records
             if record.kind == "message"
             and not record.metadata.get("bootstrap_identity", False)
+            and not record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)
             and not record.metadata.get("memory_bootstrap")
             and not record.metadata.get("summary_seed", False)
         ]
@@ -2191,6 +2207,20 @@ class AgentLoop:
             content=message.content,
             metadata=metadata,
         )
+
+    def _serialize_basic_tool_bootstrap(self) -> list[dict[str, Any]] | None:
+        definitions = self._tool_registry.basic_definitions()
+        if not definitions:
+            return None
+        return [
+            {
+                "name": definition.name,
+                "description": definition.description,
+                "input_schema": deepcopy(dict(definition.input_schema)),
+                "strict": definition.strict,
+            }
+            for definition in definitions
+        ]
 
     def _default_tool_definitions(
         self,
@@ -2637,6 +2667,9 @@ def _record_to_llm_message(
     *,
     include_tool_calls: bool = True,
 ) -> LLMMessage | None:
+    if bool(record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)):
+        return None
+
     if record.role in {"system", "developer", "user"}:
         parts: list[ImagePart | TextPart] = []
         image_part = _record_image_part(record)

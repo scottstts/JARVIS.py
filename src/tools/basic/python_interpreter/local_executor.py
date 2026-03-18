@@ -350,17 +350,17 @@ def build_python_interpreter_description(settings: ToolSettings) -> str:
     packages = ", ".join(settings.python_interpreter_allowed_packages)
     return (
         "Run constrained Python inside the isolated tool_runtime container. "
-        "Always use this tool whenever you need to execute Python code or a Python script, rather than the shell tool. "
+        "Always use this tool whenever you need to execute Python code or a Python script. "
         "Exactly one of 'code' or 'script_path' is required. "
         "If you anticipate long script, write the Python code as a file first, "
         "and then call this tool to execute the script as a .py file. "
-        "The shared /workspace is mounted directly and is the only writable filesystem "
+        "The shared `/workspace` is mounted directly and is the only writable filesystem "
         "location available to the script. Writes outside /workspace are denied. "
         "Workspace helper modules and curated runtime packages import normally; direct native FFI "
         "imports such as ctypes/cffi are blocked and subprocess spawning is blocked. "
         f"Curated third-party packages available: {packages}, "
-        "but you can install packages you need using the shell tool. If approved, "
-        "the packages will be installed in `python_interpreter`'s venv. " 
+        "but you can install packages you need using the `bash` tool. If approved, "
+        "the packages will be installed in `python_interpreter`'s default venv. " 
         "No network access is available in this tool."
     )
 

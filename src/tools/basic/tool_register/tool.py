@@ -170,7 +170,7 @@ def build_tool_register_tool(registry: ToolRegisterRegistry) -> RegisteredTool:
         definition=ToolDefinition(
             name="tool_register",
             description=(
-                "Register or update one runtime tool manifest in /workspace/runtime_tools so "
+                "Register or update one runtime tool manifest in `/workspace/runtime_tools/` so "
                 "future tool_search calls can discover it. Registration itself requires "
                 "explicit user approval."
             ),

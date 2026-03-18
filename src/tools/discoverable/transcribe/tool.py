@@ -218,21 +218,14 @@ def build_transcribe_tool(settings: ToolSettings) -> RegisteredTool:
         exposure="discoverable",
         definition=ToolDefinition(
             name="transcribe",
-            description=(
-                "Transcribe speech from one workspace audio or video file to text using "
-                f"OpenAI {OPENAI_TRANSCRIPTION_MODEL}. The tool validates the local input "
-                "extension and the 25 MB Audio API size limit before uploading. Supported "
-                f"extensions: {', '.join(SUPPORTED_AUDIO_FORMATS)}. If the source file is "
-                "larger than 25 MB, split it into smaller chunks first."
-            ),
+            description=_build_transcribe_tool_description(),
             input_schema={
                 "type": "object",
                 "properties": {
                     "audio_path": {
                         "type": "string",
                         "description": (
-                            "Required workspace path to one supported audio or video file "
-                            "to transcribe. Supported extensions: "
+                            "Required workspace path to a supported audio or video file: "
                             f"{', '.join(SUPPORTED_AUDIO_FORMATS)}."
                         ),
                     }
@@ -254,59 +247,28 @@ def build_transcribe_discoverable() -> DiscoverableTool:
             "speech to text",
             "audio transcription",
             "transcribe audio",
-            "transcribe speech",
         ),
         purpose=(
             "Transcribe spoken audio from one workspace media file into plain text."
         ),
-        detailed_description=(
-            "Backed executable discoverable tool that uploads one local audio or video "
-            f"file to OpenAI {OPENAI_TRANSCRIPTION_MODEL} and returns the transcript text. "
-            "It pre-validates the file extension and the 25 MB Audio API upload limit "
-            "before sending the request. Use a separate media-conversion step first if "
-            "you need to extract audio from another container format or convert an "
-            "unsupported file."
-        ),
+        detailed_description=_build_transcribe_tool_description(),
         usage={
             "arguments": [
                 {
                     "name": "audio_path",
                     "type": "string",
                     "required": True,
-                    "description": (
-                        "Workspace path to one supported local media file to transcribe."
-                    ),
                 }
             ],
-            "examples": [
-                {
-                    "arguments": {
-                        "audio_path": "temp/meeting.m4a",
-                    }
-                },
-                {
-                    "arguments": {
-                        "audio_path": "temp/interview.mp4",
-                    }
-                },
-            ],
-            "notes": [
-                "Only one argument is accepted: audio_path.",
-                "audio_path must stay inside the workspace.",
-                f"Supported formats: {', '.join(SUPPORTED_AUDIO_FORMATS)}.",
-                "Files larger than 25 MB are rejected before upload.",
-                "For files larger than 25 MB, split the source into smaller chunks first.",
-                "Use ffmpeg if you need to convert or extract audio first.",
-            ],
-        },
-        metadata={
-            "provider": "openai",
-            "model": OPENAI_TRANSCRIPTION_MODEL,
-            "response_format": OPENAI_TRANSCRIPTION_RESPONSE_FORMAT,
-            "supported_input_formats": list(SUPPORTED_AUDIO_FORMATS),
-            "max_file_size_bytes": MAX_AUDIO_FILE_SIZE_BYTES,
         },
         backing_tool_name="transcribe",
+    )
+
+
+def _build_transcribe_tool_description() -> str:
+    return (
+        "Transcribe one workspace audio or video file to text with OpenAI. `audio_path` "
+        "must be under 25 MB; convert or split first if needed."
     )
 
 

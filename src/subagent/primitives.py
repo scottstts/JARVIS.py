@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from llm import ToolDefinition
+from tools.definition_docs import render_tool_definition_docs
 
 SUBAGENT_PRIMITIVE_NAMES = (
     "subagent_invoke",
@@ -101,35 +102,11 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
 
 
 def render_subagent_primitive_docs() -> str:
-    lines = [
-        "Subagent control primitives are available only to Jarvis.",
-        "Use them for bounded side work, monitor them, and dispose them when done.",
-        "Subagents cannot spawn subagents.",
-    ]
-    for definition in build_subagent_primitive_definitions():
-        lines.extend(
-            [
-                "",
-                definition.name,
-                definition.description or "",
-                _render_schema_summary(definition),
-            ]
-        )
-    return "\n".join(line for line in lines if line is not None)
-
-
-def _render_schema_summary(definition: ToolDefinition) -> str:
-    schema = definition.input_schema
-    properties = schema.get("properties", {})
-    required = set(schema.get("required", []))
-    lines = ["Arguments:"]
-    for name, payload in properties.items():
-        type_name = payload.get("type", "object")
-        required_suffix = " required" if name in required else " optional"
-        enum = payload.get("enum")
-        if isinstance(enum, list) and enum:
-            type_name = f"{type_name} ({', '.join(str(item) for item in enum)})"
-        lines.append(f"- {name}: {type_name};{required_suffix}")
-    if len(lines) == 1:
-        lines.append("- none")
-    return "\n".join(lines)
+    return render_tool_definition_docs(
+        build_subagent_primitive_definitions(),
+        intro_lines=(
+            "Subagent control primitives are available only to Jarvis.",
+            "Use them for bounded side work, monitor them, and dispose them when done.",
+            "Subagents cannot spawn subagents.",
+        ),
+    )

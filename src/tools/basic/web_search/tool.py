@@ -162,12 +162,9 @@ def build_web_search_tool(settings: ToolSettings) -> RegisteredTool:
 
 def _build_web_search_tool_description(settings: ToolSettings) -> str:
     return (
-        "Run a basic web search through Brave Search and return normalized web results. "
+        "Run a basic web search through Brave Search and return normalized web results "
+        "including the URL and content snippet. "
         f"Each search returns up to {settings.web_search_result_count} web results. "
-        "Web search is for basic web page search oriented at text information. "
-        "For other types of information or gated information like YouTube, X(Twitter), etc., "
-        "look for dedicated tools first, and only default to web search "
-        "if you cannot find dedicated tools or if they're not available."
     )
 
 

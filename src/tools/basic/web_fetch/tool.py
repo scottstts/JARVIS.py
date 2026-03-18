@@ -425,14 +425,11 @@ def build_web_fetch_tool(settings: ToolSettings) -> RegisteredTool:
 
 def _build_web_fetch_tool_description(settings: ToolSettings) -> str:
     return (
-        "Fetch a specific web page and return clean markdown for downstream reasoning. "
-        "The tool uses a three-tier strategy: first request markdown directly with "
-        "Accept: text/markdown, then fetch normal HTML and convert it with Cloudflare "
-        "toMarkdown, and only then fall back to local Playwright rendering for "
-        "JavaScript-heavy pages. "
-        f"Each fetch uses a {settings.web_fetch_timeout_seconds:.0f}s HTTP timeout, a "
-        f"{settings.web_fetch_playwright_timeout_seconds:.0f}s Playwright timeout, and "
-        f"caps fetched response bodies at {settings.web_fetch_max_response_bytes} bytes."
+        "Fetch a specific web page and return clean markdown. "
+        "Web fetch is for basic web page text content. "
+        "For other types of information or gated information like YouTube, X(Twitter), etc., "
+        "look for dedicated tools first, and only default to web fetch "
+        "if you cannot find dedicated tools or if they're not available."
     )
 
 

@@ -156,17 +156,16 @@ def _resolve_timeout_seconds(arguments: dict[str, Any], settings: ToolSettings) 
 
 def format_bash_tool_description() -> str:
     return (
-        "Run a bash command from /workspace inside the isolated tool_runtime container. "
-        "Use this for shell commands, CLI tools, installs, builds, file inspection, and small scripts. "
-        "Do not use this tool to run code through an interpreter. "
-        "Do not use bash tool to invoke Python in any form; use the dedicated interpreter tool (`python_interpreter`) instead. "
+        "Run a bash command from `/workspace` inside the isolated tool_runtime container. "
+        "Use this for shell commands, CLI tools, installs, builds, file inspection, scripts., "
+        "and anything bash-appropriate. "
+        "Do not use `bash` tool to invoke Python in any form; use the dedicated `python_interpreter` tool instead. "
         "You can directly install python packages using bash tool, use the virtualenv pip executable directly, "
         "e.g., `uv pip install --python /opt/venv/bin/python <package-name>`. Do NOT use `python -m pip install`. "
         "Use normal shell syntax, including pipes, redirects, command substitution, &&, ||, and multiline scripts. "
-        "The shared /workspace is mounted in this runtime. "
         "Some commands may require user approval, so when that seems likely, provide clear approval context. "
         "Available commands depend on what exists in the current tool runtime. "
-        "If you install or create a reusable tool, consider registering it with tool_register."
+        "If you install or create a potentially reusable tool, consider registering it with tool_register."
     )
 
 

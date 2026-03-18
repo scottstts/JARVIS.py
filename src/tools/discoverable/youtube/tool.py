@@ -366,11 +366,7 @@ def build_youtube_tool(settings: ToolSettings) -> RegisteredTool:
         exposure="discoverable",
         definition=ToolDefinition(
             name="youtube",
-            description=(
-                "Understand public YouTube videos. Use transcript mode for exact spoken "
-                "content; use Gemini mode for summaries, focused questions, and multimodal "
-                f"video understanding with {GEMINI_YOUTUBE_MODEL}."
-            ),
+            description=_build_youtube_tool_description(),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -378,27 +374,15 @@ def build_youtube_tool(settings: ToolSettings) -> RegisteredTool:
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
-                        "description": (
-                            "Required list of one or more public YouTube video URLs. Each URL "
-                            "must be a valid YouTube video link."
-                        ),
+                        "description": "Required list of 1 to 10 public YouTube video URLs.",
                     },
                     "objectives": {
                         "type": "string",
-                        "description": (
-                            "Optional custom task-specific objective for how to analyze the "
-                            "videos. If omitted, the tool uses its default summary objective. "
-                            "The tool's universal system instruction remains in place either "
-                            "way. Ignored when transcript is true."
-                        ),
+                        "description": "Optional analysis instructions.",
                     },
                     "transcript": {
                         "type": "boolean",
-                        "description": (
-                            "Optional mode switch. If true, the tool ignores objectives and "
-                            "fetches transcript text for each video via Defuddle using curl "
-                            "instead of running Gemini analysis. Defaults to false."
-                        ),
+                        "description": "Transcript mode.",
                     },
                 },
                 "required": ["video_urls"],
@@ -415,115 +399,43 @@ def build_youtube_discoverable() -> DiscoverableTool:
     return DiscoverableTool(
         name="youtube",
         aliases=(
-            "view_youtube",
-            "youtube video",
             "youtube summary",
             "youtube transcript",
             "video understanding",
-            "video transcript",
-            "summarize youtube",
         ),
         purpose=(
             "Understand one or more public YouTube videos by summarizing them, answering "
             "focused questions, or retrieving transcript text for them."
         ),
-        detailed_description=(
-            "Backed executable discoverable tool for understanding public YouTube videos "
-            "through two modes. Transcript mode is for exact dialogue or narration details "
-            "when wording matters. Gemini mode is for synthesized understanding of the full "
-            "video, including summaries, targeted question answering, comparisons, and "
-            "analysis that depends on visuals or non-speech audio. Choose transcript mode "
-            "when you need the spoken content itself; choose Gemini mode when you need an "
-            f"interpretation of the video as a whole through {GEMINI_YOUTUBE_MODEL}."
-        ),
+        detailed_description=_build_youtube_tool_description(),
         usage={
             "arguments": [
                 {
                     "name": "video_urls",
                     "type": "string[]",
                     "required": True,
-                    "description": "List of one or more public YouTube video URLs.",
                 },
                 {
                     "name": "objectives",
                     "type": "string",
                     "required": False,
-                    "default": "default_summary_objective",
-                    "description": (
-                        "Optional custom task objective. When provided, it replaces the "
-                        "tool's default summary objective but keeps the shared system "
-                        "instruction in place."
-                    ),
                 },
                 {
                     "name": "transcript",
                     "type": "boolean",
                     "required": False,
-                    "default": False,
-                    "description": (
-                        "If true, ignore objectives and fetch transcript text for each "
-                        "video via Defuddle using curl instead of running Gemini."
-                    ),
                 },
             ],
-            "examples": [
-                {
-                    "mode": "default_summary",
-                    "arguments": {
-                        "video_urls": [
-                            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                        ],
-                    },
-                },
-                {
-                    "mode": "focused_extraction",
-                    "arguments": {
-                        "video_urls": [
-                            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                            "https://youtu.be/3JZ_D3ELwOQ",
-                        ],
-                        "objectives": (
-                            "Context: I do not need a general summary. I am trying to "
-                            "reconcile release-timeline claims across these videos for "
-                            "downstream planning. Task: compare the videos and extract only "
-                            "concrete statements about launch timing, release windows, "
-                            "milestones, or deadlines. For each claim, note which video it "
-                            "came from and distinguish direct statements from speculation or "
-                            "ambiguous hints. Ignore unrelated product details unless they "
-                            "materially affect the timeline."
-                        ),
-                    },
-                },
-                {
-                    "mode": "transcript_fetch",
-                    "arguments": {
-                        "video_urls": [
-                            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                        ],
-                        "transcript": True,
-                    },
-                },
-            ],
-            "notes": [
-                "All video_urls must be valid YouTube video URLs or the tool returns an error before calling Gemini.",
-                "Only public YouTube URLs are supported by both the Gemini analysis path and the Defuddle transcript path.",
-                f"The current implementation allows at most {MAX_YOUTUBE_VIDEO_URLS} video URLs per call.",
-                "Use transcript=true when exact dialogue or narration wording matters.",
-                "Use transcript=false when you want overview, question answering, or analysis that can depend on visual or non-speech audio content.",
-                "If objectives is omitted, the tool defaults to a summary-oriented task objective.",
-                "If objectives is provided, it replaces only the default task objective and keeps the shared system instruction.",
-                "If transcript is true, objectives is ignored and the tool internally runs curl against Defuddle for each video URL.",
-            ],
-        },
-        metadata={
-            "providers": ["gemini", "defuddle"],
-            "model": GEMINI_YOUTUBE_MODEL,
-            "max_video_urls": MAX_YOUTUBE_VIDEO_URLS,
-            "default_behavior": "summary",
-            "system_instruction_mode": "shared_plus_task_objective",
-            "supports_transcript_mode": True,
         },
         backing_tool_name="youtube",
+    )
+
+
+def _build_youtube_tool_description() -> str:
+    return (
+        "Analyze public YouTube videos, or fetch transcripts when exact wording matters. "
+        "Set `transcript=true` for transcript mode; otherwise use optional `objectives` "
+        "to steer analysis."
     )
 
 

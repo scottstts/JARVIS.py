@@ -96,13 +96,11 @@ def build_tool_search_tool(catalog: ToolSearchCatalog) -> RegisteredTool:
             description=(
                 "Search discoverable tools that are hidden by default. "
                 "Prefer starting with verbosity='low' so you only get tool names and one-line "
-                "purposes. Use verbosity='high' only after you have narrowed down promising "
-                "targets, because high verbosity returns fuller docs and can surface matched "
-                "backed discoverable tools for the rest of the current turn. "
+                "purposes. Use verbosity='high' only after you have narrowed down promising targets. "
                 "If query is omitted or empty, this lists every discoverable tool at low "
                 "verbosity by default."
                 "For tasks that require tools, you **MUST ALWAYS** first use `tool_search` tool "
-                "to find the best suitable tool for the task before you start the task"
+                "to find the best suitable tool for the task before you start the task."
             ),
             input_schema={
                 "type": "object",

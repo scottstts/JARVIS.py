@@ -480,9 +480,9 @@ class ToolSettingsTests(unittest.TestCase):
     def test_bash_description_directs_python_execution_to_python_interpreter(self) -> None:
         description = format_bash_tool_description().lower()
 
-        self.assertIn("do not use this tool to run code through an interpreter", description)
-        self.assertIn("dedicated interpreter tool", description)
-        self.assertIn("/opt/venv", description)
+        self.assertIn("do not use `bash` tool to invoke python", description)
+        self.assertIn("`python_interpreter` tool instead", description)
+        self.assertIn("uv pip install --python /opt/venv/bin/python", description)
 
     def test_python_interpreter_description_explicitly_claims_python_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -492,9 +492,12 @@ class ToolSettingsTests(unittest.TestCase):
 
         description = build_python_interpreter_description(settings).lower()
 
-        self.assertIn("always use this tool whenever you need to execute python code", description)
-        self.assertIn("rather than the shell tool", description)
-        self.assertIn("execute python code or a python script", description)
+        self.assertIn(
+            "always use this tool whenever you need to execute python code or a python script",
+            description,
+        )
+        self.assertIn("exactly one of 'code' or 'script_path' is required", description)
+        self.assertIn("no network access is available in this tool", description)
 
 
 class PythonInterpreterExecutorTests(unittest.TestCase):
@@ -805,7 +808,7 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(registry.search("bash"), ())
             self.assertEqual(
                 [tool.name for tool in registry.search("bash", include_basic=True)],
-                ["bash"],
+                ["bash", "python_interpreter"],
             )
             self.assertEqual(registry.search("patch"), ())
             self.assertEqual(
@@ -877,6 +880,28 @@ class ToolRegistryTests(unittest.TestCase):
                 ],
                 [],
             )
+
+    def test_backed_discoverable_entries_reuse_executable_tool_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+
+            for tool_name in (
+                "generate_edit_image",
+                "memory_admin",
+                "transcribe",
+                "youtube",
+            ):
+                registered = registry.require(tool_name)
+                discoverable = registry.get_discoverable(tool_name)
+
+                self.assertIsNotNone(discoverable)
+                self.assertEqual(
+                    registered.definition.description,
+                    discoverable.detailed_description,
+                )
 
     def test_search_discoverable_matches_name_alias_and_description(self) -> None:
         registry = ToolRegistry()
@@ -3685,7 +3710,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("transcribe", result.content)
-        self.assertIn("gpt-4o-mini-transcribe", result.content)
+        self.assertIn("25 MB", result.content)
+        self.assertIn("audio_path", result.content)
         self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["transcribe"])
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],
@@ -3705,7 +3731,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("youtube", result.content)
-        self.assertIn("gemini-3-flash-preview", result.content)
+        self.assertIn("transcript=true", result.content)
+        self.assertIn("objectives", result.content)
         self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["youtube"])
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],

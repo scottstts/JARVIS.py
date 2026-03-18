@@ -104,10 +104,7 @@ def build_memory_admin_tool() -> RegisteredTool:
         exposure="discoverable",
         definition=ToolDefinition(
             name="memory_admin",
-            description=(
-                "Manual memory maintenance and inspection. Do not use this unless the user explicitly "
-                "requests memory administration."
-            ),
+            description=_build_memory_admin_tool_description(),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -137,10 +134,7 @@ def build_memory_admin_discoverable() -> DiscoverableTool:
         name="memory_admin",
         aliases=("memory maintenance", "memory reindex", "memory integrity"),
         purpose="Manual maintenance and inspection actions for the runtime memory system.",
-        detailed_description=(
-            "Use this only when the user explicitly asks for memory administration, reindexing, "
-            "integrity checks, embedding rebuilds, or a bootstrap preview."
-        ),
+        detailed_description=_build_memory_admin_tool_description(),
         usage={
             "actions": [
                 "reindex_all",
@@ -153,4 +147,11 @@ def build_memory_admin_discoverable() -> DiscoverableTool:
             ]
         },
         backing_tool_name="memory_admin",
+    )
+
+
+def _build_memory_admin_tool_description() -> str:
+    return (
+        "Run explicit memory maintenance or inspection actions. Use this only when the user "
+        "asks for memory admin work."
     )

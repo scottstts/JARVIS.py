@@ -119,7 +119,6 @@ def build_memory_write_tool() -> RegisteredTool:
             name="memory_write",
             description=(
                 "Create or update canonical memory documents through validated structured operations. "
-                "Prefer this over generic file editing for normal memory mutations. "
                 "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary. "
                 "For core and ongoing create/upsert operations, facts and relations are explicit-decision fields: always set both. "
                 "When the user states an explicit durable fact, pass it in facts; when they state a structured relationship, "

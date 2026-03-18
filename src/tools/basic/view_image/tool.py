@@ -129,8 +129,8 @@ def _build_view_image_tool_description(settings: ToolSettings) -> str:
         "Attach a workspace image file to the next model call so you can inspect it with "
         "multimodal vision. Only files inside "
         f"{settings.workspace_dir} are allowed. "
-        "Use this when a user message mentions a local_path for an image. "
-        "Supported image types shared across all provider adapters: PNG, JPEG, and WEBP. "
+        "Use this when you need to visually inspect a local image. "
+        "Supported image types: PNG, JPEG, and WEBP. "
         "The attachment is only guaranteed for the current tool-followup turn, so call "
         "view_image again later if you still need the image."
     )

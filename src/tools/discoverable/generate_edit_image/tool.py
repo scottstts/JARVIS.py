@@ -407,67 +407,45 @@ class GenerateEditImageToolExecutor:
 def build_generate_edit_image_tool(settings: ToolSettings) -> RegisteredTool:
     """Build the generate_edit_image registry entry."""
 
+    _ = settings
     return RegisteredTool(
         name="generate_edit_image",
         exposure="discoverable",
         definition=ToolDefinition(
             name="generate_edit_image",
-            description=_build_generate_edit_image_tool_description(settings),
+            description=_build_generate_edit_image_tool_description(),
             input_schema={
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": (
-                            "Required natural-language prompt describing the image to generate "
-                            "or the change to apply when editing an existing image."
-                        ),
+                        "description": "Required image instruction.",
                     },
                     "image_path": {
                         "type": "string",
-                        "description": (
-                            "Optional workspace image path. Omit it to generate a new image. "
-                            "Provide it only when you want to edit an existing PNG, JPEG, or "
-                            "WEBP image inside the workspace."
-                        ),
+                        "description": "Optional workspace source image.",
                     },
                     "output_path": {
                         "type": "string",
                         "description": (
-                            "Required workspace output file path for the generated image. "
-                            "The tool will create missing parent directories automatically. "
-                            "If the path has no file extension, the provider-safe image "
-                            "extension is appended automatically."
+                            "Required workspace output path. Parent directories are created "
+                            "automatically, and a safe image extension is added if needed."
                         ),
                     },
                     "provider": {
                         "type": "string",
                         "enum": list(_SUPPORTED_PROVIDERS),
-                        "description": (
-                            "Optional image provider. Defaults to 'gemini', which is usually "
-                            "faster and cheaper. Use 'openai' only when you specifically want "
-                            "the OpenAI image model."
-                        ),
+                        "description": "Optional provider: gemini or openai.",
                     },
                     "quality": {
                         "type": "string",
                         "enum": list(_OPENAI_QUALITY_VALUES),
-                        "description": (
-                            "Optional OpenAI-only quality hint. low is faster/cheaper, medium "
-                            "is the default balance, and high is slower/costlier but more "
-                            "detailed. Leave it unset unless higher fidelity or lower latency "
-                            "is explicitly needed."
-                        ),
+                        "description": "Optional OpenAI-only quality override.",
                     },
                     "resolution": {
                         "type": "string",
                         "enum": list(_GEMINI_RESOLUTION_VALUES),
-                        "description": (
-                            "Optional Gemini-only resolution hint. 512 is fastest/cheapest, "
-                            "1K is the default balance, and 2K/4K increase detail at higher "
-                            "latency/cost. Leave it unset unless a larger or smaller output is "
-                            "explicitly needed."
-                        ),
+                        "description": "Optional Gemini-only resolution override.",
                     },
                 },
                 "required": ["prompt", "output_path"],
@@ -486,136 +464,59 @@ def build_generate_edit_image_discoverable() -> DiscoverableTool:
         aliases=(
             "generate image",
             "edit image",
-            "image generation",
-            "image editing",
             "create image",
         ),
         purpose=(
             "Generate a new image from a text prompt or edit an existing workspace image "
             "with a text prompt."
         ),
-        detailed_description=(
-            "Backed executable discoverable tool for prompt-based image generation and "
-            "single-image editing. It defaults to Gemini because that path is usually "
-            "faster and cheaper, but it can also use OpenAI. The agent chooses an explicit "
-            "workspace output_path, the tool creates missing parent directories, and the "
-            "saved local path is returned in the result."
-        ),
+        detailed_description=_build_generate_edit_image_tool_description(),
         usage={
             "arguments": [
                 {
                     "name": "prompt",
                     "type": "string",
                     "required": True,
-                    "description": "Describe the image to generate or the edit to apply.",
                 },
                 {
                     "name": "image_path",
                     "type": "string",
                     "required": False,
-                    "description": (
-                        "Workspace image path for edit mode. Omit it for generation mode."
-                    ),
                 },
                 {
                     "name": "output_path",
                     "type": "string",
                     "required": True,
-                    "description": (
-                        "Workspace file path for the output image. Missing parent directories "
-                        "are created automatically."
-                    ),
                 },
                 {
                     "name": "provider",
                     "type": "string",
                     "required": False,
-                    "default": _DEFAULT_PROVIDER,
                     "enum": list(_SUPPORTED_PROVIDERS),
-                    "description": (
-                        "Provider selector. Gemini is the default and should usually be tried "
-                        "first."
-                    ),
                 },
                 {
                     "name": "quality",
                     "type": "string",
                     "required": False,
-                    "default": _DEFAULT_OPENAI_QUALITY,
                     "enum": list(_OPENAI_QUALITY_VALUES),
-                    "description": (
-                        "OpenAI-only quality hint. Use only when you explicitly need faster "
-                        "lower-fidelity output or slower higher-fidelity output."
-                    ),
                 },
                 {
                     "name": "resolution",
                     "type": "string",
                     "required": False,
-                    "default": _DEFAULT_GEMINI_RESOLUTION,
                     "enum": list(_GEMINI_RESOLUTION_VALUES),
-                    "description": (
-                        "Gemini-only resolution hint. Use only when you explicitly need a "
-                        "smaller or larger output than the default."
-                    ),
                 },
             ],
-            "examples": [
-                {
-                    "mode": "generate",
-                    "arguments": {
-                        "prompt": "A clean product photo of a matte black coffee grinder on a white studio background.",
-                        "output_path": "artifacts/coffee-grinder.png",
-                    },
-                },
-                {
-                    "mode": "edit",
-                    "arguments": {
-                        "prompt": "Replace the background with a warm sunrise sky while keeping the subject unchanged.",
-                        "image_path": "temp/input.png",
-                        "output_path": "artifacts/input-sunrise.png",
-                    },
-                },
-            ],
-            "notes": [
-                "Use image_path only for editing.",
-                "output_path must stay inside the workspace.",
-                "Missing parent directories for output_path are created automatically.",
-                "Gemini is the default because it is usually faster and cheaper.",
-                "Leave quality or resolution unset unless the prompt explicitly needs a non-default tradeoff.",
-            ],
-        },
-        metadata={
-            "default_provider": _DEFAULT_PROVIDER,
-            "providers": {
-                "gemini": {
-                    "model": _GEMINI_IMAGE_MODEL,
-                    "default_resolution": _DEFAULT_GEMINI_RESOLUTION,
-                    "resolution_options": list(_GEMINI_RESOLUTION_VALUES),
-                },
-                "openai": {
-                    "model": _OPENAI_IMAGE_MODEL,
-                    "default_quality": _DEFAULT_OPENAI_QUALITY,
-                    "quality_options": list(_OPENAI_QUALITY_VALUES),
-                },
-            },
         },
         backing_tool_name="generate_edit_image",
     )
 
 
-def _build_generate_edit_image_tool_description(settings: ToolSettings) -> str:
+def _build_generate_edit_image_tool_description() -> str:
     return (
-        "Generate a new image from a text prompt or edit an existing workspace image. "
-        "You must provide output_path inside the workspace, and the tool will create missing "
-        "parent directories automatically. "
-        "Use provider='gemini' by default because it is usually faster and cheaper; switch "
-        "to provider='openai' only when OpenAI image output is specifically needed. "
-        "Provider-specific tuning is optional: OpenAI quality supports low/medium/high and "
-        "Gemini resolution supports 512/1K/2K/4K. Leave those unset unless the prompt "
-        "explicitly needs a non-default tradeoff; the tool defaults to OpenAI medium and "
-        "Gemini 1K. Gemini requests image-only output because this tool is intended for "
-        "image generation/editing rather than mixed text responses."
+        "Generate from `prompt` or edit `image_path`, writing the result to workspace "
+        "`output_path`. Default to `provider='gemini'`; use `openai` only when needed. "
+        "Leave `quality` and `resolution` unset unless the user asks for a specific tradeoff."
     )
 
 
