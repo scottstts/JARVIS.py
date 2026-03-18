@@ -125,6 +125,7 @@ def build_send_file_tool(settings: ToolSettings) -> RegisteredTool:
             },
         ),
         executor=SendFileToolExecutor(),
+        allowed_agent_kinds=("main",),
     )
 
 

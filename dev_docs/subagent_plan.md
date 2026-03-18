@@ -54,7 +54,7 @@ These are the settled design decisions and should be implemented exactly as foll
 15. Subagents must not perform memory reflection.
 16. Subagents must not have access to memory tools.
 17. The initial built-in tool blocklist for subagents is:
-   `memory_search`, `memory_get`, `memory_write`, `memory_admin`
+   `memory_search`, `memory_get`, `memory_write`, `memory_admin`, `send_file`
 18. Runtime tools registered through `workspace/runtime_tools/` remain available to subagents.
 19. The tool filtering design must be scalable so future built-in tools can be blocked from subagents without reworking the architecture.
 20. Subagent transcripts must be stored separately from main transcripts under `workspace/archive/`.
@@ -528,6 +528,7 @@ The initial built-in blocklist should be exactly:
 - `memory_get`
 - `memory_write`
 - `memory_admin`
+- `send_file`
 
 Do not silently add more blocked tools unless a later design decision says to.
 
@@ -887,7 +888,7 @@ Recommended settings:
 - `JARVIS_SUBAGENT_MAX_ACTIVE = 7`
 - `JARVIS_SUBAGENT_CODENAME_POOL = ("Friday", "Edith", "Karen", "Jocasta", "Tadashi", "Homer", "Ultron")`
 - `JARVIS_SUBAGENT_ARCHIVE_DIR = f"{AGENT_WORKSPACE}/archive/subagents"` when workspace is configured
-- `JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST = ("memory_search", "memory_get", "memory_write", "memory_admin")`
+- `JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST = ("memory_search", "memory_get", "memory_write", "memory_admin", "send_file")`
 - `JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT`
   - small integer to bound how many recent noteworthy subagent events are injected into the main turn snapshot
 
@@ -1061,6 +1062,7 @@ Add automated tests for the following.
 - subagent cannot access `memory_get`
 - subagent cannot access `memory_write`
 - subagent cannot activate `memory_admin`
+- subagent cannot access `send_file`
 - runtime manifest discoverables remain visible to subagents
 
 ### Storage

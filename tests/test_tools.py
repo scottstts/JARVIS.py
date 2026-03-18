@@ -930,7 +930,19 @@ class ToolRegistryTests(unittest.TestCase):
 
 
 class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
-    async def test_subagent_filtered_view_hides_blocked_memory_tools(self) -> None:
+    async def test_subagent_view_hides_main_only_send_file_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+            main_view = registry.filtered_view(agent_kind="main")
+            subagent_view = registry.filtered_view(agent_kind="subagent")
+
+            self.assertIsNotNone(main_view.get("send_file"))
+            self.assertIsNone(subagent_view.get("send_file"))
+
+    async def test_subagent_filtered_view_hides_blocked_built_in_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
@@ -943,6 +955,7 @@ class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
                     "memory_get",
                     "memory_write",
                     "memory_admin",
+                    "send_file",
                 ),
             )
 
@@ -956,6 +969,10 @@ class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotIn(
                 "memory_write",
+                [tool.name for tool in subagent_view.basic_definitions()],
+            )
+            self.assertNotIn(
+                "send_file",
                 [tool.name for tool in subagent_view.basic_definitions()],
             )
             self.assertEqual(
@@ -985,6 +1002,7 @@ class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
                     "memory_get",
                     "memory_write",
                     "memory_admin",
+                    "send_file",
                 ),
             )
             tool_search = subagent_view.require("tool_search")
