@@ -101,6 +101,8 @@ def build_tool_search_tool(catalog: ToolSearchCatalog) -> RegisteredTool:
                 "backed discoverable tools for the rest of the current turn. "
                 "If query is omitted or empty, this lists every discoverable tool at low "
                 "verbosity by default."
+                "For tasks that require tools, you **MUST ALWAYS** first use `tool_search` tool "
+                "to find the best suitable tool for the task before you start the task"
             ),
             input_schema={
                 "type": "object",

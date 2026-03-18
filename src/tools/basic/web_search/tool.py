@@ -164,8 +164,10 @@ def _build_web_search_tool_description(settings: ToolSettings) -> str:
     return (
         "Run a basic web search through Brave Search and return normalized web results. "
         f"Each search returns up to {settings.web_search_result_count} web results. "
-        "This tool intentionally keeps the Brave request minimal: web results only, no "
-        "advanced filters, no custom re-ranking, and no summary generation."
+        "Web search is for basic web page search oriented at text information. "
+        "For other types of information or gated information like YouTube, X(Twitter), etc., "
+        "look for dedicated tools first, and only default to web search "
+        "if you cannot find dedicated tools or if they're not available."
     )
 
 

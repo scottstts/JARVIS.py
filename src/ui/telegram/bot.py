@@ -39,8 +39,6 @@ from .gateway_client import (
 )
 
 LOGGER = logging.getLogger(__name__)
-_GENERIC_ERROR_REPLY = "I hit an internal error while processing that message."
-_FILE_DOWNLOAD_ERROR_REPLY = "I couldn't download that file from Telegram."
 _FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _APPROVAL_CALLBACK_PREFIX = "appr"
@@ -224,7 +222,7 @@ class _LegacyRouteSessionAdapter:
                         agent_kind="main",
                         agent_name="Jarvis",
                         code="gateway_unavailable",
-                        message=_GENERIC_ERROR_REPLY,
+                        message="",
                     )
                 )
 
@@ -349,11 +347,13 @@ class TelegramGatewayBridge:
                 approved=callback.approved,
             )
         except GatewayBridgeError:
-            LOGGER.exception("Failed to submit approval callback to the gateway.")
+            LOGGER.exception(
+                "Failed to submit approval callback to the gateway; suppressing Telegram error text."
+            )
             await self._telegram.answer_callback_query(
                 callback_query_id=callback.callback_query_id,
-                text="Could not contact the gateway.",
-                show_alert=True,
+                text=None,
+                show_alert=False,
             )
             return
 
@@ -489,7 +489,7 @@ class TelegramGatewayBridge:
                         agent_name="Jarvis",
                         subagent_id=None,
                         code=exc.code,
-                        message=exc.message or _GENERIC_ERROR_REPLY,
+                        message=exc.message,
                     )
                 )
         except Exception:
@@ -506,7 +506,7 @@ class TelegramGatewayBridge:
                         agent_name="Jarvis",
                         subagent_id=None,
                         code="gateway_unavailable",
-                        message=_GENERIC_ERROR_REPLY,
+                        message="",
                     )
                 )
         finally:
@@ -570,10 +570,13 @@ class TelegramGatewayBridge:
             )
             return
         if isinstance(event, GatewayErrorEvent):
-            await self._send_final_text(
-                chat_id=chat_id,
-                text=event.message or _GENERIC_ERROR_REPLY,
+            LOGGER.warning(
+                "Suppressing background gateway error for Telegram chat %s (code=%s, message=%s).",
+                chat_id,
+                event.code or "gateway_error",
+                event.message or "",
             )
+            return
 
     async def handle_message(self, message: IncomingTelegramMessage) -> None:
         if message.chat_type != "private":
@@ -593,10 +596,8 @@ class TelegramGatewayBridge:
             try:
                 user_text = await self._build_file_turn_text(message)
             except TelegramAPIError:
-                LOGGER.exception("Telegram file download failed.")
-                await self._send_final_text(
-                    chat_id=message.chat_id,
-                    text=_FILE_DOWNLOAD_ERROR_REPLY,
+                LOGGER.exception(
+                    "Telegram file download failed; suppressing Telegram error text."
                 )
                 return
 
@@ -624,9 +625,11 @@ class TelegramGatewayBridge:
             while True:
                 event = await pending_queue.get()
                 if isinstance(event, GatewayErrorEvent):
-                    await self._send_final_text(
-                        chat_id=message.chat_id,
-                        text=event.message if event.message else _GENERIC_ERROR_REPLY,
+                    LOGGER.warning(
+                        "Suppressing gateway error for Telegram chat %s (code=%s, message=%s).",
+                        message.chat_id,
+                        event.code or "gateway_error",
+                        event.message or "",
                     )
                     return
                 if isinstance(event, GatewayDeltaEvent):
@@ -747,23 +750,14 @@ class TelegramGatewayBridge:
                             text=final_text,
                         )
                     return
-        except GatewayBridgeError as exc:
-            LOGGER.exception("Gateway bridge failed.")
-            await self._send_final_text(
-                chat_id=message.chat_id,
-                text=exc.message if exc.message else _GENERIC_ERROR_REPLY,
+        except GatewayBridgeError:
+            LOGGER.exception(
+                "Gateway bridge failed; suppressing Telegram error text."
             )
         except TelegramAPIError:
             LOGGER.exception("Telegram API send failed.")
         except Exception:
-            LOGGER.exception("Unexpected bridge error.")
-            try:
-                await self._send_final_text(
-                    chat_id=message.chat_id,
-                    text=_GENERIC_ERROR_REPLY,
-                )
-            except TelegramAPIError:
-                LOGGER.exception("Failed to send fallback error text.")
+            LOGGER.exception("Unexpected bridge error; suppressing Telegram error text.")
         finally:
             self._pending_turn_events_by_chat.pop(message.chat_id, None)
 
@@ -799,10 +793,10 @@ class TelegramGatewayBridge:
             route_session = await self._ensure_route_session(message.chat_id)
             stop_requested = await route_session.request_stop()
         except GatewayBridgeError as exc:
-            LOGGER.exception("Gateway stop request failed.")
-            await self._send_final_text(
-                chat_id=message.chat_id,
-                text=exc.message if exc.message else _GENERIC_ERROR_REPLY,
+            LOGGER.exception(
+                "Gateway stop request failed; suppressing Telegram error text (code=%s, message=%s).",
+                exc.code,
+                exc.message,
             )
             return
 
