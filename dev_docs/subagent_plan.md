@@ -63,7 +63,7 @@ These are the settled design decisions and should be implemented exactly as foll
    invoke, monitor, stop, step in, and dispose subagents
 23. `step in` means:
    cooperatively stop the subagent if it is currently running, wait for the turn to settle, then start a new subagent turn with updated direction
-24. `/stop` from the user continues to stop the main agent only.
+24. `/stop` from the user cooperatively stops the main agent and any active subagents.
 25. The user does not directly converse with subagents.
 26. Telegram should receive system messages when a subagent is invoked and when a subagent is disposed.
 27. Telegram tool-use notices and approval notices must include the acting agent name.
@@ -926,7 +926,10 @@ Tasks:
 Exit criteria:
 
 - main-agent chat still works end to end
-- `/stop` still stops the main agent only
+- `/stop` still cooperatively stops the main agent at assistant/tool-step boundaries
+- active subagents are also cooperatively stopped and later settle into `paused`
+- already-running subagent tool executions are still allowed to finish and log their results before pause
+- the main transcript gets a persistent system note reminding Jarvis to inspect paused subagents after the user resumes
 - approvals still work for the main agent
 
 ### Phase 3: AgentLoop Configurability
@@ -1140,7 +1143,7 @@ This feature is done when all of the following are true:
    - dispose notice
    - attributed tool notices
    - attributed approval requests
-11. User `/stop` still affects only the main agent.
+11. User `/stop` cooperatively affects the main agent and any active subagents, while still requiring a later user message before Jarvis resumes.
 12. Rejected subagent approvals pause the subagent rather than collapsing the whole route.
 13. Jarvis sees concise subagent state in later turns without the user manually managing it.
 14. Related development docs have been updated where the implementation made them stale.

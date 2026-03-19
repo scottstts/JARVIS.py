@@ -24,6 +24,7 @@ from gateway.route_runtime import (
     _tool_result_for_payload,
 )
 from gateway.session_router import SessionRouter, validate_route_id
+from subagent.types import SubagentSnapshot
 from tests.helpers import build_core_settings
 
 
@@ -213,6 +214,43 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_requested_when_only_subagent_is_running_appends_main_transcript_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Friday",
+                status="running",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="main_turn",
+                current_subagent_session_id="sub_session",
+            )
+
+            with patch.object(runtime._main_loop, "request_stop", return_value=False):
+                with patch.object(
+                    runtime._subagent_manager,
+                    "request_stop_all_for_user_stop",
+                    return_value=(snapshot,),
+                ):
+                    self.assertTrue(runtime.request_stop())
+
+            self.assertTrue(runtime._main_resume_requires_user_message)
+            records = runtime._main_loop._storage.load_records(session_id)
+            stop_notes = [
+                record
+                for record in records
+                if record.role == "system" and record.metadata.get("user_stop_subagents") is True
+            ]
+            self.assertEqual(len(stop_notes), 1)
+            self.assertIn("The user issued /stop.", stop_notes[0].content)
+            self.assertIn("Friday (sub_1)", stop_notes[0].content)
+            self.assertEqual(stop_notes[0].metadata["subagent_ids"], ["sub_1"])
+
     async def test_stop_suppresses_new_terminal_subagent_followup_until_user_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(

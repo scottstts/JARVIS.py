@@ -21,6 +21,7 @@ from gateway.route_events import (
 )
 from llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent
 from subagent.manager import SubagentManager
+from subagent.runtime import SubagentRuntime
 from subagent.settings import SubagentSettings
 from subagent.storage import SubagentCatalogStorage
 from tests.helpers import build_core_settings
@@ -57,6 +58,7 @@ class _FakeSubagentLoop:
     def __init__(self, events: list[object], *, session_id: str = "subagent_session") -> None:
         self._events = tuple(events)
         self._session_id = session_id
+        self.stop_requests = 0
 
     async def prepare_session(self, *, start_reason: str) -> str:
         _ = start_reason
@@ -71,6 +73,7 @@ class _FakeSubagentLoop:
         return self._session_id
 
     def request_stop(self) -> bool:
+        self.stop_requests += 1
         return True
 
 
@@ -254,6 +257,89 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     for event in published_events
                 )
             )
+
+    async def test_request_stop_all_for_user_stop_targets_only_active_subagents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            running_loop = _FakeSubagentLoop([], session_id="running_session")
+            paused_loop = _FakeSubagentLoop([], session_id="paused_session")
+            awaiting_loop = _FakeSubagentLoop([], session_id="awaiting_session")
+            completed_loop = _FakeSubagentLoop([], session_id="completed_session")
+
+            manager._subagents = {
+                "sub_running": SubagentRuntime(
+                    subagent_id="sub_running",
+                    codename="Friday",
+                    loop=running_loop,  # type: ignore[arg-type]
+                    storage=manager._catalog.session_storage("sub_running"),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="main_turn",
+                    status="running",
+                    created_at="2026-03-19T12:00:00+00:00",
+                    updated_at="2026-03-19T12:00:00+00:00",
+                ),
+                "sub_paused": SubagentRuntime(
+                    subagent_id="sub_paused",
+                    codename="Karen",
+                    loop=paused_loop,  # type: ignore[arg-type]
+                    storage=manager._catalog.session_storage("sub_paused"),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="main_turn",
+                    status="paused",
+                    created_at="2026-03-19T12:00:00+00:00",
+                    updated_at="2026-03-19T12:00:00+00:00",
+                ),
+                "sub_awaiting": SubagentRuntime(
+                    subagent_id="sub_awaiting",
+                    codename="Ultron",
+                    loop=awaiting_loop,  # type: ignore[arg-type]
+                    storage=manager._catalog.session_storage("sub_awaiting"),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="main_turn",
+                    status="awaiting_approval",
+                    created_at="2026-03-19T12:00:00+00:00",
+                    updated_at="2026-03-19T12:00:00+00:00",
+                ),
+                "sub_completed": SubagentRuntime(
+                    subagent_id="sub_completed",
+                    codename="Edith",
+                    loop=completed_loop,  # type: ignore[arg-type]
+                    storage=manager._catalog.session_storage("sub_completed"),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="main_turn",
+                    status="completed",
+                    created_at="2026-03-19T12:00:00+00:00",
+                    updated_at="2026-03-19T12:00:00+00:00",
+                ),
+            }
+
+            affected = manager.request_stop_all_for_user_stop()
+
+            self.assertEqual([snapshot.subagent_id for snapshot in affected], ["sub_running", "sub_awaiting"])
+            self.assertEqual(running_loop.stop_requests, 1)
+            self.assertEqual(awaiting_loop.stop_requests, 1)
+            self.assertEqual(paused_loop.stop_requests, 0)
+            self.assertEqual(completed_loop.stop_requests, 0)
+            self.assertEqual(manager._subagents["sub_running"].pending_pause_reason, "main_stop")
+            self.assertEqual(manager._subagents["sub_awaiting"].pending_pause_reason, "main_stop")
+            self.assertIsNone(manager._subagents["sub_paused"].pending_pause_reason)
+            self.assertIsNone(manager._subagents["sub_completed"].pending_pause_reason)
 
     async def test_completed_subagent_counts_until_dispose_and_codename_reuses_after_dispose(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

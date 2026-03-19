@@ -330,6 +330,31 @@ class AgentLoop:
         active = self._storage.get_active_session()
         return active.session_id if active is not None else None
 
+    def append_system_note(
+        self,
+        content: str,
+        *,
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        normalized_content = content.strip()
+        if not normalized_content:
+            return False
+
+        target_session_id = session_id or self.active_session_id()
+        if target_session_id is None:
+            return False
+        if self._storage.get_session(target_session_id) is None:
+            return False
+
+        self._append_message(
+            session_id=target_session_id,
+            role="system",
+            content=normalized_content,
+            metadata=metadata,
+        )
+        return True
+
     async def prepare_session(self, *, start_reason: str = "initial") -> str:
         await self._ensure_memory_runtime_ready()
         active = self._storage.get_active_session()

@@ -30,6 +30,7 @@ from subagent import (
     build_subagent_primitive_definitions,
     render_subagent_primitive_docs,
 )
+from subagent.types import SubagentSnapshot
 from tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 
 from .route_events import (
@@ -47,6 +48,10 @@ _INTERNAL_ERROR_MESSAGE = "Internal error while processing message."
 _PROVIDER_TIMEOUT_MESSAGE = "The model timed out while processing that message."
 _SUBAGENT_TERMINAL_NOTICE_KINDS = frozenset(
     {"subagent_completed", "subagent_failed", "subagent_approval_rejected"}
+)
+_SUBAGENT_USER_STOP_NOTE_HEADER = (
+    "The user issued /stop. Any active background subagents were also asked to stop "
+    "cooperatively."
 )
 _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT = (
     "Internal runtime follow-up: a background subagent reached a terminal state. "
@@ -171,10 +176,14 @@ class RouteRuntime:
         return self._main_loop.active_session_id()
 
     def request_stop(self) -> bool:
-        stop_requested = self._main_loop.request_stop()
+        main_stop_requested = self._main_loop.request_stop()
+        affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
+        stop_requested = main_stop_requested or bool(affected_subagents)
         if stop_requested and not self._main_resume_requires_user_message:
             self._main_resume_requires_user_message = True
             self._internal_followup_generation += 1
+        if affected_subagents:
+            self._append_user_stop_subagent_note(affected_subagents)
         return stop_requested
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
@@ -527,6 +536,46 @@ class RouteRuntime:
                     "arguments": dict(tool_call.arguments),
                 },
             )
+
+
+    def _append_user_stop_subagent_note(
+        self,
+        affected_subagents: Sequence[SubagentSnapshot],
+    ) -> None:
+        session_id = self._main_loop.active_session_id()
+        if session_id is None and affected_subagents:
+            owner_session_id = affected_subagents[0].owner_main_session_id
+            if owner_session_id.strip():
+                session_id = owner_session_id
+        if session_id is None:
+            return
+
+        lines = [_SUBAGENT_USER_STOP_NOTE_HEADER, "", "Affected subagents:"]
+        subagent_ids: list[str] = []
+        codenames: list[str] = []
+        for snapshot in affected_subagents:
+            codename = snapshot.codename.strip() or "Unknown"
+            subagent_id = snapshot.subagent_id.strip() or "unknown"
+            status = snapshot.status.strip() or "unknown"
+            lines.append(f"- {codename} ({subagent_id}) [status_at_stop_request={status}]")
+            subagent_ids.append(subagent_id)
+            codenames.append(codename)
+        lines.extend(
+            [
+                "",
+                "Any tool execution already started by one of these subagents was allowed to finish and log its result in the child transcript before the child settles.",
+                "When you resume, inspect current subagent status, then decide whether to resume it, step in, dispose it, or otherwise handle it so no paused child is left orphaned.",
+            ]
+        )
+        self._main_loop.append_system_note(
+            "\n".join(lines),
+            session_id=session_id,
+            metadata={
+                "user_stop_subagents": True,
+                "subagent_ids": subagent_ids,
+                "subagent_codenames": codenames,
+            },
+        )
 
 
 def _optional_string(value: Any) -> str | None:

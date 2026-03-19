@@ -102,3 +102,4 @@
 - Session transcripts now log the raw session-start basic `ToolDefinition` payloads as transcript-only developer records for audit, so the stored JSONL reflects the same basic tool schema/description data the agent received in `LLMRequest.tools`.
 - Built-in discoverable tool text is now intentionally minimal for model context: keep purpose/search cues strong, keep high-verbosity surfaces compact, and omit examples/metadata/repeated defaults unless they add unique operator value.
 - Added a main-agent-only discoverable `email` tool that sends through SMTP with per-send approval hashing, markdown-to-HTML rendering, optional workspace attachments, and a forced `Sent by Jarvis` footer.
+- User `/stop` is now route-wide: it cooperatively stops active subagents too, lets any already-started child tool call finish and persist before pause, and writes a persistent main-session system note reminding Jarvis to inspect paused subagents after resume.

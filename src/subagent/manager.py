@@ -40,7 +40,12 @@ from .codenames import allocate_codename
 from .runtime import SubagentRuntime
 from .settings import SubagentSettings
 from .storage import SubagentCatalogStorage
-from .types import SubagentCatalogEntry, SubagentEventNote, SubagentSnapshot
+from .types import (
+    SubagentCatalogEntry,
+    SubagentEventNote,
+    SubagentPauseReason,
+    SubagentSnapshot,
+)
 
 
 class SubagentManager:
@@ -184,17 +189,22 @@ class SubagentManager:
             ],
         }
 
+    def request_stop_all_for_user_stop(self) -> tuple[SubagentSnapshot, ...]:
+        affected: list[SubagentSnapshot] = []
+        for runtime in self._non_disposed_runtimes():
+            if self._request_runtime_stop(runtime, pause_reason="main_stop"):
+                affected.append(runtime.snapshot())
+        return tuple(affected)
+
     async def stop(self, *, agent: str, reason: str | None = None) -> dict[str, Any]:
         runtime = self._require_runtime(agent)
-        if runtime.status in {"paused", "completed", "failed", "disposed"}:
+        if not self._request_runtime_stop(runtime, pause_reason="main_stop"):
             return {
                 "subagent_id": runtime.subagent_id,
                 "codename": runtime.codename,
                 "status": runtime.status,
                 "changed": False,
             }
-        runtime.pending_pause_reason = "main_stop"
-        runtime.loop.request_stop()
         await self._wait_for_turn_settle(runtime)
         if reason and reason.strip():
             self._append_notable_event(
@@ -655,6 +665,19 @@ class SubagentManager:
             await task
         finally:
             runtime.task = None
+
+    def _request_runtime_stop(
+        self,
+        runtime: SubagentRuntime,
+        *,
+        pause_reason: SubagentPauseReason,
+    ) -> bool:
+        if runtime.status in {"paused", "completed", "failed", "disposed"}:
+            return False
+        if not runtime.loop.request_stop():
+            return False
+        runtime.pending_pause_reason = pause_reason
+        return True
 
     def _require_runtime(self, agent: str) -> SubagentRuntime:
         normalized = agent.strip()

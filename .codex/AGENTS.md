@@ -104,7 +104,7 @@ Some of the docs are implementation plans, some are ad hoc documentations. All o
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
 - No need to delete __pycache__/
 - agent system runtime settings live in src/settings.py, and only secrets (api keys, bot tokens, etc.) need to be in secrets/
-- After testing, clean up any testing artifacts inside the ~/.jarvis/workspace/ dir
+- After testing, **clean up** any testing artifacts inside the ~/.jarvis/workspace/ dir. The artifacts i refer to are the folders inside workspace/ like this: `~/.jarvis/workspace/jarvis-test-_gmb1oo6/`
 
 # Notes & Lessons
 
