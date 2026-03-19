@@ -965,7 +965,7 @@ class ToolRegistryTests(unittest.TestCase):
 
 
 class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
-    async def test_subagent_view_hides_main_only_send_file_tool(self) -> None:
+    async def test_subagent_view_hides_main_only_send_file_and_email_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
@@ -976,6 +976,8 @@ class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNotNone(main_view.get("send_file"))
             self.assertIsNone(subagent_view.get("send_file"))
+            self.assertIsNotNone(main_view.get("email"))
+            self.assertIsNone(subagent_view.get("email"))
 
     async def test_subagent_filtered_view_hides_blocked_built_in_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -991,6 +993,7 @@ class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
                     "memory_write",
                     "memory_admin",
                     "send_file",
+                    "email",
                 ),
             )
 
@@ -1008,6 +1011,10 @@ class ToolRegistryFilteredViewTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotIn(
                 "send_file",
+                [tool.name for tool in subagent_view.basic_definitions()],
+            )
+            self.assertNotIn(
+                "email",
                 [tool.name for tool in subagent_view.basic_definitions()],
             )
             self.assertEqual(

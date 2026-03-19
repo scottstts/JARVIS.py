@@ -156,6 +156,7 @@ JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST: Final[tuple[str, ...]] = (
     "memory_write",
     "memory_admin",
     "send_file",
+    "email",
 )
 JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT: Final = 8
 

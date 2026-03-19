@@ -55,6 +55,9 @@ Current rule:
 - high-verbosity `tool_search` may transiently surface matched backed discoverable tools for the rest of the current turn
 - `ToolRegistry.filtered_view(...)` provides agent-scoped visibility so different actor types can share the same registry with different allowed tools
 - the current subagent filtered view hides the built-in memory tools by settings-backed blocklist while still allowing runtime manifest discoverables to remain visible through `tool_search`
+- every executable tool must have an explicit developer-decided subagent allow status from day 1
+- in code, do not rely on default agent visibility for new tools; set `allowed_agent_kinds` explicitly on every `RegisteredTool` and every `DiscoverableTool` entry that can activate a backing tool
+- treat subagent allow status as required tool-spec input during implementation, not as a later cleanup once subagent compatibility questions arise
 
 ### Discoverable Catalog
 
@@ -126,15 +129,17 @@ Required wiring:
 1. Create the discoverable executable tool package under `src/tools/discoverable/<tool_name>/`.
 2. Implement the executor and `build_<tool_name>_tool(...)` exactly like any other tool.
 3. Set `exposure="discoverable"` on the returned `RegisteredTool`.
-4. Register that executable tool in `ToolRegistry.default(...)` with `registry.register(...)`.
-5. Register a separate discoverable catalog entry with `registry.register_discoverable(DiscoverableTool(...))`.
-6. Set `backing_tool_name` on the discoverable entry to the executable tool name.
-7. Add the policy branch in `src/tools/policy.py`.
+4. Explicitly set the tool's subagent allow status through `allowed_agent_kinds`; never leave this implicit.
+5. Register that executable tool in `ToolRegistry.default(...)` with `registry.register(...)`.
+6. Register a separate discoverable catalog entry with `registry.register_discoverable(DiscoverableTool(...))`.
+7. Explicitly set the discoverable entry's `allowed_agent_kinds` to match the intended subagent allow status when it maps to a backing tool.
+8. Set `backing_tool_name` on the discoverable entry to the executable tool name.
+9. Add the policy branch in `src/tools/policy.py`.
 
 Important:
 
 - the executable tool registration and the discoverable catalog registration are separate steps by design
-- if you forget step 7, the tool may appear in the follow-up request after `tool_search`, but runtime execution will still be denied by policy
+- if you forget step 9, the tool may appear in the follow-up request after `tool_search`, but runtime execution will still be denied by policy
 - the recommended convention is for discoverable `name` and executable tool name to match unless there is a strong reason not to
 - for backed discoverables, keep one long-form description source of truth by reusing the executable `ToolDefinition.description` text for the discoverable entry's `detailed_description` instead of maintaining two separate long descriptions
 - do not mirror the same defaults, limits, or path rules across `purpose`, `detailed_description`, `usage`, and `metadata`; keep each field doing distinct work
