@@ -54,16 +54,32 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
         exposure="basic",
         definition=ToolDefinition(
             name="bash",
-            description=format_bash_tool_description(),
+            description=format_bash_tool_description(settings),
             input_schema={
                 "type": "object",
                 "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["foreground", "background", "status", "tail", "cancel"],
+                        "description": (
+                            "Optional bash operation mode. Defaults to 'foreground'. "
+                            "Use 'background' to start a long-running job, 'status' to "
+                            "inspect it, 'tail' to read recent output, and 'cancel' to stop it."
+                        ),
+                    },
                     "command": {
                         "type": "string",
                         "description": (
-                            "Bash command to run."
+                            "Bash command to run for foreground or background execution. "
                             "Use normal shell syntax, including pipes, redirects, "
                             "command substitution, &&, ||, and multiline scripts."
+                        ),
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": (
+                            "Background job identifier used with mode='status', "
+                            "mode='tail', or mode='cancel'."
                         ),
                     },
                     "timeout_seconds": {
@@ -71,8 +87,25 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                         "minimum": 1,
                         "maximum": settings.bash_max_timeout_seconds,
                         "description": (
-                            "Optional command timeout in seconds. Use only when a "
-                            "command may legitimately need more than the default."
+                            "Optional foreground command timeout in seconds. Use only when a "
+                            "foreground command may legitimately need more than the default."
+                        ),
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "description": (
+                            "Optional number of trailing lines to return for mode='tail'."
+                        ),
+                    },
+                    "tail_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": settings.bash_max_output_chars,
+                        "description": (
+                            "Optional byte limit for mode='tail'. Defaults to the bash "
+                            "output limit when omitted."
                         ),
                     },
                     "approval_summary": {
@@ -97,7 +130,6 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                         ),
                     },
                 },
-                "required": ["command"],
                 "additionalProperties": False,
             },
         ),

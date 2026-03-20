@@ -58,7 +58,7 @@ class ToolSettings:
     bash_max_output_chars: int
     bash_dangerously_skip_permission: bool
     python_interpreter_venv: Path
-    python_interpreter_allowed_packages: tuple[str, ...]
+    python_interpreter_starter_packages: tuple[str, ...]
     python_interpreter_default_timeout_seconds: float
     python_interpreter_max_timeout_seconds: float
     python_interpreter_max_output_chars: int
@@ -107,8 +107,6 @@ class ToolSettings:
             raise ValueError("bash_dangerously_skip_permission must be a boolean.")
         if not str(self.python_interpreter_venv).strip():
             raise ValueError("python_interpreter_venv cannot be empty.")
-        if not self.python_interpreter_allowed_packages:
-            raise ValueError("python_interpreter_allowed_packages cannot be empty.")
         if self.python_interpreter_default_timeout_seconds <= 0:
             raise ValueError("python_interpreter_default_timeout_seconds must be > 0.")
         if self.python_interpreter_max_timeout_seconds <= 0:
@@ -218,8 +216,8 @@ class ToolSettings:
                 _optional_env("JARVIS_TOOL_PYTHON_INTERPRETER_VENV")
                 or app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_VENV
             ).expanduser(),
-            python_interpreter_allowed_packages=tuple(
-                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_ALLOWED_PACKAGES
+            python_interpreter_starter_packages=tuple(
+                app_settings.JARVIS_TOOL_PYTHON_INTERPRETER_STARTER_PACKAGES
             ),
             python_interpreter_default_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_PYTHON_INTERPRETER_DEFAULT_TIMEOUT_SECONDS",

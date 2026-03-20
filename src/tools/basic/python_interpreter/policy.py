@@ -13,7 +13,7 @@ _MAX_ARG_CHARS = 512
 
 
 class PythonInterpreterPolicy:
-    """Restricts python_interpreter to explicit, sandboxable workspace access."""
+    """Validates structured python_interpreter requests before direct execution."""
 
     def __init__(self, settings: ToolSettings) -> None:
         self._settings = settings

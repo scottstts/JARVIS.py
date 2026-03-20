@@ -12,7 +12,7 @@ from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 from .local_executor import (
     _MAX_ARGS,
     _MAX_ARG_CHARS,
-    SandboxedPythonInterpreterToolExecutor,
+    DirectPythonInterpreterToolExecutor,
     build_python_interpreter_description,
 )
 
@@ -22,7 +22,7 @@ class PythonInterpreterToolExecutor:
 
     def __init__(self, settings: ToolSettings) -> None:
         self._remote_client = RemoteToolRuntimeClient(settings)
-        self._local_executor = SandboxedPythonInterpreterToolExecutor(
+        self._local_executor = DirectPythonInterpreterToolExecutor(
             settings,
             target_runtime="local_app_process",
             runtime_location="local_app_process",

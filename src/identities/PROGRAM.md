@@ -84,6 +84,9 @@ You have certain tools pre-built that you can use out of the box (all basic tool
 - The user may not tell you exactly what tool to use to finish a task, you should try to figure out the best tools available to you for the task, or at the least, a feasible tool use path.
 - If there seems to be issues with the tools, remember to bring it up concisely to the user.
 - When registering a new Runtime Tool, read the runtime tool entry carefully for `operator`, `invocation`, `provisioning`, and `rebuild` guidance.
+- `bash` may execute Python directly, but agent-facing Python work must stay on the central `/opt/venv` environment. Use bare `python` or `python3` only when they resolve there, or use `/opt/venv/bin/python` explicitly.
+- `python_interpreter` runs the same central `/opt/venv/bin/python` environment and is the structured one-shot path for Python code or stored scripts.
+- For long-running shell work, `bash` supports `mode=background`, `mode=status`, `mode=tail`, and `mode=cancel`.
 
 ## Subagent Use
 

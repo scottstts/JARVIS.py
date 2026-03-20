@@ -34,13 +34,8 @@ class ToolPolicy:
         context: ToolExecutionContext,
     ) -> ToolPolicyDecision:
         if tool_name == "bash":
-            command = str(arguments.get("command", "")).strip()
-            if not command:
-                return ToolPolicyDecision(allowed=False, reason="bash command cannot be empty.")
-
             settings = ToolSettings.from_workspace_dir(context.workspace_dir)
             return BashCommandPolicy(settings).authorize(
-                command=command,
                 arguments=arguments,
                 context=context,
             )

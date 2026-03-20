@@ -18,6 +18,7 @@ class RemoteToolRuntimeClient:
     """Executes remote-capable tools inside the isolated tool-runtime container."""
 
     def __init__(self, settings: ToolSettings) -> None:
+        self._settings = settings
         self._base_url = settings.tool_runtime_base_url
         self._timeout_seconds = settings.tool_runtime_timeout_seconds
         self._healthcheck_timeout_seconds = settings.tool_runtime_healthcheck_timeout_seconds
@@ -80,10 +81,16 @@ class RemoteToolRuntimeClient:
             payload["route_id"] = context.route_id
 
         endpoint = f"/tools/{tool_name}/execute"
+        request_timeout = _resolve_request_timeout_seconds(
+            self._settings,
+            tool_name=tool_name,
+            arguments=arguments,
+            base_timeout_seconds=self._timeout_seconds,
+        )
         try:
             async with httpx.AsyncClient(
                 base_url=self._base_url,
-                timeout=self._timeout_seconds,
+                timeout=request_timeout,
             ) as client:
                 response = await client.post(endpoint, json=payload)
         except httpx.HTTPError as exc:
@@ -143,7 +150,6 @@ def _parse_execution_result(
     metadata = payload.get("metadata", {})
     if not isinstance(metadata, dict):
         raise RemoteToolRuntimeError("tool_runtime response field 'metadata' must be an object.")
-
     return ToolExecutionResult(
         call_id=call_id,
         name=name,
@@ -151,6 +157,48 @@ def _parse_execution_result(
         content=content,
         metadata=dict(metadata),
     )
+
+
+def _resolve_effective_timeout(
+    requested_timeout: object,
+    *,
+    default_timeout: float,
+    max_timeout: float,
+) -> float:
+    if requested_timeout is None:
+        return default_timeout
+
+    effective_timeout = float(requested_timeout)
+    if effective_timeout < 1:
+        effective_timeout = 1.0
+    if effective_timeout > max_timeout:
+        effective_timeout = max_timeout
+    return effective_timeout
+
+
+def _resolve_request_timeout_seconds(
+    settings: ToolSettings,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    base_timeout_seconds: float,
+) -> float:
+    requested_timeout = arguments.get("timeout_seconds")
+    if tool_name == "bash":
+        effective_timeout = _resolve_effective_timeout(
+            requested_timeout,
+            default_timeout=settings.bash_default_timeout_seconds,
+            max_timeout=settings.bash_max_timeout_seconds,
+        )
+    elif tool_name == "python_interpreter":
+        effective_timeout = _resolve_effective_timeout(
+            requested_timeout,
+            default_timeout=settings.python_interpreter_default_timeout_seconds,
+            max_timeout=settings.python_interpreter_max_timeout_seconds,
+        )
+    else:
+        return base_timeout_seconds
+    return max(base_timeout_seconds, effective_timeout + 15.0)
 
 
 async def ensure_remote_tool_runtime_healthy(settings: ToolSettings) -> None:

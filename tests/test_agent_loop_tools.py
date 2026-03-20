@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import tempfile
 import unittest
 from base64 import b64decode
@@ -437,14 +439,13 @@ class _FakePythonInterpreterLLMService:
                         arguments={
                             "code": (
                                 "from pathlib import Path\n"
-                                "Path('/workspace/exports/report.txt').write_text("
-                                "'hello', encoding='utf-8')\n"
+                                "Path('exports/report.txt').write_text('hello', encoding='utf-8')\n"
                                 "print('done')\n"
                             ),
                         },
                         raw_arguments=(
                             '{"code":"from pathlib import Path\\nPath('
-                            "'/workspace/exports/report.txt').write_text('hello', "
+                            "'exports/report.txt').write_text('hello', "
                             "encoding='utf-8')\\nprint('done')\\n\"}"
                         ),
                     )
@@ -1820,13 +1821,23 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             exports_dir.mkdir(parents=True, exist_ok=True)
 
             storage = SessionStorage(settings.transcript_archive_dir)
-            loop = AgentLoop(
-                llm_service=_FakePythonInterpreterLLMService(),
-                settings=settings,
-                storage=storage,
-            )
-
-            result = await loop.handle_user_input("Use python to write hello into exports/report.txt.")
+            with patch.dict(
+                os.environ,
+                {
+                    "JARVIS_TOOL_PYTHON_INTERPRETER_VENV": str(
+                        Path(sys.executable).resolve().parent.parent
+                    )
+                },
+                clear=False,
+            ):
+                loop = AgentLoop(
+                    llm_service=_FakePythonInterpreterLLMService(),
+                    settings=settings,
+                    storage=storage,
+                )
+                result = await loop.handle_user_input(
+                    "Use python to write hello into exports/report.txt."
+                )
 
             self.assertEqual(result.response_text, "Python task finished.")
             self.assertEqual(
@@ -1863,7 +1874,10 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             async def _fake_send_telegram_file(**kwargs):
                 self.assertEqual(kwargs["route_id"], "tg_123")
-                self.assertEqual(kwargs["file_path"], report_path)
+                self.assertEqual(
+                    kwargs["file_path"].resolve(strict=False),
+                    report_path.resolve(strict=False),
+                )
                 return {"message_id": 7, "chat_id": 123}
 
             with patch(

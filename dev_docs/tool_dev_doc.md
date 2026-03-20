@@ -288,8 +288,8 @@ Structure:
 
 Current active policy:
 
-- `bash` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it scrubs the environment, shares only `/workspace`, enforces approval for install/build/system-mutation commands, and hard-denies pointless or harmful container-admin commands even inside `tool_runtime` unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
-- `python_interpreter` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it keeps the workspace-only script-path model, subprocess blocking, and no-network sandbox behavior
+- `bash` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it scrubs the environment, forces agent-facing Python usage through the central `/opt/venv` environment, supports foreground and background job modes, enforces approval for install/build/system-mutation commands, and hard-denies pointless or harmful container-admin commands even inside `tool_runtime` unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
+- `python_interpreter` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it is now a direct one-shot runner over the same central `/opt/venv/bin/python` environment used by `bash`
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
 - `tool_register` always requires exact-action approval and binds approval to the manifest payload hash
@@ -352,8 +352,15 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Input Schema
 
-- `command: string` required
-- `timeout_seconds: number` optional
+- `mode: string` optional; `foreground`, `background`, `status`, `tail`, `cancel`
+- `command: string` required for `foreground` and `background`
+- `job_id: string` required for `status`, `tail`, and `cancel`
+- `timeout_seconds: number` optional for `foreground`
+- `tail_lines: integer` optional for `tail`
+- `tail_bytes: integer` optional for `tail`
+- `approval_summary: string` optional
+- `approval_details: string` optional
+- `inspection_url: string` optional
 
 #### Executor Behavior
 
@@ -363,19 +370,24 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - the project repo is not mounted there, so `/repo` is absent by construction
 - no app secrets are mounted in `tool_runtime`
 - runs bash with `--noprofile --norc`
-- clears the environment and sets only a minimal runtime env (`PATH`, `HOME`, `PWD`, `TMPDIR`, `LANG`, `LC_ALL`)
+- clears the environment and sets only a minimal runtime env (`PATH`, `HOME`, `PWD`, `TMPDIR`, `LANG`, `LC_ALL`, `VIRTUAL_ENV`, `UV_PROJECT_ENVIRONMENT`, `PIP_REQUIRE_VIRTUALENV`)
+- prepends `/opt/venv/bin` to `PATH` so bare `python` and `python3` resolve to the central agent venv
 - keeps the `tool_runtime` container network available so tools like `curl` can still work
 - `set -o pipefail` is enabled
-- default timeout is `10s`
-- max timeout is `30s`
+- default foreground timeout is `120s`
+- max foreground timeout is `1800s`
+- remote-runtime HTTP timeout is derived from the requested tool timeout plus `15s` headroom, so transport timeout does not undercut the tool timeout
 - captures both `stdout` and `stderr`
 - truncates large output to the configured cap
 - returns a normalized tool result even when the command produces no `stdout`
+- supports background jobs persisted under `.jarvis_internal/bash_jobs/`; the same tool surface can start, inspect, tail, and cancel them
 
 #### Policy
 
 - rejects empty commands
 - rejects commands containing null bytes
+- allows direct Python execution through the central `/opt/venv` environment
+- denies alternate venv creation, non-central interpreter paths, `uv run python`, and `uv pip install --python` targeting a different interpreter
 - requires approval for install/build/system-mutation commands targeting the isolated `tool_runtime` container
 - hard-denies upgrade, service/init-control, mount/kernel-admin, and container-runtime-recursion commands even inside `tool_runtime`
 
@@ -389,7 +401,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - Status: implemented
 - Exposure: `basic`
 - Package: `src/tools/basic/python_interpreter/`
-- Purpose: run constrained Python code or stored workspace scripts for parsing, tabular work, PDF/text extraction, image processing, and structured transformations that are awkward in shell
+- Purpose: run direct one-shot Python code or stored workspace scripts through the central agent venv for parsing, tabular work, PDF/text extraction, image processing, automation, and structured transformations that are awkward in shell
 
 #### Input Schema
 
@@ -403,45 +415,26 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 #### Executor Behavior
 
 - policy is evaluated in `dev`, but execution happens in the sibling `tool_runtime` container over internal HTTP
-- still runs inside `bubblewrap` in `tool_runtime` so network stays disabled and writes stay constrained to `/workspace`
+- runs `/opt/venv/bin/python` directly inside `tool_runtime` with the same central venv model used by `bash`
 - mounts the real workspace directly at `/workspace`
-- only `/workspace` is writable; writes outside `/workspace` are denied by the sandbox
-- disables network with `--unshare-net`
-- only mounts the minimal Python runtime roots needed for the interpreter plus the tool-runtime Python environment
-- executes through an internal runner that applies resource limits, blocks process-spawn APIs, and enforces a low-interference import trust model
 - supports inline code and stored scripts under `/workspace`
+- preserves the compatibility `read_paths` and `write_paths` fields as no-ops
+- keeps network and subprocess capability available because there is no longer an inner Python sandbox
 - captures both `stdout` and `stderr`
 - truncates large output to the configured cap
-
-#### Security / Capability Ethos
-
-- The python tool is capability-constrained, not package-by-package micromanaged.
-- Hard security lives at the sandbox boundary first:
-  - no network namespace
-  - writable filesystem limited to `/workspace`
-  - scrubbed environment
-  - process spawning blocked
-  - resource and output limits enforced
-- Python-level guarding should be minimal and low-friction because invasive import hooks can break legitimate native and SWIG-backed libraries.
-- Imports are therefore judged mainly by trust root, not by an ever-growing library exception list:
-  - stdlib modules are allowed
-  - packages installed in the dedicated curated venv are allowed
-  - workspace-local helper modules are allowed so stored scripts can be composed normally
-- The small hard import denylist is reserved for true escape hatches such as direct native FFI (`ctypes`, `_ctypes`, `cffi`, `_cffi_backend`).
-- This means adding ordinary curated packages should usually require no policy changes; policy should only move when a new capability class is intentionally granted.
 
 #### Policy
 
 - exactly one of `code` or `script_path` must be provided
 - `script_path` must stay inside `/workspace`
+- argument count and argument size caps are still enforced
 - shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
 
 #### Current Limitations
 
 - intentionally one-shot and stateless; no persistent kernel/session memory across tool calls
 - `read_paths` and `write_paths` are deprecated compatibility fields and no longer control filesystem access
-- third-party availability is defined by the curated package setting and the dependency closure of those installed packages in the tool-runtime Python environment
-- workspace imports are intended for normal pure-Python helper modules; importing arbitrary native extensions from `/workspace` is intentionally disallowed
+- third-party availability starts with the configured `starter_packages` installed into `/opt/venv`, and the agent may add more packages into that same venv at runtime
 
 ### `file_patch`
 

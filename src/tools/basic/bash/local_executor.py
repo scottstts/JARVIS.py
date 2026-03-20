@@ -5,14 +5,25 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from ...config import ToolSettings
 from ...types import ToolExecutionContext, ToolExecutionResult
+from .jobs import (
+    BashJobError,
+    cancel_job,
+    create_background_job,
+    job_status,
+    load_job,
+    read_job_tail,
+    write_job_metadata,
+)
 
 _DEFAULT_RUNTIME_PATH = "/usr/local/bin:/usr/bin:/bin"
+_DEFAULT_MODE = "foreground"
 
 
 class DirectBashToolExecutor:
@@ -40,7 +51,56 @@ class DirectBashToolExecutor:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
-        command = str(arguments["command"])
+        mode = _normalize_mode(arguments.get("mode"))
+        if mode == "foreground":
+            return await self._run_foreground(
+                call_id=call_id,
+                arguments=arguments,
+                context=context,
+            )
+        if mode == "background":
+            return await self._start_background_job(
+                call_id=call_id,
+                arguments=arguments,
+                context=context,
+            )
+        if mode == "status":
+            return self._background_job_status(
+                call_id=call_id,
+                arguments=arguments,
+                context=context,
+            )
+        if mode == "tail":
+            return self._background_job_tail(
+                call_id=call_id,
+                arguments=arguments,
+                context=context,
+            )
+        if mode == "cancel":
+            return self._background_job_cancel(
+                call_id=call_id,
+                arguments=arguments,
+                context=context,
+            )
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=False,
+            content=(
+                "Bash execution request failed\n"
+                f"reason: unsupported mode '{mode}'."
+            ),
+            metadata={"mode": mode},
+        )
+
+    async def _run_foreground(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        command = str(arguments.get("command", ""))
         timeout_seconds = _resolve_timeout_seconds(arguments, self._settings)
         started_at = perf_counter()
 
@@ -99,6 +159,7 @@ class DirectBashToolExecutor:
             ok=ok,
             content=content,
             metadata={
+                "mode": "foreground",
                 "command": command,
                 "cwd": "/workspace",
                 "workspace_source_dir": str(context.workspace_dir),
@@ -112,6 +173,251 @@ class DirectBashToolExecutor:
                 "stderr": stderr_text,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
+                "runtime_location": self._runtime_location,
+                "runtime_transport": self._runtime_transport,
+                "target_runtime": self._target_runtime,
+                "filesystem_scope": "container_direct",
+                "container_mutation_boundary": self._container_mutation_boundary,
+            },
+        )
+
+    async def _start_background_job(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        command = str(arguments.get("command", "")).strip()
+        started_at = perf_counter()
+        try:
+            job = create_background_job(
+                workspace_dir=context.workspace_dir,
+                bash_executable=self._settings.bash_executable,
+                command=command,
+                cwd="/workspace",
+            )
+            with open(os.devnull, "wb") as devnull:
+                process = await asyncio.create_subprocess_exec(
+                    self._settings.bash_executable,
+                    "--noprofile",
+                    "--norc",
+                    str(job.runner_path),
+                    stdout=devnull,
+                    stderr=devnull,
+                    cwd=str(context.workspace_dir),
+                    env=_build_scrubbed_environment(self._settings),
+                    start_new_session=True,
+                )
+            pgid = os.getpgid(process.pid)
+            write_job_metadata(
+                paths=job,
+                pid=process.pid,
+                pgid=pgid,
+                command=command,
+                launched_at=_utc_now(),
+                cwd="/workspace",
+            )
+        except (BashJobError, OSError) as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=(
+                    "Bash background job failed\n"
+                    f"reason: {exc}"
+                ),
+                metadata={"mode": "background", "error": str(exc)},
+            )
+
+        duration_seconds = perf_counter() - started_at
+        content = "\n".join(
+            [
+                "Bash background job started",
+                f"job_id: {job.job_id}",
+                f"pid: {process.pid}",
+                f"pgid: {pgid}",
+                "cwd: /workspace",
+                f"command: {command}",
+                f"duration_seconds: {duration_seconds:.3f}",
+            ]
+        )
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content=content,
+            metadata={
+                "mode": "background",
+                "job_id": job.job_id,
+                "pid": process.pid,
+                "pgid": pgid,
+                "command": command,
+                "cwd": "/workspace",
+                "duration_seconds": round(duration_seconds, 3),
+                "stdout_path": str(job.stdout_path),
+                "stderr_path": str(job.stderr_path),
+                "runtime_location": self._runtime_location,
+                "runtime_transport": self._runtime_transport,
+                "target_runtime": self._target_runtime,
+                "filesystem_scope": "container_direct",
+                "container_mutation_boundary": self._container_mutation_boundary,
+            },
+        )
+
+    def _background_job_status(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        try:
+            job_id = _require_job_id(arguments)
+            paths, record = load_job(context.workspace_dir, job_id)
+            status = job_status(paths, record)
+        except BashJobError as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=(
+                    "Bash job status failed\n"
+                    f"reason: {exc}"
+                ),
+                metadata={"mode": "status", "error": str(exc)},
+            )
+
+        lines = [
+            "Bash job status",
+            f"job_id: {status['job_id']}",
+            f"status: {status['status']}",
+            f"pid: {status['pid']}",
+            f"pgid: {status['pgid']}",
+            f"launched_at: {status['launched_at']}",
+        ]
+        if status["finished_at"] is not None:
+            lines.append(f"finished_at: {status['finished_at']}")
+        if status["cancelled_at"] is not None:
+            lines.append(f"cancelled_at: {status['cancelled_at']}")
+        if status["exit_code"] is not None:
+            lines.append(f"exit_code: {status['exit_code']}")
+        lines.append(f"command: {status['command']}")
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content="\n".join(lines),
+            metadata={
+                "mode": "status",
+                **status,
+                "runtime_location": self._runtime_location,
+                "runtime_transport": self._runtime_transport,
+                "target_runtime": self._target_runtime,
+                "filesystem_scope": "container_direct",
+                "container_mutation_boundary": self._container_mutation_boundary,
+            },
+        )
+
+    def _background_job_tail(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        try:
+            job_id = _require_job_id(arguments)
+            paths, record = load_job(context.workspace_dir, job_id)
+            max_bytes = _resolve_tail_bytes(arguments, self._settings)
+            tail_lines = _resolve_tail_lines(arguments)
+            tail = read_job_tail(
+                paths,
+                max_bytes=max_bytes,
+                tail_lines=tail_lines,
+            )
+        except BashJobError as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=(
+                    "Bash job tail failed\n"
+                    f"reason: {exc}"
+                ),
+                metadata={"mode": "tail", "error": str(exc)},
+            )
+
+        content = "\n".join(
+            [
+                "Bash job output tail",
+                f"job_id: {record.job_id}",
+                "stdout:",
+                tail["stdout"] or "(empty)",
+                "stderr:",
+                tail["stderr"] or "(empty)",
+            ]
+        )
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content=content,
+            metadata={
+                "mode": "tail",
+                "job_id": record.job_id,
+                "tail_lines": tail_lines,
+                "tail_bytes": max_bytes,
+                "stdout": tail["stdout"],
+                "stderr": tail["stderr"],
+                "runtime_location": self._runtime_location,
+                "runtime_transport": self._runtime_transport,
+                "target_runtime": self._target_runtime,
+                "filesystem_scope": "container_direct",
+                "container_mutation_boundary": self._container_mutation_boundary,
+            },
+        )
+
+    def _background_job_cancel(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        try:
+            job_id = _require_job_id(arguments)
+            paths, record = load_job(context.workspace_dir, job_id)
+            status = cancel_job(paths, record)
+        except BashJobError as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=(
+                    "Bash job cancel failed\n"
+                    f"reason: {exc}"
+                ),
+                metadata={"mode": "cancel", "error": str(exc)},
+            )
+
+        lines = [
+            "Bash job cancelled",
+            f"job_id: {status['job_id']}",
+            f"status: {status['status']}",
+        ]
+        if status["exit_code"] is not None:
+            lines.append(f"exit_code: {status['exit_code']}")
+        if status["cancelled_at"] is not None:
+            lines.append(f"cancelled_at: {status['cancelled_at']}")
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content="\n".join(lines),
+            metadata={
+                "mode": "cancel",
+                **status,
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
@@ -154,18 +460,23 @@ def _resolve_timeout_seconds(arguments: dict[str, Any], settings: ToolSettings) 
     return timeout_seconds
 
 
-def format_bash_tool_description() -> str:
+def format_bash_tool_description(settings: ToolSettings) -> str:
+    venv_root = settings.python_interpreter_venv
+    interpreter_path = venv_root / "bin" / "python"
     return (
         "Run a bash command from `/workspace` inside the isolated tool_runtime container. "
-        "Use this for shell commands, CLI tools, installs, builds, file inspection, scripts., "
-        "and anything bash-appropriate. "
-        "Do not use `bash` tool to invoke Python in any form; use the dedicated `python_interpreter` tool instead. "
-        "You can directly install python packages using bash tool, use the virtualenv pip executable directly, "
-        "e.g., `uv pip install --python /opt/venv/bin/python <package-name>`. Do NOT use `python -m pip install`. "
-        "Use normal shell syntax, including pipes, redirects, command substitution, &&, ||, and multiline scripts. "
-        "Some commands may require user approval, so when that seems likely, provide clear approval context. "
-        "Available commands depend on what exists in the current tool runtime. "
-        "If you install or create a potentially reusable tool, consider registering it with tool_register."
+        "Use this for shell commands, CLI tools, installs, builds, file inspection, scripts, "
+        "and long-running background jobs. Python execution is allowed here, but it must use "
+        f"the central `{venv_root}` environment; prefer bare `python`/`python3` or "
+        f"`{interpreter_path}`, and install packages with "
+        f"`uv pip install --python {interpreter_path} <package-name>`. "
+        "Set `mode='background'` to start a long-running job, then use the same tool with "
+        "`mode='status'`, `mode='tail'`, or `mode='cancel'` plus `job_id` to manage it. "
+        "User approval is typically required for commands that install packages or tools, "
+        "run remote installer pipelines such as `curl|bash`, or write into system paths "
+        "outside `/workspace` such as `/usr/local/bin`, `/etc`, `/opt`, or `/var`. "
+        "When approval is likely, provide clear "
+        "`approval_summary`, `approval_details`, and optional `inspection_url` context."
     )
 
 
@@ -223,6 +534,44 @@ def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
     return truncated, True
 
 
+def _normalize_mode(value: object) -> str:
+    if value is None:
+        return _DEFAULT_MODE
+    normalized = str(value).strip().lower()
+    return normalized or _DEFAULT_MODE
+
+
+def _require_job_id(arguments: dict[str, Any]) -> str:
+    job_id = str(arguments.get("job_id", "")).strip()
+    if not job_id:
+        raise BashJobError("bash job operations require a non-empty job_id.")
+    return job_id
+
+
+def _resolve_tail_lines(arguments: dict[str, Any]) -> int | None:
+    raw_value = arguments.get("tail_lines")
+    if raw_value is None:
+        return 50
+    value = int(raw_value)
+    if value < 1:
+        return 1
+    if value > 2000:
+        return 2000
+    return value
+
+
+def _resolve_tail_bytes(arguments: dict[str, Any], settings: ToolSettings) -> int:
+    raw_value = arguments.get("tail_bytes")
+    if raw_value is None:
+        return settings.bash_max_output_chars
+    value = int(raw_value)
+    if value < 1:
+        return 1
+    if value > settings.bash_max_output_chars:
+        return settings.bash_max_output_chars
+    return value
+
+
 def _kill_process_group(process_id: int | None) -> None:
     if process_id is None:
         return
@@ -230,3 +579,7 @@ def _kill_process_group(process_id: int | None) -> None:
         os.killpg(process_id, signal.SIGKILL)
     except ProcessLookupError:
         return
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

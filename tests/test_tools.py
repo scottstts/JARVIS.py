@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from email import policy as email_parser_policy
@@ -40,7 +41,7 @@ from tools.basic.bash.local_executor import (
     format_bash_tool_description,
 )
 from tools.basic.python_interpreter.local_executor import (
-    SandboxedPythonInterpreterToolExecutor,
+    DirectPythonInterpreterToolExecutor,
     build_python_interpreter_description,
 )
 from tools.basic.web_fetch.tool import (
@@ -54,18 +55,18 @@ from tools.basic.web_fetch.tool import (
 
 _REMOTE_TOOL_RUNTIME_CONFIGURED = bool(os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"))
 _PYTHON_INTERPRETER_VENV = Path("/opt/venv/bin/python")
-_BASH_SANDBOX_RUNTIME_AVAILABLE = (
+_BASH_RUNTIME_AVAILABLE = (
     _REMOTE_TOOL_RUNTIME_CONFIGURED
     or Path("/bin/bash").exists()
     or shutil.which("bash") is not None
 )
 _FFMPEG_BASH_RUNTIME_AVAILABLE = (
     _REMOTE_TOOL_RUNTIME_CONFIGURED
-    or (_BASH_SANDBOX_RUNTIME_AVAILABLE and shutil.which("ffmpeg") is not None)
+    or (_BASH_RUNTIME_AVAILABLE and shutil.which("ffmpeg") is not None)
 )
 _PYTHON_INTERPRETER_RUNTIME_AVAILABLE = (
     _REMOTE_TOOL_RUNTIME_CONFIGURED
-    or (shutil.which("bwrap") is not None and _PYTHON_INTERPRETER_VENV.exists())
+    or _PYTHON_INTERPRETER_VENV.exists()
 )
 _SAMPLE_JPEG_BASE64 = (
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
@@ -442,10 +443,10 @@ class ToolSettingsTests(unittest.TestCase):
             Path("/opt/venv"),
         )
         self.assertIsNone(settings.tool_runtime_base_url)
-        self.assertEqual(settings.tool_runtime_timeout_seconds, 45.0)
+        self.assertEqual(settings.tool_runtime_timeout_seconds, 135.0)
         self.assertEqual(settings.tool_runtime_healthcheck_timeout_seconds, 5.0)
         self.assertEqual(
-            settings.python_interpreter_allowed_packages,
+            settings.python_interpreter_starter_packages,
             (
                 "python-dateutil",
                 "pyyaml",
@@ -462,8 +463,8 @@ class ToolSettingsTests(unittest.TestCase):
                 "icalendar",
             ),
         )
-        self.assertEqual(settings.python_interpreter_default_timeout_seconds, 10.0)
-        self.assertEqual(settings.python_interpreter_max_timeout_seconds, 30.0)
+        self.assertEqual(settings.python_interpreter_default_timeout_seconds, 120.0)
+        self.assertEqual(settings.python_interpreter_max_timeout_seconds, 1800.0)
 
     def test_bash_scrubbed_environment_targets_python_tool_venv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -479,14 +480,25 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertEqual(environment["PIP_REQUIRE_VIRTUALENV"], "1")
         self.assertEqual(environment["PATH"], "/opt/venv/bin:/usr/bin:/bin")
 
-    def test_bash_description_directs_python_execution_to_python_interpreter(self) -> None:
-        description = format_bash_tool_description().lower()
+    def test_bash_description_explains_central_python_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
 
-        self.assertIn("do not use `bash` tool to invoke python", description)
-        self.assertIn("`python_interpreter` tool instead", description)
+        description = format_bash_tool_description(settings).lower()
+
+        self.assertIn("python execution is allowed here", description)
+        self.assertIn("central `/opt/venv` environment", description)
+        self.assertIn("mode='background'", description)
         self.assertIn("uv pip install --python /opt/venv/bin/python", description)
+        self.assertIn("user approval is typically required", description)
+        self.assertIn("install packages or tools", description)
+        self.assertIn("curl|bash", description)
+        self.assertIn("/usr/local/bin", description)
+        self.assertIn("approval_summary", description)
 
-    def test_python_interpreter_description_explicitly_claims_python_execution(self) -> None:
+    def test_python_interpreter_description_explains_direct_central_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
@@ -494,30 +506,18 @@ class ToolSettingsTests(unittest.TestCase):
 
         description = build_python_interpreter_description(settings).lower()
 
-        self.assertIn(
-            "always use this tool whenever you need to execute python code or a python script",
-            description,
-        )
+        self.assertIn("run python directly inside the isolated tool_runtime container", description)
+        self.assertIn("central `/opt/venv/bin/python` environment", description)
         self.assertIn("exactly one of 'code' or 'script_path' is required", description)
-        self.assertIn("no network access is available in this tool", description)
+        self.assertIn("starter packages preinstalled", description)
 
-
-class PythonInterpreterExecutorTests(unittest.TestCase):
-    def test_bwrap_command_execs_venv_python_and_binds_symlink_chain(self) -> None:
+class PythonInterpreterExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_executor_reports_missing_central_interpreter_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             temp_root = Path(tmp)
             workspace_dir = temp_root / "workspace"
-            venv_dir = temp_root / "venv"
-            runtime_dir = temp_root / "runtime"
-            runner_config_path = temp_root / "runner-config.json"
+            venv_dir = temp_root / "missing-venv"
             workspace_dir.mkdir()
-            (venv_dir / "bin").mkdir(parents=True)
-            (runtime_dir / "bin").mkdir(parents=True)
-            (runtime_dir / "lib").mkdir(parents=True)
-            (runtime_dir / "bin" / "python3.12").write_text("", encoding="utf-8")
-            (runtime_dir / "bin" / "python3").symlink_to(runtime_dir / "bin" / "python3.12")
-            (venv_dir / "bin" / "python").symlink_to(runtime_dir / "bin" / "python3")
-            runner_config_path.write_text("{}", encoding="utf-8")
 
             with patch.dict(
                 os.environ,
@@ -526,58 +526,34 @@ class PythonInterpreterExecutorTests(unittest.TestCase):
             ):
                 settings = ToolSettings.from_workspace_dir(workspace_dir)
 
-            executor = SandboxedPythonInterpreterToolExecutor(
+            executor = DirectPythonInterpreterToolExecutor(
                 settings,
                 target_runtime="tool_runtime",
                 runtime_location="tool_runtime_container",
                 runtime_transport="http",
                 container_mutation_boundary="isolated_from_app_runtime",
             )
-            command = executor._build_bwrap_command(
-                interpreter_path=venv_dir / "bin" / "python",
-                workspace_source_dir=workspace_dir,
-                runner_config_path=runner_config_path,
-                inline_script_path=None,
+            result = await executor(
+                call_id="call_python_missing_interpreter",
+                arguments={"code": "print('hello')"},
+                context=ToolExecutionContext(workspace_dir=workspace_dir),
             )
 
-        ro_bind_pairs = [
-            (command[index + 1], command[index + 2])
-            for index, token in enumerate(command)
-            if token == "--ro-bind"
-        ]
-
-        self.assertEqual(
-            command[-3:],
-            [
-                str(venv_dir / "bin" / "python"),
-                "/jarvis-python-runner.py",
-                "/jarvis-python-runner-config.json",
-            ],
-        )
-        self.assertIn(
-            (
-                str(runtime_dir / "bin" / "python3"),
-                str(runtime_dir / "bin" / "python3"),
-            ),
-            ro_bind_pairs,
-        )
-        self.assertIn(
-            (
-                str(runtime_dir / "bin" / "python3.12"),
-                str(runtime_dir / "bin" / "python3.12"),
-            ),
-            ro_bind_pairs,
-        )
+        self.assertFalse(result.ok)
+        self.assertIn("central agent Python environment", result.content)
+        self.assertIn(str(venv_dir / "bin" / "python"), result.content)
 
 
 class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_execute_serializes_request_and_parses_result(self) -> None:
         captured_requests: list[tuple[str, str, dict[str, object] | None]] = []
+        captured_timeouts: list[float] = []
 
         class _FakeAsyncClient:
             def __init__(self, *, base_url: str, timeout: float) -> None:
                 self.base_url = base_url
                 self.timeout = timeout
+                captured_timeouts.append(timeout)
 
             async def __aenter__(self) -> "_FakeAsyncClient":
                 return self
@@ -641,6 +617,107 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+        self.assertEqual(captured_timeouts, [135.0])
+
+    async def test_execute_uses_requested_tool_timeout_plus_headroom(self) -> None:
+        captured_timeouts: list[float] = []
+
+        class _FakeAsyncClient:
+            def __init__(self, *, base_url: str, timeout: float) -> None:
+                _ = base_url
+                captured_timeouts.append(timeout)
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                _ = exc_type, exc, tb
+
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+            ) -> _FakeAsyncHTTPResponse:
+                _ = url, json
+                return _FakeAsyncHTTPResponse(
+                    status_code=200,
+                    payload={
+                        "call_id": "call_timeout",
+                        "name": "python_interpreter",
+                        "ok": True,
+                        "content": "Python interpreter result",
+                        "metadata": {},
+                    },
+                )
+
+        with patch.dict(
+            os.environ,
+            {"JARVIS_TOOL_RUNTIME_BASE_URL": "http://tool_runtime:8081"},
+            clear=False,
+        ):
+            settings = ToolSettings.from_workspace_dir(Path("/workspace"))
+
+        client = RemoteToolRuntimeClient(settings)
+        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+            await client.execute(
+                tool_name="python_interpreter",
+                call_id="call_timeout",
+                arguments={"code": "print('ok')", "timeout_seconds": 600},
+                context=ToolExecutionContext(workspace_dir=Path("/workspace")),
+            )
+
+        self.assertEqual(captured_timeouts, [615.0])
+
+    async def test_execute_clamps_requested_timeout_to_tool_max_before_adding_headroom(self) -> None:
+        captured_timeouts: list[float] = []
+
+        class _FakeAsyncClient:
+            def __init__(self, *, base_url: str, timeout: float) -> None:
+                _ = base_url
+                captured_timeouts.append(timeout)
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                _ = exc_type, exc, tb
+
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+            ) -> _FakeAsyncHTTPResponse:
+                _ = url, json
+                return _FakeAsyncHTTPResponse(
+                    status_code=200,
+                    payload={
+                        "call_id": "call_timeout_clamped",
+                        "name": "bash",
+                        "ok": True,
+                        "content": "Bash execution result",
+                        "metadata": {},
+                    },
+                )
+
+        with patch.dict(
+            os.environ,
+            {"JARVIS_TOOL_RUNTIME_BASE_URL": "http://tool_runtime:8081"},
+            clear=False,
+        ):
+            settings = ToolSettings.from_workspace_dir(Path("/workspace"))
+
+        client = RemoteToolRuntimeClient(settings)
+        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+            await client.execute(
+                tool_name="bash",
+                call_id="call_timeout_clamped",
+                arguments={"command": "pwd", "timeout_seconds": 999999},
+                context=ToolExecutionContext(workspace_dir=Path("/workspace")),
+            )
+
+        self.assertEqual(captured_timeouts, [1815.0])
 
     async def test_execute_raises_for_malformed_response_payload(self) -> None:
         class _FakeAsyncClient:
@@ -1157,18 +1234,36 @@ class ToolPolicyTests(unittest.TestCase):
             "tool_runtime service and init control commands are denied.",
         )
 
-    def test_bash_policy_hard_denies_direct_python_execution(self) -> None:
+    def test_bash_policy_allows_direct_python_execution(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "python -c 'print(1)'"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertEqual(
-            decision.reason,
-            "Direct Python execution via bash is denied; use python_interpreter instead.",
+        self.assertTrue(decision.allowed)
+
+    def test_bash_policy_requires_job_id_for_status_mode(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"mode": "status"},
+            context=self.context,
         )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("job_id", decision.reason or "")
+
+    def test_bash_policy_hard_denies_noncentral_python_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "/usr/bin/python -c 'print(1)'"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("non-central interpreter path", decision.reason or "")
+        self.assertIn("/opt/venv", decision.reason or "")
+        self.assertIn("/opt/venv/bin/python", decision.reason or "")
 
     def test_bash_policy_hard_denies_uv_run_python_execution(self) -> None:
         decision = self.policy.authorize(
@@ -1178,10 +1273,72 @@ class ToolPolicyTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(
-            decision.reason,
-            "Direct Python execution via bash is denied; use python_interpreter instead.",
+        self.assertIn("must not route through `uv run python`", decision.reason or "")
+        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+
+    def test_bash_policy_hard_denies_unknown_python_command_name(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "python9.9 -c 'print(1)'"},
+            context=self.context,
         )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("does not resolve to the central interpreter set", decision.reason or "")
+        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+
+    def test_bash_policy_allows_explicit_central_python_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "/opt/venv/bin/python -c 'print(1)'"},
+            context=self.context,
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_bash_policy_hard_denies_workspace_venv_python_path(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "./.venv/bin/python -c 'print(1)'"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("non-central interpreter path", decision.reason or "")
+        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+
+    def test_bash_policy_hard_denies_second_venv_creation(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "python -m venv .venv"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("must not create a second Python environment", decision.reason or "")
+        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+
+    def test_bash_policy_hard_denies_uv_pip_install_targeting_noncentral_python(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={
+                "command": "uv pip install --python /usr/bin/python requests"
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("targets a non-central interpreter path", decision.reason or "")
+        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+
+    def test_bash_policy_allows_background_mode_command_validation(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"mode": "background", "command": "python -c 'print(1)'"},
+            context=self.context,
+        )
+
+        self.assertTrue(decision.allowed)
 
     def test_bash_policy_requires_approval_for_uv_pip_install(self) -> None:
         decision = self.policy.authorize(
@@ -1199,6 +1356,20 @@ class ToolPolicyTests(unittest.TestCase):
             decision.approval_request["detector_reason"],
             "matched install or package-manager mutation pattern for tool_runtime",
         )
+
+    def test_bash_policy_requires_approval_for_background_system_write(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={
+                "mode": "background",
+                "command": "printf 'jarvis' > /etc/jarvis-bash-test",
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "bash command requires explicit approval.")
+        self.assertIsNotNone(decision.approval_request)
 
     def test_bash_policy_allows_exactly_approved_system_write_command(self) -> None:
         command = "printf 'jarvis' > /etc/jarvis-bash-test"
@@ -1808,8 +1979,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self._tmp.cleanup()
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_executes_pwd_inside_workspace(self) -> None:
         result = await self.runtime.execute(
@@ -1828,8 +1999,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metadata["workspace_source_dir"], str(self.workspace_dir))
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_writes_file_inside_workspace(self) -> None:
         result = await self.runtime.execute(
@@ -1849,8 +2020,133 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @unittest.skipUnless(
+        _BASH_RUNTIME_AVAILABLE and _PYTHON_INTERPRETER_VENV.exists(),
+        "bash Python execution requires the central /opt/venv interpreter",
+    )
+    async def test_bash_executes_python_in_the_central_venv(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_bash_python",
+                name="bash",
+                arguments={"command": "python -c 'import sys; print(sys.executable)'"},
+                raw_arguments=(
+                    '{"command":"python -c \\"import sys; print(sys.executable)\\""}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("/opt/venv/bin/python", result.content)
+
+    @unittest.skipUnless(
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
+    )
+    async def test_bash_background_job_lifecycle(self) -> None:
+        start_result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_bash_background_start",
+                name="bash",
+                arguments={
+                    "mode": "background",
+                    "command": "sleep 0.1; printf 'ready\\n'",
+                },
+                raw_arguments=(
+                    '{"mode":"background","command":"sleep 0.1; printf \\"ready\\\\n\\""}'
+                ),
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(start_result.ok)
+        job_id = str(start_result.metadata["job_id"])
+
+        status_result = None
+        for _ in range(10):
+            status_result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_bash_background_status",
+                    name="bash",
+                    arguments={"mode": "status", "job_id": job_id},
+                    raw_arguments=f'{{"mode":"status","job_id":"{job_id}"}}',
+                ),
+                context=self.context,
+            )
+            self.assertTrue(status_result.ok)
+            if status_result.metadata["status"] == "finished":
+                break
+            await asyncio.sleep(0.05)
+
+        self.assertIsNotNone(status_result)
+        if status_result is None:
+            self.fail("Expected a bash background status result.")
+        self.assertEqual(status_result.metadata["status"], "finished")
+        self.assertEqual(status_result.metadata["exit_code"], 0)
+
+        tail_result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_bash_background_tail",
+                name="bash",
+                arguments={"mode": "tail", "job_id": job_id},
+                raw_arguments=f'{{"mode":"tail","job_id":"{job_id}"}}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(tail_result.ok)
+        self.assertIn("ready", tail_result.content)
+
+    @unittest.skipUnless(
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
+    )
+    async def test_bash_background_job_can_be_cancelled(self) -> None:
+        start_result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_bash_background_cancel_start",
+                name="bash",
+                arguments={
+                    "mode": "background",
+                    "command": "sleep 5",
+                },
+                raw_arguments='{"mode":"background","command":"sleep 5"}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(start_result.ok)
+        job_id = str(start_result.metadata["job_id"])
+
+        cancel_result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_bash_background_cancel",
+                name="bash",
+                arguments={"mode": "cancel", "job_id": job_id},
+                raw_arguments=f'{{"mode":"cancel","job_id":"{job_id}"}}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(cancel_result.ok)
+        self.assertEqual(cancel_result.metadata["status"], "cancelled")
+
+        status_result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_bash_background_cancel_status",
+                name="bash",
+                arguments={"mode": "status", "job_id": job_id},
+                raw_arguments=f'{{"mode":"status","job_id":"{job_id}"}}',
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(status_result.ok)
+        self.assertEqual(status_result.metadata["status"], "cancelled")
+
+    @unittest.skipUnless(
         _FFMPEG_BASH_RUNTIME_AVAILABLE,
-        "ffmpeg bash runtime is only available when bubblewrap and ffmpeg are installed",
+        "ffmpeg bash runtime is only available in the dev container when ffmpeg is installed",
     )
     async def test_bash_can_execute_ffmpeg_when_installed(self) -> None:
         result = await self.runtime.execute(
@@ -1867,8 +2163,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ffmpeg version", result.content)
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_bash_requires_approval_for_system_write_command(self) -> None:
         result = await self.runtime.execute(
@@ -2034,8 +2330,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(target_path.read_text(encoding="utf-8"), "alpha\nbeta\n")
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_returns_policy_error_for_null_byte_command(self) -> None:
         result = await self.runtime.execute(
@@ -2053,8 +2349,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.workspace_dir / "note.txt").exists())
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_bash_cannot_read_repo(self) -> None:
         result = await self.runtime.execute(
@@ -2072,8 +2368,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No such file", result.content)
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_bash_cannot_read_run_secrets(self) -> None:
         result = await self.runtime.execute(
@@ -2350,8 +2646,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attachments[0].get_content().strip(), "ship it")
 
     @unittest.skipUnless(
-        _BASH_SANDBOX_RUNTIME_AVAILABLE,
-        "bash sandbox runtime is only available when bubblewrap is installed",
+        _BASH_RUNTIME_AVAILABLE,
+        "bash runtime is only available in the dev container",
     )
     async def test_bash_scrubs_environment(self) -> None:
         with patch.dict(
@@ -2637,7 +2933,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
     async def test_python_interpreter_executes_inline_code_with_direct_workspace_access(self) -> None:
         input_dir = self.workspace_dir / "inputs"
@@ -2676,12 +2972,12 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             (output_dir / "result.txt").read_text(encoding="utf-8"),
             "HELLO",
         )
-        self.assertIn("pyyaml", result.metadata["allowed_packages"])
+        self.assertIn("pyyaml", result.metadata["starter_packages"])
         self.assertEqual(result.metadata["workspace_mode"], "direct_bind")
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
     async def test_python_interpreter_executes_stored_script_with_curated_package(self) -> None:
         scripts_dir = self.workspace_dir / "scripts"
@@ -2724,7 +3020,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
     async def test_python_interpreter_allows_workspace_local_helper_imports(self) -> None:
         scripts_dir = self.workspace_dir / "scripts"
@@ -2757,7 +3053,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
     async def test_python_interpreter_supports_pymupdf_text_round_trip(self) -> None:
         result = await self.runtime.execute(
@@ -2787,7 +3083,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
     async def test_python_interpreter_can_edit_workspace_jpeg_with_pillow(self) -> None:
         input_path = self.workspace_dir / "cat_input.jpg"
@@ -2822,9 +3118,9 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
-    async def test_python_interpreter_denies_writes_outside_workspace(self) -> None:
+    async def test_python_interpreter_allows_writes_outside_workspace_in_tool_runtime(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_python_outside_write",
@@ -2832,44 +3128,47 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 arguments={
                     "code": (
                         "from pathlib import Path\n"
-                        "Path('/tmp/outside.txt').write_text('blocked', encoding='utf-8')\n"
+                        "Path('/tmp/jarvis-python-outside.txt').write_text('allowed', encoding='utf-8')\n"
+                        "print(Path('/tmp/jarvis-python-outside.txt').read_text(encoding='utf-8'))\n"
                     ),
                 },
                 raw_arguments=(
                     '{"code":"from pathlib import Path\\n'
-                    "Path('/tmp/outside.txt').write_text('blocked', encoding='utf-8')\\n\"}"
+                    "Path('/tmp/jarvis-python-outside.txt').write_text('allowed', encoding='utf-8')\\n"
+                    "print(Path('/tmp/jarvis-python-outside.txt').read_text(encoding='utf-8'))\\n\"}"
                 ),
             ),
             context=self.context,
         )
 
-        self.assertFalse(result.ok)
-        self.assertIn("/tmp", result.content)
-        self.assertFalse((self.workspace_dir / "outside.txt").exists())
+        self.assertTrue(result.ok)
+        self.assertIn("allowed", result.content)
+        self.assertTrue(Path("/tmp/jarvis-python-outside.txt").exists())
+        Path("/tmp/jarvis-python-outside.txt").unlink(missing_ok=True)
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
-    async def test_python_interpreter_blocks_disallowed_imports(self) -> None:
+    async def test_python_interpreter_allows_ctypes_imports(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_python_ctypes",
                 name="python_interpreter",
-                arguments={"code": "import ctypes\n"},
-                raw_arguments='{"code":"import ctypes\\n"}',
+                arguments={"code": "import ctypes\nprint(ctypes.sizeof(ctypes.c_int))\n"},
+                raw_arguments='{"code":"import ctypes\\nprint(ctypes.sizeof(ctypes.c_int))\\n"}',
             ),
             context=self.context,
         )
 
-        self.assertFalse(result.ok)
-        self.assertIn("blocked", result.content.lower())
+        self.assertTrue(result.ok)
+        self.assertIn("4", result.content)
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
-    async def test_python_interpreter_allows_socket_import_but_network_use_still_fails(self) -> None:
+    async def test_python_interpreter_allows_socket_imports_without_network_sandbox_errors(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_python_socket_runtime",
@@ -2879,23 +3178,23 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         "import socket\n"
                         "sock = socket.socket()\n"
                         "sock.settimeout(1)\n"
-                        "sock.connect(('1.1.1.1', 80))\n"
+                        "print(type(sock).__name__)\n"
+                        "sock.close()\n"
                     ),
                 },
-                raw_arguments='{"code":"socket runtime"}',
+                raw_arguments='{"code":"import socket\\nsock = socket.socket()\\nprint(type(sock).__name__)\\nsock.close()\\n"}',
             ),
             context=self.context,
         )
 
-        self.assertFalse(result.ok)
-        self.assertNotIn("blocked", result.content.lower())
-        self.assertIn("OSError", result.content)
+        self.assertTrue(result.ok)
+        self.assertIn("socket", result.content.lower())
 
     @unittest.skipUnless(
         _PYTHON_INTERPRETER_RUNTIME_AVAILABLE,
-        "python_interpreter runtime is only available in the dev container",
+        "python_interpreter runtime is only available when /opt/venv/bin/python exists",
     )
-    async def test_python_interpreter_blocks_subprocess_execution_even_when_imported(self) -> None:
+    async def test_python_interpreter_allows_subprocess_execution(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_python_subprocess",
@@ -2903,16 +3202,21 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 arguments={
                     "code": (
                         "import subprocess\n"
-                        "subprocess.run(['echo', 'hello'], check=True)\n"
+                        "completed = subprocess.run(['echo', 'hello'], check=True, capture_output=True, text=True)\n"
+                        "print(completed.stdout.strip())\n"
                     ),
                 },
-                raw_arguments='{"code":"import subprocess\\nsubprocess.run([\'echo\', \'hello\'], check=True)\\n"}',
+                raw_arguments=(
+                    '{"code":"import subprocess\\ncompleted = subprocess.run([\'echo\', '
+                    '\'hello\'], check=True, capture_output=True, text=True)\\n'
+                    'print(completed.stdout.strip())\\n"}'
+                ),
             ),
             context=self.context,
         )
 
-        self.assertFalse(result.ok)
-        self.assertIn("does not allow spawning child processes", result.content)
+        self.assertTrue(result.ok)
+        self.assertIn("hello", result.content)
 
     async def test_send_file_executes_for_workspace_file(self) -> None:
         report_path = self.workspace_dir / "exports" / "report.txt"
@@ -2925,7 +3229,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_send_telegram_file(**kwargs):
             self.assertEqual(kwargs["route_id"], "tg_123")
-            self.assertEqual(kwargs["file_path"], report_path)
+            self.assertEqual(
+                kwargs["file_path"].resolve(strict=False),
+                report_path.resolve(strict=False),
+            )
             self.assertEqual(kwargs["caption"], "Attached report")
             self.assertEqual(kwargs["filename"], "weekly.txt")
             return {"message_id": 9, "chat_id": 123}
@@ -2975,8 +3282,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metadata["media_type"], "image/png")
         self.assertEqual(result.metadata["detail"], "high")
         self.assertEqual(
-            result.metadata["image_attachment"]["path"],
-            str(image_path),
+            Path(result.metadata["image_attachment"]["path"]).resolve(strict=False),
+            image_path.resolve(strict=False),
         )
 
     async def test_generate_edit_image_executes_openai_generation(self) -> None:
@@ -3154,7 +3461,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result.metadata["model"],
             "gemini-3.1-flash-image-preview",
         )
-        self.assertEqual(result.metadata["image_path"], str(input_path))
+        self.assertEqual(
+            Path(result.metadata["image_path"]).resolve(strict=False),
+            input_path.resolve(strict=False),
+        )
         self.assertEqual(result.metadata["input_media_type"], "image/png")
         self.assertNotIn("provider_text", result.metadata)
         self.assertEqual(captured["api_key"], "test-google-key")
@@ -3328,7 +3638,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(captured["model"], "gpt-4o-mini-transcribe")
         self.assertEqual(captured["response_format"], "json")
-        self.assertEqual(captured["uploaded_file_name"], str(audio_path))
+        self.assertEqual(
+            Path(captured["uploaded_file_name"]).resolve(strict=False),
+            audio_path.resolve(strict=False),
+        )
         self.assertTrue(captured["closed"])
         self.assertIn("Audio transcription completed", result.content)
         self.assertIn("transcript:", result.content)
