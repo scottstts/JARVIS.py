@@ -63,8 +63,10 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                         "enum": ["foreground", "background", "status", "tail", "cancel"],
                         "description": (
                             "Optional bash operation mode. Defaults to 'foreground'. "
-                            "Use 'background' to start a long-running job, 'status' to "
-                            "inspect it, 'tail' to read recent output, and 'cancel' to stop it."
+                            "Foreground runs that are still running after the soft timeout are "
+                            "automatically moved into a background job. Use 'background' to start "
+                            "one explicitly, 'status' to inspect it, 'tail' to read recent "
+                            "output, and 'cancel' to stop it."
                         ),
                     },
                     "command": {
@@ -88,7 +90,9 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                         "maximum": settings.bash_max_timeout_seconds,
                         "description": (
                             "Optional foreground command timeout in seconds. Use only when a "
-                            "foreground command may legitimately need more than the default."
+                            "foreground command may legitimately need more than the default. "
+                            "If the requested timeout exceeds the soft-timeout window, the "
+                            "command may be auto-promoted into a background job first."
                         ),
                     },
                     "tail_lines": {

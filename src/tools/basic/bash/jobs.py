@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import time
 from dataclasses import dataclass
@@ -237,6 +238,10 @@ def read_job_tail(
         "stdout": _read_tail_text(paths.stdout_path, max_bytes=max_bytes, tail_lines=tail_lines),
         "stderr": _read_tail_text(paths.stderr_path, max_bytes=max_bytes, tail_lines=tail_lines),
     }
+
+
+def remove_job_artifacts(paths: BashJobPaths) -> None:
+    shutil.rmtree(paths.job_dir, ignore_errors=True)
 
 
 def _build_runner_script(

@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -38,6 +39,7 @@ from tools.runtime_tool_manifest import (
 from tools.runtime_tools import load_runtime_tool_catalog
 from tools.basic.bash.local_executor import (
     _build_scrubbed_environment,
+    DirectBashToolExecutor,
     format_bash_tool_description,
 )
 from tools.basic.python_interpreter.local_executor import (
@@ -491,6 +493,8 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("python execution is allowed here", description)
         self.assertIn("central `/opt/venv` environment", description)
         self.assertIn("mode='background'", description)
+        self.assertIn("soft timeout", description)
+        self.assertIn("automatically moved to background mode", description)
         self.assertIn("uv pip install --python /opt/venv/bin/python", description)
         self.assertIn("user approval is typically required", description)
         self.assertIn("install packages or tools", description)
@@ -542,6 +546,117 @@ class PythonInterpreterExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("central agent Python environment", result.content)
         self.assertIn(str(venv_dir / "bin" / "python"), result.content)
+
+
+class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_promotes_long_foreground_command_to_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "JARVIS_TOOL_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS": "1",
+                    "JARVIS_TOOL_BASH_DEFAULT_TIMEOUT_SECONDS": "5",
+                    "JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS": "30",
+                },
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            result = await executor(
+                call_id="call_bash_soft_timeout",
+                arguments={
+                    "command": "sleep 2; printf 'late\\n'",
+                    "timeout_seconds": 5,
+                },
+                context=context,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertTrue(result.metadata["promoted_to_background"])
+            self.assertEqual(result.metadata["mode"], "foreground")
+            self.assertEqual(result.metadata["status"], "running")
+            self.assertIn("moved to background", result.content)
+            job_id = str(result.metadata["job_id"])
+
+            try:
+                status_result = await executor(
+                    call_id="call_bash_soft_timeout_status",
+                    arguments={"mode": "status", "job_id": job_id},
+                    context=context,
+                )
+                self.assertTrue(status_result.ok)
+                self.assertIn(status_result.metadata["status"], {"running", "finished"})
+
+                tail_result = await executor(
+                    call_id="call_bash_soft_timeout_tail",
+                    arguments={"mode": "tail", "job_id": job_id},
+                    context=context,
+                )
+                self.assertTrue(tail_result.ok)
+            finally:
+                cancel_result = await executor(
+                    call_id="call_bash_soft_timeout_cancel",
+                    arguments={"mode": "cancel", "job_id": job_id},
+                    context=context,
+                )
+                self.assertTrue(cancel_result.ok)
+
+    async def test_promotes_when_requested_timeout_matches_soft_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "JARVIS_TOOL_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS": "1",
+                    "JARVIS_TOOL_BASH_DEFAULT_TIMEOUT_SECONDS": "5",
+                    "JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS": "30",
+                },
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            result = await executor(
+                call_id="call_bash_soft_timeout_boundary",
+                arguments={
+                    "command": "sleep 2; printf 'late\\n'",
+                    "timeout_seconds": 1,
+                },
+                context=context,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertTrue(result.metadata["promoted_to_background"])
+            job_id = str(result.metadata["job_id"])
+
+            cancel_result = await executor(
+                call_id="call_bash_soft_timeout_boundary_cancel",
+                arguments={"mode": "cancel", "job_id": job_id},
+                context=context,
+            )
+            self.assertTrue(cancel_result.ok)
 
 
 class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
@@ -2038,6 +2153,58 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("/opt/venv/bin/python", result.content)
+
+    @unittest.skipUnless(
+        _REMOTE_TOOL_RUNTIME_CONFIGURED,
+        "remote tool_runtime integration is only available in the dev container",
+    )
+    async def test_remote_bash_foreground_soft_timeout_promotes_to_background(self) -> None:
+        started_at = time.monotonic()
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_remote_bash_soft_timeout",
+                name="bash",
+                arguments={
+                    "command": "sleep 35; printf 'late\\n'",
+                    "timeout_seconds": 180,
+                },
+                raw_arguments=(
+                    '{"command":"sleep 35; printf \\"late\\\\n\\"","timeout_seconds":180}'
+                ),
+            ),
+            context=self.context,
+        )
+        duration_seconds = time.monotonic() - started_at
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.metadata["promoted_to_background"])
+        self.assertIn("moved to background", result.content)
+        self.assertLess(duration_seconds, 90.0)
+
+        job_id = str(result.metadata["job_id"])
+        try:
+            status_result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_remote_bash_soft_timeout_status",
+                    name="bash",
+                    arguments={"mode": "status", "job_id": job_id},
+                    raw_arguments=f'{{"mode":"status","job_id":"{job_id}"}}',
+                ),
+                context=self.context,
+            )
+            self.assertTrue(status_result.ok)
+            self.assertIn(status_result.metadata["status"], {"running", "finished"})
+        finally:
+            cancel_result = await self.runtime.execute(
+                tool_call=ToolCall(
+                    call_id="call_remote_bash_soft_timeout_cancel",
+                    name="bash",
+                    arguments={"mode": "cancel", "job_id": job_id},
+                    raw_arguments=f'{{"mode":"cancel","job_id":"{job_id}"}}',
+                ),
+                context=self.context,
+            )
+            self.assertTrue(cancel_result.ok)
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,

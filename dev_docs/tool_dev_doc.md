@@ -376,11 +376,13 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - `set -o pipefail` is enabled
 - default foreground timeout is `120s`
 - max foreground timeout is `1800s`
+- foreground runs that are still active after the `30s` soft-timeout are automatically converted into persisted background jobs and return early with a `job_id`
 - remote-runtime HTTP timeout is derived from the requested tool timeout plus `15s` headroom, so transport timeout does not undercut the tool timeout
 - captures both `stdout` and `stderr`
 - truncates large output to the configured cap
 - returns a normalized tool result even when the command produces no `stdout`
 - supports background jobs persisted under `.jarvis_internal/bash_jobs/`; the same tool surface can start, inspect, tail, and cancel them
+- when a foreground run is auto-promoted, the agent loop injects a transient system reminder telling the model to use `status`, `tail`, or `cancel` with the returned `job_id` instead of rerunning the command in foreground
 
 #### Policy
 

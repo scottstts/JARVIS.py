@@ -55,6 +55,7 @@ _TURN_ID_METADATA_KEY = "turn_id"
 _INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
 _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
+_BASH_BACKGROUND_PROMOTION_METADATA_KEY = "bash_background_promotion"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
     "Continue in a new turn if you want me to keep using tools."
@@ -2277,37 +2278,65 @@ class AgentLoop:
         session_id: str,
         result: ToolExecutionResult,
     ) -> list[ConversationRecord]:
+        records: list[ConversationRecord] = []
         attachment = result.metadata.get("image_attachment")
-        if not isinstance(attachment, dict):
-            return []
+        if isinstance(attachment, dict):
+            path = str(attachment.get("path", "")).strip()
+            media_type = str(attachment.get("media_type", "")).strip()
+            detail = str(attachment.get("detail", "auto")).strip() or "auto"
+            if path and media_type:
+                content = (
+                    "Attached image from a local workspace file requested via view_image.\n"
+                    f"path: {path}\n"
+                    f"media_type: {media_type}"
+                )
+                records.append(
+                    self._build_message_record(
+                        session_id=session_id,
+                        role="user",
+                        content=content,
+                        metadata={
+                            _TRANSIENT_RECORD_METADATA_KEY: True,
+                            _IMAGE_INPUT_METADATA_KEY: {
+                                "path": path,
+                                "media_type": media_type,
+                                "detail": detail,
+                            },
+                            "source_tool": result.name,
+                        },
+                    )
+                )
 
-        path = str(attachment.get("path", "")).strip()
-        media_type = str(attachment.get("media_type", "")).strip()
-        detail = str(attachment.get("detail", "auto")).strip() or "auto"
-        if not path or not media_type:
-            return []
-
-        content = (
-            "Attached image from a local workspace file requested via view_image.\n"
-            f"path: {path}\n"
-            f"media_type: {media_type}"
-        )
-        return [
-            self._build_message_record(
-                session_id=session_id,
-                role="user",
-                content=content,
-                metadata={
-                    _TRANSIENT_RECORD_METADATA_KEY: True,
-                    _IMAGE_INPUT_METADATA_KEY: {
-                        "path": path,
-                        "media_type": media_type,
-                        "detail": detail,
-                    },
-                    "source_tool": result.name,
-                },
+        if result.name == "bash" and result.metadata.get("promoted_to_background"):
+            job_id = str(result.metadata.get("job_id", "")).strip()
+            soft_timeout = result.metadata.get("soft_timeout_seconds")
+            timeout_label = (
+                f"{float(soft_timeout):.3f}s"
+                if isinstance(soft_timeout, (int, float))
+                else "the configured soft-timeout"
             )
-        ]
+            content = (
+                "The last foreground `bash` command was automatically moved to background "
+                f"after {timeout_label}. Do not rerun the same command in foreground. "
+                f"Use `bash` with `mode='status'` and `job_id='{job_id}'` to check progress, "
+                f"`mode='tail'` and `job_id='{job_id}'` to inspect recent stdout/stderr, or "
+                f"`mode='cancel'` and `job_id='{job_id}'` to stop it."
+            )
+            records.append(
+                self._build_message_record(
+                    session_id=session_id,
+                    role="system",
+                    content=content,
+                    metadata={
+                        _TRANSIENT_RECORD_METADATA_KEY: True,
+                        _BASH_BACKGROUND_PROMOTION_METADATA_KEY: True,
+                        "source_tool": result.name,
+                        "job_id": job_id,
+                    },
+                )
+            )
+
+        return records
 
     def _append_message(
         self,

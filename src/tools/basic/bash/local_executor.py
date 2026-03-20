@@ -14,11 +14,13 @@ from ...config import ToolSettings
 from ...types import ToolExecutionContext, ToolExecutionResult
 from .jobs import (
     BashJobError,
+    BashJobPaths,
     cancel_job,
     create_background_job,
     job_status,
     load_job,
     read_job_tail,
+    remove_job_artifacts,
     write_job_metadata,
 )
 
@@ -102,6 +104,31 @@ class DirectBashToolExecutor:
     ) -> ToolExecutionResult:
         command = str(arguments.get("command", ""))
         timeout_seconds = _resolve_timeout_seconds(arguments, self._settings)
+        soft_timeout_seconds = self._settings.bash_foreground_soft_timeout_seconds
+        if timeout_seconds < soft_timeout_seconds:
+            return await self._run_plain_foreground(
+                call_id=call_id,
+                command=command,
+                timeout_seconds=timeout_seconds,
+                context=context,
+            )
+
+        return await self._run_promotable_foreground(
+            call_id=call_id,
+            command=command,
+            timeout_seconds=timeout_seconds,
+            soft_timeout_seconds=soft_timeout_seconds,
+            context=context,
+        )
+
+    async def _run_plain_foreground(
+        self,
+        *,
+        call_id: str,
+        command: str,
+        timeout_seconds: float,
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
         started_at = perf_counter()
 
         process = await asyncio.create_subprocess_exec(
@@ -181,6 +208,144 @@ class DirectBashToolExecutor:
             },
         )
 
+    async def _run_promotable_foreground(
+        self,
+        *,
+        call_id: str,
+        command: str,
+        timeout_seconds: float,
+        soft_timeout_seconds: float,
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        started_at = perf_counter()
+        try:
+            job, process, pgid = await self._launch_background_process(
+                workspace_dir=context.workspace_dir,
+                command=command,
+            )
+        except (BashJobError, OSError) as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=(
+                    "Bash execution request failed\n"
+                    f"reason: {exc}"
+                ),
+                metadata={"mode": "foreground", "error": str(exc)},
+            )
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=soft_timeout_seconds)
+        except asyncio.TimeoutError:
+            duration_seconds = perf_counter() - started_at
+            output_tail = read_job_tail(
+                job,
+                max_bytes=self._settings.bash_max_output_chars,
+                tail_lines=50,
+            )
+            content = _format_background_promotion_result(
+                command=command,
+                cwd=Path("/workspace"),
+                job_id=job.job_id,
+                pid=process.pid,
+                pgid=pgid,
+                duration_seconds=duration_seconds,
+                soft_timeout_seconds=soft_timeout_seconds,
+                timeout_seconds=timeout_seconds,
+                stdout_text=output_tail["stdout"],
+                stderr_text=output_tail["stderr"],
+            )
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=True,
+                content=content,
+                metadata={
+                    "mode": "foreground",
+                    "promoted_to_background": True,
+                    "job_id": job.job_id,
+                    "pid": process.pid,
+                    "pgid": pgid,
+                    "status": "running",
+                    "command": command,
+                    "cwd": "/workspace",
+                    "workspace_source_dir": str(context.workspace_dir),
+                    "environment_scrubbed": True,
+                    "approval_consumed": bool(context.approved_action),
+                    "exit_code": None,
+                    "timed_out": False,
+                    "soft_timed_out": True,
+                    "soft_timeout_seconds": soft_timeout_seconds,
+                    "timeout_seconds": timeout_seconds,
+                    "duration_seconds": round(duration_seconds, 3),
+                    "stdout": output_tail["stdout"],
+                    "stderr": output_tail["stderr"],
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "stdout_path": str(job.stdout_path),
+                    "stderr_path": str(job.stderr_path),
+                    "runtime_location": self._runtime_location,
+                    "runtime_transport": self._runtime_transport,
+                    "target_runtime": self._target_runtime,
+                    "filesystem_scope": "container_direct",
+                    "container_mutation_boundary": self._container_mutation_boundary,
+                },
+            )
+
+        duration_seconds = perf_counter() - started_at
+        stdout_text, stdout_truncated = _truncate_text(
+            _read_job_output_text(job.stdout_path),
+            self._settings.bash_max_output_chars,
+        )
+        stderr_text, stderr_truncated = _truncate_text(
+            _read_job_output_text(job.stderr_path),
+            self._settings.bash_max_output_chars,
+        )
+        exit_code = process.returncode if process.returncode is not None else -1
+        content = _format_bash_result(
+            command=command,
+            cwd=Path("/workspace"),
+            exit_code=exit_code,
+            timed_out=False,
+            timeout_seconds=timeout_seconds,
+            duration_seconds=duration_seconds,
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+        )
+        remove_job_artifacts(job)
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=exit_code == 0,
+            content=content,
+            metadata={
+                "mode": "foreground",
+                "command": command,
+                "cwd": "/workspace",
+                "workspace_source_dir": str(context.workspace_dir),
+                "environment_scrubbed": True,
+                "approval_consumed": bool(context.approved_action),
+                "exit_code": exit_code,
+                "timed_out": False,
+                "soft_timed_out": False,
+                "timeout_seconds": timeout_seconds,
+                "soft_timeout_seconds": soft_timeout_seconds,
+                "duration_seconds": round(duration_seconds, 3),
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "runtime_location": self._runtime_location,
+                "runtime_transport": self._runtime_transport,
+                "target_runtime": self._target_runtime,
+                "filesystem_scope": "container_direct",
+                "container_mutation_boundary": self._container_mutation_boundary,
+            },
+        )
+
     async def _start_background_job(
         self,
         *,
@@ -191,32 +356,9 @@ class DirectBashToolExecutor:
         command = str(arguments.get("command", "")).strip()
         started_at = perf_counter()
         try:
-            job = create_background_job(
+            job, process, pgid = await self._launch_background_process(
                 workspace_dir=context.workspace_dir,
-                bash_executable=self._settings.bash_executable,
                 command=command,
-                cwd="/workspace",
-            )
-            with open(os.devnull, "wb") as devnull:
-                process = await asyncio.create_subprocess_exec(
-                    self._settings.bash_executable,
-                    "--noprofile",
-                    "--norc",
-                    str(job.runner_path),
-                    stdout=devnull,
-                    stderr=devnull,
-                    cwd=str(context.workspace_dir),
-                    env=_build_scrubbed_environment(self._settings),
-                    start_new_session=True,
-                )
-            pgid = os.getpgid(process.pid)
-            write_job_metadata(
-                paths=job,
-                pid=process.pid,
-                pgid=pgid,
-                command=command,
-                launched_at=_utc_now(),
-                cwd="/workspace",
             )
         except (BashJobError, OSError) as exc:
             return ToolExecutionResult(
@@ -264,6 +406,45 @@ class DirectBashToolExecutor:
                 "container_mutation_boundary": self._container_mutation_boundary,
             },
         )
+
+    async def _launch_background_process(
+        self,
+        *,
+        workspace_dir: Path,
+        command: str,
+    ) -> tuple[BashJobPaths, asyncio.subprocess.Process, int]:
+        job = create_background_job(
+            workspace_dir=workspace_dir,
+            bash_executable=self._settings.bash_executable,
+            command=command,
+            cwd="/workspace",
+        )
+        try:
+            with open(os.devnull, "wb") as devnull:
+                process = await asyncio.create_subprocess_exec(
+                    self._settings.bash_executable,
+                    "--noprofile",
+                    "--norc",
+                    str(job.runner_path),
+                    stdout=devnull,
+                    stderr=devnull,
+                    cwd=str(workspace_dir),
+                    env=_build_scrubbed_environment(self._settings),
+                    start_new_session=True,
+                )
+            pgid = os.getpgid(process.pid)
+            write_job_metadata(
+                paths=job,
+                pid=process.pid,
+                pgid=pgid,
+                command=command,
+                launched_at=_utc_now(),
+                cwd="/workspace",
+            )
+        except Exception:
+            remove_job_artifacts(job)
+            raise
+        return job, process, pgid
 
     def _background_job_status(
         self,
@@ -470,8 +651,11 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
         f"the central `{venv_root}` environment; prefer bare `python`/`python3` or "
         f"`{interpreter_path}`, and install packages with "
         f"`uv pip install --python {interpreter_path} <package-name>`. "
+        f"Foreground commands that are still running after the {settings.bash_foreground_soft_timeout_seconds:.0f}s "
+        "soft timeout are automatically moved to background mode; after that, use the same tool "
+        "with `mode='status'`, `mode='tail'`, or `mode='cancel'` plus `job_id` to manage them. "
         "Set `mode='background'` to start a long-running job, then use the same tool with "
-        "`mode='status'`, `mode='tail'`, or `mode='cancel'` plus `job_id` to manage it. "
+        "`mode='status'`, `mode='tail'`, or `mode='cancel'` plus `job_id` to manage it explicitly. "
         "User approval is typically required for commands that install packages or tools, "
         "run remote installer pipelines such as `curl|bash`, or write into system paths "
         "outside `/workspace` such as `/usr/local/bin`, `/etc`, `/opt`, or `/var`. "
@@ -525,6 +709,39 @@ def _format_bash_result(
     return "\n".join(lines)
 
 
+def _format_background_promotion_result(
+    *,
+    command: str,
+    cwd: Path,
+    job_id: str,
+    pid: int,
+    pgid: int,
+    duration_seconds: float,
+    soft_timeout_seconds: float,
+    timeout_seconds: float,
+    stdout_text: str,
+    stderr_text: str,
+) -> str:
+    lines = [
+        "Bash foreground execution moved to background",
+        "status: background",
+        f"command: {command}",
+        f"cwd: {cwd}",
+        f"job_id: {job_id}",
+        f"pid: {pid}",
+        f"pgid: {pgid}",
+        f"duration_seconds: {duration_seconds:.3f}",
+        f"soft_timeout_seconds: {soft_timeout_seconds:.3f}",
+        f"requested_timeout_seconds: {timeout_seconds:.3f}",
+        "Use `mode='status'` to check the job, `mode='tail'` to inspect output, or `mode='cancel'` to stop it.",
+        "stdout:",
+        stdout_text or "(empty)",
+        "stderr:",
+        stderr_text or "(empty)",
+    ]
+    return "\n".join(lines)
+
+
 def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
     if len(text) <= limit:
         return text, False
@@ -532,6 +749,13 @@ def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
     tail = max(1, limit - head)
     truncated = f"{text[:head]}\n...[truncated]...\n{text[-tail:]}"
     return truncated, True
+
+
+def _read_job_output_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
 
 
 def _normalize_mode(value: object) -> str:

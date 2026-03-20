@@ -55,6 +55,7 @@ class ToolSettings:
     bash_executable: str
     bash_default_timeout_seconds: float
     bash_max_timeout_seconds: float
+    bash_foreground_soft_timeout_seconds: float
     bash_max_output_chars: int
     bash_dangerously_skip_permission: bool
     python_interpreter_venv: Path
@@ -101,6 +102,8 @@ class ToolSettings:
             raise ValueError(
                 "bash_default_timeout_seconds cannot exceed bash_max_timeout_seconds."
             )
+        if self.bash_foreground_soft_timeout_seconds <= 0:
+            raise ValueError("bash_foreground_soft_timeout_seconds must be > 0.")
         if self.bash_max_output_chars <= 0:
             raise ValueError("bash_max_output_chars must be > 0.")
         if not isinstance(self.bash_dangerously_skip_permission, bool):
@@ -203,6 +206,10 @@ class ToolSettings:
             bash_max_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS",
                 app_settings.JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS,
+            ),
+            bash_foreground_soft_timeout_seconds=_parse_float_env(
+                "JARVIS_TOOL_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS",
+                app_settings.JARVIS_TOOL_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS,
             ),
             bash_max_output_chars=_parse_int_env(
                 "JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS",

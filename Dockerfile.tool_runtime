@@ -31,7 +31,7 @@ COPY pyproject.toml uv.lock ./
 COPY src ./src
 RUN uv sync --frozen --no-install-project \
   && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" pytest \
-  && export JARVIS_PYTHON_TOOL_PACKAGES="$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('jarvis_settings', 'src/settings.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(' '.join(module.JARVIS_TOOL_PYTHON_INTERPRETER_ALLOWED_PACKAGES))")" \
+  && export JARVIS_PYTHON_TOOL_PACKAGES="$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('jarvis_settings', 'src/settings.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(' '.join(module.JARVIS_TOOL_PYTHON_INTERPRETER_STARTER_PACKAGES))")" \
   && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" ${JARVIS_PYTHON_TOOL_PACKAGES}
 
 WORKDIR /app

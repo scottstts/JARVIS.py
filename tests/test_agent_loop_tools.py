@@ -278,6 +278,88 @@ class _FakeToolFirstLLMService(_FakeToolLLMService):
         yield DoneEvent(response=_build_response("File written."))
 
 
+class _ForegroundPromotionToolExecutor:
+    async def __call__(self, *, call_id: str, arguments: dict[str, object], context) -> ToolExecutionResult:
+        _ = arguments, context
+        job_id = "deadbeefdeadbeefdeadbeefdeadbeef"
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content=(
+                "Bash foreground execution moved to background\n"
+                f"job_id: {job_id}\n"
+                "Use mode='status' or mode='tail'."
+            ),
+            metadata={
+                "mode": "foreground",
+                "promoted_to_background": True,
+                "job_id": job_id,
+                "soft_timeout_seconds": 30.0,
+            },
+        )
+
+
+class _FakeForegroundPromotionLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != ["bash"]:
+            raise AssertionError(f"Expected only bash to be registered, got {names}.")
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="bash_promote_1",
+                        name="bash",
+                        arguments={"command": "long-running command"},
+                        raw_arguments='{"command":"long-running command"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        assistant_message = request.messages[-3]
+        tool_message = request.messages[-2]
+        system_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result before foreground-promotion notice.")
+        if system_message.role != "system":
+            raise AssertionError("Expected transient system promotion notice before follow-up.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected exactly one bash tool result part.")
+        if "moved to background" not in tool_result_parts[0].content:
+            raise AssertionError("Expected tool result to mention background promotion.")
+
+        system_text_parts = [
+            part.text for part in system_message.parts if isinstance(part, TextPart)
+        ]
+        if len(system_text_parts) != 1:
+            raise AssertionError("Expected a single system promotion notice.")
+        if "automatically moved to background" not in system_text_parts[0]:
+            raise AssertionError("Expected system promotion notice to explain the soft-timeout.")
+        if "mode='status'" not in system_text_parts[0]:
+            raise AssertionError("Expected system promotion notice to mention status probing.")
+        if "deadbeefdeadbeefdeadbeefdeadbeef" not in system_text_parts[0]:
+            raise AssertionError("Expected system promotion notice to include the job id.")
+
+        return _build_response("Monitoring the promoted job.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _FakeViewImageLLMService:
     def __init__(self, expected_image_bytes: bytes) -> None:
         self._expected_image_bytes = expected_image_bytes
@@ -1228,6 +1310,65 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].content, "")
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "bash")
             self.assertIn("Bash execution result", message_records[-2].content)
+
+    async def test_handle_user_input_adds_transient_notice_when_bash_foreground_is_promoted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="bash",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="bash",
+                            input_schema={
+                                "type": "object",
+                                "properties": {
+                                    "command": {"type": "string"},
+                                },
+                                "required": ["command"],
+                                "additionalProperties": False,
+                            },
+                            description="Test bash tool.",
+                        ),
+                        executor=_ForegroundPromotionToolExecutor(),
+                    )
+                ]
+            )
+            loop = AgentLoop(
+                llm_service=_FakeForegroundPromotionLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            result = await loop.handle_user_input("Run the long bash command.")
+
+            self.assertEqual(result.response_text, "Monitoring the promoted job.")
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertTrue(
+                message_records[-2].metadata.get("promoted_to_background", False)
+            )
+            self.assertFalse(
+                any(
+                    record.role == "system"
+                    and record.metadata.get("bash_background_promotion")
+                    for record in message_records
+                )
+            )
 
     async def test_handle_user_input_auto_compacts_when_followup_preflight_budget_is_exceeded(
         self,
