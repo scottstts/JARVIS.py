@@ -58,7 +58,6 @@ _SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS = frozenset(
         "subagent_failed",
         "subagent_approval_rejected",
         "subagent_waiting_background",
-        "subagent_resumed_after_bash_update",
         "subagent_needs_attention",
     }
 )

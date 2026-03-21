@@ -378,6 +378,29 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued.force_session_id, session_id)
             self.assertEqual(queued.runtime_turn_kind, "main_subagent_progress")
 
+    async def test_subagent_resumed_notice_does_not_enqueue_main_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(runtime, "_ensure_message_worker"):
+                await runtime.publish_event(
+                    RouteSystemNoticeEvent(
+                        route_id="route_1",
+                        agent_kind="subagent",
+                        agent_name="Ultron",
+                        subagent_id="sub_1",
+                        session_id="sub_session",
+                        notice_kind="subagent_resumed_after_bash_update",
+                        text="resumed after detached bash update.",
+                    )
+                )
+
+            self.assertTrue(runtime._message_queue.empty())
+
     async def test_main_subagent_runtime_turn_persists_concise_agent_only_system_notice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
