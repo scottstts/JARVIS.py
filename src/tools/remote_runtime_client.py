@@ -184,20 +184,13 @@ def _resolve_request_timeout_seconds(
     base_timeout_seconds: float,
 ) -> float:
     requested_timeout = arguments.get("timeout_seconds")
-    if tool_name == "bash":
-        effective_timeout = _resolve_effective_timeout(
-            requested_timeout,
-            default_timeout=settings.bash_default_timeout_seconds,
-            max_timeout=settings.bash_max_timeout_seconds,
-        )
-    elif tool_name == "python_interpreter":
-        effective_timeout = _resolve_effective_timeout(
-            requested_timeout,
-            default_timeout=settings.python_interpreter_default_timeout_seconds,
-            max_timeout=settings.python_interpreter_max_timeout_seconds,
-        )
-    else:
+    if tool_name != "bash":
         return base_timeout_seconds
+    effective_timeout = _resolve_effective_timeout(
+        requested_timeout,
+        default_timeout=settings.bash_default_timeout_seconds,
+        max_timeout=settings.bash_max_timeout_seconds,
+    )
     return max(base_timeout_seconds, effective_timeout + 15.0)
 
 

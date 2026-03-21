@@ -712,7 +712,7 @@ class DirectBashToolExecutor:
 
 
 def _build_scrubbed_environment(settings: ToolSettings) -> dict[str, str]:
-    venv_root = str(settings.python_interpreter_venv)
+    venv_root = str(settings.central_python_venv)
     venv_bin = f"{venv_root}/bin"
     runtime_path = os.getenv("PATH") or _DEFAULT_RUNTIME_PATH
     path_entries = [entry for entry in runtime_path.split(":") if entry and entry != venv_bin]
@@ -745,15 +745,16 @@ def _resolve_timeout_seconds(arguments: dict[str, Any], settings: ToolSettings) 
 
 
 def format_bash_tool_description(settings: ToolSettings) -> str:
-    venv_root = settings.python_interpreter_venv
+    venv_root = settings.central_python_venv
     interpreter_path = venv_root / "bin" / "python"
     return (
-        "Run a bash command from `/workspace` inside the isolated tool_runtime container. "
-        "Use this for shell commands, CLI tools, installs, builds, file inspection, scripts, "
-        "and long-running background jobs. Python execution is allowed here, but it must use "
-        f"the central `{venv_root}` environment; prefer bare `python`/`python3` or "
+        "Run a linux bash command from `/workspace` inside the isolated container. "
+        "Use this tool for all bash-related tasks, including built-in Python. "
+        f"Python uses the central `{venv_root}` environment; prefer bare `python`/`python3` or "
         f"`{interpreter_path}`, and install packages with "
         f"`uv pip install --python {interpreter_path} <package-name>`. "
+        "Use `python -c` for short snippets, `python - <<'PY'` for multi-line code, or run a "
+        "script stored in `/workspace` for longer jobs. "
         f"Foreground commands that are still running after the {settings.bash_foreground_soft_timeout_seconds:.0f}s "
         "soft timeout are automatically moved to background mode. Set `mode='background'` to start a long-running "
         "job explicitly. Detached jobs are monitored by the orchestrator, which will surface noteworthy progress or "
@@ -763,7 +764,7 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
         "User approval is typically required for commands that install packages or tools, "
         "run remote installer pipelines such as `curl|bash`, or write into system paths "
         "outside `/workspace` such as `/usr/local/bin`, `/etc`, `/opt`, or `/var`. "
-        "When approval is likely, provide clear "
+        "When approval is likely needed, provide clear "
         "`approval_summary`, `approval_details`, and optional `inspection_url` context."
     )
 

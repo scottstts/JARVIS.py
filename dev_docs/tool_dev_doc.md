@@ -289,7 +289,6 @@ Structure:
 Current active policy:
 
 - `bash` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it scrubs the environment, forces agent-facing Python usage through the central `/opt/venv` environment, supports foreground and background job modes, enforces approval for install/build/system-mutation commands, and hard-denies pointless or harmful container-admin commands even inside `tool_runtime` unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
-- `python_interpreter` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it is now a direct one-shot runner over the same central `/opt/venv/bin/python` environment used by `bash`
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
 - `tool_register` always requires exact-action approval and binds approval to the manifest payload hash
@@ -420,46 +419,6 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - only `/workspace` is shared back to the app; if the command writes elsewhere, those changes stay local to the long-lived `tool_runtime` container
 - command availability depends on what is installed in the runtime image
 - background job logs intentionally keep only the recent retained window; full historical raw output is not preserved once per-stream compaction drops older bytes
-
-### `python_interpreter`
-
-- Status: implemented
-- Exposure: `basic`
-- Package: `src/tools/basic/python_interpreter/`
-- Purpose: run direct one-shot Python code or stored workspace scripts through the central agent venv for parsing, tabular work, PDF/text extraction, image processing, automation, and structured transformations that are awkward in shell
-
-#### Input Schema
-
-- `code: string | null` optional; exactly one of `code` or `script_path` is required
-- `script_path: string | null` optional; exactly one of `code` or `script_path` is required
-- `args: string[]` optional
-- `read_paths: string[]` optional
-- `write_paths: string[]` optional
-- `timeout_seconds: number` optional
-
-#### Executor Behavior
-
-- policy is evaluated in `dev`, but execution happens in the sibling `tool_runtime` container over internal HTTP
-- runs `/opt/venv/bin/python` directly inside `tool_runtime` with the same central venv model used by `bash`
-- mounts the real workspace directly at `/workspace`
-- supports inline code and stored scripts under `/workspace`
-- preserves the compatibility `read_paths` and `write_paths` fields as no-ops
-- keeps network and subprocess capability available because there is no longer an inner Python sandbox
-- captures both `stdout` and `stderr`
-- truncates large output to the configured cap
-
-#### Policy
-
-- exactly one of `code` or `script_path` must be provided
-- `script_path` must stay inside `/workspace`
-- argument count and argument size caps are still enforced
-- shell-expanded forms like `~`, `*`, `?`, and `[` are rejected
-
-#### Current Limitations
-
-- intentionally one-shot and stateless; no persistent kernel/session memory across tool calls
-- `read_paths` and `write_paths` are deprecated compatibility fields and no longer control filesystem access
-- third-party availability starts with the configured `starter_packages` installed into `/opt/venv`, and the agent may add more packages into that same venv at runtime
 
 ### `file_patch`
 
@@ -1015,6 +974,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
-- Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `python_interpreter`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
+- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
 - Implemented discoverable tools: `email`, `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`

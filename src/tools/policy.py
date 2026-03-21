@@ -7,7 +7,6 @@ from .basic.file_patch import FilePatchPolicy
 from .basic.memory_get import MemoryGetPolicy
 from .basic.memory_search import MemorySearchPolicy
 from .basic.memory_write import MemoryWritePolicy
-from .basic.python_interpreter import PythonInterpreterPolicy
 from .basic.send_file import SendFilePolicy
 from .basic.tool_register import ToolRegisterPolicy
 from .basic.tool_search import ToolSearchPolicy
@@ -73,13 +72,6 @@ class ToolPolicy:
                 context=context,
             )
 
-        if tool_name == "python_interpreter":
-            settings = ToolSettings.from_workspace_dir(context.workspace_dir)
-            return PythonInterpreterPolicy(settings).authorize(
-                arguments=arguments,
-                context=context,
-            )
-
         if tool_name == "send_file":
             path = str(arguments.get("path", "")).strip()
             return SendFilePolicy().authorize(path=path, context=context)
@@ -141,7 +133,6 @@ class ToolPolicy:
         if tool_name not in {
             "bash",
             "file_patch",
-            "python_interpreter",
             "memory_search",
             "memory_get",
             "memory_write",

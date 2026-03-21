@@ -53,7 +53,6 @@ _EXPECTED_BASIC_TOOL_NAMES = [
     "memory_search",
     "memory_get",
     "memory_write",
-    "python_interpreter",
     "web_search",
     "web_fetch",
     "view_image",
@@ -61,6 +60,11 @@ _EXPECTED_BASIC_TOOL_NAMES = [
     "tool_search",
     "tool_register",
 ]
+
+
+def _bash_python_heredoc(code: str) -> str:
+    normalized = code.rstrip("\n")
+    return f"python - <<'PY'\n{normalized}\nPY"
 
 
 def _build_response(
@@ -324,15 +328,12 @@ class _FakeForegroundPromotionLLMService:
                 finish_reason="tool_calls",
             )
 
-        assistant_message = request.messages[-3]
-        tool_message = request.messages[-2]
-        system_message = request.messages[-1]
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
         if assistant_message.role != "assistant":
             raise AssertionError("Expected assistant tool-call message before tool result.")
         if tool_message.role != "tool":
-            raise AssertionError("Expected tool result before foreground-promotion notice.")
-        if system_message.role != "system":
-            raise AssertionError("Expected transient system promotion notice before follow-up.")
+            raise AssertionError("Expected tool result before follow-up.")
 
         tool_result_parts = [
             part for part in tool_message.parts if isinstance(part, ToolResultPart)
@@ -341,18 +342,6 @@ class _FakeForegroundPromotionLLMService:
             raise AssertionError("Expected exactly one bash tool result part.")
         if "moved to background" not in tool_result_parts[0].content:
             raise AssertionError("Expected tool result to mention background promotion.")
-
-        system_text_parts = [
-            part.text for part in system_message.parts if isinstance(part, TextPart)
-        ]
-        if len(system_text_parts) != 1:
-            raise AssertionError("Expected a single system promotion notice.")
-        if "automatically moved to background" not in system_text_parts[0]:
-            raise AssertionError("Expected system promotion notice to explain the soft-timeout.")
-        if "mode='status'" not in system_text_parts[0]:
-            raise AssertionError("Expected system promotion notice to mention status probing.")
-        if "deadbeefdeadbeefdeadbeefdeadbeef" not in system_text_parts[0]:
-            raise AssertionError("Expected system promotion notice to include the job id.")
 
         return _build_response("Monitoring the promoted job.")
 
@@ -499,7 +488,7 @@ class _FakeFilePatchLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
-class _FakePythonInterpreterLLMService:
+class _FakeBashPythonLLMService:
     def __init__(self) -> None:
         self.generate_calls = 0
 
@@ -516,20 +505,16 @@ class _FakePythonInterpreterLLMService:
                 "",
                 tool_calls=[
                     ToolCall(
-                        call_id="python_interpreter_1",
-                        name="python_interpreter",
+                        call_id="bash_python_1",
+                        name="bash",
                         arguments={
-                            "code": (
+                            "command": _bash_python_heredoc(
                                 "from pathlib import Path\n"
                                 "Path('exports/report.txt').write_text('hello', encoding='utf-8')\n"
                                 "print('done')\n"
                             ),
                         },
-                        raw_arguments=(
-                            '{"code":"from pathlib import Path\\nPath('
-                            "'exports/report.txt').write_text('hello', "
-                            "encoding='utf-8')\\nprint('done')\\n\"}"
-                        ),
+                        raw_arguments='{"command":"python heredoc"}',
                     )
                 ],
                 finish_reason="tool_calls",
@@ -547,10 +532,10 @@ class _FakePythonInterpreterLLMService:
         ]
         if len(tool_result_parts) != 1:
             raise AssertionError("Expected one tool result part before follow-up model call.")
-        if "Python interpreter result" not in tool_result_parts[0].content:
-            raise AssertionError("Expected python_interpreter tool result content.")
-        if "workspace_mode: direct_bind" not in tool_result_parts[0].content:
-            raise AssertionError("Expected python_interpreter result to mention direct workspace mode.")
+        if "Bash execution result" not in tool_result_parts[0].content:
+            raise AssertionError("Expected bash tool result content.")
+        if "done" not in tool_result_parts[0].content:
+            raise AssertionError("Expected bash Python result to include command output.")
 
         return _build_response("Python task finished.")
 
@@ -1098,15 +1083,15 @@ class _InterruptedToolProposalContinuationLLMService:
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_requests.append(request)
         if any(
-            isinstance(part, ToolCall) and part.name == "python_interpreter"
+            isinstance(part, ToolCall) and part.name == "bash"
             for message in request.messages
             if message.role == "assistant"
             for part in message.parts
         ):
-            raise AssertionError("Dangling interrupted python tool calls should be normalized before prompt build.")
+            raise AssertionError("Dangling interrupted bash tool calls should be normalized before prompt build.")
         if not any(
             isinstance(part, TextPart)
-            and "python_interpreter" in part.text
+            and "bash" in part.text
             and "Treat them as not run." in part.text
             for message in request.messages
             if message.role == "system"
@@ -1116,20 +1101,20 @@ class _InterruptedToolProposalContinuationLLMService:
         return _build_response("continued")
 
     async def stream_generate(self, request: LLMRequest):
-        if "python_interpreter" not in [tool.name for tool in request.tools]:
-            raise AssertionError("Expected python_interpreter to be available in the initial tool request.")
-        yield TextDeltaEvent(delta="I'll use python.")
+        if "bash" not in [tool.name for tool in request.tools]:
+            raise AssertionError("Expected bash to be available in the initial tool request.")
+        yield TextDeltaEvent(delta="I'll use bash with Python.")
         self.stream_started.set()
         await self.release_stream.wait()
         yield DoneEvent(
             response=_build_response(
-                "I'll use python.",
+                "I'll use bash with Python.",
                 tool_calls=[
                     ToolCall(
                         call_id="python_1",
-                        name="python_interpreter",
-                        arguments={"code": "print('x')"},
-                        raw_arguments='{"code":"print(\\"x\\")"}',
+                        name="bash",
+                        arguments={"command": "python -c pass"},
+                        raw_arguments='{"command":"python -c pass"}',
                     )
                 ],
                 finish_reason="tool_calls",
@@ -1195,20 +1180,20 @@ class _StopMidToolCallStreamingLLMService:
     async def stream_generate(self, request: LLMRequest):
         try:
             names = [tool.name for tool in request.tools]
-            if "python_interpreter" not in names:
-                raise AssertionError("Expected python_interpreter to be available in the request.")
+            if "bash" not in names:
+                raise AssertionError("Expected bash to be available in the request.")
             yield TextDeltaEvent(delta="I'll use Python for this.")
             yield ToolCallDeltaEvent(
                 call_id="python_1",
-                tool_name="python_interpreter",
-                arguments_delta='{"code":"print(',
+                tool_name="bash",
+                arguments_delta='{"command":"python -c pass',
             )
             self.tool_call_started.set()
             await self.release_stream.wait()
             yield ToolCallDeltaEvent(
                 call_id="python_1",
-                tool_name="python_interpreter",
-                arguments_delta='"hello world")"}',
+                tool_name="bash",
+                arguments_delta='"}',
             )
             yield DoneEvent(
                 response=_build_response(
@@ -1216,9 +1201,9 @@ class _StopMidToolCallStreamingLLMService:
                     tool_calls=[
                         ToolCall(
                             call_id="python_1",
-                            name="python_interpreter",
-                            arguments={"code": 'print("hello world")'},
-                            raw_arguments='{"code":"print(\\"hello world\\")"}',
+                            name="bash",
+                            arguments={"command": "python -c pass"},
+                            raw_arguments='{"command":"python -c pass"}',
                         )
                     ],
                     finish_reason="tool_calls",
@@ -1651,7 +1636,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             tool_event = events[1]
             if not isinstance(tool_event, AgentToolCallEvent):
                 self.fail("Expected the second event to be an AgentToolCallEvent.")
-            self.assertEqual(tool_event.tool_names, ("python_interpreter",))
+            self.assertEqual(tool_event.tool_names, ("bash",))
 
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
@@ -1955,7 +1940,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "file_patch")
             self.assertIn("File patch applied", message_records[-2].content)
 
-    async def test_handle_user_input_executes_python_interpreter_tool_round(self) -> None:
+    async def test_handle_user_input_executes_bash_python_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             exports_dir = settings.workspace_dir / "exports"
@@ -1965,14 +1950,14 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             with patch.dict(
                 os.environ,
                 {
-                    "JARVIS_TOOL_PYTHON_INTERPRETER_VENV": str(
+                    "JARVIS_TOOL_CENTRAL_PYTHON_VENV": str(
                         Path(sys.executable).resolve().parent.parent
                     )
                 },
                 clear=False,
             ):
                 loop = AgentLoop(
-                    llm_service=_FakePythonInterpreterLLMService(),
+                    llm_service=_FakeBashPythonLLMService(),
                     settings=settings,
                     storage=storage,
                 )
@@ -1994,9 +1979,9 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-1].role, "assistant")
             self.assertEqual(
                 message_records[-3].metadata["tool_calls"][0]["name"],
-                "python_interpreter",
+                "bash",
             )
-            self.assertIn("Python interpreter result", message_records[-2].content)
+            self.assertIn("Bash execution result", message_records[-2].content)
 
     async def test_handle_user_input_executes_send_file_tool_with_route_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

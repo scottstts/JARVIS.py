@@ -6,9 +6,9 @@ This document defines the implementation plan for runtime tool registration and 
 
 Status note:
 
-- The active execution topology for `bash` and `python_interpreter` is now the isolated sibling `tool_runtime` container described in `dev_docs/tool_runtime_isolation_plan.md`.
-- Read this document together with that isolation plan; where this document still mentions the old in-app sandbox shape, the isolation plan and current code take precedence.
-- Current capability model also differs from parts of this older plan: `bash` now supports direct Python through the central `/opt/venv` environment, `python_interpreter` is a direct one-shot `/opt/venv/bin/python` runner with no inner bubblewrap layer, and `bash` includes built-in non-PTY background job control.
+- The active execution topology now routes `bash` into the isolated sibling `tool_runtime` container.
+- Parts of this document still reflect the older in-app sandbox shape; where they conflict, current code takes precedence.
+- Current capability model also differs from parts of this older plan: all agent-facing Python work now goes through `bash` using the central `/opt/venv` environment, and `bash` includes built-in non-PTY background job control.
 
 The target outcome is:
 

@@ -1,4 +1,4 @@
-"""Internal HTTP service for isolated bash and python_interpreter execution."""
+"""Internal HTTP service for isolated bash execution."""
 
 from .app import build_asgi_app, create_app
 

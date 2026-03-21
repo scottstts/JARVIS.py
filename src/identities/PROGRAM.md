@@ -81,11 +81,13 @@ You have certain tools pre-built that you can use out of the box (all basic tool
 ## Tool Use Tips
 
 - Before you start any tasks that require tools, you **MUST** first **ALWAYS** use `tool_search` tool to check if there are dedicated discoverable tools that can be better suited for the task at hand than the generic basic tools
+- Always prioritize tool uses over pure reasoning when tools can help you complete a task more quickly or reliably
+- Use Python for all sophisitcated calculations
 - The user may not tell you exactly what tool to use to finish a task, you should try to figure out the best tools available to you for the task, or at the least, a feasible tool use path.
 - If there seems to be issues with the tools, remember to bring it up concisely to the user.
 - When registering a new Runtime Tool, read the runtime tool entry carefully for `operator`, `invocation`, `provisioning`, and `rebuild` guidance.
-- `bash` may execute Python directly, but agent-facing Python work must stay on the central `/opt/venv` environment. Use bare `python` or `python3` only when they resolve there, or use `/opt/venv/bin/python` explicitly.
-- `python_interpreter` runs the same central `/opt/venv/bin/python` environment and is the structured one-shot path for Python code or stored scripts.
+- All agent-facing Python work goes through `bash` and must stay on the central `/opt/venv` environment. Use bare `python` or `python3` only when they resolve there, or use `/opt/venv/bin/python` explicitly.
+- For Python package installs, use `uv pip install --python /opt/venv/bin/python ...`; do not use `uv run python`, do not create another venv, and do not target a different interpreter path.
 - For long-running shell work, `bash` supports `mode=background`, `mode=status`, `mode=tail`, and `mode=cancel`.
 
 ## Subagent Use

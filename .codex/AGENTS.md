@@ -25,7 +25,7 @@ The runtime is now split across two sibling containers in the same compose proje
   - mounts the repo at `/repo`
   - mounts the shared workspace at `/workspace`
 - `tool_runtime`
-  - runs the internal HTTP service for `bash` and `python_interpreter`
+  - runs the internal HTTP service for `bash`
   - mounts the shared workspace at `/workspace`
   - does **not** mount `/repo`
 
@@ -45,7 +45,7 @@ The repo is still bind-mounted into `dev` (`Jarvis/` on macOS ↔ `/repo` in the
 
 Tool note:
 
-- `bash` and `python_interpreter` no longer execute inside `dev`; they are remotely executed in the isolated `tool_runtime` container through the app.
+- `bash` no longer executes inside `dev`; it is remotely executed in the isolated `tool_runtime` container through the app.
 
 ### Standard commands (run from macOS terminal)
 

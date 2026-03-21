@@ -1,4 +1,4 @@
-"""ASGI app for isolated bash and python_interpreter execution."""
+"""ASGI app for isolated bash execution."""
 
 from __future__ import annotations
 
@@ -20,13 +20,11 @@ from .models import (
     parse_execute_request,
     serialize_execution_result,
 )
-from .python_executor import build_service_python_executor
 
 
 def create_app(settings: ToolSettings | None = None) -> Starlette:
     resolved_settings = settings or ToolSettings.from_env()
     bash_executor = build_service_bash_executor(resolved_settings)
-    python_executor = build_service_python_executor(resolved_settings)
 
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse(
@@ -39,23 +37,11 @@ def create_app(settings: ToolSettings | None = None) -> Starlette:
     async def execute_bash(request: Request) -> JSONResponse:
         return await _execute_request(request, executor=bash_executor, workspace_dir=resolved_settings.workspace_dir)
 
-    async def execute_python_interpreter(request: Request) -> JSONResponse:
-        return await _execute_request(
-            request,
-            executor=python_executor,
-            workspace_dir=resolved_settings.workspace_dir,
-        )
-
     return Starlette(
         debug=False,
         routes=[
             Route("/health", healthcheck, methods=["GET"]),
             Route("/tools/bash/execute", execute_bash, methods=["POST"]),
-            Route(
-                "/tools/python_interpreter/execute",
-                execute_python_interpreter,
-                methods=["POST"],
-            ),
         ],
     )
 

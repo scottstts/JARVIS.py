@@ -297,7 +297,7 @@ def _python_environment_violation_reason(
 
 
 def _allowed_central_python_commands(settings: ToolSettings) -> set[str]:
-    venv_bin = settings.python_interpreter_venv / "bin"
+    venv_bin = settings.central_python_venv / "bin"
     allowed: set[str] = {"python", "python3"}
     try:
         for entry in venv_bin.iterdir():
@@ -309,7 +309,7 @@ def _allowed_central_python_commands(settings: ToolSettings) -> set[str]:
 
 
 def _central_venv_path(settings: ToolSettings) -> str:
-    return str(settings.python_interpreter_venv)
+    return str(settings.central_python_venv)
 
 
 def _central_interpreter_path(settings: ToolSettings) -> str:

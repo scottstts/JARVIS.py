@@ -8,7 +8,6 @@ from .basic.memory_get import MemoryGetPolicy
 from .basic.memory_search import MemorySearchPolicy
 from .basic.memory_write import MemoryWritePolicy
 from .policy import ToolPolicy
-from .basic.python_interpreter import PythonInterpreterPolicy
 from .registry import ToolRegistry
 from .runtime import ToolRuntime
 from .basic.send_file import SendFilePolicy
@@ -40,7 +39,6 @@ __all__ = [
     "MemoryGetPolicy",
     "MemorySearchPolicy",
     "MemoryWritePolicy",
-    "PythonInterpreterPolicy",
     "RegisteredTool",
     "SendFilePolicy",
     "ToolRegisterPolicy",
