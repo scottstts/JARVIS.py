@@ -57,6 +57,9 @@ class ToolSettings:
     bash_max_timeout_seconds: float
     bash_foreground_soft_timeout_seconds: float
     bash_max_output_chars: int
+    bash_job_log_max_bytes: int
+    bash_job_total_storage_budget_bytes: int
+    bash_job_retention_seconds: float
     bash_dangerously_skip_permission: bool
     python_interpreter_venv: Path
     python_interpreter_starter_packages: tuple[str, ...]
@@ -106,6 +109,12 @@ class ToolSettings:
             raise ValueError("bash_foreground_soft_timeout_seconds must be > 0.")
         if self.bash_max_output_chars <= 0:
             raise ValueError("bash_max_output_chars must be > 0.")
+        if self.bash_job_log_max_bytes <= 0:
+            raise ValueError("bash_job_log_max_bytes must be > 0.")
+        if self.bash_job_total_storage_budget_bytes <= 0:
+            raise ValueError("bash_job_total_storage_budget_bytes must be > 0.")
+        if self.bash_job_retention_seconds <= 0:
+            raise ValueError("bash_job_retention_seconds must be > 0.")
         if not isinstance(self.bash_dangerously_skip_permission, bool):
             raise ValueError("bash_dangerously_skip_permission must be a boolean.")
         if not str(self.python_interpreter_venv).strip():
@@ -214,6 +223,18 @@ class ToolSettings:
             bash_max_output_chars=_parse_int_env(
                 "JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS",
                 app_settings.JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS,
+            ),
+            bash_job_log_max_bytes=_parse_int_env(
+                "JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES",
+                app_settings.JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES,
+            ),
+            bash_job_total_storage_budget_bytes=_parse_int_env(
+                "JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES",
+                app_settings.JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES,
+            ),
+            bash_job_retention_seconds=_parse_float_env(
+                "JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS",
+                app_settings.JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS,
             ),
             bash_dangerously_skip_permission=_parse_bool_env(
                 "BASH_DANGEROUSLY_SKIP_PERMISSION",

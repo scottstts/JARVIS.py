@@ -42,6 +42,7 @@ from tools.basic.bash.local_executor import (
     DirectBashToolExecutor,
     format_bash_tool_description,
 )
+from tools.basic.bash.jobs import load_job, sweep_job_artifacts
 from tools.basic.python_interpreter.local_executor import (
     DirectPythonInterpreterToolExecutor,
     build_python_interpreter_description,
@@ -657,6 +658,216 @@ class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                 context=context,
             )
             self.assertTrue(cancel_result.ok)
+
+    async def test_background_job_output_is_capped_and_reports_dropped_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES": "128",
+                    "JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES": "1048576",
+                    "JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            start_result = await executor(
+                call_id="call_bash_background_capped_start",
+                arguments={
+                    "mode": "background",
+                    "command": (
+                        "python3 -c \"import sys; sys.stdout.write('x' * 4096); sys.stdout.flush()\""
+                    ),
+                },
+                context=context,
+            )
+
+            self.assertTrue(start_result.ok)
+            job_id = str(start_result.metadata["job_id"])
+
+            status_result = None
+            for _ in range(20):
+                status_result = await executor(
+                    call_id="call_bash_background_capped_status",
+                    arguments={"mode": "status", "job_id": job_id},
+                    context=context,
+                )
+                self.assertTrue(status_result.ok)
+                if status_result.metadata["status"] == "finished":
+                    break
+                await asyncio.sleep(0.05)
+
+            self.assertIsNotNone(status_result)
+            if status_result is None:
+                self.fail("Expected a bash background status result.")
+            self.assertEqual(status_result.metadata["status"], "finished")
+            self.assertGreater(status_result.metadata["stdout_bytes_dropped"], 0)
+            self.assertLessEqual(
+                status_result.metadata["stdout_bytes_retained"],
+                settings.bash_job_log_max_bytes,
+            )
+
+            tail_result = await executor(
+                call_id="call_bash_background_capped_tail",
+                arguments={"mode": "tail", "job_id": job_id},
+                context=context,
+            )
+
+            self.assertTrue(tail_result.ok)
+            self.assertGreater(tail_result.metadata["stdout_bytes_dropped"], 0)
+            self.assertIn("earlier output dropped", tail_result.content)
+
+            paths, _ = load_job(workspace_dir, job_id)
+            self.assertLessEqual(paths.stdout_path.stat().st_size, settings.bash_job_log_max_bytes)
+
+    async def test_background_job_metadata_tracks_child_process_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            start_result = await executor(
+                call_id="call_bash_child_pid_start",
+                arguments={"mode": "background", "command": "sleep 5"},
+                context=context,
+            )
+
+            self.assertTrue(start_result.ok)
+            job_id = str(start_result.metadata["job_id"])
+
+            try:
+                status_result = await executor(
+                    call_id="call_bash_child_pid_status",
+                    arguments={"mode": "status", "job_id": job_id},
+                    context=context,
+                )
+                self.assertTrue(status_result.ok)
+                self.assertGreater(status_result.metadata["runner_pid"], 0)
+                self.assertGreater(status_result.metadata["pid"], 0)
+                self.assertNotEqual(
+                    status_result.metadata["runner_pid"],
+                    status_result.metadata["pid"],
+                )
+            finally:
+                cancel_result = await executor(
+                    call_id="call_bash_child_pid_cancel",
+                    arguments={"mode": "cancel", "job_id": job_id},
+                    context=context,
+                )
+                self.assertTrue(cancel_result.ok)
+
+    async def test_background_job_budget_rejects_new_job_when_active_jobs_exhaust_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES": "1024",
+                    "JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES": "265000",
+                    "JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            first_result = await executor(
+                call_id="call_bash_budget_first",
+                arguments={"mode": "background", "command": "sleep 5"},
+                context=context,
+            )
+            self.assertTrue(first_result.ok)
+            first_job_id = str(first_result.metadata["job_id"])
+
+            try:
+                second_result = await executor(
+                    call_id="call_bash_budget_second",
+                    arguments={"mode": "background", "command": "sleep 5"},
+                    context=context,
+                )
+                self.assertFalse(second_result.ok)
+                self.assertIn("storage budget", second_result.content)
+            finally:
+                cancel_result = await executor(
+                    call_id="call_bash_budget_cancel",
+                    arguments={"mode": "cancel", "job_id": first_job_id},
+                    context=context,
+                )
+                self.assertTrue(cancel_result.ok)
+
+    async def test_sweeper_removes_expired_cancelled_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            start_result = await executor(
+                call_id="call_bash_sweeper_start",
+                arguments={"mode": "background", "command": "sleep 5"},
+                context=context,
+            )
+            self.assertTrue(start_result.ok)
+            job_id = str(start_result.metadata["job_id"])
+
+            cancel_result = await executor(
+                call_id="call_bash_sweeper_cancel",
+                arguments={"mode": "cancel", "job_id": job_id},
+                context=context,
+            )
+            self.assertTrue(cancel_result.ok)
+
+            paths, _ = load_job(workspace_dir, job_id)
+            stale_timestamp = "2000-01-01T00:00:00Z\n"
+            paths.cancelled_at_path.write_text(stale_timestamp, encoding="utf-8")
+
+            sweep_job_artifacts(
+                workspace_dir=workspace_dir,
+                retention_seconds=1.0,
+                total_storage_budget_bytes=settings.bash_job_total_storage_budget_bytes,
+            )
+
+            self.assertFalse(paths.job_dir.exists())
 
 
 class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):

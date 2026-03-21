@@ -376,12 +376,16 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - `set -o pipefail` is enabled
 - default foreground timeout is `120s`
 - max foreground timeout is `1800s`
-- foreground runs that are still active after the `30s` soft-timeout are automatically converted into persisted background jobs and return early with a `job_id`
+- foreground runs that are still active after soft-timeout are automatically converted into persisted background jobs and return early with a `job_id`
 - remote-runtime HTTP timeout is derived from the requested tool timeout plus `15s` headroom, so transport timeout does not undercut the tool timeout
 - captures both `stdout` and `stderr`
 - truncates large output to the configured cap
 - returns a normalized tool result even when the command produces no `stdout`
 - supports background jobs persisted under `.jarvis_internal/bash_jobs/`; the same tool surface can start, inspect, tail, and cancel them
+- background job `stdout`/`stderr` storage is now bounded per stream with plain-text on-disk compaction (`JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES`, default `4 MiB`), and `status` / `tail` metadata reports seen, retained, and dropped byte counts
+- background job retention is now swept opportunistically on later bash operations: finished/cancelled jobs older than `JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS` (default `86400s`) are deleted, and new background jobs enforce a shared `JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES` budget (default `128 MiB`) across `.jarvis_internal/bash_jobs/`
+- the detached runner now records the actual child process identifiers and cancellation targets that child process group plus the wrapper group, reducing orphaned log writers after `mode='cancel'`
+- promoted-foreground completion now reads only direct head/tail slices from job logs instead of loading whole persisted log files into memory first
 - when a foreground run is auto-promoted, the agent loop injects a transient system reminder telling the model to use `status`, `tail`, or `cancel` with the returned `job_id` instead of rerunning the command in foreground
 
 #### Policy
@@ -397,6 +401,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - only `/workspace` is shared back to the app; if the command writes elsewhere, those changes stay local to the long-lived `tool_runtime` container
 - command availability depends on what is installed in the runtime image
+- background job logs intentionally keep only the recent retained window; full historical raw output is not preserved once per-stream compaction drops older bytes
 
 ### `python_interpreter`
 

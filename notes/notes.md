@@ -104,4 +104,5 @@
 - Added a main-agent-only discoverable `email` tool that sends through SMTP with per-send approval hashing, markdown-to-HTML rendering, optional workspace attachments, and a forced `Sent by Jarvis` footer.
 - User `/stop` is now route-wide: it cooperatively stops active subagents too, lets any already-started child tool call finish and persist before pause, and writes a persistent main-session system note reminding Jarvis to inspect paused subagents after resume.
 - Foreground `bash` runs now auto-promote into persisted background jobs after the soft-timeout window and the agent loop injects a transient system reminder to probe the returned `job_id` instead of rerunning the command in foreground.
+- Bash background jobs now cap retained stdout/stderr per stream, report dropped-byte counts in status/tail metadata, sweep old finished/cancelled job dirs opportunistically, and enforce a total `.jarvis_internal/bash_jobs` storage budget before starting new long-running jobs.
 - `tool_runtime` does not bind-mount the repo, so any `bash` or `python_interpreter` executor change is inert until `docker compose up -d --build tool_runtime` rebuilds the image.

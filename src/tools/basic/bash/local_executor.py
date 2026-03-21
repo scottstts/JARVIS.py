@@ -21,6 +21,7 @@ from .jobs import (
     load_job,
     read_job_tail,
     remove_job_artifacts,
+    sweep_job_artifacts,
     write_job_metadata,
 )
 
@@ -219,7 +220,7 @@ class DirectBashToolExecutor:
     ) -> ToolExecutionResult:
         started_at = perf_counter()
         try:
-            job, process, pgid = await self._launch_background_process(
+            job, process, pid, pgid = await self._launch_background_process(
                 workspace_dir=context.workspace_dir,
                 command=command,
             )
@@ -248,7 +249,7 @@ class DirectBashToolExecutor:
                 command=command,
                 cwd=Path("/workspace"),
                 job_id=job.job_id,
-                pid=process.pid,
+                pid=pid,
                 pgid=pgid,
                 duration_seconds=duration_seconds,
                 soft_timeout_seconds=soft_timeout_seconds,
@@ -265,7 +266,7 @@ class DirectBashToolExecutor:
                     "mode": "foreground",
                     "promoted_to_background": True,
                     "job_id": job.job_id,
-                    "pid": process.pid,
+                    "pid": pid,
                     "pgid": pgid,
                     "status": "running",
                     "command": command,
@@ -294,12 +295,12 @@ class DirectBashToolExecutor:
             )
 
         duration_seconds = perf_counter() - started_at
-        stdout_text, stdout_truncated = _truncate_text(
-            _read_job_output_text(job.stdout_path),
+        stdout_text, stdout_truncated = _read_truncated_file_text(
+            job.stdout_path,
             self._settings.bash_max_output_chars,
         )
-        stderr_text, stderr_truncated = _truncate_text(
-            _read_job_output_text(job.stderr_path),
+        stderr_text, stderr_truncated = _read_truncated_file_text(
+            job.stderr_path,
             self._settings.bash_max_output_chars,
         )
         exit_code = process.returncode if process.returncode is not None else -1
@@ -356,7 +357,7 @@ class DirectBashToolExecutor:
         command = str(arguments.get("command", "")).strip()
         started_at = perf_counter()
         try:
-            job, process, pgid = await self._launch_background_process(
+            job, process, pid, pgid = await self._launch_background_process(
                 workspace_dir=context.workspace_dir,
                 command=command,
             )
@@ -377,7 +378,7 @@ class DirectBashToolExecutor:
             [
                 "Bash background job started",
                 f"job_id: {job.job_id}",
-                f"pid: {process.pid}",
+                f"pid: {pid}",
                 f"pgid: {pgid}",
                 "cwd: /workspace",
                 f"command: {command}",
@@ -392,7 +393,7 @@ class DirectBashToolExecutor:
             metadata={
                 "mode": "background",
                 "job_id": job.job_id,
-                "pid": process.pid,
+                "pid": pid,
                 "pgid": pgid,
                 "command": command,
                 "cwd": "/workspace",
@@ -412,12 +413,15 @@ class DirectBashToolExecutor:
         *,
         workspace_dir: Path,
         command: str,
-    ) -> tuple[BashJobPaths, asyncio.subprocess.Process, int]:
+    ) -> tuple[BashJobPaths, asyncio.subprocess.Process, int, int]:
         job = create_background_job(
             workspace_dir=workspace_dir,
             bash_executable=self._settings.bash_executable,
             command=command,
             cwd="/workspace",
+            log_max_bytes=self._settings.bash_job_log_max_bytes,
+            total_storage_budget_bytes=self._settings.bash_job_total_storage_budget_bytes,
+            retention_seconds=self._settings.bash_job_retention_seconds,
         )
         try:
             with open(os.devnull, "wb") as devnull:
@@ -432,11 +436,18 @@ class DirectBashToolExecutor:
                     env=_build_scrubbed_environment(self._settings),
                     start_new_session=True,
                 )
-            pgid = os.getpgid(process.pid)
+            runner_pgid = os.getpgid(process.pid)
+            pid, pgid = await _await_job_process_identifiers(
+                job,
+                fallback_pid=process.pid,
+                fallback_pgid=runner_pgid,
+            )
             write_job_metadata(
                 paths=job,
-                pid=process.pid,
+                pid=pid,
                 pgid=pgid,
+                runner_pid=process.pid,
+                runner_pgid=runner_pgid,
                 command=command,
                 launched_at=_utc_now(),
                 cwd="/workspace",
@@ -444,7 +455,7 @@ class DirectBashToolExecutor:
         except Exception:
             remove_job_artifacts(job)
             raise
-        return job, process, pgid
+        return job, process, pid, pgid
 
     def _background_job_status(
         self,
@@ -455,6 +466,10 @@ class DirectBashToolExecutor:
     ) -> ToolExecutionResult:
         try:
             job_id = _require_job_id(arguments)
+            self._sweep_background_jobs(
+                workspace_dir=context.workspace_dir,
+                protected_job_ids={job_id},
+            )
             paths, record = load_job(context.workspace_dir, job_id)
             status = job_status(paths, record)
         except BashJobError as exc:
@@ -483,6 +498,10 @@ class DirectBashToolExecutor:
             lines.append(f"cancelled_at: {status['cancelled_at']}")
         if status["exit_code"] is not None:
             lines.append(f"exit_code: {status['exit_code']}")
+        if status["stdout_bytes_dropped"] > 0:
+            lines.append(f"stdout_bytes_dropped: {status['stdout_bytes_dropped']}")
+        if status["stderr_bytes_dropped"] > 0:
+            lines.append(f"stderr_bytes_dropped: {status['stderr_bytes_dropped']}")
         lines.append(f"command: {status['command']}")
         return ToolExecutionResult(
             call_id=call_id,
@@ -509,6 +528,10 @@ class DirectBashToolExecutor:
     ) -> ToolExecutionResult:
         try:
             job_id = _require_job_id(arguments)
+            self._sweep_background_jobs(
+                workspace_dir=context.workspace_dir,
+                protected_job_ids={job_id},
+            )
             paths, record = load_job(context.workspace_dir, job_id)
             max_bytes = _resolve_tail_bytes(arguments, self._settings)
             tail_lines = _resolve_tail_lines(arguments)
@@ -529,16 +552,27 @@ class DirectBashToolExecutor:
                 metadata={"mode": "tail", "error": str(exc)},
             )
 
-        content = "\n".join(
+        lines = [
+            "Bash job output tail",
+            f"job_id: {record.job_id}",
+            "stdout:",
+            tail["stdout"] or "(empty)",
+        ]
+        if tail["stdout_bytes_dropped"] > 0:
+            lines.append(
+                f"[stdout earlier output dropped: {tail['stdout_bytes_dropped']} bytes]"
+            )
+        lines.extend(
             [
-                "Bash job output tail",
-                f"job_id: {record.job_id}",
-                "stdout:",
-                tail["stdout"] or "(empty)",
                 "stderr:",
                 tail["stderr"] or "(empty)",
             ]
         )
+        if tail["stderr_bytes_dropped"] > 0:
+            lines.append(
+                f"[stderr earlier output dropped: {tail['stderr_bytes_dropped']} bytes]"
+            )
+        content = "\n".join(lines)
         return ToolExecutionResult(
             call_id=call_id,
             name="bash",
@@ -551,6 +585,12 @@ class DirectBashToolExecutor:
                 "tail_bytes": max_bytes,
                 "stdout": tail["stdout"],
                 "stderr": tail["stderr"],
+                "stdout_bytes_seen": tail["stdout_bytes_seen"],
+                "stderr_bytes_seen": tail["stderr_bytes_seen"],
+                "stdout_bytes_retained": tail["stdout_bytes_retained"],
+                "stderr_bytes_retained": tail["stderr_bytes_retained"],
+                "stdout_bytes_dropped": tail["stdout_bytes_dropped"],
+                "stderr_bytes_dropped": tail["stderr_bytes_dropped"],
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
@@ -568,8 +608,13 @@ class DirectBashToolExecutor:
     ) -> ToolExecutionResult:
         try:
             job_id = _require_job_id(arguments)
+            self._sweep_background_jobs(
+                workspace_dir=context.workspace_dir,
+                protected_job_ids={job_id},
+            )
             paths, record = load_job(context.workspace_dir, job_id)
             status = cancel_job(paths, record)
+            self._sweep_background_jobs(workspace_dir=context.workspace_dir)
         except BashJobError as exc:
             return ToolExecutionResult(
                 call_id=call_id,
@@ -605,6 +650,19 @@ class DirectBashToolExecutor:
                 "filesystem_scope": "container_direct",
                 "container_mutation_boundary": self._container_mutation_boundary,
             },
+        )
+
+    def _sweep_background_jobs(
+        self,
+        *,
+        workspace_dir: Path,
+        protected_job_ids: set[str] | None = None,
+    ) -> None:
+        sweep_job_artifacts(
+            workspace_dir=workspace_dir,
+            retention_seconds=self._settings.bash_job_retention_seconds,
+            total_storage_budget_bytes=self._settings.bash_job_total_storage_budget_bytes,
+            protected_job_ids=protected_job_ids,
         )
 
 
@@ -751,11 +809,22 @@ def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
     return truncated, True
 
 
-def _read_job_output_text(path: Path) -> str:
+def _read_truncated_file_text(path: Path, limit: int) -> tuple[str, bool]:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        size = path.stat().st_size
     except FileNotFoundError:
-        return ""
+        return "", False
+
+    if size <= limit:
+        return path.read_text(encoding="utf-8", errors="replace"), False
+
+    head_bytes = max(1, limit // 2)
+    tail_bytes = max(1, limit - head_bytes)
+    with path.open("rb") as handle:
+        head = handle.read(head_bytes).decode("utf-8", errors="replace")
+        handle.seek(max(0, size - tail_bytes))
+        tail = handle.read(tail_bytes).decode("utf-8", errors="replace")
+    return f"{head}\n...[truncated]...\n{tail}", True
 
 
 def _normalize_mode(value: object) -> str:
@@ -807,3 +876,35 @@ def _kill_process_group(process_id: int | None) -> None:
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+async def _await_job_process_identifiers(
+    paths: BashJobPaths,
+    *,
+    fallback_pid: int,
+    fallback_pgid: int,
+    timeout_seconds: float = 0.2,
+) -> tuple[int, int]:
+    deadline = time.monotonic() + timeout_seconds
+    pid = fallback_pid
+    pgid = fallback_pgid
+    while time.monotonic() < deadline:
+        child_pid = _read_optional_int(paths.child_pid_path)
+        child_pgid = _read_optional_int(paths.child_pgid_path)
+        if child_pid is not None and child_pgid is not None:
+            return child_pid, child_pgid
+        await asyncio.sleep(0.05)
+    return pid, pgid
+
+
+def _read_optional_int(path: Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
