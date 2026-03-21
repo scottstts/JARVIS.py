@@ -310,6 +310,8 @@ Current standard:
 - detached-bash revivals are now persisted transcripted system messages plus fresh runtime turns for the owning agent, not fake user messages or hidden internal-only turns; the progress notice is agent-only (`public=False`) and is not forwarded to Telegram
 - detached-bash progress pacing is hybrid: clear runtime signals fire immediately when available (first output, substantial output growth, terminal state), and fallback heartbeats use an increasing backoff (`30s`, then `60s`, then `180s`, then `300s` capped) measured from the last delivered update
 - detached-bash notices are batched and deduped per owner so multiple job updates coalesce into one revival instead of one turn per job
+- delegated subagent progress is now orchestrator-owned too: after `subagent_invoke` or `subagent_step_in`, the main turn parks instead of polling, and later subagent checkpoints revive Jarvis through concise agent-only system notices plus a fresh runtime turn
+- wait-only orchestrator progress turns can now disable tool use for that one turn, so Jarvis emits a status update and waits instead of burning tool rounds on reactive polling
 - route-level `/stop` now also suppresses detached-bash auto-followups until the next user message, but it does not cancel already-running foreground or background bash executions
 
 Current provider-native follow-up handling:
@@ -399,6 +401,9 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - main-agent detached bash updates now revive Jarvis through concise persisted system messages followed by `stream_runtime_turn()`; those system notices are agent-only route events and there is no synthetic user follow-up text for detached bash anymore
 - main detached-bash updates are queued/batched in `RouteRuntime`, merged by `job_id`, and marked delivered only after the visible system message is appended and published
 - subagents with pending detached bash jobs now enter `waiting_background` instead of reporting completion to main; when detached bash progress becomes noteworthy, the runtime appends a concise persisted child-system note and resumes that same subagent through `stream_runtime_turn()` rather than fake user follow-up text
+- child detached-bash system notes now include an explicit orchestrator recommendation (`wait`, `inspect`, or `finalize`); benign heartbeats tell the child not to call tools, while suspicious output patterns or repeated no-output heartbeats can escalate into `bash_job_needs_attention`
+- the main route now receives queued agent-only subagent progress notices such as `subagent_waiting_background`, `subagent_resumed_after_bash_update`, `subagent_needs_attention`, and terminal child states through the same persisted-system-note plus runtime-turn pattern; `subagent_monitor` becomes on-demand instead of the default supervision loop
+- `subagent_monitor` now includes full `pending_background_job_ids`, and repeated unchanged monitor calls return a minimal no-delta nudge instead of another full snapshot
 - the promotion-time transient reminder about polling was removed; the only detached-bash revivals now come from orchestrator-owned progress updates
 
 #### Policy

@@ -52,20 +52,24 @@ from .route_events import (
 
 _INTERNAL_ERROR_MESSAGE = "Internal error while processing message."
 _PROVIDER_TIMEOUT_MESSAGE = "The model timed out while processing that message."
-_SUBAGENT_TERMINAL_NOTICE_KINDS = frozenset(
-    {"subagent_completed", "subagent_failed", "subagent_approval_rejected"}
+_SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS = frozenset(
+    {
+        "subagent_completed",
+        "subagent_failed",
+        "subagent_approval_rejected",
+        "subagent_waiting_background",
+        "subagent_resumed_after_bash_update",
+        "subagent_needs_attention",
+    }
 )
 _SUBAGENT_USER_STOP_NOTE_HEADER = (
     "The user issued /stop. Any active background subagents were also asked to stop "
     "cooperatively."
 )
-_SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT = (
-    "Internal runtime follow-up: a background subagent reached a terminal state. "
-    "Review the runtime context, supervise the outcome, dispose the subagent when appropriate, "
-    "and tell the user the result."
-)
 _MAIN_BASH_PROGRESS_RUNTIME_KIND = "main_bash_progress"
 _MAIN_BASH_PROGRESS_NOTICE_KIND = "bash_job_progress_update"
+_MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND = "main_subagent_progress"
+_MAIN_SUBAGENT_PROGRESS_NOTICE_KIND = "subagent_progress_update"
 
 
 @dataclass(slots=True, frozen=True)
@@ -159,6 +163,8 @@ class RouteRuntime:
         self._internal_followup_generation = 0
         self._pending_main_bash_notices: dict[str, BashJobNotice] = {}
         self._main_bash_runtime_turn_queued = False
+        self._pending_main_subagent_notices: dict[str, RouteSystemNoticeEvent] = {}
+        self._main_subagent_runtime_turn_queued = False
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
         self._bash_job_supervisor = BashJobSupervisor(
@@ -293,10 +299,14 @@ class RouteRuntime:
                     if self._main_resume_requires_user_message:
                         if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
                             self._clear_pending_main_bash_notices()
+                        if request.runtime_turn_kind == _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND:
+                            self._clear_pending_main_subagent_notices()
                         continue
                     if request.internal_generation != self._internal_followup_generation:
                         if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
                             self._clear_pending_main_bash_notices()
+                        if request.runtime_turn_kind == _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND:
+                            self._clear_pending_main_subagent_notices()
                         continue
                 if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
                     self._main_bash_runtime_turn_queued = False
@@ -315,6 +325,26 @@ class RouteRuntime:
                         continue
                     event_stream = self._main_loop.stream_runtime_turn(
                         force_session_id=force_session_id,
+                        pre_turn_messages=self._build_wait_only_runtime_messages(system_message),
+                    )
+                elif request.runtime_turn_kind == _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND:
+                    self._main_subagent_runtime_turn_queued = False
+                    runtime_message = self._drain_main_subagent_progress_message(
+                        force_session_id=request.force_session_id,
+                    )
+                    if runtime_message is None:
+                        continue
+                    force_session_id, system_message, notices = runtime_message
+                    published = await self._publish_main_subagent_system_message(
+                        session_id=force_session_id,
+                        message=system_message,
+                        notices=notices,
+                    )
+                    if not published:
+                        continue
+                    event_stream = self._main_loop.stream_runtime_turn(
+                        force_session_id=force_session_id,
+                        pre_turn_messages=self._build_wait_only_runtime_messages(system_message),
                     )
                 elif request.parse_commands:
                     if request.user_text is None:
@@ -374,25 +404,11 @@ class RouteRuntime:
             return
         if event.agent_kind != "subagent" or event.subagent_id is None:
             return
-        if event.notice_kind not in _SUBAGENT_TERMINAL_NOTICE_KINDS:
+        if event.notice_kind not in _SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS:
             return
         if self._main_resume_requires_user_message:
             return
-        await self._message_queue.put(
-            _RouteTurnRequest(
-                user_text=_SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
-                force_session_id=self._main_loop.active_session_id(),
-                pre_turn_messages=self._subagent_manager.main_followup_runtime_messages(
-                    agent=event.subagent_id,
-                    notice_kind=event.notice_kind,
-                    notice_text=event.text,
-                ),
-                parse_commands=False,
-                user_initiated=False,
-                internal_generation=self._internal_followup_generation,
-            )
-        )
-        self._ensure_message_worker()
+        await self._enqueue_main_subagent_followup(event)
 
     async def _publish_main_loop_event(self, event: AgentTurnStreamEvent) -> None:
         if isinstance(event, AgentTextDeltaEvent):
@@ -718,6 +734,28 @@ class RouteRuntime:
             return
         await self._subagent_manager.enqueue_bash_job_followup(notices)
 
+    async def _enqueue_main_subagent_followup(
+        self,
+        notice: RouteSystemNoticeEvent,
+    ) -> None:
+        if self._main_resume_requires_user_message:
+            return
+        self._merge_main_subagent_notice(notice)
+        if self._main_subagent_runtime_turn_queued:
+            return
+        self._main_subagent_runtime_turn_queued = True
+        await self._message_queue.put(
+            _RouteTurnRequest(
+                user_text=None,
+                force_session_id=self._resolve_main_subagent_notice_session_id(notice),
+                parse_commands=False,
+                user_initiated=False,
+                internal_generation=self._internal_followup_generation,
+                runtime_turn_kind=_MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND,
+            )
+        )
+        self._ensure_message_worker()
+
     def _merge_main_bash_notices(self, notices: Sequence[BashJobNotice]) -> None:
         for notice in notices:
             self._pending_main_bash_notices.pop(notice.job_id, None)
@@ -726,6 +764,16 @@ class RouteRuntime:
     def _clear_pending_main_bash_notices(self) -> None:
         self._pending_main_bash_notices.clear()
         self._main_bash_runtime_turn_queued = False
+
+    def _merge_main_subagent_notice(self, notice: RouteSystemNoticeEvent) -> None:
+        subagent_id = notice.subagent_id or ""
+        if not subagent_id:
+            return
+        self._pending_main_subagent_notices[subagent_id] = notice
+
+    def _clear_pending_main_subagent_notices(self) -> None:
+        self._pending_main_subagent_notices.clear()
+        self._main_subagent_runtime_turn_queued = False
 
     def _resolve_main_bash_notice_session_id(
         self,
@@ -737,6 +785,19 @@ class RouteRuntime:
         for notice in notices:
             if notice.owner_session_id:
                 return notice.owner_session_id
+        return None
+
+    def _resolve_main_subagent_notice_session_id(
+        self,
+        notice: RouteSystemNoticeEvent,
+    ) -> str | None:
+        active_session_id = self._main_loop.active_session_id()
+        if active_session_id is not None:
+            return active_session_id
+        if notice.subagent_id:
+            snapshot = self._subagent_manager.snapshot_for(notice.subagent_id)
+            if snapshot is not None and snapshot.owner_main_session_id:
+                return snapshot.owner_main_session_id
         return None
 
     def _drain_main_bash_progress_message(
@@ -752,6 +813,28 @@ class RouteRuntime:
         if session_id is None:
             return None
         return session_id, self._build_main_bash_job_followup_message(notices), notices
+
+    def _drain_main_subagent_progress_message(
+        self,
+        *,
+        force_session_id: str | None,
+    ) -> tuple[str, AgentRuntimeMessage, tuple[RouteSystemNoticeEvent, ...]] | None:
+        notices = tuple(self._pending_main_subagent_notices.values())
+        self._pending_main_subagent_notices.clear()
+        if not notices:
+            return None
+        session_id = force_session_id
+        if session_id is None:
+            for notice in notices:
+                session_id = self._resolve_main_subagent_notice_session_id(notice)
+                if session_id is not None:
+                    break
+        if session_id is None:
+            return None
+        message = self._build_main_subagent_followup_message(notices)
+        if message is None:
+            return None
+        return session_id, message, notices
 
     async def _publish_main_system_message(
         self,
@@ -783,15 +866,46 @@ class RouteRuntime:
         self._record_bash_notice_delivery(notices)
         return True
 
+    async def _publish_main_subagent_system_message(
+        self,
+        *,
+        session_id: str,
+        message: AgentRuntimeMessage,
+        notices: Sequence[RouteSystemNoticeEvent],
+    ) -> bool:
+        if not self._main_loop.append_system_note(
+            message.content,
+            session_id=session_id,
+            metadata=message.metadata,
+        ):
+            return False
+        notice_kind = str(
+            message.metadata.get("notice_kind", _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND)
+        ).strip() or _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND
+        await self.publish_event(
+            RouteSystemNoticeEvent(
+                route_id=self._route_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                session_id=session_id,
+                notice_kind=notice_kind,
+                text=message.content,
+                public=False,
+            )
+        )
+        return True
+
     def _build_main_bash_job_followup_message(
         self,
         notices: Sequence[BashJobNotice],
     ) -> AgentRuntimeMessage:
         running_notices = [notice for notice in notices if notice.status == "running"]
         terminal_notices = [notice for notice in notices if notice.status != "running"]
+        recommendation = self._recommend_main_bash_action(notices)
         lines = ["Detached bash update."]
         for notice in notices:
             lines.append(f"- {self._format_main_bash_job_notice_line(notice)}")
+        lines.append(f"recommendation={recommendation}")
         guidance = (
             "This is a system update from the orchestrator, not a new user message. Detached bash is orchestrator-monitored; react to this update and update the user accordingly instead of polling unless the user asks for immediate inspection."
         )
@@ -806,6 +920,7 @@ class RouteRuntime:
             metadata={
                 "bash_job_progress_update": True,
                 "notice_kind": _MAIN_BASH_PROGRESS_NOTICE_KIND,
+                "recommended_action": recommendation,
                 "detached_bash_job_ids": [notice.job_id for notice in notices],
                 "bash_job_notice_kinds": [notice.notice_kind for notice in notices],
                 "bash_job_running_ids": [notice.job_id for notice in running_notices],
@@ -813,6 +928,86 @@ class RouteRuntime:
             },
             content="\n".join(lines),
         )
+
+    def _build_main_subagent_followup_message(
+        self,
+        notices: Sequence[RouteSystemNoticeEvent],
+    ) -> AgentRuntimeMessage | None:
+        lines = ["Subagent update."]
+        pending_subagent_ids: list[str] = []
+        recommendations: list[str] = []
+        for notice in notices:
+            if notice.subagent_id is None:
+                continue
+            payload = self._subagent_manager.build_main_progress_message(
+                agent=notice.subagent_id,
+                notice_kind=notice.notice_kind,
+                notice_text=notice.text,
+            )
+            if payload is None:
+                continue
+            _session_id, message = payload
+            lines.extend(message.content.splitlines()[1:])
+            for pending_subagent_id in message.metadata.get("pending_subagent_ids", []):
+                normalized = str(pending_subagent_id).strip()
+                if normalized and normalized not in pending_subagent_ids:
+                    pending_subagent_ids.append(normalized)
+            recommendation = str(message.metadata.get("recommended_action", "")).strip()
+            if recommendation:
+                recommendations.append(recommendation)
+        if len(lines) == 1:
+            return None
+        aggregated_recommendation = self._aggregate_recommendations(recommendations)
+        return AgentRuntimeMessage(
+            role="system",
+            transient=False,
+            metadata={
+                "subagent_progress_update": True,
+                "notice_kind": _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND,
+                "recommended_action": aggregated_recommendation,
+                "pending_subagent_ids": pending_subagent_ids,
+            },
+            content="\n".join(lines),
+        )
+
+    def _build_wait_only_runtime_messages(
+        self,
+        message: AgentRuntimeMessage,
+    ) -> tuple[AgentRuntimeMessage, ...]:
+        if str(message.metadata.get("recommended_action", "")).strip() != "wait":
+            return ()
+        return (
+            AgentRuntimeMessage(
+                role="developer",
+                transient=True,
+                metadata={
+                    "force_no_tools_this_turn": True,
+                    "orchestrator_wait_only_update": True,
+                },
+                content=(
+                    "This orchestrator progress update is wait-only. Do not call tools in this "
+                    "response. Send a brief progress update and wait for the next orchestrator "
+                    "system message unless the user explicitly asks for immediate inspection."
+                ),
+            ),
+        )
+
+    def _recommend_main_bash_action(self, notices: Sequence[BashJobNotice]) -> str:
+        if any(
+            notice.notice_kind in {"bash_job_failed", "bash_job_cancelled", "bash_job_needs_attention"}
+            for notice in notices
+        ):
+            return "inspect"
+        if any(notice.status == "running" for notice in notices):
+            return "wait"
+        return "finalize"
+
+    def _aggregate_recommendations(self, recommendations: Sequence[str]) -> str:
+        if any(recommendation == "inspect" for recommendation in recommendations):
+            return "inspect"
+        if any(recommendation == "finalize" for recommendation in recommendations):
+            return "finalize"
+        return "wait"
 
     def _format_main_bash_job_notice_line(self, notice: BashJobNotice) -> str:
         notice_name = notice.notice_kind.removeprefix("bash_job_") or notice.notice_kind

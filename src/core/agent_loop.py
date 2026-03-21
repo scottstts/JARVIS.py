@@ -71,11 +71,12 @@ _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
 _APPROVAL_REJECTED_TEXT = "Approval request was rejected. I did not execute the action."
 _PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
 _TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
-_DETACHED_BASH_MONITORING_FOLLOWUP_TEXT = (
-    "Detached bash jobs are monitored by the orchestrator, not by proactive model polling. "
-    "Do not call more tools in this response. Do not claim the task is finished while detached "
-    "bash jobs are still pending. Briefly report the current in-progress state and wait for the "
-    "next orchestrator system progress update unless the user explicitly asks for immediate inspection."
+_ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT = (
+    "Background work is being monitored by the orchestrator, not by proactive model polling. "
+    "Do not call more tools in this response. Do not claim the task is finished while any listed "
+    "detached bash job or delegated subagent is still pending. Briefly report the current "
+    "in-progress state and wait for the next orchestrator system progress update unless the user "
+    "explicitly asks for immediate inspection."
 )
 LOGGER = logging.getLogger(__name__)
 
@@ -193,6 +194,7 @@ class _ToolExecutionOutcome:
     approval_rejected: bool = False
     interrupted: bool = False
     pending_detached_job_ids: frozenset[str] = frozenset()
+    pending_subagent_ids: frozenset[str] = frozenset()
 
 
 class AgentLoop:
@@ -597,6 +599,7 @@ class AgentLoop:
                 current_estimated_input_tokens=final_estimated_input_tokens,
                 turn_id=turn_id,
                 pending_detached_job_ids=_collect_pending_detached_job_ids(turn_runtime_messages),
+                pending_subagent_ids=_collect_pending_subagent_ids(turn_runtime_messages),
             )
             if followup_compacted:
                 did_compaction = True
@@ -653,9 +656,11 @@ class AgentLoop:
         current_response: LLMResponse,
         turn_id: str,
         pending_detached_job_ids: frozenset[str] = frozenset(),
+        pending_subagent_ids: frozenset[str] = frozenset(),
     ) -> _ToolExecutionOutcome:
         transient_records: list[ConversationRecord] = []
         current_pending_detached_job_ids = set(pending_detached_job_ids)
+        current_pending_subagent_ids = set(pending_subagent_ids)
         for tool_call in current_response.tool_calls:
             tool_context = replace(
                 self._tool_context,
@@ -688,6 +693,10 @@ class AgentLoop:
                         current_pending_detached_job_ids,
                         tool_result,
                     )
+                    _update_pending_subagent_ids(
+                        current_pending_subagent_ids,
+                        tool_result,
+                    )
                     break
 
                 self._append_turn_record(
@@ -712,6 +721,7 @@ class AgentLoop:
                     return _ToolExecutionOutcome(
                         interrupted=True,
                         pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+                        pending_subagent_ids=frozenset(current_pending_subagent_ids),
                     )
                 self._append_turn_record(
                     session_id=session_id,
@@ -727,12 +737,14 @@ class AgentLoop:
                     return _ToolExecutionOutcome(
                         approval_rejected=True,
                         pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+                        pending_subagent_ids=frozenset(current_pending_subagent_ids),
                     )
                 tool_context = replace(tool_context, approved_action=pending_approval)
 
         pending_records.extend(transient_records)
         return _ToolExecutionOutcome(
-            pending_detached_job_ids=frozenset(current_pending_detached_job_ids)
+            pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+            pending_subagent_ids=frozenset(current_pending_subagent_ids),
         )
 
     def _build_followup_request(
@@ -762,25 +774,30 @@ class AgentLoop:
 
         return request, estimated_input_tokens
 
-    def _build_detached_bash_waiting_request(
+    def _build_orchestrator_monitored_waiting_request(
         self,
         *,
         session_id: str,
         base_records: Sequence[ConversationRecord],
         pending_records: Sequence[ConversationRecord],
         pending_detached_job_ids: Sequence[str],
+        pending_subagent_ids: Sequence[str],
     ) -> tuple[LLMRequest, int]:
+        metadata: dict[str, Any] = {}
+        if pending_detached_job_ids:
+            metadata["detached_bash_jobs_pending"] = True
+            metadata["detached_bash_job_ids"] = list(pending_detached_job_ids)
+        if pending_subagent_ids:
+            metadata["subagents_pending"] = True
+            metadata["pending_subagent_ids"] = list(pending_subagent_ids)
         extra_records = (
             self._build_runtime_message_record(
                 session_id=session_id,
                 message=AgentRuntimeMessage(
                     role="developer",
                     transient=True,
-                    metadata={
-                        "detached_bash_jobs_pending": True,
-                        "detached_bash_job_ids": list(pending_detached_job_ids),
-                    },
-                    content=_DETACHED_BASH_MONITORING_FOLLOWUP_TEXT,
+                    metadata=metadata,
+                    content=_ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT,
                 ),
             ),
         )
@@ -1150,6 +1167,7 @@ class AgentLoop:
             tool_rounds = 0
             turn_approval_rejected = False
             pending_detached_job_ids = _collect_pending_detached_job_ids(turn_runtime_messages)
+            pending_subagent_ids = _collect_pending_subagent_ids(turn_runtime_messages)
             while current_response.tool_calls:
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
@@ -1191,6 +1209,7 @@ class AgentLoop:
                     transient_records: list[ConversationRecord] = []
                     approval_rejected = False
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
+                    current_pending_subagent_ids = set(pending_subagent_ids)
                     for tool_call in current_response.tool_calls:
                         tool_context = replace(
                             self._tool_context,
@@ -1221,6 +1240,10 @@ class AgentLoop:
                                 )
                                 _update_pending_detached_job_ids(
                                     current_pending_detached_job_ids,
+                                    tool_result,
+                                )
+                                _update_pending_subagent_ids(
+                                    current_pending_subagent_ids,
                                     tool_result,
                                 )
                                 break
@@ -1304,6 +1327,7 @@ class AgentLoop:
 
                     pending_records.extend(transient_records)
                     pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
+                    pending_subagent_ids = frozenset(current_pending_subagent_ids)
                     if approval_rejected:
                         break
                     if self._stop_requested(turn_id):
@@ -1322,13 +1346,14 @@ class AgentLoop:
                             interrupted=True,
                         )
                         return
-                    if pending_detached_job_ids:
+                    if pending_detached_job_ids or pending_subagent_ids:
                         request, final_estimated_input_tokens = (
-                            self._build_detached_bash_waiting_request(
+                            self._build_orchestrator_monitored_waiting_request(
                                 session_id=session.session_id,
                                 base_records=base_records,
                                 pending_records=pending_records,
                                 pending_detached_job_ids=pending_detached_job_ids,
+                                pending_subagent_ids=pending_subagent_ids,
                             )
                         )
                     else:
@@ -1573,6 +1598,10 @@ class AgentLoop:
             session_id=session.session_id,
             pre_turn_messages=pre_turn_messages,
         )
+        allow_tools_for_initial_request = not _turn_requires_no_tools(
+            runtime_messages=turn_runtime_messages,
+            user_text=user_text,
+        )
         request = self._build_turn_request(
             session_id=session.session_id,
             records=records,
@@ -1580,6 +1609,7 @@ class AgentLoop:
             turn_context_text=turn_context_text,
             interruption_notice_text=interruption_notice_text,
             runtime_messages=turn_runtime_messages,
+            allow_tools=allow_tools_for_initial_request,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -1601,6 +1631,7 @@ class AgentLoop:
                     turn_context_text=turn_context_text,
                     interruption_notice_text=interruption_notice_text,
                     runtime_messages=turn_runtime_messages,
+                    allow_tools=allow_tools_for_initial_request,
                 )
                 estimated_input_tokens = estimate_request_input_tokens(request)
 
@@ -1691,6 +1722,7 @@ class AgentLoop:
         turn_context_text: str,
         interruption_notice_text: str | None = None,
         runtime_messages: Sequence[AgentRuntimeMessage] = (),
+        allow_tools: bool = True,
     ) -> LLMRequest:
         turn_records = self._build_pending_turn_records(
             session_id=session_id,
@@ -1706,7 +1738,7 @@ class AgentLoop:
                     content=user_text,
                 )
             )
-        return self._build_request(list(records) + turn_records)
+        return self._build_request(list(records) + turn_records, allow_tools=allow_tools)
 
     def _build_turn_runtime_messages(
         self,
@@ -1761,6 +1793,7 @@ class AgentLoop:
         current_estimated_input_tokens: int,
         turn_id: str,
         pending_detached_job_ids: frozenset[str] = frozenset(),
+        pending_subagent_ids: frozenset[str] = frozenset(),
     ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool]:
         tool_rounds = 0
         did_compaction = False
@@ -1799,8 +1832,10 @@ class AgentLoop:
                     current_response=current_response,
                     turn_id=turn_id,
                     pending_detached_job_ids=pending_detached_job_ids,
+                    pending_subagent_ids=pending_subagent_ids,
                 )
                 pending_detached_job_ids = tool_execution_outcome.pending_detached_job_ids
+                pending_subagent_ids = tool_execution_outcome.pending_subagent_ids
                 if tool_execution_outcome.interrupted:
                     return (
                         current_session,
@@ -1839,13 +1874,14 @@ class AgentLoop:
                         True,
                         approval_rejected,
                     )
-                if pending_detached_job_ids:
+                if pending_detached_job_ids or pending_subagent_ids:
                     request, current_estimated_input_tokens = (
-                        self._build_detached_bash_waiting_request(
+                        self._build_orchestrator_monitored_waiting_request(
                             session_id=current_session.session_id,
                             base_records=current_base_records,
                             pending_records=pending_records,
                             pending_detached_job_ids=pending_detached_job_ids,
+                            pending_subagent_ids=pending_subagent_ids,
                         )
                     )
                 else:
@@ -2742,6 +2778,31 @@ def _collect_pending_detached_job_ids(
     return frozenset(job_ids)
 
 
+def _collect_pending_subagent_ids(
+    runtime_messages: Sequence[AgentRuntimeMessage],
+) -> frozenset[str]:
+    subagent_ids: set[str] = set()
+    for message in runtime_messages:
+        raw_ids = message.metadata.get("pending_subagent_ids")
+        if not isinstance(raw_ids, list):
+            continue
+        for raw_subagent_id in raw_ids:
+            subagent_id = str(raw_subagent_id).strip()
+            if subagent_id:
+                subagent_ids.add(subagent_id)
+    return frozenset(subagent_ids)
+
+
+def _turn_requires_no_tools(
+    *,
+    runtime_messages: Sequence[AgentRuntimeMessage],
+    user_text: str | None,
+) -> bool:
+    if user_text is not None:
+        return False
+    return any(bool(message.metadata.get("force_no_tools_this_turn")) for message in runtime_messages)
+
+
 def _update_pending_detached_job_ids(
     pending_job_ids: set[str],
     tool_result: ToolExecutionResult,
@@ -2765,6 +2826,24 @@ def _update_pending_detached_job_ids(
         return
     if status in {"finished", "cancelled"}:
         pending_job_ids.discard(job_id)
+
+
+def _update_pending_subagent_ids(
+    pending_subagent_ids: set[str],
+    tool_result: ToolExecutionResult,
+) -> None:
+    if not tool_result.metadata.get("subagent_control"):
+        return
+    subagent_id = str(tool_result.metadata.get("subagent_id", "")).strip()
+    if not subagent_id:
+        return
+    action = str(tool_result.metadata.get("subagent_action", "")).strip()
+    status = str(tool_result.metadata.get("status", "")).strip()
+    if action in {"invoke", "step_in"} and status in {"running", "waiting_background", "awaiting_approval"}:
+        pending_subagent_ids.add(subagent_id)
+        return
+    if status in {"paused", "completed", "failed", "disposed"}:
+        pending_subagent_ids.discard(subagent_id)
 
 
 def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:

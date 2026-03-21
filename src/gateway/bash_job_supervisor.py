@@ -27,6 +27,8 @@ LOGGER = logging.getLogger(__name__)
 _POLL_INTERVAL_SECONDS = 2.0
 _HEARTBEAT_NOTICE_BACKOFF_SECONDS = (30.0, 60.0, 180.0, 300.0)
 _SIGNIFICANT_OUTPUT_GROWTH_BYTES = 4096
+_NEEDS_ATTENTION_NO_OUTPUT_HEARTBEAT_COUNT = 2
+_NEEDS_ATTENTION_DROPPED_BYTES = 65536
 _TAIL_LINES = 80
 _TAIL_BYTES = 8192
 
@@ -283,6 +285,27 @@ class BashJobSupervisor:
         )
         stdout = str(tail_result.metadata.get("stdout", "")) if tail_result.ok else ""
         stderr = str(tail_result.metadata.get("stderr", "")) if tail_result.ok else ""
+        stdout_bytes_dropped = (
+            _optional_int(tail_result.metadata.get("stdout_bytes_dropped")) or 0
+            if tail_result.ok
+            else 0
+        )
+        stderr_bytes_dropped = (
+            _optional_int(tail_result.metadata.get("stderr_bytes_dropped")) or 0
+            if tail_result.ok
+            else 0
+        )
+        progress_hint = _derive_progress_hint(stdout_text=stdout, stderr_text=stderr)
+        notice_kind = _promote_notice_kind_for_attention(
+            notice_kind=notice_kind,
+            record=record,
+            status=status,
+            stdout_bytes_seen=_optional_int(status_result.metadata.get("stdout_bytes_seen")) or 0,
+            stderr_bytes_seen=_optional_int(status_result.metadata.get("stderr_bytes_seen")) or 0,
+            stdout_bytes_dropped=stdout_bytes_dropped,
+            stderr_bytes_dropped=stderr_bytes_dropped,
+            progress_hint=progress_hint,
+        )
         return BashJobNotice(
             job_id=job_id,
             notice_kind=notice_kind,
@@ -303,17 +326,9 @@ class BashJobSupervisor:
             stderr=stderr,
             stdout_bytes_seen=_optional_int(status_result.metadata.get("stdout_bytes_seen")) or 0,
             stderr_bytes_seen=_optional_int(status_result.metadata.get("stderr_bytes_seen")) or 0,
-            stdout_bytes_dropped=(
-                _optional_int(tail_result.metadata.get("stdout_bytes_dropped")) or 0
-                if tail_result.ok
-                else 0
-            ),
-            stderr_bytes_dropped=(
-                _optional_int(tail_result.metadata.get("stderr_bytes_dropped")) or 0
-                if tail_result.ok
-                else 0
-            ),
-            progress_hint=_derive_progress_hint(stdout_text=stdout, stderr_text=stderr),
+            stdout_bytes_dropped=stdout_bytes_dropped,
+            stderr_bytes_dropped=stderr_bytes_dropped,
+            progress_hint=progress_hint,
         )
 
     async def _dispatch_main_notices(self, notices: tuple[BashJobNotice, ...]) -> None:
@@ -397,6 +412,19 @@ def _classify_notice_kind(
         return "bash_job_output_started"
     if total_bytes_seen - previous_total_bytes_seen >= _SIGNIFICANT_OUTPUT_GROWTH_BYTES:
         return "bash_job_output_grew"
+    if (
+        total_bytes_seen == 0
+        and previous_total_bytes_seen == 0
+        and (record.progress_notice_count or 0) >= _NEEDS_ATTENTION_NO_OUTPUT_HEARTBEAT_COUNT
+    ):
+        baseline = _parse_optional_iso(record.last_progress_notice_at) or _parse_optional_iso(
+            record.launched_at
+        )
+        if baseline is None:
+            return None
+        heartbeat_notice_seconds = _heartbeat_notice_interval_seconds(record=record)
+        if (datetime.now(UTC) - baseline).total_seconds() >= heartbeat_notice_seconds:
+            return "bash_job_needs_attention"
 
     baseline = _parse_optional_iso(record.last_progress_notice_at) or _parse_optional_iso(
         record.launched_at
@@ -435,6 +463,43 @@ def _notice_kind_for_status(*, status: str, exit_code: object) -> str:
     return "bash_job_failed"
 
 
+def _promote_notice_kind_for_attention(
+    *,
+    notice_kind: str,
+    record: BashJobRecord,
+    status: str,
+    stdout_bytes_seen: int,
+    stderr_bytes_seen: int,
+    stdout_bytes_dropped: int,
+    stderr_bytes_dropped: int,
+    progress_hint: str | None,
+) -> str:
+    if status != "running":
+        return notice_kind
+    if notice_kind == "bash_job_needs_attention":
+        return notice_kind
+    if notice_kind not in {"bash_job_output_grew", "bash_job_heartbeat"}:
+        return notice_kind
+    total_bytes_seen = stdout_bytes_seen + stderr_bytes_seen
+    previous_total_bytes_seen = (
+        (record.last_progress_notice_stdout_bytes_seen or 0)
+        + (record.last_progress_notice_stderr_bytes_seen or 0)
+    )
+    if (
+        total_bytes_seen == 0
+        and previous_total_bytes_seen == 0
+        and (record.progress_notice_count or 0) >= _NEEDS_ATTENTION_NO_OUTPUT_HEARTBEAT_COUNT
+    ):
+        return "bash_job_needs_attention"
+    dropped_bytes = max(stdout_bytes_dropped, stderr_bytes_dropped)
+    if dropped_bytes < _NEEDS_ATTENTION_DROPPED_BYTES:
+        return notice_kind
+    normalized_hint = (progress_hint or "").strip()
+    if normalized_hint and (len(normalized_hint) <= 4 or _looks_repetitive_hint(normalized_hint)):
+        return "bash_job_needs_attention"
+    return notice_kind
+
+
 def _derive_progress_hint(*, stdout_text: str, stderr_text: str) -> str | None:
     for candidate in (stdout_text, stderr_text):
         lines = [line.strip() for line in candidate.splitlines() if line.strip()]
@@ -443,6 +508,11 @@ def _derive_progress_hint(*, stdout_text: str, stderr_text: str) -> str | None:
         hint = lines[-1]
         return hint if len(hint) <= 240 else hint[:237] + "..."
     return None
+
+
+def _looks_repetitive_hint(value: str) -> bool:
+    normalized = "".join(ch for ch in value if not ch.isspace())
+    return len(normalized) >= 8 and len(set(normalized)) <= 2
 
 
 def _parse_optional_iso(value: str | None) -> datetime | None:

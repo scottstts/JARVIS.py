@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 from core import (
     AgentAssistantMessageEvent,
-    AgentRuntimeMessage,
     AgentTextDeltaEvent,
     AgentTurnDoneEvent,
     AgentTurnResult,
@@ -23,7 +22,6 @@ from gateway.route_runtime import (
     RouteEventBus,
     RouteRuntime,
     _RouteTurnRequest,
-    _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
     _tool_result_for_payload,
 )
 from gateway.session_router import SessionRouter, validate_route_id
@@ -298,28 +296,25 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                     response_text=f"user:{user_text}",
                 )
 
-            async def _stream_turn(
-                *,
-                user_text: str,
-                force_session_id: str | None = None,
-                pre_turn_messages=(),
-            ):
-                observed_calls.append(("internal", user_text))
+            async def _stream_runtime_turn(*, force_session_id: str | None = None, pre_turn_messages=()):
+                _ = pre_turn_messages
+                observed_calls.append(("runtime", force_session_id or "main_session"))
                 yield AgentTurnDoneEvent(
                     session_id=force_session_id or "main_session",
-                    response_text=f"internal:{user_text}",
+                    response_text="runtime",
                 )
 
             runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
-            runtime._main_loop.stream_turn = _stream_turn  # type: ignore[method-assign]
+            runtime._main_loop.stream_runtime_turn = _stream_runtime_turn  # type: ignore[method-assign]
 
             await runtime._message_queue.put(
                 _RouteTurnRequest(
-                    user_text=_SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT,
+                    user_text=None,
                     force_session_id="main_session",
                     parse_commands=False,
                     user_initiated=False,
                     internal_generation=runtime._internal_followup_generation,
+                    runtime_turn_kind="main_subagent_progress",
                 )
             )
 
@@ -338,25 +333,32 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await worker
 
-    async def test_terminal_subagent_notice_enqueues_internal_main_followup(self) -> None:
+    async def test_subagent_progress_notice_enqueues_runtime_main_followup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
                 route_id="route_1",
                 llm_service=object(),  # type: ignore[arg-type]
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
+            session_id = await runtime._main_loop.prepare_session()
 
-            followup_message = AgentRuntimeMessage(
-                role="developer",
-                content="Subagent finished and needs supervision.",
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="waiting_background",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="turn_1",
+                current_subagent_session_id="sub_session",
+                pending_background_job_count=1,
+                pending_background_job_ids=("deadbeefdeadbeefdeadbeefdeadbeef",),
             )
 
             with patch.object(runtime, "_ensure_message_worker"):
                 with patch.object(
                     runtime._subagent_manager,
-                    "main_followup_runtime_messages",
-                    return_value=(followup_message,),
-                ) as build_followup:
+                    "snapshot_for",
+                    return_value=snapshot,
+                ):
                     await runtime.publish_event(
                         RouteSystemNoticeEvent(
                             route_id="route_1",
@@ -364,20 +366,90 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                             agent_name="Ultron",
                             subagent_id="sub_1",
                             session_id="sub_session",
-                            notice_kind="subagent_completed",
-                            text="Ultron completed.",
+                            notice_kind="subagent_waiting_background",
+                            text="waiting on detached bash jobs.",
                         )
                     )
 
             queued = runtime._message_queue.get_nowait()
-            self.assertEqual(queued.user_text, _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT)
+            self.assertIsNone(queued.user_text)
             self.assertFalse(queued.parse_commands)
-            self.assertEqual(queued.pre_turn_messages, (followup_message,))
-            build_followup.assert_called_once_with(
-                agent="sub_1",
-                notice_kind="subagent_completed",
-                notice_text="Ultron completed.",
+            self.assertEqual(queued.pre_turn_messages, ())
+            self.assertEqual(queued.force_session_id, session_id)
+            self.assertEqual(queued.runtime_turn_kind, "main_subagent_progress")
+
+    async def test_main_subagent_runtime_turn_persists_concise_agent_only_system_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
             )
+            session_id = await runtime._main_loop.prepare_session()
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="waiting_background",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="turn_1",
+                current_subagent_session_id="sub_session",
+                pending_background_job_count=1,
+                pending_background_job_ids=("deadbeefdeadbeefdeadbeefdeadbeef",),
+            )
+            notice = RouteSystemNoticeEvent(
+                route_id="route_1",
+                agent_kind="subagent",
+                agent_name="Ultron",
+                subagent_id="sub_1",
+                session_id="sub_session",
+                notice_kind="subagent_waiting_background",
+                text="waiting on detached bash jobs.",
+                public=False,
+            )
+            published_events: list[RouteSystemNoticeEvent] = []
+
+            async def _publish_event(event):
+                if isinstance(event, RouteSystemNoticeEvent):
+                    published_events.append(event)
+
+            async def _stream_runtime_turn(*, force_session_id=None, command_override=None, pre_turn_messages=()):
+                _ = command_override, pre_turn_messages
+                yield AgentTurnDoneEvent(
+                    session_id=force_session_id or session_id,
+                    response_text="waiting on subagent",
+                )
+
+            runtime.publish_event = _publish_event  # type: ignore[method-assign]
+            runtime._main_loop.stream_runtime_turn = _stream_runtime_turn  # type: ignore[method-assign]
+
+            with patch.object(runtime._subagent_manager, "snapshot_for", return_value=snapshot):
+                await runtime._enqueue_main_subagent_followup(notice)
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._message_queue.join(), timeout=1)
+
+            records = runtime._main_loop._storage.load_records(session_id)
+            system_notes = [
+                record
+                for record in records
+                if record.role == "system"
+                and record.metadata.get("subagent_progress_update") is True
+            ]
+            user_records = [record for record in records if record.role == "user"]
+            self.assertEqual(len(system_notes), 1)
+            self.assertIn("subagent=Ultron", system_notes[0].content)
+            self.assertIn("recommendation=wait", system_notes[0].content)
+            self.assertIn("not a new user message", system_notes[0].content)
+            self.assertLess(len(system_notes[0].content), 600)
+            self.assertEqual(user_records, [])
+            self.assertEqual(len(published_events), 1)
+            self.assertEqual(published_events[0].notice_kind, "subagent_progress_update")
+            self.assertFalse(published_events[0].public)
+
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
 
     async def test_stop_latches_when_detached_bash_jobs_are_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -660,4 +732,17 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 record=third_heartbeat_not_due,
                 status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
             )
+        )
+
+        third_heartbeat_due = replace(
+            first_heartbeat_record,
+            last_progress_notice_at=(now - timedelta(seconds=181)).isoformat(),
+            progress_notice_count=2,
+        )
+        self.assertEqual(
+            _classify_notice_kind(
+                record=third_heartbeat_due,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            ),
+            "bash_job_needs_attention",
         )

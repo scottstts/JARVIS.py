@@ -395,6 +395,8 @@ Recommended behavior:
 
 - no side effects
 - return current status, last activity, pause reason if any, and recent noteworthy events
+- include full `pending_background_job_ids` when detached child bash work is in flight
+- if nothing changed since the last monitor, return a minimal no-delta response that nudges Jarvis to wait for orchestrator updates instead of polling again
 
 #### `subagent_stop`
 
@@ -813,8 +815,8 @@ Do not implement strict main/subagent turn lockstep.
 Correct behavior is:
 
 - subagents run independently in background tasks
-- the main agent learns about them at checkpoints
-- `subagent_monitor` gives explicit current state on demand
+- the main agent learns about them at orchestrator checkpoints, not by keeping the same turn open and polling
+- `subagent_monitor` gives explicit current state on demand, not as the default supervision loop
 - `subagent_step_in` gives a deliberate intervention path
 
 ## Telegram/UI Behavior
@@ -1077,6 +1079,7 @@ Add automated tests for the following.
 ### Control Primitives
 
 - `subagent_monitor` returns summary for all when no target is provided
+- after `subagent_invoke` / `subagent_step_in`, Jarvis should let orchestrator progress notices drive the next supervision turn instead of polling immediately
 - `subagent_stop` pauses a running subagent
 - `subagent_step_in` stops then starts a new turn with new instructions
 - `subagent_dispose` is rejected for a running subagent

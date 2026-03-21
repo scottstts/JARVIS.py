@@ -416,6 +416,14 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(runtime.status, "waiting_background")
+            waiting_events = [
+                event
+                for event in published_events
+                if isinstance(event, RouteSystemNoticeEvent)
+                and event.notice_kind == "subagent_waiting_background"
+            ]
+            self.assertEqual(len(waiting_events), 1)
+            self.assertIn("deadbeefdeadbeefdeadbeefdeadbeef", waiting_events[0].text)
             self.assertFalse(
                 any(
                     isinstance(event, RouteSystemNoticeEvent)
@@ -618,9 +626,11 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(notice.job_id, note_content)
             self.assertNotIn("command:", note_content)
             self.assertNotIn("stdout tail:", note_content)
+            self.assertIn("recommendation=finalize", note_content)
             self.assertIn("not a new user message or a new instruction from Jarvis", note_content)
             self.assertEqual(note_session_id, "subagent_session")
             self.assertEqual(note_metadata["notice_kind"], "bash_job_progress_update")
+            self.assertEqual(note_metadata["recommended_action"], "finalize")
 
     async def test_running_bash_job_followup_keeps_pending_job_until_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,6 +722,54 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 runtime.pending_background_job_ids,
                 {"deadbeefdeadbeefdeadbeefdeadbeef"},
             )
+            note_content, _note_session_id, note_metadata = runtime.loop.system_notes[0]
+            self.assertIn("recommendation=wait", note_content)
+            self.assertIn("Do not call tools for this update", note_content)
+            self.assertEqual(note_metadata["recommended_action"], "wait")
+
+    async def test_monitor_returns_full_pending_job_ids_and_nudges_on_unchanged_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage("sub_1"),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="waiting_background",
+                created_at="2026-03-21T10:00:00+00:00",
+                updated_at="2026-03-21T10:00:00+00:00",
+            )
+            runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
+            manager._subagents[runtime.subagent_id] = runtime
+
+            first = await manager.monitor(agent="sub_1", detail="summary")
+            second = await manager.monitor(agent="sub_1", detail="summary")
+
+            self.assertTrue(first["changed"])
+            self.assertEqual(
+                first["subagents"][0]["pending_background_job_ids"],
+                ["deadbeefdeadbeefdeadbeefdeadbeef"],
+            )
+            self.assertFalse(second["changed"])
+            self.assertIn("Wait for orchestrator updates", second["message"])
 
     async def test_completed_subagent_counts_until_dispose_and_codename_reuses_after_dispose(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

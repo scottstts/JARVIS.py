@@ -90,6 +90,7 @@ class SubagentManager:
         )
         self._subagents: dict[str, SubagentRuntime] = {}
         self._pending_bash_job_notices: dict[str, dict[str, BashJobNotice]] = {}
+        self._last_monitor_signatures: dict[str, str] = {}
 
     async def invoke(
         self,
@@ -173,6 +174,7 @@ class SubagentManager:
                 session_id=session_id,
                 notice_kind="subagent_invoked",
                 text="came online.",
+                public=False,
             )
         )
         return {
@@ -193,13 +195,41 @@ class SubagentManager:
             targets = self._non_disposed_runtimes()
         else:
             targets = [self._require_runtime(agent)]
-        return {
+        payload = {
             "count": len(targets),
             "subagents": [
                 self._serialize_snapshot(runtime.snapshot(), detail=detail)
                 for runtime in targets
             ],
         }
+        monitor_key = (agent or "__all__") + ":" + detail
+        signature = repr(payload)
+        last_signature = self._last_monitor_signatures.get(monitor_key)
+        self._last_monitor_signatures[monitor_key] = signature
+        if last_signature == signature:
+            return {
+                "count": len(targets),
+                "changed": False,
+                "message": (
+                    "No subagent state changes since the last monitor. Wait for orchestrator "
+                    "updates instead of polling unless immediate detail is required."
+                ),
+                "subagents": [
+                    {
+                        "subagent_id": snapshot["subagent_id"],
+                        "codename": snapshot["codename"],
+                        "status": snapshot["status"],
+                        "pending_background_job_count": snapshot["pending_background_job_count"],
+                        "pending_background_job_ids": snapshot.get(
+                            "pending_background_job_ids",
+                            [],
+                        ),
+                    }
+                    for snapshot in payload["subagents"]
+                ],
+            }
+        payload["changed"] = True
+        return payload
 
     def request_stop_all_for_user_stop(self) -> tuple[SubagentSnapshot, ...]:
         affected: list[SubagentSnapshot] = []
@@ -288,6 +318,7 @@ class SubagentManager:
                 session_id=runtime.loop.active_session_id(),
                 notice_kind="subagent_disposed",
                 text="came offline.",
+                public=False,
             )
         )
         return {
@@ -304,13 +335,17 @@ class SubagentManager:
                 AgentRuntimeMessage(
                     role="developer",
                     transient=True,
-                    metadata={"subagent_status_snapshot": True},
+                    metadata={
+                        "subagent_status_snapshot": True,
+                        "pending_subagent_ids": [],
+                    },
                     content="Subagent status snapshot:\n- no non-disposed subagents.",
                 ),
             )
 
         lines = ["Subagent status snapshot:"]
         recent_events: list[tuple[str, str, str]] = []
+        pending_subagent_ids: list[str] = []
         for runtime in runtimes:
             snapshot = runtime.snapshot()
             status_line = f"- {snapshot.codename} ({snapshot.subagent_id}): {snapshot.status}"
@@ -318,6 +353,10 @@ class SubagentManager:
             if snapshot.pending_background_job_count > 0:
                 extras.append(
                     f"pending_background_jobs={snapshot.pending_background_job_count}"
+                )
+                extras.append(
+                    "pending_background_job_ids="
+                    + ",".join(snapshot.pending_background_job_ids)
                 )
             if snapshot.pause_reason is not None:
                 extras.append(f"pause_reason={snapshot.pause_reason}")
@@ -328,6 +367,8 @@ class SubagentManager:
             if extras:
                 status_line += " [" + ", ".join(extras) + "]"
             lines.append(status_line)
+            if snapshot.status in {"running", "waiting_background", "awaiting_approval"}:
+                pending_subagent_ids.append(snapshot.subagent_id)
             for event in list(snapshot.notable_events)[-self._settings.main_context_event_limit :]:
                 recent_events.append((snapshot.codename, event.kind, event.summary))
 
@@ -341,13 +382,83 @@ class SubagentManager:
             AgentRuntimeMessage(
                 role="developer",
                 transient=True,
-                metadata={"subagent_status_snapshot": True},
+                metadata={
+                    "subagent_status_snapshot": True,
+                    "pending_subagent_ids": pending_subagent_ids,
+                },
                 content="\n".join(lines),
             ),
         )
 
     def active_snapshots(self) -> tuple[SubagentSnapshot, ...]:
         return tuple(runtime.snapshot() for runtime in self._non_disposed_runtimes())
+
+    def snapshot_for(self, agent: str) -> SubagentSnapshot | None:
+        runtime = self._subagents.get(agent)
+        if runtime is None:
+            return None
+        return runtime.snapshot()
+
+    def build_main_progress_message(
+        self,
+        *,
+        agent: str,
+        notice_kind: str,
+        notice_text: str,
+    ) -> tuple[str | None, AgentRuntimeMessage] | None:
+        snapshot = self.snapshot_for(agent)
+        if snapshot is None:
+            return None
+        recommendation = self._recommend_main_supervision_action(
+            notice_kind=notice_kind,
+            snapshot=snapshot,
+        )
+        parts = [
+            f"subagent={snapshot.codename}",
+            f"id={snapshot.subagent_id}",
+            f"status={snapshot.status}",
+            f"notice={notice_kind}",
+        ]
+        if snapshot.pending_background_job_ids:
+            parts.append(
+                "pending_background_job_ids="
+                + ",".join(snapshot.pending_background_job_ids)
+            )
+        if notice_text.strip():
+            parts.append(f'note="{self._truncate_for_notice(notice_text, max_length=140)}"')
+        content = "\n".join(
+            [
+                "Subagent update.",
+                "- " + " ".join(parts),
+                f"recommendation={recommendation}",
+                (
+                    "This is a system update from the orchestrator, not a new user message. "
+                    "Subagent progress is orchestrator-monitored; react to this update and "
+                    "update the user accordingly instead of polling unless immediate detail is "
+                    "required."
+                ),
+            ]
+        )
+        return (
+            snapshot.owner_main_session_id,
+            AgentRuntimeMessage(
+                role="system",
+                transient=False,
+                metadata={
+                    "subagent_progress_update": True,
+                    "notice_kind": "subagent_progress_update",
+                    "subagent_id": snapshot.subagent_id,
+                    "subagent_notice_kind": notice_kind,
+                    "recommended_action": recommendation,
+                    "pending_subagent_ids": (
+                        [snapshot.subagent_id]
+                        if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
+                        else []
+                    ),
+                },
+                content=content,
+            ),
+        )
 
     def is_turn_active(self, subagent_id: str) -> bool:
         runtime = self._subagents.get(subagent_id)
@@ -439,7 +550,7 @@ class SubagentManager:
             ),
         )
         self._sync_catalog(runtime)
-        self._maybe_start_next_bash_job_followup(runtime)
+        await self._maybe_start_next_bash_job_followup(runtime)
 
     async def _run_turn(
         self,
@@ -578,6 +689,15 @@ class SubagentManager:
                                     "Waiting for detached bash jobs: "
                                     f"{len(runtime.pending_background_job_ids)} pending."
                                 ),
+                            )
+                            await self._publish_lifecycle_notice(
+                                runtime,
+                                notice_kind="subagent_waiting_background",
+                                text=(
+                                    "waiting on detached bash jobs: "
+                                    f"{', '.join(sorted(runtime.pending_background_job_ids))}."
+                                ),
+                                session_id=event.session_id,
                             )
                         else:
                             runtime.status = "completed"
@@ -756,9 +876,9 @@ class SubagentManager:
             await finished_task
         except Exception:
             return
-        self._maybe_start_next_bash_job_followup(runtime)
+        await self._maybe_start_next_bash_job_followup(runtime)
 
-    def _maybe_start_next_bash_job_followup(self, runtime: SubagentRuntime) -> bool:
+    async def _maybe_start_next_bash_job_followup(self, runtime: SubagentRuntime) -> bool:
         if runtime.task is not None and not runtime.task.done():
             return False
         if runtime.status in {"paused", "awaiting_approval", "failed", "disposed"}:
@@ -770,7 +890,11 @@ class SubagentManager:
         session_id = notices[0].owner_session_id or runtime.loop.active_session_id()
         if session_id is None:
             return False
-        message = self._build_bash_job_followup_message(notices)
+        recommendation = self._recommend_bash_followup_action(notices)
+        message = self._build_bash_job_followup_message(
+            notices,
+            recommendation=recommendation,
+        )
         if not self._append_bash_job_system_message(
             runtime,
             session_id=session_id,
@@ -795,6 +919,22 @@ class SubagentManager:
         )
         self._sync_catalog(runtime)
         self._record_bash_notice_delivery(notices)
+        notice_kind = (
+            "subagent_needs_attention"
+            if recommendation == "inspect"
+            else "subagent_resumed_after_bash_update"
+        )
+        notice_text = (
+            "needs attention after detached bash update."
+            if recommendation == "inspect"
+            else "resumed after detached bash update."
+        )
+        await self._publish_lifecycle_notice(
+            runtime,
+            notice_kind=notice_kind,
+            text=notice_text,
+            session_id=session_id,
+        )
         self._launch_runtime_task(
             runtime,
             user_text=None,
@@ -821,20 +961,36 @@ class SubagentManager:
     def _build_bash_job_followup_message(
         self,
         notices: tuple[BashJobNotice, ...],
+        *,
+        recommendation: str,
     ) -> AgentRuntimeMessage:
         running_notices = [notice for notice in notices if notice.status == "running"]
         terminal_notices = [notice for notice in notices if notice.status != "running"]
         lines = ["Detached bash update."]
         for notice in notices:
             lines.append(f"- {self._format_bash_job_notice_line(notice)}")
-        guidance = (
-            "This is a system update from the orchestrator, not a new user message or a new instruction from Jarvis. Detached bash is orchestrator-monitored; react to this update and continue the assignment instead of polling unless Jarvis explicitly asks for immediate inspection."
+        lines.append(f"recommendation={recommendation}")
+        lines.append(
+            "This is a system update from the orchestrator, not a new user message or a "
+            "new instruction from Jarvis."
         )
-        if running_notices:
-            lines.append(guidance)
+        if recommendation == "wait":
+            lines.append(
+                "Detached bash is orchestrator-monitored. Do not call tools for this update. "
+                "Continue the assignment and wait for the next orchestrator update unless Jarvis "
+                "explicitly asks for immediate inspection."
+            )
             lines.append("Do not declare the assignment complete while any listed job is still running.")
+        elif recommendation == "inspect":
+            lines.append(
+                "One of the detached bash updates may need inspection. Check the listed job only "
+                "if the issue blocks the assignment; otherwise continue without polling."
+            )
         elif terminal_notices:
-            lines.append(guidance)
+            lines.append(
+                "Incorporate the finished detached bash result into the assignment and continue "
+                "or finish as appropriate."
+            )
         return AgentRuntimeMessage(
             role="system",
             transient=False,
@@ -842,6 +998,7 @@ class SubagentManager:
                 "bash_job_progress_update": True,
                 "subagent_bash_job_progress_update": True,
                 "notice_kind": "bash_job_progress_update",
+                "recommended_action": recommendation,
                 "detached_bash_job_ids": [notice.job_id for notice in notices],
                 "bash_job_notice_kinds": [notice.notice_kind for notice in notices],
                 "bash_job_running_ids": [notice.job_id for notice in running_notices],
@@ -849,6 +1006,35 @@ class SubagentManager:
             },
             content="\n".join(lines),
         )
+
+    def _recommend_bash_followup_action(
+        self,
+        notices: tuple[BashJobNotice, ...],
+    ) -> str:
+        if any(notice.notice_kind == "bash_job_needs_attention" for notice in notices):
+            return "inspect"
+        if any(
+            notice.notice_kind in {"bash_job_failed", "bash_job_cancelled"}
+            for notice in notices
+        ):
+            return "inspect"
+        if any(notice.status == "running" for notice in notices):
+            return "wait"
+        return "finalize"
+
+    def _recommend_main_supervision_action(
+        self,
+        *,
+        notice_kind: str,
+        snapshot: SubagentSnapshot,
+    ) -> str:
+        if notice_kind in {"subagent_needs_attention", "subagent_failed"}:
+            return "inspect"
+        if notice_kind in {"subagent_completed", "subagent_approval_rejected", "subagent_paused"}:
+            return "finalize"
+        if snapshot.status in {"running", "waiting_background", "awaiting_approval"}:
+            return "wait"
+        return "finalize"
 
     def _format_bash_job_notice_line(self, notice: BashJobNotice) -> str:
         notice_name = notice.notice_kind.removeprefix("bash_job_") or notice.notice_kind
@@ -987,6 +1173,7 @@ class SubagentManager:
                 session_id=session_id or runtime.loop.active_session_id(),
                 notice_kind=notice_kind,
                 text=text,
+                public=False,
             )
         )
 
@@ -1013,6 +1200,7 @@ class SubagentManager:
             "last_tool_name": snapshot.last_tool_name,
             "last_activity_at": snapshot.last_activity_at,
             "pending_background_job_count": snapshot.pending_background_job_count,
+            "pending_background_job_ids": list(snapshot.pending_background_job_ids),
         }
         if detail == "full":
             payload["notable_events"] = [

@@ -134,4 +134,5 @@ class SubagentSnapshot:
     last_tool_name: str | None = None
     last_activity_at: str | None = None
     pending_background_job_count: int = 0
+    pending_background_job_ids: tuple[str, ...] = field(default_factory=tuple)
     notable_events: tuple[SubagentEventNote, ...] = field(default_factory=tuple)

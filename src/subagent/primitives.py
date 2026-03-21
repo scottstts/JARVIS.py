@@ -20,7 +20,9 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
             name="subagent_invoke",
             description=(
                 "Start a background subagent for a bounded side task. Use when the work is "
-                "self-contained and can run independently while you continue supervising."
+                "self-contained and can run independently while you continue supervising. "
+                "After invocation, let the orchestrator surface meaningful progress instead of "
+                "polling the child."
             ),
             input_schema={
                 "type": "object",
@@ -37,7 +39,8 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
             name="subagent_monitor",
             description=(
                 "Inspect subagent status without changing it. Omit agent to get a summary "
-                "of all non-disposed subagents."
+                "of all non-disposed subagents. Use this on demand when immediate detail is "
+                "required; do not poll unchanged subagents while orchestration updates are flowing."
             ),
             input_schema={
                 "type": "object",

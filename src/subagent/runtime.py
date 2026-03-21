@@ -50,5 +50,6 @@ class SubagentRuntime:
             last_tool_name=self.last_tool_name,
             last_activity_at=self.last_activity_at,
             pending_background_job_count=len(self.pending_background_job_ids),
+            pending_background_job_ids=tuple(sorted(self.pending_background_job_ids)),
             notable_events=tuple(self.notable_events),
         )
