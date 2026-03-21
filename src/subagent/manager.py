@@ -174,7 +174,7 @@ class SubagentManager:
                 session_id=session_id,
                 notice_kind="subagent_invoked",
                 text="came online.",
-                public=False,
+                public=True,
             )
         )
         return {
@@ -318,7 +318,7 @@ class SubagentManager:
                 session_id=runtime.loop.active_session_id(),
                 notice_kind="subagent_disposed",
                 text="came offline.",
-                public=False,
+                public=True,
             )
         )
         return {
@@ -1173,7 +1173,7 @@ class SubagentManager:
                 session_id=session_id or runtime.loop.active_session_id(),
                 notice_kind=notice_kind,
                 text=text,
-                public=False,
+                public=_subagent_notice_is_public(notice_kind),
             )
         )
 
@@ -1256,3 +1256,7 @@ class SubagentManager:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _subagent_notice_is_public(notice_kind: str) -> bool:
+    return notice_kind in {"subagent_invoked", "subagent_disposed"}

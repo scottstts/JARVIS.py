@@ -166,12 +166,14 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected invoke notice to be a route system notice.")
             self.assertEqual(notice.session_id, payload["session_id"])
             self.assertEqual(notice.notice_kind, "subagent_invoked")
+            self.assertTrue(notice.public)
             completion_notice = published_events[1]
             self.assertIsInstance(completion_notice, RouteSystemNoticeEvent)
             if not isinstance(completion_notice, RouteSystemNoticeEvent):
                 self.fail("Expected completion notice to be a route system notice.")
             self.assertEqual(completion_notice.notice_kind, "subagent_completed")
             self.assertEqual(completion_notice.text, "completed.")
+            self.assertFalse(completion_notice.public)
 
     async def test_subagent_publishes_resume_and_completion_notices_after_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -785,9 +787,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 builtin_tool_blocklist=defaults.builtin_tool_blocklist,
                 main_context_event_limit=defaults.main_context_event_limit,
             )
+            published_events: list[object] = []
 
-            async def publish_event(_event: object) -> None:
-                return None
+            async def publish_event(event: object) -> None:
+                published_events.append(event)
 
             manager = SubagentManager(
                 route_id="route_1",
@@ -820,6 +823,14 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             dispose_result = await manager.dispose(agent=first["subagent_id"])
             self.assertEqual(dispose_result["status"], "disposed")
+            dispose_notices = [
+                event
+                for event in published_events
+                if isinstance(event, RouteSystemNoticeEvent)
+                and event.notice_kind == "subagent_disposed"
+            ]
+            self.assertEqual(len(dispose_notices), 1)
+            self.assertTrue(dispose_notices[0].public)
 
             second = await manager.invoke(
                 requester_kind="main",
