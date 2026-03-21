@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +17,7 @@ from core import (
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
+from gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
 from gateway.route_events import RouteAssistantMessageEvent, RouteSystemNoticeEvent
 from gateway.route_runtime import (
     RouteEventBus,
@@ -26,6 +29,8 @@ from gateway.route_runtime import (
 from gateway.session_router import SessionRouter, validate_route_id
 from subagent.types import SubagentSnapshot
 from tests.helpers import build_core_settings
+from tools import ToolSettings
+from tools.basic.bash.jobs import BashJobRecord, claim_job_owner, create_background_job
 
 
 class _TrackingLoop:
@@ -373,3 +378,286 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 notice_kind="subagent_completed",
                 notice_text="Ultron completed.",
             )
+
+    async def test_stop_latches_when_detached_bash_jobs_are_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            tool_settings = ToolSettings.from_workspace_dir(runtime._core_settings.workspace_dir)
+            job = create_background_job(
+                workspace_dir=tool_settings.workspace_dir,
+                bash_executable="/bin/bash",
+                command="sleep 5",
+                cwd="/workspace",
+                log_max_bytes=tool_settings.bash_job_log_max_bytes,
+                total_storage_budget_bytes=tool_settings.bash_job_total_storage_budget_bytes,
+                retention_seconds=tool_settings.bash_job_retention_seconds,
+            )
+            claim_job_owner(
+                workspace_dir=tool_settings.workspace_dir,
+                job_id=job.job_id,
+                route_id="route_1",
+                session_id=session_id,
+                turn_id="turn_1",
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+
+            with patch.object(runtime._main_loop, "request_stop", return_value=False):
+                self.assertTrue(runtime.request_stop())
+
+            self.assertTrue(runtime._main_resume_requires_user_message)
+            records = runtime._main_loop._storage.load_records(session_id)
+            stop_notes = [
+                record
+                for record in records
+                if record.role == "system" and record.metadata.get("user_stop_bash_jobs") is True
+            ]
+            self.assertEqual(len(stop_notes), 1)
+            self.assertIn("detached bash jobs", stop_notes[0].content)
+            self.assertIn(job.job_id, stop_notes[0].content)
+
+    async def test_detached_bash_notice_enqueues_internal_main_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_completed",
+                owner_route_id="route_1",
+                owner_session_id=session_id,
+                owner_turn_id="turn_1",
+                owner_agent_kind="main",
+                owner_agent_name="Jarvis",
+                owner_subagent_id=None,
+                status="finished",
+                command="sleep 1; echo done",
+                started_at="2026-03-21T10:00:00Z",
+                last_update_at="2026-03-21T10:00:02Z",
+                finished_at="2026-03-21T10:00:02Z",
+                cancelled_at=None,
+                exit_code=0,
+                stdout="done\n",
+                stderr="",
+                stdout_bytes_seen=5,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint="done",
+            )
+
+            with patch.object(runtime, "_ensure_message_worker"):
+                await runtime._enqueue_main_bash_job_followup((notice,))
+
+            queued = runtime._message_queue.get_nowait()
+            self.assertIsNone(queued.user_text)
+            self.assertFalse(queued.parse_commands)
+            self.assertEqual(queued.force_session_id, session_id)
+            self.assertEqual(queued.internal_generation, runtime._internal_followup_generation)
+            self.assertEqual(queued.runtime_turn_kind, "main_bash_progress")
+            self.assertEqual(queued.pre_turn_messages, ())
+            self.assertIn(notice.job_id, runtime._pending_main_bash_notices)
+
+    async def test_detached_bash_notice_is_suppressed_while_route_is_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            runtime._main_resume_requires_user_message = True
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_completed",
+                owner_route_id="route_1",
+                owner_session_id="main_session",
+                owner_turn_id="turn_1",
+                owner_agent_kind="main",
+                owner_agent_name="Jarvis",
+                owner_subagent_id=None,
+                status="finished",
+                command="sleep 1; echo done",
+                started_at="2026-03-21T10:00:00Z",
+                last_update_at="2026-03-21T10:00:02Z",
+                finished_at="2026-03-21T10:00:02Z",
+                cancelled_at=None,
+                exit_code=0,
+                stdout="done\n",
+                stderr="",
+                stdout_bytes_seen=5,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint="done",
+            )
+
+            await runtime._enqueue_main_bash_job_followup((notice,))
+
+            self.assertTrue(runtime._message_queue.empty())
+
+    async def test_main_bash_runtime_turn_persists_concise_agent_only_system_notice_and_uses_runtime_turn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_output_started",
+                owner_route_id="route_1",
+                owner_session_id=session_id,
+                owner_turn_id="turn_1",
+                owner_agent_kind="main",
+                owner_agent_name="Jarvis",
+                owner_subagent_id=None,
+                status="running",
+                command="sleep 1; echo done",
+                started_at="2026-03-21T10:00:00Z",
+                last_update_at="2026-03-21T10:00:02Z",
+                finished_at=None,
+                cancelled_at=None,
+                exit_code=None,
+                stdout="done\n",
+                stderr="",
+                stdout_bytes_seen=5,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint="done",
+            )
+            published_events: list[RouteSystemNoticeEvent] = []
+
+            async def _publish_event(event):
+                if isinstance(event, RouteSystemNoticeEvent):
+                    published_events.append(event)
+
+            async def _stream_runtime_turn(*, force_session_id=None, command_override=None, pre_turn_messages=()):
+                _ = command_override, pre_turn_messages
+                yield AgentTurnDoneEvent(
+                    session_id=force_session_id or session_id,
+                    response_text="waiting on background",
+                )
+
+            runtime.publish_event = _publish_event  # type: ignore[method-assign]
+            runtime._main_loop.stream_runtime_turn = _stream_runtime_turn  # type: ignore[method-assign]
+
+            await runtime._enqueue_main_bash_job_followup((notice,))
+            runtime._ensure_message_worker()
+            await asyncio.wait_for(runtime._message_queue.join(), timeout=1)
+
+            records = runtime._main_loop._storage.load_records(session_id)
+            system_notes = [
+                record
+                for record in records
+                if record.role == "system"
+                and record.metadata.get("bash_job_progress_update") is True
+            ]
+            user_records = [record for record in records if record.role == "user"]
+            self.assertEqual(len(system_notes), 1)
+            self.assertIn(notice.job_id, system_notes[0].content)
+            self.assertNotIn("command:", system_notes[0].content)
+            self.assertNotIn("stdout tail:", system_notes[0].content)
+            self.assertIn("not a new user message", system_notes[0].content)
+            self.assertLess(len(system_notes[0].content), 500)
+            self.assertEqual(user_records, [])
+            self.assertEqual(len(published_events), 1)
+            self.assertEqual(published_events[0].notice_kind, "bash_job_progress_update")
+            self.assertIn(notice.job_id, published_events[0].text)
+            self.assertFalse(published_events[0].public)
+
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    def test_bash_heartbeat_backoff_uses_progress_notice_count(self) -> None:
+        now = datetime.now(UTC)
+        base_record = BashJobRecord(
+            job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+            command="sleep 1; echo done",
+            pid=1,
+            pgid=1,
+            runner_pid=1,
+            runner_pgid=1,
+            launched_at=(now - timedelta(minutes=10)).isoformat(),
+            cwd="/workspace",
+            stdout_path="/workspace/stdout.log",
+            stderr_path="/workspace/stderr.log",
+            job_dir="/workspace/job",
+            owner_route_id="route_1",
+            owner_session_id="main_session",
+            owner_turn_id="turn_1",
+            owner_agent_kind="main",
+            owner_agent_name="Jarvis",
+            owner_subagent_id=None,
+            terminal_notice_kind=None,
+            terminal_notice_dispatched_at=None,
+        )
+
+        first_heartbeat_record = replace(
+            base_record,
+            last_progress_notice_kind="bash_job_started",
+            last_progress_notice_at=(now - timedelta(seconds=31)).isoformat(),
+            last_progress_notice_status="running",
+            last_progress_notice_stdout_bytes_seen=0,
+            last_progress_notice_stderr_bytes_seen=0,
+            last_progress_notice_last_update_at=(now - timedelta(seconds=31)).isoformat(),
+            progress_notice_count=0,
+        )
+        self.assertEqual(
+            _classify_notice_kind(
+                record=first_heartbeat_record,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            ),
+            "bash_job_heartbeat",
+        )
+
+        second_heartbeat_not_due = replace(
+            first_heartbeat_record,
+            last_progress_notice_at=(now - timedelta(seconds=45)).isoformat(),
+            progress_notice_count=1,
+        )
+        self.assertIsNone(
+            _classify_notice_kind(
+                record=second_heartbeat_not_due,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            )
+        )
+
+        second_heartbeat_due = replace(
+            first_heartbeat_record,
+            last_progress_notice_at=(now - timedelta(seconds=61)).isoformat(),
+            progress_notice_count=1,
+        )
+        self.assertEqual(
+            _classify_notice_kind(
+                record=second_heartbeat_due,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            ),
+            "bash_job_heartbeat",
+        )
+
+        third_heartbeat_not_due = replace(
+            first_heartbeat_record,
+            last_progress_notice_at=(now - timedelta(seconds=120)).isoformat(),
+            progress_notice_count=2,
+        )
+        self.assertIsNone(
+            _classify_notice_kind(
+                record=third_heartbeat_not_due,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            )
+        )

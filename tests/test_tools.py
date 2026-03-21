@@ -496,6 +496,8 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("mode='background'", description)
         self.assertIn("soft timeout", description)
         self.assertIn("automatically moved to background mode", description)
+        self.assertIn("detached jobs are monitored by the orchestrator", description)
+        self.assertIn("proactive polling", description)
         self.assertIn("uv pip install --python /opt/venv/bin/python", description)
         self.assertIn("user approval is typically required", description)
         self.assertIn("install packages or tools", description)
@@ -588,6 +590,10 @@ class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.metadata["promoted_to_background"])
             self.assertEqual(result.metadata["mode"], "foreground")
             self.assertEqual(result.metadata["status"], "running")
+            self.assertEqual(result.metadata["state"], "running")
+            self.assertIsNotNone(result.metadata["started_at"])
+            self.assertIsNotNone(result.metadata["last_update_at"])
+            self.assertEqual(result.metadata["suggested_next_check_seconds"], 5)
             self.assertIn("moved to background", result.content)
             job_id = str(result.metadata["job_id"])
 
@@ -696,6 +702,11 @@ class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertTrue(start_result.ok)
+            self.assertEqual(start_result.metadata["status"], "running")
+            self.assertEqual(start_result.metadata["state"], "running")
+            self.assertIsNotNone(start_result.metadata["started_at"])
+            self.assertIsNotNone(start_result.metadata["last_update_at"])
+            self.assertEqual(start_result.metadata["suggested_next_check_seconds"], 5)
             job_id = str(start_result.metadata["job_id"])
 
             status_result = None
@@ -2438,6 +2449,12 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(start_result.ok)
+        if not _REMOTE_TOOL_RUNTIME_CONFIGURED:
+            self.assertEqual(start_result.metadata["status"], "running")
+            self.assertEqual(start_result.metadata["state"], "running")
+            self.assertIsNotNone(start_result.metadata["started_at"])
+            self.assertIsNotNone(start_result.metadata["last_update_at"])
+            self.assertEqual(start_result.metadata["suggested_next_check_seconds"], 5)
         job_id = str(start_result.metadata["job_id"])
 
         status_result = None

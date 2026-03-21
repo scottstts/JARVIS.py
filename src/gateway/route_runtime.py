@@ -32,7 +32,13 @@ from subagent import (
 )
 from subagent.types import SubagentSnapshot
 from tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
+from tools.basic.bash.jobs import (
+    BashJobError,
+    mark_job_progress_notified,
+    mark_job_terminal_notice_dispatched,
+)
 
+from .bash_job_supervisor import BashJobNotice, BashJobSupervisor
 from .route_events import (
     RouteApprovalRequestEvent,
     RouteAssistantDeltaEvent,
@@ -58,16 +64,19 @@ _SUBAGENT_SUPERVISOR_FOLLOWUP_TEXT = (
     "Review the runtime context, supervise the outcome, dispose the subagent when appropriate, "
     "and tell the user the result."
 )
+_MAIN_BASH_PROGRESS_RUNTIME_KIND = "main_bash_progress"
+_MAIN_BASH_PROGRESS_NOTICE_KIND = "bash_job_progress_update"
 
 
 @dataclass(slots=True, frozen=True)
 class _RouteTurnRequest:
-    user_text: str
+    user_text: str | None = None
     force_session_id: str | None = None
     pre_turn_messages: tuple[AgentRuntimeMessage, ...] = ()
     parse_commands: bool = True
     user_initiated: bool = True
     internal_generation: int | None = None
+    runtime_turn_kind: str | None = None
 
 
 class RouteEventBus:
@@ -148,8 +157,19 @@ class RouteRuntime:
         self._message_worker: asyncio.Task[None] | None = None
         self._main_resume_requires_user_message = False
         self._internal_followup_generation = 0
+        self._pending_main_bash_notices: dict[str, BashJobNotice] = {}
+        self._main_bash_runtime_turn_queued = False
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
+        self._bash_job_supervisor = BashJobSupervisor(
+            route_id=route_id,
+            settings=tool_settings,
+            followups_allowed=self._internal_followups_allowed,
+            main_turn_active=self._main_loop_has_active_turn,
+            subagent_turn_active=self._subagent_manager_turn_active,
+            handle_main_notices=self._enqueue_main_bash_job_followup,
+            handle_subagent_notices=self._enqueue_subagent_bash_job_followup,
+        )
         self._subagent_manager = SubagentManager(
             route_id=route_id,
             llm_service=llm_service,
@@ -158,6 +178,7 @@ class RouteRuntime:
             tool_execution_guard=self._tool_execution_guard,
             publish_event=self.publish_event,
             register_approval_target=self._approval_registry.register,
+            tool_result_observer=self._bash_job_supervisor.observe_tool_result,
         )
         self._main_loop = AgentLoop(
             llm_service=llm_service,
@@ -178,18 +199,26 @@ class RouteRuntime:
     def request_stop(self) -> bool:
         main_stop_requested = self._main_loop.request_stop()
         affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
-        stop_requested = main_stop_requested or bool(affected_subagents)
+        pending_bash_jobs = self._bash_job_supervisor.pending_jobs()
+        stop_requested = (
+            main_stop_requested
+            or bool(affected_subagents)
+            or bool(pending_bash_jobs)
+        )
         if stop_requested and not self._main_resume_requires_user_message:
             self._main_resume_requires_user_message = True
             self._internal_followup_generation += 1
         if affected_subagents:
             self._append_user_stop_subagent_note(affected_subagents)
+        if pending_bash_jobs:
+            self._append_user_stop_bash_job_note(pending_bash_jobs)
         return stop_requested
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._approval_registry.resolve(approval_id, approved)
 
     async def enqueue_user_message(self, user_text: str) -> None:
+        self._bash_job_supervisor.ensure_running()
         await self._message_queue.put(
             _RouteTurnRequest(
                 user_text=user_text,
@@ -262,18 +291,46 @@ class RouteRuntime:
                         self._main_resume_requires_user_message = False
                 else:
                     if self._main_resume_requires_user_message:
+                        if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
+                            self._clear_pending_main_bash_notices()
                         continue
                     if request.internal_generation != self._internal_followup_generation:
+                        if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
+                            self._clear_pending_main_bash_notices()
                         continue
-                event_stream = (
-                    self._main_loop.stream_user_input(request.user_text)
-                    if request.parse_commands
-                    else self._main_loop.stream_turn(
+                if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
+                    self._main_bash_runtime_turn_queued = False
+                    runtime_message = self._drain_main_bash_progress_message(
+                        force_session_id=request.force_session_id,
+                    )
+                    if runtime_message is None:
+                        continue
+                    force_session_id, system_message, notices = runtime_message
+                    published = await self._publish_main_system_message(
+                        session_id=force_session_id,
+                        message=system_message,
+                        notices=notices,
+                    )
+                    if not published:
+                        continue
+                    event_stream = self._main_loop.stream_runtime_turn(
+                        force_session_id=force_session_id,
+                    )
+                elif request.parse_commands:
+                    if request.user_text is None:
+                        continue
+                    event_stream = self._main_loop.stream_user_input(request.user_text)
+                elif request.user_text is None:
+                    event_stream = self._main_loop.stream_runtime_turn(
+                        force_session_id=request.force_session_id,
+                        pre_turn_messages=request.pre_turn_messages,
+                    )
+                else:
+                    event_stream = self._main_loop.stream_turn(
                         user_text=request.user_text,
                         force_session_id=request.force_session_id,
                         pre_turn_messages=request.pre_turn_messages,
                     )
-                )
                 async for event in event_stream:
                     await self._publish_main_loop_event(event)
             except ContextBudgetError as exc:
@@ -432,10 +489,12 @@ class RouteRuntime:
         if tool_call.name in SUBAGENT_PRIMITIVE_NAMES:
             return await self._execute_subagent_primitive(tool_call, context)
         async with self._tool_execution_guard:
-            return await self._main_tool_runtime.execute(
+            result = await self._main_tool_runtime.execute(
                 tool_call=tool_call,
                 context=context,
             )
+        await self._bash_job_supervisor.observe_tool_result(result=result, context=context)
+        return result
 
     async def _execute_subagent_primitive(
         self,
@@ -576,6 +635,279 @@ class RouteRuntime:
                 "subagent_codenames": codenames,
             },
         )
+
+    def _append_user_stop_bash_job_note(
+        self,
+        pending_jobs: Sequence[object],
+    ) -> None:
+        session_id = self._main_loop.active_session_id()
+        if session_id is None and pending_jobs:
+            owner_session_id = getattr(pending_jobs[0], "owner_session_id", None)
+            if isinstance(owner_session_id, str) and owner_session_id.strip():
+                session_id = owner_session_id
+        if session_id is None:
+            return
+
+        lines = [
+            "The user issued /stop while detached bash jobs were still pending.",
+            "",
+            "Pending detached bash jobs:",
+        ]
+        job_ids: list[str] = []
+        for record in pending_jobs:
+            job_id = str(getattr(record, "job_id", "")).strip() or "unknown"
+            command = str(getattr(record, "command", "")).strip() or "(unknown command)"
+            owner_kind = str(getattr(record, "owner_agent_kind", "")).strip() or "main"
+            owner_subagent_id = str(getattr(record, "owner_subagent_id", "")).strip()
+            owner_label = owner_kind if not owner_subagent_id else f"{owner_kind}:{owner_subagent_id}"
+            lines.append(f"- {job_id} [owner={owner_label}] command={command}")
+            job_ids.append(job_id)
+        lines.extend(
+            [
+                "",
+                "The bash jobs continue running, but automatic runtime follow-ups are suppressed until the next user message.",
+            ]
+        )
+        self._main_loop.append_system_note(
+            "\n".join(lines),
+            session_id=session_id,
+            metadata={
+                "user_stop_bash_jobs": True,
+                "bash_job_ids": job_ids,
+            },
+        )
+
+    def _internal_followups_allowed(self) -> bool:
+        return not self._main_resume_requires_user_message
+
+    def _main_loop_has_active_turn(self) -> bool:
+        return self._main_loop.has_active_turn()
+
+    def _subagent_manager_turn_active(self, subagent_id: str) -> bool:
+        return self._subagent_manager.is_turn_active(subagent_id)
+
+    async def _enqueue_main_bash_job_followup(
+        self,
+        notices: tuple[BashJobNotice, ...],
+    ) -> None:
+        if not notices:
+            return
+        if self._main_resume_requires_user_message:
+            return
+        self._merge_main_bash_notices(notices)
+        if self._main_bash_runtime_turn_queued:
+            return
+        self._main_bash_runtime_turn_queued = True
+        await self._message_queue.put(
+            _RouteTurnRequest(
+                user_text=None,
+                force_session_id=self._resolve_main_bash_notice_session_id(notices),
+                parse_commands=False,
+                user_initiated=False,
+                internal_generation=self._internal_followup_generation,
+                runtime_turn_kind=_MAIN_BASH_PROGRESS_RUNTIME_KIND,
+            )
+        )
+        self._ensure_message_worker()
+
+    async def _enqueue_subagent_bash_job_followup(
+        self,
+        notices: tuple[BashJobNotice, ...],
+    ) -> None:
+        if self._main_resume_requires_user_message:
+            return
+        await self._subagent_manager.enqueue_bash_job_followup(notices)
+
+    def _merge_main_bash_notices(self, notices: Sequence[BashJobNotice]) -> None:
+        for notice in notices:
+            self._pending_main_bash_notices.pop(notice.job_id, None)
+            self._pending_main_bash_notices[notice.job_id] = notice
+
+    def _clear_pending_main_bash_notices(self) -> None:
+        self._pending_main_bash_notices.clear()
+        self._main_bash_runtime_turn_queued = False
+
+    def _resolve_main_bash_notice_session_id(
+        self,
+        notices: Sequence[BashJobNotice],
+    ) -> str | None:
+        active_session_id = self._main_loop.active_session_id()
+        if active_session_id is not None:
+            return active_session_id
+        for notice in notices:
+            if notice.owner_session_id:
+                return notice.owner_session_id
+        return None
+
+    def _drain_main_bash_progress_message(
+        self,
+        *,
+        force_session_id: str | None,
+    ) -> tuple[str, AgentRuntimeMessage, tuple[BashJobNotice, ...]] | None:
+        notices = tuple(self._pending_main_bash_notices.values())
+        self._pending_main_bash_notices.clear()
+        if not notices:
+            return None
+        session_id = force_session_id or self._resolve_main_bash_notice_session_id(notices)
+        if session_id is None:
+            return None
+        return session_id, self._build_main_bash_job_followup_message(notices), notices
+
+    async def _publish_main_system_message(
+        self,
+        *,
+        session_id: str,
+        message: AgentRuntimeMessage,
+        notices: Sequence[BashJobNotice],
+    ) -> bool:
+        if not self._main_loop.append_system_note(
+            message.content,
+            session_id=session_id,
+            metadata=message.metadata,
+        ):
+            return False
+        notice_kind = str(
+            message.metadata.get("notice_kind", _MAIN_BASH_PROGRESS_NOTICE_KIND)
+        ).strip() or _MAIN_BASH_PROGRESS_NOTICE_KIND
+        await self.publish_event(
+            RouteSystemNoticeEvent(
+                route_id=self._route_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                session_id=session_id,
+                notice_kind=notice_kind,
+                text=message.content,
+                public=False,
+            )
+        )
+        self._record_bash_notice_delivery(notices)
+        return True
+
+    def _build_main_bash_job_followup_message(
+        self,
+        notices: Sequence[BashJobNotice],
+    ) -> AgentRuntimeMessage:
+        running_notices = [notice for notice in notices if notice.status == "running"]
+        terminal_notices = [notice for notice in notices if notice.status != "running"]
+        lines = ["Detached bash update."]
+        for notice in notices:
+            lines.append(f"- {self._format_main_bash_job_notice_line(notice)}")
+        guidance = (
+            "This is a system update from the orchestrator, not a new user message. Detached bash is orchestrator-monitored; react to this update and update the user accordingly instead of polling unless the user asks for immediate inspection."
+        )
+        if running_notices:
+            lines.append(guidance)
+            lines.append("Do not close the overall task while any listed job is still running.")
+        elif terminal_notices:
+            lines.append(guidance)
+        return AgentRuntimeMessage(
+            role="system",
+            transient=False,
+            metadata={
+                "bash_job_progress_update": True,
+                "notice_kind": _MAIN_BASH_PROGRESS_NOTICE_KIND,
+                "detached_bash_job_ids": [notice.job_id for notice in notices],
+                "bash_job_notice_kinds": [notice.notice_kind for notice in notices],
+                "bash_job_running_ids": [notice.job_id for notice in running_notices],
+                "bash_job_terminal_ids": [notice.job_id for notice in terminal_notices],
+            },
+            content="\n".join(lines),
+        )
+
+    def _format_main_bash_job_notice_line(self, notice: BashJobNotice) -> str:
+        notice_name = notice.notice_kind.removeprefix("bash_job_") or notice.notice_kind
+        timestamp_label, timestamp_value = self._main_bash_notice_timestamp(notice)
+        parts = [
+            f"job_id={notice.job_id}",
+            f"status={notice.status}",
+            f"notice={notice_name}",
+            f"{timestamp_label}={timestamp_value}",
+        ]
+        if notice.status != "cancelled" and notice.exit_code is not None:
+            parts.append(f"exit_code={notice.exit_code}")
+        detail = self._main_bash_notice_detail(notice)
+        if detail is not None:
+            detail_label = "progress" if notice.status == "running" else "result"
+            parts.append(f'{detail_label}="{detail}"')
+        return " ".join(parts)
+
+    def _main_bash_notice_timestamp(self, notice: BashJobNotice) -> tuple[str, str]:
+        if notice.status == "cancelled":
+            return "cancelled_at", notice.cancelled_at or notice.last_update_at or notice.started_at
+        if notice.status != "running":
+            return "finished_at", notice.finished_at or notice.last_update_at or notice.started_at
+        if notice.last_update_at is not None:
+            return "last_update_at", notice.last_update_at
+        return "started_at", notice.started_at
+
+    def _main_bash_notice_detail(self, notice: BashJobNotice) -> str | None:
+        if notice.progress_hint:
+            return self._truncate_for_notice(notice.progress_hint, max_length=120)
+        if notice.status == "running":
+            return (
+                f"stdout={self._format_notice_bytes(notice.stdout_bytes_seen)} "
+                f"stderr={self._format_notice_bytes(notice.stderr_bytes_seen)}"
+            )
+        tail_hint = self._truncate_for_notice(
+            self._last_non_empty_line(notice.stderr) or self._last_non_empty_line(notice.stdout),
+            max_length=120,
+        )
+        if tail_hint is not None:
+            return tail_hint
+        if notice.status == "cancelled":
+            return None
+        return (
+            f"stdout={self._format_notice_bytes(notice.stdout_bytes_seen)} "
+            f"stderr={self._format_notice_bytes(notice.stderr_bytes_seen)}"
+        )
+
+    def _truncate_for_notice(self, value: str | None, *, max_length: int) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized:
+            return None
+        if len(normalized) <= max_length:
+            return normalized
+        return normalized[: max_length - 3] + "..."
+
+    def _last_non_empty_line(self, text: str) -> str | None:
+        for line in reversed(text.splitlines()):
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return None
+
+    def _format_notice_bytes(self, count: int) -> str:
+        if count < 1024:
+            return f"{count}B"
+        kib = count / 1024
+        if kib < 1024:
+            return f"{kib:.1f}KiB"
+        mib = kib / 1024
+        return f"{mib:.1f}MiB"
+
+    def _record_bash_notice_delivery(self, notices: Sequence[BashJobNotice]) -> None:
+        workspace_dir = self._core_settings.workspace_dir
+        for notice in notices:
+            try:
+                mark_job_progress_notified(
+                    workspace_dir=workspace_dir,
+                    job_id=notice.job_id,
+                    notice_kind=notice.notice_kind,
+                    status=notice.status,
+                    stdout_bytes_seen=notice.stdout_bytes_seen,
+                    stderr_bytes_seen=notice.stderr_bytes_seen,
+                    last_update_at=notice.last_update_at,
+                )
+                if notice.status in {"finished", "cancelled"}:
+                    mark_job_terminal_notice_dispatched(
+                        workspace_dir=workspace_dir,
+                        job_id=notice.job_id,
+                        notice_kind=notice.notice_kind,
+                    )
+            except BashJobError:
+                continue
 
 
 def _optional_string(value: Any) -> str | None:

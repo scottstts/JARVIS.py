@@ -69,6 +69,21 @@ class BashJobRecord:
     stdout_path: str
     stderr_path: str
     job_dir: str
+    owner_route_id: str | None = None
+    owner_session_id: str | None = None
+    owner_turn_id: str | None = None
+    owner_agent_kind: str | None = None
+    owner_agent_name: str | None = None
+    owner_subagent_id: str | None = None
+    last_progress_notice_kind: str | None = None
+    last_progress_notice_at: str | None = None
+    last_progress_notice_status: str | None = None
+    last_progress_notice_stdout_bytes_seen: int | None = None
+    last_progress_notice_stderr_bytes_seen: int | None = None
+    last_progress_notice_last_update_at: str | None = None
+    progress_notice_count: int | None = None
+    terminal_notice_kind: str | None = None
+    terminal_notice_dispatched_at: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,6 +91,7 @@ class BashJobLogStats:
     bytes_seen: int
     bytes_retained: int
     bytes_dropped: int
+    updated_at: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -182,6 +198,21 @@ def write_job_metadata(
     command: str,
     launched_at: str,
     cwd: str,
+    owner_route_id: str | None = None,
+    owner_session_id: str | None = None,
+    owner_turn_id: str | None = None,
+    owner_agent_kind: str | None = None,
+    owner_agent_name: str | None = None,
+    owner_subagent_id: str | None = None,
+    last_progress_notice_kind: str | None = None,
+    last_progress_notice_at: str | None = None,
+    last_progress_notice_status: str | None = None,
+    last_progress_notice_stdout_bytes_seen: int | None = None,
+    last_progress_notice_stderr_bytes_seen: int | None = None,
+    last_progress_notice_last_update_at: str | None = None,
+    progress_notice_count: int | None = None,
+    terminal_notice_kind: str | None = None,
+    terminal_notice_dispatched_at: str | None = None,
 ) -> None:
     payload = {
         "job_id": paths.job_id,
@@ -196,6 +227,42 @@ def write_job_metadata(
         "stderr_path": str(paths.stderr_path),
         "job_dir": str(paths.job_dir),
     }
+    if owner_route_id is not None:
+        payload["owner_route_id"] = owner_route_id
+    if owner_session_id is not None:
+        payload["owner_session_id"] = owner_session_id
+    if owner_turn_id is not None:
+        payload["owner_turn_id"] = owner_turn_id
+    if owner_agent_kind is not None:
+        payload["owner_agent_kind"] = owner_agent_kind
+    if owner_agent_name is not None:
+        payload["owner_agent_name"] = owner_agent_name
+    if owner_subagent_id is not None:
+        payload["owner_subagent_id"] = owner_subagent_id
+    if last_progress_notice_kind is not None:
+        payload["last_progress_notice_kind"] = last_progress_notice_kind
+    if last_progress_notice_at is not None:
+        payload["last_progress_notice_at"] = last_progress_notice_at
+    if last_progress_notice_status is not None:
+        payload["last_progress_notice_status"] = last_progress_notice_status
+    if last_progress_notice_stdout_bytes_seen is not None:
+        payload["last_progress_notice_stdout_bytes_seen"] = (
+            int(last_progress_notice_stdout_bytes_seen)
+        )
+    if last_progress_notice_stderr_bytes_seen is not None:
+        payload["last_progress_notice_stderr_bytes_seen"] = (
+            int(last_progress_notice_stderr_bytes_seen)
+        )
+    if last_progress_notice_last_update_at is not None:
+        payload["last_progress_notice_last_update_at"] = (
+            last_progress_notice_last_update_at
+        )
+    if progress_notice_count is not None:
+        payload["progress_notice_count"] = int(progress_notice_count)
+    if terminal_notice_kind is not None:
+        payload["terminal_notice_kind"] = terminal_notice_kind
+    if terminal_notice_dispatched_at is not None:
+        payload["terminal_notice_dispatched_at"] = terminal_notice_dispatched_at
     _write_json_atomic(paths.metadata_path, payload)
 
 
@@ -204,7 +271,7 @@ def load_job(workspace_dir: Path, job_id: str) -> tuple[BashJobPaths, BashJobRec
     if not paths.job_dir.exists():
         raise BashJobError(f"Unknown bash job id: {job_id}")
     try:
-        payload = json.loads(paths.metadata_path.read_text(encoding="utf-8"))
+        payload = _load_metadata_payload(paths)
     except FileNotFoundError as exc:
         raise BashJobError(f"Unknown bash job id: {job_id}") from exc
     except json.JSONDecodeError as exc:
@@ -227,6 +294,35 @@ def load_job(workspace_dir: Path, job_id: str) -> tuple[BashJobPaths, BashJobRec
         stdout_path=str(payload["stdout_path"]),
         stderr_path=str(payload["stderr_path"]),
         job_dir=str(payload["job_dir"]),
+        owner_route_id=_optional_non_empty_string(payload.get("owner_route_id")),
+        owner_session_id=_optional_non_empty_string(payload.get("owner_session_id")),
+        owner_turn_id=_optional_non_empty_string(payload.get("owner_turn_id")),
+        owner_agent_kind=_optional_non_empty_string(payload.get("owner_agent_kind")),
+        owner_agent_name=_optional_non_empty_string(payload.get("owner_agent_name")),
+        owner_subagent_id=_optional_non_empty_string(payload.get("owner_subagent_id")),
+        last_progress_notice_kind=_optional_non_empty_string(
+            payload.get("last_progress_notice_kind")
+        ),
+        last_progress_notice_at=_optional_non_empty_string(
+            payload.get("last_progress_notice_at")
+        ),
+        last_progress_notice_status=_optional_non_empty_string(
+            payload.get("last_progress_notice_status")
+        ),
+        last_progress_notice_stdout_bytes_seen=_optional_int(
+            payload.get("last_progress_notice_stdout_bytes_seen")
+        ),
+        last_progress_notice_stderr_bytes_seen=_optional_int(
+            payload.get("last_progress_notice_stderr_bytes_seen")
+        ),
+        last_progress_notice_last_update_at=_optional_non_empty_string(
+            payload.get("last_progress_notice_last_update_at")
+        ),
+        progress_notice_count=_optional_int(payload.get("progress_notice_count")),
+        terminal_notice_kind=_optional_non_empty_string(payload.get("terminal_notice_kind")),
+        terminal_notice_dispatched_at=_optional_non_empty_string(
+            payload.get("terminal_notice_dispatched_at")
+        ),
     )
 
 
@@ -260,6 +356,167 @@ def read_job_process_identifiers(paths: BashJobPaths) -> tuple[int | None, int |
     return _read_int(paths.child_pid_path), _read_int(paths.child_pgid_path)
 
 
+def list_jobs(workspace_dir: Path) -> list[tuple[BashJobPaths, BashJobRecord]]:
+    jobs_dir = workspace_dir / _JOBS_DIRNAME
+    if not jobs_dir.exists():
+        return []
+
+    jobs: list[tuple[BashJobPaths, BashJobRecord]] = []
+    for child in jobs_dir.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            jobs.append(load_job(workspace_dir, child.name))
+        except BashJobError:
+            continue
+    return jobs
+
+
+def claim_job_owner(
+    *,
+    workspace_dir: Path,
+    job_id: str,
+    route_id: str,
+    session_id: str,
+    turn_id: str,
+    agent_kind: str,
+    agent_name: str,
+    subagent_id: str | None = None,
+) -> BashJobRecord:
+    paths, record = load_job(workspace_dir, job_id)
+    if record.owner_route_id is not None:
+        existing = (
+            record.owner_route_id,
+            record.owner_session_id,
+            record.owner_turn_id,
+            record.owner_agent_kind,
+            record.owner_subagent_id,
+        )
+        requested = (
+            route_id,
+            session_id,
+            turn_id,
+            agent_kind,
+            subagent_id,
+        )
+        if existing != requested:
+            raise BashJobError(
+                "bash job ownership is already claimed by a different agent context."
+            )
+        return record
+
+    write_job_metadata(
+        paths=paths,
+        pid=record.pid,
+        pgid=record.pgid,
+        runner_pid=record.runner_pid,
+        runner_pgid=record.runner_pgid,
+        command=record.command,
+        launched_at=record.launched_at,
+        cwd=record.cwd,
+        owner_route_id=route_id,
+        owner_session_id=session_id,
+        owner_turn_id=turn_id,
+        owner_agent_kind=agent_kind,
+        owner_agent_name=agent_name,
+        owner_subagent_id=subagent_id,
+        last_progress_notice_kind=record.last_progress_notice_kind,
+        last_progress_notice_at=record.last_progress_notice_at,
+        last_progress_notice_status=record.last_progress_notice_status,
+        last_progress_notice_stdout_bytes_seen=record.last_progress_notice_stdout_bytes_seen,
+        last_progress_notice_stderr_bytes_seen=record.last_progress_notice_stderr_bytes_seen,
+        last_progress_notice_last_update_at=record.last_progress_notice_last_update_at,
+        progress_notice_count=record.progress_notice_count,
+        terminal_notice_kind=record.terminal_notice_kind,
+        terminal_notice_dispatched_at=record.terminal_notice_dispatched_at,
+    )
+    _, updated = load_job(workspace_dir, job_id)
+    return updated
+
+
+def mark_job_terminal_notice_dispatched(
+    *,
+    workspace_dir: Path,
+    job_id: str,
+    notice_kind: str,
+    dispatched_at: str | None = None,
+) -> BashJobRecord:
+    paths, record = load_job(workspace_dir, job_id)
+    timestamp = dispatched_at or _utc_now()
+    write_job_metadata(
+        paths=paths,
+        pid=record.pid,
+        pgid=record.pgid,
+        runner_pid=record.runner_pid,
+        runner_pgid=record.runner_pgid,
+        command=record.command,
+        launched_at=record.launched_at,
+        cwd=record.cwd,
+        owner_route_id=record.owner_route_id,
+        owner_session_id=record.owner_session_id,
+        owner_turn_id=record.owner_turn_id,
+        owner_agent_kind=record.owner_agent_kind,
+        owner_agent_name=record.owner_agent_name,
+        owner_subagent_id=record.owner_subagent_id,
+        last_progress_notice_kind=record.last_progress_notice_kind,
+        last_progress_notice_at=record.last_progress_notice_at,
+        last_progress_notice_status=record.last_progress_notice_status,
+        last_progress_notice_stdout_bytes_seen=record.last_progress_notice_stdout_bytes_seen,
+        last_progress_notice_stderr_bytes_seen=record.last_progress_notice_stderr_bytes_seen,
+        last_progress_notice_last_update_at=record.last_progress_notice_last_update_at,
+        progress_notice_count=record.progress_notice_count,
+        terminal_notice_kind=notice_kind,
+        terminal_notice_dispatched_at=timestamp,
+    )
+    _, updated = load_job(workspace_dir, job_id)
+    return updated
+
+
+def mark_job_progress_notified(
+    *,
+    workspace_dir: Path,
+    job_id: str,
+    notice_kind: str,
+    status: str,
+    stdout_bytes_seen: int,
+    stderr_bytes_seen: int,
+    last_update_at: str | None,
+    count_as_progress_update: bool = True,
+) -> BashJobRecord:
+    paths, record = load_job(workspace_dir, job_id)
+    timestamp = _utc_now()
+    progress_notice_count = record.progress_notice_count or 0
+    if count_as_progress_update:
+        progress_notice_count += 1
+    write_job_metadata(
+        paths=paths,
+        pid=record.pid,
+        pgid=record.pgid,
+        runner_pid=record.runner_pid,
+        runner_pgid=record.runner_pgid,
+        command=record.command,
+        launched_at=record.launched_at,
+        cwd=record.cwd,
+        owner_route_id=record.owner_route_id,
+        owner_session_id=record.owner_session_id,
+        owner_turn_id=record.owner_turn_id,
+        owner_agent_kind=record.owner_agent_kind,
+        owner_agent_name=record.owner_agent_name,
+        owner_subagent_id=record.owner_subagent_id,
+        last_progress_notice_kind=notice_kind,
+        last_progress_notice_at=timestamp,
+        last_progress_notice_status=status,
+        last_progress_notice_stdout_bytes_seen=int(stdout_bytes_seen),
+        last_progress_notice_stderr_bytes_seen=int(stderr_bytes_seen),
+        last_progress_notice_last_update_at=last_update_at,
+        progress_notice_count=progress_notice_count,
+        terminal_notice_kind=record.terminal_notice_kind,
+        terminal_notice_dispatched_at=record.terminal_notice_dispatched_at,
+    )
+    _, updated = load_job(workspace_dir, job_id)
+    return updated
+
+
 def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
     effective_pid, effective_pgid = _effective_process_identifiers(paths, record)
     active_running = _process_is_running(effective_pid)
@@ -271,6 +528,13 @@ def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
     cancelled_at = _read_optional_text(paths.cancelled_at_path)
     stdout_stats = _read_log_stats(paths.stdout_path, paths.stdout_stats_path)
     stderr_stats = _read_log_stats(paths.stderr_path, paths.stderr_stats_path)
+    last_update_at = _latest_timestamp_text(
+        stdout_stats.updated_at,
+        stderr_stats.updated_at,
+        finished_at,
+        cancelled_at,
+        record.launched_at,
+    )
 
     if running:
         status = "running"
@@ -286,7 +550,9 @@ def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
         "pgid": effective_pgid,
         "runner_pid": record.runner_pid,
         "runner_pgid": record.runner_pgid,
+        "started_at": record.launched_at,
         "launched_at": record.launched_at,
+        "last_update_at": last_update_at,
         "finished_at": finished_at,
         "cancelled_at": cancelled_at,
         "exit_code": exit_code,
@@ -299,6 +565,25 @@ def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
         "stdout_bytes_dropped": stdout_stats.bytes_dropped,
         "stderr_bytes_dropped": stderr_stats.bytes_dropped,
         "command": record.command,
+        "owner_route_id": record.owner_route_id,
+        "owner_session_id": record.owner_session_id,
+        "owner_turn_id": record.owner_turn_id,
+        "owner_agent_kind": record.owner_agent_kind,
+        "owner_agent_name": record.owner_agent_name,
+        "owner_subagent_id": record.owner_subagent_id,
+        "last_progress_notice_kind": record.last_progress_notice_kind,
+        "last_progress_notice_at": record.last_progress_notice_at,
+        "last_progress_notice_status": record.last_progress_notice_status,
+        "last_progress_notice_stdout_bytes_seen": (
+            record.last_progress_notice_stdout_bytes_seen
+        ),
+        "last_progress_notice_stderr_bytes_seen": (
+            record.last_progress_notice_stderr_bytes_seen
+        ),
+        "last_progress_notice_last_update_at": record.last_progress_notice_last_update_at,
+        "progress_notice_count": record.progress_notice_count,
+        "terminal_notice_kind": record.terminal_notice_kind,
+        "terminal_notice_dispatched_at": record.terminal_notice_dispatched_at,
     }
 
 
@@ -642,11 +927,13 @@ def _read_log_stats(log_path: Path, stats_path: Path) -> BashJobLogStats:
             bytes_seen=retained_bytes,
             bytes_retained=retained_bytes,
             bytes_dropped=0,
+            updated_at=None,
         )
 
     bytes_seen = _coerce_non_negative_int(payload.get("bytes_seen"), retained_bytes)
     bytes_retained = _coerce_non_negative_int(payload.get("bytes_retained"), retained_bytes)
     bytes_dropped = _coerce_non_negative_int(payload.get("bytes_dropped"), 0)
+    updated_at = _optional_non_empty_string(payload.get("updated_at"))
     if bytes_retained != retained_bytes:
         bytes_retained = retained_bytes
         bytes_dropped = max(0, bytes_seen - bytes_retained)
@@ -654,6 +941,7 @@ def _read_log_stats(log_path: Path, stats_path: Path) -> BashJobLogStats:
         bytes_seen=bytes_seen,
         bytes_retained=bytes_retained,
         bytes_dropped=bytes_dropped,
+        updated_at=updated_at,
     )
 
 
@@ -788,6 +1076,44 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temp_path.replace(path)
+
+
+def _load_metadata_payload(paths: BashJobPaths) -> dict[str, Any]:
+    payload = json.loads(paths.metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise json.JSONDecodeError("metadata payload must be an object", "", 0)
+    return payload
+
+
+def _optional_non_empty_string(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_timestamp_text(*values: str | None) -> str | None:
+    latest_value: str | None = None
+    latest_timestamp = float("-inf")
+    for value in values:
+        if value is None:
+            continue
+        parsed = _parse_utc_timestamp(value)
+        if parsed is None:
+            continue
+        if parsed > latest_timestamp:
+            latest_timestamp = parsed
+            latest_value = value
+    return latest_value
 
 
 def _utc_now() -> str:

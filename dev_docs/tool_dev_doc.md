@@ -305,6 +305,12 @@ Current standard:
 - follow-up tool rounds are rebuilt into provider-native request shapes inside `src/llm/`
 - `tool_search` may attach discoverable-activation metadata to its tool result
 - only current-turn pending tool results can activate discoverable tools; activations do not persist across turns
+- detached bash jobs are no longer correctness-coupled to model polling; once `bash` returns a running `job_id`, that tool round is complete
+- route-scoped runtime supervision now owns detached bash monitoring outside the model loop; the main/subagent turn parks after detached start or promotion, and later revivals are driven by orchestrator progress decisions instead of model polling
+- detached-bash revivals are now persisted transcripted system messages plus fresh runtime turns for the owning agent, not fake user messages or hidden internal-only turns; the progress notice is agent-only (`public=False`) and is not forwarded to Telegram
+- detached-bash progress pacing is hybrid: clear runtime signals fire immediately when available (first output, substantial output growth, terminal state), and fallback heartbeats use an increasing backoff (`30s`, then `60s`, then `180s`, then `300s` capped) measured from the last delivered update
+- detached-bash notices are batched and deduped per owner so multiple job updates coalesce into one revival instead of one turn per job
+- route-level `/stop` now also suppresses detached-bash auto-followups until the next user message, but it does not cancel already-running foreground or background bash executions
 
 Current provider-native follow-up handling:
 
@@ -382,11 +388,18 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - truncates large output to the configured cap
 - returns a normalized tool result even when the command produces no `stdout`
 - supports background jobs persisted under `.jarvis_internal/bash_jobs/`; the same tool surface can start, inspect, tail, and cancel them
+- detached start/promotion results now include a stable running-job surface with `job_id`, `status`/`state`, `started_at`, `last_update_at`, and `suggested_next_check_seconds`
 - background job `stdout`/`stderr` storage is now bounded per stream with plain-text on-disk compaction (`JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES`, default `4 MiB`), and `status` / `tail` metadata reports seen, retained, and dropped byte counts
 - background job retention is now swept opportunistically on later bash operations: finished/cancelled jobs older than `JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS` (default `86400s`) are deleted, and new background jobs enforce a shared `JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES` budget (default `128 MiB`) across `.jarvis_internal/bash_jobs/`
 - the detached runner now records the actual child process identifiers and cancellation targets that child process group plus the wrapper group, reducing orphaned log writers after `mode='cancel'`
 - promoted-foreground completion now reads only direct head/tail slices from job logs instead of loading whole persisted log files into memory first
-- when a foreground run is auto-promoted, the agent loop injects a transient system reminder telling the model to use `status`, `tail`, or `cancel` with the returned `job_id` instead of rerunning the command in foreground
+- detached job metadata now persists owner route/session/turn and owner agent identity so the runtime can recover supervision without relying on in-memory model state
+- a route-scoped detached-bash supervisor now observes route-owned jobs with persisted per-job progress snapshots, uses signal-based progress detection plus backoff heartbeats, suppresses duplicate notices when the owning agent already inspected the same progress in-band, and dispatches owner-targeted updates for the main agent or subagents
+- subagent `bash` tool results are forwarded into that same shared detached-bash supervisor path, so promoted/background jobs are claimed with owner metadata and can later be routed back to the correct child session
+- main-agent detached bash updates now revive Jarvis through concise persisted system messages followed by `stream_runtime_turn()`; those system notices are agent-only route events and there is no synthetic user follow-up text for detached bash anymore
+- main detached-bash updates are queued/batched in `RouteRuntime`, merged by `job_id`, and marked delivered only after the visible system message is appended and published
+- subagents with pending detached bash jobs now enter `waiting_background` instead of reporting completion to main; when detached bash progress becomes noteworthy, the runtime appends a concise persisted child-system note and resumes that same subagent through `stream_runtime_turn()` rather than fake user follow-up text
+- the promotion-time transient reminder about polling was removed; the only detached-bash revivals now come from orchestrator-owned progress updates
 
 #### Policy
 

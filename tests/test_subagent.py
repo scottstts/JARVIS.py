@@ -14,6 +14,7 @@ from core import (
     AgentToolCallEvent,
     AgentTurnDoneEvent,
 )
+from gateway.bash_job_supervisor import BashJobNotice
 from gateway.route_events import (
     RouteApprovalRequestEvent,
     RouteSystemNoticeEvent,
@@ -24,8 +25,9 @@ from subagent.manager import SubagentManager
 from subagent.runtime import SubagentRuntime
 from subagent.settings import SubagentSettings
 from subagent.storage import SubagentCatalogStorage
+from subagent.types import SubagentCatalogEntry
 from tests.helpers import build_core_settings
-from tools import ToolRegistry, ToolSettings
+from tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolSettings
 
 
 def _build_response(text: str) -> LLMResponse:
@@ -59,6 +61,7 @@ class _FakeSubagentLoop:
         self._events = tuple(events)
         self._session_id = session_id
         self.stop_requests = 0
+        self.system_notes: list[tuple[str, str | None, dict[str, object] | None]] = []
 
     async def prepare_session(self, *, start_reason: str) -> str:
         _ = start_reason
@@ -69,8 +72,23 @@ class _FakeSubagentLoop:
         for event in self._events:
             yield event
 
+    async def stream_runtime_turn(self, *, force_session_id: str | None, pre_turn_messages):
+        _ = (force_session_id, pre_turn_messages)
+        for event in self._events:
+            yield event
+
     def active_session_id(self) -> str | None:
         return self._session_id
+
+    def append_system_note(
+        self,
+        content: str,
+        *,
+        session_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> bool:
+        self.system_notes.append((content, session_id, metadata))
+        return True
 
     def request_stop(self) -> bool:
         self.stop_requests += 1
@@ -340,6 +358,360 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manager._subagents["sub_awaiting"].pending_pause_reason, "main_stop")
             self.assertIsNone(manager._subagents["sub_paused"].pending_pause_reason)
             self.assertIsNone(manager._subagents["sub_completed"].pending_pause_reason)
+
+    async def test_subagent_waits_for_detached_bash_jobs_before_reporting_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+            published_events: list[object] = []
+
+            async def publish_event(event: object) -> None:
+                published_events.append(event)
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=_FakeSubagentLoop(
+                    [AgentTurnDoneEvent(session_id="subagent_session", response_text="done")]
+                ),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage("sub_1"),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="running",
+                created_at="2026-03-21T10:00:00+00:00",
+                updated_at="2026-03-21T10:00:00+00:00",
+            )
+            runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
+            manager._subagents[runtime.subagent_id] = runtime
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id=runtime.subagent_id,
+                    codename=runtime.codename,
+                    status=runtime.status,
+                    created_at=runtime.created_at,
+                    updated_at=runtime.updated_at,
+                    route_id="route_1",
+                    owner_main_session_id=runtime.owner_main_session_id,
+                    owner_main_turn_id=runtime.owner_main_turn_id,
+                    current_subagent_session_id="subagent_session",
+                )
+            )
+
+            await manager._run_turn(
+                runtime,
+                user_text="Continue.",
+                force_session_id="subagent_session",
+                pre_turn_messages=(),
+            )
+
+            self.assertEqual(runtime.status, "waiting_background")
+            self.assertFalse(
+                any(
+                    isinstance(event, RouteSystemNoticeEvent)
+                    and event.notice_kind == "subagent_completed"
+                    for event in published_events
+                )
+            )
+
+    async def test_subagent_bash_results_are_forwarded_to_shared_observer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+            observed: list[tuple[ToolExecutionResult, ToolExecutionContext]] = []
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            async def observe_tool_result(
+                *,
+                result: ToolExecutionResult,
+                context: ToolExecutionContext,
+            ) -> None:
+                observed.append((result, context))
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+                tool_result_observer=observe_tool_result,
+            )
+
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage("sub_1"),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="running",
+                created_at="2026-03-21T10:00:00+00:00",
+                updated_at="2026-03-21T10:00:00+00:00",
+            )
+            manager._subagents[runtime.subagent_id] = runtime
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id=runtime.subagent_id,
+                    codename=runtime.codename,
+                    status=runtime.status,
+                    created_at=runtime.created_at,
+                    updated_at=runtime.updated_at,
+                    route_id="route_1",
+                    owner_main_session_id=runtime.owner_main_session_id,
+                    owner_main_turn_id=runtime.owner_main_turn_id,
+                    current_subagent_session_id="subagent_session",
+                )
+            )
+
+            result = ToolExecutionResult(
+                call_id="call_1",
+                name="bash",
+                ok=True,
+                content="background running",
+                metadata={
+                    "mode": "foreground",
+                    "promoted_to_background": True,
+                    "job_id": "deadbeefdeadbeefdeadbeefdeadbeef",
+                    "status": "running",
+                    "state": "running",
+                },
+            )
+            context = ToolExecutionContext(
+                workspace_dir=core_settings.workspace_dir,
+                route_id="route_1",
+                session_id="subagent_session",
+                turn_id="turn_1",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_1",
+            )
+
+            await manager._observe_tool_result(
+                subagent_id="sub_1",
+                result=result,
+                context=context,
+            )
+
+            self.assertEqual(len(observed), 1)
+            self.assertIs(observed[0][0], result)
+            self.assertEqual(observed[0][1], context)
+            self.assertEqual(
+                runtime.pending_background_job_ids,
+                {"deadbeefdeadbeefdeadbeefdeadbeef"},
+            )
+
+    async def test_bash_job_followup_resumes_waiting_subagent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage("sub_1"),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="waiting_background",
+                created_at="2026-03-21T10:00:00+00:00",
+                updated_at="2026-03-21T10:00:00+00:00",
+            )
+            runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
+            manager._subagents[runtime.subagent_id] = runtime
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id=runtime.subagent_id,
+                    codename=runtime.codename,
+                    status=runtime.status,
+                    created_at=runtime.created_at,
+                    updated_at=runtime.updated_at,
+                    route_id="route_1",
+                    owner_main_session_id=runtime.owner_main_session_id,
+                    owner_main_turn_id=runtime.owner_main_turn_id,
+                    current_subagent_session_id="subagent_session",
+                )
+            )
+
+            launched: dict[str, object] = {}
+
+            def fake_launch_runtime_task(
+                runtime_arg,
+                *,
+                user_text,
+                force_session_id,
+                pre_turn_messages,
+                runtime_turn,
+                name,
+            ):
+                launched["runtime"] = runtime_arg
+                launched["user_text"] = user_text
+                launched["force_session_id"] = force_session_id
+                launched["pre_turn_messages"] = pre_turn_messages
+                launched["runtime_turn"] = runtime_turn
+                launched["name"] = name
+
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_completed",
+                owner_route_id="route_1",
+                owner_session_id="subagent_session",
+                owner_turn_id="turn_1",
+                owner_agent_kind="subagent",
+                owner_agent_name="Friday",
+                owner_subagent_id="sub_1",
+                status="finished",
+                command="sleep 1; echo done",
+                started_at="2026-03-21T10:00:00Z",
+                last_update_at="2026-03-21T10:00:02Z",
+                finished_at="2026-03-21T10:00:02Z",
+                cancelled_at=None,
+                exit_code=0,
+                stdout="done\n",
+                stderr="",
+                stdout_bytes_seen=5,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint="done",
+            )
+
+            with patch.object(manager, "_launch_runtime_task", side_effect=fake_launch_runtime_task):
+                await manager.enqueue_bash_job_followup((notice,))
+
+            self.assertEqual(runtime.status, "running")
+            self.assertEqual(runtime.pending_background_job_ids, set())
+            self.assertEqual(launched["runtime"], runtime)
+            self.assertIsNone(launched["user_text"])
+            self.assertEqual(launched["pre_turn_messages"], ())
+            self.assertTrue(bool(launched["runtime_turn"]))
+            self.assertEqual(len(runtime.loop.system_notes), 1)
+            note_content, note_session_id, note_metadata = runtime.loop.system_notes[0]
+            self.assertIn(notice.job_id, note_content)
+            self.assertNotIn("command:", note_content)
+            self.assertNotIn("stdout tail:", note_content)
+            self.assertIn("not a new user message or a new instruction from Jarvis", note_content)
+            self.assertEqual(note_session_id, "subagent_session")
+            self.assertEqual(note_metadata["notice_kind"], "bash_job_progress_update")
+
+    async def test_running_bash_job_followup_keeps_pending_job_until_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage("sub_1"),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="waiting_background",
+                created_at="2026-03-21T10:00:00+00:00",
+                updated_at="2026-03-21T10:00:00+00:00",
+            )
+            runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
+            manager._subagents[runtime.subagent_id] = runtime
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id=runtime.subagent_id,
+                    codename=runtime.codename,
+                    status=runtime.status,
+                    created_at=runtime.created_at,
+                    updated_at=runtime.updated_at,
+                    route_id="route_1",
+                    owner_main_session_id=runtime.owner_main_session_id,
+                    owner_main_turn_id=runtime.owner_main_turn_id,
+                    current_subagent_session_id="subagent_session",
+                )
+            )
+
+            def fake_launch_runtime_task(
+                runtime_arg,
+                *,
+                user_text,
+                force_session_id,
+                pre_turn_messages,
+                runtime_turn,
+                name,
+            ):
+                _ = (runtime_arg, user_text, force_session_id, pre_turn_messages, runtime_turn, name)
+
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_heartbeat",
+                owner_route_id="route_1",
+                owner_session_id="subagent_session",
+                owner_turn_id="turn_1",
+                owner_agent_kind="subagent",
+                owner_agent_name="Friday",
+                owner_subagent_id="sub_1",
+                status="running",
+                command="sleep 60",
+                started_at="2026-03-21T10:00:00Z",
+                last_update_at="2026-03-21T10:01:00Z",
+                finished_at=None,
+                cancelled_at=None,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                stdout_bytes_seen=0,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint=None,
+            )
+
+            with patch.object(manager, "_launch_runtime_task", side_effect=fake_launch_runtime_task):
+                await manager.enqueue_bash_job_followup((notice,))
+
+            self.assertEqual(runtime.status, "running")
+            self.assertEqual(
+                runtime.pending_background_job_ids,
+                {"deadbeefdeadbeefdeadbeefdeadbeef"},
+            )
 
     async def test_completed_subagent_counts_until_dispose_and_codename_reuses_after_dispose(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

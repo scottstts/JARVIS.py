@@ -66,7 +66,9 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                             "Foreground runs that are still running after the soft timeout are "
                             "automatically moved into a background job. Use 'background' to start "
                             "one explicitly, 'status' to inspect it, 'tail' to read recent "
-                            "output, and 'cancel' to stop it."
+                            "output, and 'cancel' to stop it. Detached jobs are monitored by the "
+                            "orchestrator; use 'status' or 'tail' only for explicit on-demand "
+                            "inspection, not proactive polling."
                         ),
                     },
                     "command": {

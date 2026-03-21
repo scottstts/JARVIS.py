@@ -55,7 +55,6 @@ _TURN_ID_METADATA_KEY = "turn_id"
 _INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
 _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
-_BASH_BACKGROUND_PROMOTION_METADATA_KEY = "bash_background_promotion"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
     "Continue in a new turn if you want me to keep using tools."
@@ -72,6 +71,12 @@ _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
 _APPROVAL_REJECTED_TEXT = "Approval request was rejected. I did not execute the action."
 _PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
 _TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
+_DETACHED_BASH_MONITORING_FOLLOWUP_TEXT = (
+    "Detached bash jobs are monitored by the orchestrator, not by proactive model polling. "
+    "Do not call more tools in this response. Do not claim the task is finished while detached "
+    "bash jobs are still pending. Briefly report the current in-progress state and wait for the "
+    "next orchestrator system progress update unless the user explicitly asks for immediate inspection."
+)
 LOGGER = logging.getLogger(__name__)
 
 AgentKind = Literal["main", "subagent"]
@@ -187,6 +192,7 @@ AgentTurnStreamEvent = (
 class _ToolExecutionOutcome:
     approval_rejected: bool = False
     interrupted: bool = False
+    pending_detached_job_ids: frozenset[str] = frozenset()
 
 
 class AgentLoop:
@@ -311,6 +317,20 @@ class AgentLoop:
             pre_turn_messages=pre_turn_messages,
         )
 
+    async def handle_runtime_turn(
+        self,
+        *,
+        force_session_id: str | None = None,
+        command_override: str | None = None,
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
+    ) -> AgentTurnResult:
+        return await self._handle_message_turn(
+            None,
+            force_session_id=force_session_id,
+            command_override=command_override,
+            pre_turn_messages=pre_turn_messages,
+        )
+
     async def stream_turn(
         self,
         *,
@@ -327,9 +347,27 @@ class AgentLoop:
         ):
             yield event
 
+    async def stream_runtime_turn(
+        self,
+        *,
+        force_session_id: str | None = None,
+        command_override: str | None = None,
+        pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
+    ) -> AsyncIterator[AgentTurnStreamEvent]:
+        async for event in self._stream_message_turn(
+            None,
+            force_session_id=force_session_id,
+            command_override=command_override,
+            pre_turn_messages=pre_turn_messages,
+        ):
+            yield event
+
     def active_session_id(self) -> str | None:
         active = self._storage.get_active_session()
         return active.session_id if active is not None else None
+
+    def has_active_turn(self) -> bool:
+        return self._active_turn_id is not None
 
     def append_system_note(
         self,
@@ -463,7 +501,7 @@ class AgentLoop:
 
     async def _handle_message_turn(
         self,
-        user_text: str,
+        user_text: str | None,
         *,
         force_session_id: str | None = None,
         command_override: str | None = None,
@@ -478,7 +516,7 @@ class AgentLoop:
             request,
             estimated_input_tokens,
             did_compaction,
-        ) = await self._prepare_message_turn(
+        ) = await self._prepare_turn(
             user_text=user_text,
             force_session_id=force_session_id,
             pre_turn_messages=pre_turn_messages,
@@ -490,18 +528,19 @@ class AgentLoop:
             interruption_notice_text=interruption_notice_text,
             runtime_messages=turn_runtime_messages,
         )
-        user_record = self._build_message_record(
-            session_id=session.session_id,
-            role="user",
-            content=user_text,
-            turn_id=turn_id,
-        )
         self._begin_turn(session_id=session.session_id, turn_id=turn_id)
-        self._append_turn_record(
-            session_id=session.session_id,
-            pending_records=pending_records,
-            record=user_record,
-        )
+        if user_text is not None:
+            user_record = self._build_message_record(
+                session_id=session.session_id,
+                role="user",
+                content=user_text,
+                turn_id=turn_id,
+            )
+            self._append_turn_record(
+                session_id=session.session_id,
+                pending_records=pending_records,
+                record=user_record,
+            )
 
         try:
             (
@@ -512,7 +551,6 @@ class AgentLoop:
                 rebound_pending_records,
             ) = await self._generate_with_overflow_retry(
                 session=session,
-                user_text=user_text,
                 turn_context_text=turn_context_text,
                 interruption_notice_text=interruption_notice_text,
                 request=request,
@@ -558,6 +596,7 @@ class AgentLoop:
                 current_response=response,
                 current_estimated_input_tokens=final_estimated_input_tokens,
                 turn_id=turn_id,
+                pending_detached_job_ids=_collect_pending_detached_job_ids(turn_runtime_messages),
             )
             if followup_compacted:
                 did_compaction = True
@@ -613,8 +652,10 @@ class AgentLoop:
         pending_records: list[ConversationRecord],
         current_response: LLMResponse,
         turn_id: str,
+        pending_detached_job_ids: frozenset[str] = frozenset(),
     ) -> _ToolExecutionOutcome:
         transient_records: list[ConversationRecord] = []
+        current_pending_detached_job_ids = set(pending_detached_job_ids)
         for tool_call in current_response.tool_calls:
             tool_context = replace(
                 self._tool_context,
@@ -643,6 +684,10 @@ class AgentLoop:
                             tool_result,
                         )
                     )
+                    _update_pending_detached_job_ids(
+                        current_pending_detached_job_ids,
+                        tool_result,
+                    )
                     break
 
                 self._append_turn_record(
@@ -664,7 +709,10 @@ class AgentLoop:
                     approval=pending_approval,
                 )
                 if approved is None:
-                    return _ToolExecutionOutcome(interrupted=True)
+                    return _ToolExecutionOutcome(
+                        interrupted=True,
+                        pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+                    )
                 self._append_turn_record(
                     session_id=session_id,
                     pending_records=pending_records,
@@ -676,25 +724,35 @@ class AgentLoop:
                     ),
                 )
                 if not approved:
-                    return _ToolExecutionOutcome(approval_rejected=True)
+                    return _ToolExecutionOutcome(
+                        approval_rejected=True,
+                        pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+                    )
                 tool_context = replace(tool_context, approved_action=pending_approval)
 
         pending_records.extend(transient_records)
-        return _ToolExecutionOutcome()
+        return _ToolExecutionOutcome(
+            pending_detached_job_ids=frozenset(current_pending_detached_job_ids)
+        )
 
     def _build_followup_request(
         self,
         *,
         base_records: Sequence[ConversationRecord],
         pending_records: Sequence[ConversationRecord],
+        allow_tools: bool = True,
+        extra_records: Sequence[ConversationRecord] = (),
     ) -> tuple[LLMRequest, int]:
         activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
             pending_records
         )
 
         request = self._build_request(
-            list(base_records) + list(pending_records),
-            activated_discoverable_tool_names=activated_discoverable_tool_names,
+            list(base_records) + list(pending_records) + list(extra_records),
+            activated_discoverable_tool_names=(
+                activated_discoverable_tool_names if allow_tools else ()
+            ),
+            allow_tools=allow_tools,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
         if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
@@ -703,6 +761,35 @@ class AgentLoop:
             )
 
         return request, estimated_input_tokens
+
+    def _build_detached_bash_waiting_request(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: Sequence[ConversationRecord],
+        pending_detached_job_ids: Sequence[str],
+    ) -> tuple[LLMRequest, int]:
+        extra_records = (
+            self._build_runtime_message_record(
+                session_id=session_id,
+                message=AgentRuntimeMessage(
+                    role="developer",
+                    transient=True,
+                    metadata={
+                        "detached_bash_jobs_pending": True,
+                        "detached_bash_job_ids": list(pending_detached_job_ids),
+                    },
+                    content=_DETACHED_BASH_MONITORING_FOLLOWUP_TEXT,
+                ),
+            ),
+        )
+        return self._build_followup_request(
+            base_records=base_records,
+            pending_records=pending_records,
+            allow_tools=False,
+            extra_records=extra_records,
+        )
 
     def _build_tool_round_limit_record(
         self,
@@ -869,7 +956,7 @@ class AgentLoop:
 
     async def _stream_message_turn(
         self,
-        user_text: str,
+        user_text: str | None,
         *,
         force_session_id: str | None = None,
         command_override: str | None = None,
@@ -884,7 +971,7 @@ class AgentLoop:
             request,
             estimated_input_tokens,
             did_compaction,
-        ) = await self._prepare_message_turn(
+        ) = await self._prepare_turn(
             user_text=user_text,
             force_session_id=force_session_id,
             pre_turn_messages=pre_turn_messages,
@@ -896,18 +983,19 @@ class AgentLoop:
             interruption_notice_text=interruption_notice_text,
             runtime_messages=turn_runtime_messages,
         )
-        user_record = self._build_message_record(
-            session_id=session.session_id,
-            role="user",
-            content=user_text,
-            turn_id=turn_id,
-        )
         self._begin_turn(session_id=session.session_id, turn_id=turn_id)
-        self._append_turn_record(
-            session_id=session.session_id,
-            pending_records=pending_records,
-            record=user_record,
-        )
+        if user_text is not None:
+            user_record = self._build_message_record(
+                session_id=session.session_id,
+                role="user",
+                content=user_text,
+                turn_id=turn_id,
+            )
+            self._append_turn_record(
+                session_id=session.session_id,
+                pending_records=pending_records,
+                record=user_record,
+            )
 
         try:
             overflow_compacted = False
@@ -1061,6 +1149,7 @@ class AgentLoop:
             current_response = initial_response
             tool_rounds = 0
             turn_approval_rejected = False
+            pending_detached_job_ids = _collect_pending_detached_job_ids(turn_runtime_messages)
             while current_response.tool_calls:
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
@@ -1101,6 +1190,7 @@ class AgentLoop:
                 try:
                     transient_records: list[ConversationRecord] = []
                     approval_rejected = False
+                    current_pending_detached_job_ids = set(pending_detached_job_ids)
                     for tool_call in current_response.tool_calls:
                         tool_context = replace(
                             self._tool_context,
@@ -1128,6 +1218,10 @@ class AgentLoop:
                                         session.session_id,
                                         tool_result,
                                     )
+                                )
+                                _update_pending_detached_job_ids(
+                                    current_pending_detached_job_ids,
+                                    tool_result,
                                 )
                                 break
 
@@ -1209,6 +1303,7 @@ class AgentLoop:
                             break
 
                     pending_records.extend(transient_records)
+                    pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
                     if approval_rejected:
                         break
                     if self._stop_requested(turn_id):
@@ -1227,10 +1322,20 @@ class AgentLoop:
                             interrupted=True,
                         )
                         return
-                    request, final_estimated_input_tokens = self._build_followup_request(
-                        base_records=base_records,
-                        pending_records=pending_records,
-                    )
+                    if pending_detached_job_ids:
+                        request, final_estimated_input_tokens = (
+                            self._build_detached_bash_waiting_request(
+                                session_id=session.session_id,
+                                base_records=base_records,
+                                pending_records=pending_records,
+                                pending_detached_job_ids=pending_detached_job_ids,
+                            )
+                        )
+                    else:
+                        request, final_estimated_input_tokens = self._build_followup_request(
+                            base_records=base_records,
+                            pending_records=pending_records,
+                        )
                 except ContextBudgetError:
                     (
                         session,
@@ -1387,6 +1492,13 @@ class AgentLoop:
                         interrupted=True,
                     )
                     return
+                if pending_detached_job_ids:
+                    current_response = replace(
+                        current_response,
+                        tool_calls=[],
+                        finish_reason="stop",
+                    )
+                    break
 
             final_response = current_response
 
@@ -1422,10 +1534,10 @@ class AgentLoop:
         finally:
             self._clear_turn_control(turn_id)
 
-    async def _prepare_message_turn(
+    async def _prepare_turn(
         self,
         *,
-        user_text: str,
+        user_text: str | None,
         force_session_id: str | None = None,
         pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> tuple[
@@ -1512,7 +1624,6 @@ class AgentLoop:
         self,
         *,
         session: SessionMetadata,
-        user_text: str,
         turn_context_text: str,
         interruption_notice_text: str | None,
         request: LLMRequest,
@@ -1576,7 +1687,7 @@ class AgentLoop:
         *,
         session_id: str,
         records: Sequence[ConversationRecord],
-        user_text: str,
+        user_text: str | None,
         turn_context_text: str,
         interruption_notice_text: str | None = None,
         runtime_messages: Sequence[AgentRuntimeMessage] = (),
@@ -1587,13 +1698,14 @@ class AgentLoop:
             interruption_notice_text=interruption_notice_text,
             runtime_messages=runtime_messages,
         )
-        turn_records.append(
-            self._build_message_record(
-                session_id=session_id,
-                role="user",
-                content=user_text,
+        if user_text is not None:
+            turn_records.append(
+                self._build_message_record(
+                    session_id=session_id,
+                    role="user",
+                    content=user_text,
+                )
             )
-        )
         return self._build_request(list(records) + turn_records)
 
     def _build_turn_runtime_messages(
@@ -1648,6 +1760,7 @@ class AgentLoop:
         current_response: LLMResponse,
         current_estimated_input_tokens: int,
         turn_id: str,
+        pending_detached_job_ids: frozenset[str] = frozenset(),
     ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool]:
         tool_rounds = 0
         did_compaction = False
@@ -1685,7 +1798,9 @@ class AgentLoop:
                     pending_records=pending_records,
                     current_response=current_response,
                     turn_id=turn_id,
+                    pending_detached_job_ids=pending_detached_job_ids,
                 )
+                pending_detached_job_ids = tool_execution_outcome.pending_detached_job_ids
                 if tool_execution_outcome.interrupted:
                     return (
                         current_session,
@@ -1724,10 +1839,20 @@ class AgentLoop:
                         True,
                         approval_rejected,
                     )
-                request, current_estimated_input_tokens = self._build_followup_request(
-                    base_records=current_base_records,
-                    pending_records=pending_records,
-                )
+                if pending_detached_job_ids:
+                    request, current_estimated_input_tokens = (
+                        self._build_detached_bash_waiting_request(
+                            session_id=current_session.session_id,
+                            base_records=current_base_records,
+                            pending_records=pending_records,
+                            pending_detached_job_ids=pending_detached_job_ids,
+                        )
+                    )
+                else:
+                    request, current_estimated_input_tokens = self._build_followup_request(
+                        base_records=current_base_records,
+                        pending_records=pending_records,
+                    )
             except ContextBudgetError:
                 (
                     current_session,
@@ -1782,6 +1907,13 @@ class AgentLoop:
                     turn_id=turn_id,
                 ),
             )
+            if pending_detached_job_ids:
+                current_response = replace(
+                    current_response,
+                    tool_calls=[],
+                    finish_reason="stop",
+                )
+                break
 
         return (
             current_session,
@@ -2307,35 +2439,6 @@ class AgentLoop:
                     )
                 )
 
-        if result.name == "bash" and result.metadata.get("promoted_to_background"):
-            job_id = str(result.metadata.get("job_id", "")).strip()
-            soft_timeout = result.metadata.get("soft_timeout_seconds")
-            timeout_label = (
-                f"{float(soft_timeout):.3f}s"
-                if isinstance(soft_timeout, (int, float))
-                else "the configured soft-timeout"
-            )
-            content = (
-                "The last foreground `bash` command was automatically moved to background "
-                f"after {timeout_label}. Do not rerun the same command in foreground. "
-                f"Use `bash` with `mode='status'` and `job_id='{job_id}'` to check progress, "
-                f"`mode='tail'` and `job_id='{job_id}'` to inspect recent stdout/stderr, or "
-                f"`mode='cancel'` and `job_id='{job_id}'` to stop it."
-            )
-            records.append(
-                self._build_message_record(
-                    session_id=session_id,
-                    role="system",
-                    content=content,
-                    metadata={
-                        _TRANSIENT_RECORD_METADATA_KEY: True,
-                        _BASH_BACKGROUND_PROMOTION_METADATA_KEY: True,
-                        "source_tool": result.name,
-                        "job_id": job_id,
-                    },
-                )
-            )
-
         return records
 
     def _append_message(
@@ -2622,6 +2725,46 @@ class AgentLoop:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _collect_pending_detached_job_ids(
+    runtime_messages: Sequence[AgentRuntimeMessage],
+) -> frozenset[str]:
+    job_ids: set[str] = set()
+    for message in runtime_messages:
+        raw_ids = message.metadata.get("detached_bash_job_ids")
+        if not isinstance(raw_ids, list):
+            continue
+        for raw_job_id in raw_ids:
+            job_id = str(raw_job_id).strip()
+            if job_id:
+                job_ids.add(job_id)
+    return frozenset(job_ids)
+
+
+def _update_pending_detached_job_ids(
+    pending_job_ids: set[str],
+    tool_result: ToolExecutionResult,
+) -> None:
+    if tool_result.name != "bash":
+        return
+    job_id = str(tool_result.metadata.get("job_id", "")).strip()
+    if not job_id:
+        return
+    status = str(
+        tool_result.metadata.get("status") or tool_result.metadata.get("state") or ""
+    ).strip()
+    if (
+        status == "running"
+        and (
+            str(tool_result.metadata.get("mode", "")).strip() == "background"
+            or bool(tool_result.metadata.get("promoted_to_background"))
+        )
+    ):
+        pending_job_ids.add(job_id)
+        return
+    if status in {"finished", "cancelled"}:
+        pending_job_ids.discard(job_id)
 
 
 def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:

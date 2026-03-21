@@ -27,6 +27,7 @@ from .jobs import (
 
 _DEFAULT_RUNTIME_PATH = "/usr/local/bin:/usr/bin:/bin"
 _DEFAULT_MODE = "foreground"
+_DEFAULT_BACKGROUND_SUGGESTED_CHECK_SECONDS = 5
 
 
 class DirectBashToolExecutor:
@@ -240,10 +241,16 @@ class DirectBashToolExecutor:
             await asyncio.wait_for(process.wait(), timeout=soft_timeout_seconds)
         except asyncio.TimeoutError:
             duration_seconds = perf_counter() - started_at
+            _, record = load_job(context.workspace_dir, job.job_id)
+            running_status = job_status(job, record)
             output_tail = read_job_tail(
                 job,
                 max_bytes=self._settings.bash_max_output_chars,
                 tail_lines=50,
+            )
+            progress_hint = _derive_progress_hint(
+                stdout_text=output_tail["stdout"],
+                stderr_text=output_tail["stderr"],
             )
             content = _format_background_promotion_result(
                 command=command,
@@ -269,6 +276,7 @@ class DirectBashToolExecutor:
                     "pid": pid,
                     "pgid": pgid,
                     "status": "running",
+                    "state": "running",
                     "command": command,
                     "cwd": "/workspace",
                     "workspace_source_dir": str(context.workspace_dir),
@@ -286,6 +294,18 @@ class DirectBashToolExecutor:
                     "stderr_truncated": False,
                     "stdout_path": str(job.stdout_path),
                     "stderr_path": str(job.stderr_path),
+                    "started_at": running_status["started_at"],
+                    "last_update_at": running_status["last_update_at"],
+                    "suggested_next_check_seconds": (
+                        _DEFAULT_BACKGROUND_SUGGESTED_CHECK_SECONDS
+                    ),
+                    "progress_hint": progress_hint,
+                    "owner_route_id": running_status["owner_route_id"],
+                    "owner_session_id": running_status["owner_session_id"],
+                    "owner_turn_id": running_status["owner_turn_id"],
+                    "owner_agent_kind": running_status["owner_agent_kind"],
+                    "owner_agent_name": running_status["owner_agent_name"],
+                    "owner_subagent_id": running_status["owner_subagent_id"],
                     "runtime_location": self._runtime_location,
                     "runtime_transport": self._runtime_transport,
                     "target_runtime": self._target_runtime,
@@ -357,7 +377,7 @@ class DirectBashToolExecutor:
         command = str(arguments.get("command", "")).strip()
         started_at = perf_counter()
         try:
-            job, process, pid, pgid = await self._launch_background_process(
+            job, _process, pid, pgid = await self._launch_background_process(
                 workspace_dir=context.workspace_dir,
                 command=command,
             )
@@ -374,16 +394,18 @@ class DirectBashToolExecutor:
             )
 
         duration_seconds = perf_counter() - started_at
-        content = "\n".join(
-            [
-                "Bash background job started",
-                f"job_id: {job.job_id}",
-                f"pid: {pid}",
-                f"pgid: {pgid}",
-                "cwd: /workspace",
-                f"command: {command}",
-                f"duration_seconds: {duration_seconds:.3f}",
-            ]
+        _, record = load_job(context.workspace_dir, job.job_id)
+        status = job_status(job, record)
+        progress_hint = _derive_progress_hint(stdout_text="", stderr_text="")
+        content = _format_background_start_result(
+            command=command,
+            cwd=Path("/workspace"),
+            job_id=job.job_id,
+            pid=pid,
+            pgid=pgid,
+            duration_seconds=duration_seconds,
+            started_at=status["started_at"],
+            last_update_at=status["last_update_at"],
         )
         return ToolExecutionResult(
             call_id=call_id,
@@ -395,11 +417,23 @@ class DirectBashToolExecutor:
                 "job_id": job.job_id,
                 "pid": pid,
                 "pgid": pgid,
+                "status": "running",
+                "state": "running",
                 "command": command,
                 "cwd": "/workspace",
                 "duration_seconds": round(duration_seconds, 3),
                 "stdout_path": str(job.stdout_path),
                 "stderr_path": str(job.stderr_path),
+                "started_at": status["started_at"],
+                "last_update_at": status["last_update_at"],
+                "suggested_next_check_seconds": _DEFAULT_BACKGROUND_SUGGESTED_CHECK_SECONDS,
+                "progress_hint": progress_hint,
+                "owner_route_id": status["owner_route_id"],
+                "owner_session_id": status["owner_session_id"],
+                "owner_turn_id": status["owner_turn_id"],
+                "owner_agent_kind": status["owner_agent_kind"],
+                "owner_agent_name": status["owner_agent_name"],
+                "owner_subagent_id": status["owner_subagent_id"],
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
@@ -490,8 +524,11 @@ class DirectBashToolExecutor:
             f"status: {status['status']}",
             f"pid: {status['pid']}",
             f"pgid: {status['pgid']}",
+            f"started_at: {status['started_at']}",
             f"launched_at: {status['launched_at']}",
         ]
+        if status["last_update_at"] is not None:
+            lines.append(f"last_update_at: {status['last_update_at']}")
         if status["finished_at"] is not None:
             lines.append(f"finished_at: {status['finished_at']}")
         if status["cancelled_at"] is not None:
@@ -511,6 +548,12 @@ class DirectBashToolExecutor:
             metadata={
                 "mode": "status",
                 **status,
+                "state": status["status"],
+                "suggested_next_check_seconds": (
+                    _DEFAULT_BACKGROUND_SUGGESTED_CHECK_SECONDS
+                    if status["status"] == "running"
+                    else None
+                ),
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
@@ -644,6 +687,8 @@ class DirectBashToolExecutor:
             metadata={
                 "mode": "cancel",
                 **status,
+                "state": status["status"],
+                "suggested_next_check_seconds": None,
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
@@ -710,10 +755,11 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
         f"`{interpreter_path}`, and install packages with "
         f"`uv pip install --python {interpreter_path} <package-name>`. "
         f"Foreground commands that are still running after the {settings.bash_foreground_soft_timeout_seconds:.0f}s "
-        "soft timeout are automatically moved to background mode; after that, use the same tool "
-        "with `mode='status'`, `mode='tail'`, or `mode='cancel'` plus `job_id` to manage them. "
-        "Set `mode='background'` to start a long-running job, then use the same tool with "
-        "`mode='status'`, `mode='tail'`, or `mode='cancel'` plus `job_id` to manage it explicitly. "
+        "soft timeout are automatically moved to background mode. Set `mode='background'` to start a long-running "
+        "job explicitly. Detached jobs are monitored by the orchestrator, which will surface noteworthy progress or "
+        "terminal updates on its own. Use the same tool with `mode='status'`, `mode='tail'`, or `mode='cancel'` "
+        "only for explicit on-demand inspection or cancellation; do not rely on proactive polling or sleep loops to "
+        "keep progress moving. "
         "User approval is typically required for commands that install packages or tools, "
         "run remote installer pipelines such as `curl|bash`, or write into system paths "
         "outside `/workspace` such as `/usr/local/bin`, `/etc`, `/opt`, or `/var`. "
@@ -791,13 +837,55 @@ def _format_background_promotion_result(
         f"duration_seconds: {duration_seconds:.3f}",
         f"soft_timeout_seconds: {soft_timeout_seconds:.3f}",
         f"requested_timeout_seconds: {timeout_seconds:.3f}",
-        "Use `mode='status'` to check the job, `mode='tail'` to inspect output, or `mode='cancel'` to stop it.",
+        "The orchestrator is now monitoring this detached job.",
+        "Use `mode='status'`, `mode='tail'`, or `mode='cancel'` only for explicit on-demand inspection or cancellation.",
+        "Do not rely on polling to keep progress moving; the orchestrator will surface noteworthy progress or terminal updates when there is something to know.",
         "stdout:",
         stdout_text or "(empty)",
         "stderr:",
         stderr_text or "(empty)",
     ]
     return "\n".join(lines)
+
+
+def _format_background_start_result(
+    *,
+    command: str,
+    cwd: Path,
+    job_id: str,
+    pid: int,
+    pgid: int,
+    duration_seconds: float,
+    started_at: str,
+    last_update_at: str | None,
+) -> str:
+    lines = [
+        "Bash background job started",
+        "status: background",
+        f"command: {command}",
+        f"cwd: {cwd}",
+        f"job_id: {job_id}",
+        f"pid: {pid}",
+        f"pgid: {pgid}",
+        f"started_at: {started_at}",
+        f"duration_seconds: {duration_seconds:.3f}",
+        "The orchestrator is now monitoring this detached job.",
+        "Use `mode='status'`, `mode='tail'`, or `mode='cancel'` only for explicit on-demand inspection or cancellation.",
+        "Do not rely on polling to keep progress moving; the orchestrator will surface noteworthy progress or terminal updates when there is something to know.",
+    ]
+    if last_update_at is not None:
+        lines.append(f"last_update_at: {last_update_at}")
+    return "\n".join(lines)
+
+
+def _derive_progress_hint(*, stdout_text: str, stderr_text: str) -> str | None:
+    for candidate in (stdout_text, stderr_text):
+        lines = [line.strip() for line in candidate.splitlines() if line.strip()]
+        if not lines:
+            continue
+        hint = lines[-1]
+        return hint if len(hint) <= 240 else hint[:237] + "..."
+    return None
 
 
 def _truncate_text(text: str, limit: int) -> tuple[str, bool]:

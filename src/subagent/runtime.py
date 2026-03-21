@@ -35,6 +35,7 @@ class SubagentRuntime:
     last_activity_at: str | None = None
     notable_events: deque[SubagentEventNote] = field(default_factory=deque)
     pending_pause_reason: SubagentPauseReason | None = None
+    pending_background_job_ids: set[str] = field(default_factory=set)
 
     def snapshot(self) -> SubagentSnapshot:
         return SubagentSnapshot(
@@ -48,5 +49,6 @@ class SubagentRuntime:
             last_error=self.last_error,
             last_tool_name=self.last_tool_name,
             last_activity_at=self.last_activity_at,
+            pending_background_job_count=len(self.pending_background_job_ids),
             notable_events=tuple(self.notable_events),
         )

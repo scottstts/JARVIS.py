@@ -8,6 +8,7 @@ from typing import Any, Literal
 SubagentStatus = Literal[
     "running",
     "awaiting_approval",
+    "waiting_background",
     "paused",
     "completed",
     "failed",
@@ -79,6 +80,7 @@ class SubagentCatalogEntry:
         if status not in {
             "running",
             "awaiting_approval",
+            "waiting_background",
             "paused",
             "completed",
             "failed",
@@ -131,4 +133,5 @@ class SubagentSnapshot:
     last_error: str | None = None
     last_tool_name: str | None = None
     last_activity_at: str | None = None
+    pending_background_job_count: int = 0
     notable_events: tuple[SubagentEventNote, ...] = field(default_factory=tuple)
