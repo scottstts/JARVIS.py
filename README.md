@@ -30,6 +30,14 @@ Set up secrets by creating files under `secrets/`. The full expected list is in 
 
 [`src/settings.py`](src/settings.py) contains non-secret settings for Jarvis. The default can work out of the box fine. For LLM providers and models, change them as you like.
 
+In telegram BotFather, add commands:
+
+```plaintext
+new - start a new session
+stop - pause Jarvis
+compact - compact current session
+```
+
 ### Run Jarvis
 
 Run Jarvis inside the `dev` container:
