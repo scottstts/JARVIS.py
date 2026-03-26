@@ -158,7 +158,11 @@ class AnthropicProvider:
                 "or provide request.max_output_tokens."
             )
 
-        system_prompt, messages = self._to_anthropic_messages(request.messages)
+        prompt_cache_ttl = self._settings.prompt_cache_ttl
+        system_prompt, messages = self._to_anthropic_messages(
+            request.messages,
+            prompt_cache_ttl=prompt_cache_ttl,
+        )
         if not messages:
             raise LLMConfigurationError("Anthropic requests require at least one user/assistant message.")
 
@@ -167,6 +171,11 @@ class AnthropicProvider:
             "messages": messages,
             "max_tokens": request.max_output_tokens,
         }
+        if prompt_cache_ttl is not None:
+            kwargs["cache_control"] = {
+                "type": "ephemeral",
+                "ttl": prompt_cache_ttl,
+            }
 
         if system_prompt is not None:
             kwargs["system"] = system_prompt
@@ -195,7 +204,9 @@ class AnthropicProvider:
     def _to_anthropic_messages(
         self,
         messages: Sequence[LLMMessage],
-    ) -> tuple[str | None, list[dict[str, Any]]]:
+        *,
+        prompt_cache_ttl: str | None,
+    ) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
         system_parts: list[str] = []
         out_messages: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
@@ -242,7 +253,13 @@ class AnthropicProvider:
                 }
             )
 
-        system_prompt = "\n\n".join(system_parts).strip() or None
+        if prompt_cache_ttl is None:
+            system_prompt = "\n\n".join(system_parts).strip() or None
+        else:
+            system_prompt = _build_anthropic_system_blocks(
+                system_parts,
+                prompt_cache_ttl=prompt_cache_ttl,
+            )
         return system_prompt, out_messages
 
     def _to_anthropic_content_blocks(self, message: LLMMessage) -> list[dict[str, Any]]:
@@ -399,6 +416,28 @@ class AnthropicProvider:
         elif stop_reason in {"end_turn", "stop_sequence"}:
             finish_reason = "stop"
 
+        usage_metadata = getattr(response, "usage", None)
+        cache_creation = getattr(usage_metadata, "cache_creation", None)
+        cache_creation_metadata: dict[str, int] | None = None
+        if cache_creation is not None:
+            cache_creation_metadata = {}
+            for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+                value = getattr(cache_creation, key, None)
+                if isinstance(value, int):
+                    cache_creation_metadata[key] = value
+            if not cache_creation_metadata:
+                cache_creation_metadata = None
+
+        provider_metadata: dict[str, Any] = {"stop_reason": stop_reason}
+        cache_read_input_tokens = getattr(usage_metadata, "cache_read_input_tokens", None)
+        if isinstance(cache_read_input_tokens, int):
+            provider_metadata["cache_read_input_tokens"] = cache_read_input_tokens
+        cache_creation_input_tokens = getattr(usage_metadata, "cache_creation_input_tokens", None)
+        if isinstance(cache_creation_input_tokens, int):
+            provider_metadata["cache_creation_input_tokens"] = cache_creation_input_tokens
+        if cache_creation_metadata is not None:
+            provider_metadata["cache_creation"] = cache_creation_metadata
+
         return LLMResponse(
             provider=self.name,
             model=response.model,
@@ -407,7 +446,7 @@ class AnthropicProvider:
             finish_reason=finish_reason,
             usage=usage,
             response_id=response.id,
-            provider_metadata={"stop_reason": stop_reason},
+            provider_metadata=provider_metadata,
         )
 
     def _extract_tool_calls(
@@ -478,3 +517,25 @@ def _to_anthropic_image_source(part: ImagePart) -> dict[str, Any]:
         "media_type": media_type,
         "data": data_base64,
     }
+
+
+def _build_anthropic_system_blocks(
+    system_parts: Sequence[str],
+    *,
+    prompt_cache_ttl: str,
+) -> list[dict[str, Any]] | None:
+    blocks = [
+        {
+            "type": "text",
+            "text": text,
+        }
+        for text in system_parts
+        if text
+    ]
+    if not blocks:
+        return None
+    blocks[-1]["cache_control"] = {
+        "type": "ephemeral",
+        "ttl": prompt_cache_ttl,
+    }
+    return blocks

@@ -203,6 +203,7 @@ class AnthropicProviderSettings:
     thinking_mode: str | None = None
     thinking_budget_tokens: int | None = None
     effort: str | None = None
+    prompt_cache_ttl: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
@@ -239,6 +240,11 @@ class AnthropicProviderSettings:
                 app_settings.JARVIS_ANTHROPIC_THINKING_BUDGET_TOKENS,
             ),
             effort=_optional_lower_setting("JARVIS_ANTHROPIC_EFFORT", app_settings.JARVIS_ANTHROPIC_EFFORT),
+            prompt_cache_ttl=_optional_choice_setting(
+                "JARVIS_ANTHROPIC_PROMPT_CACHE_TTL",
+                app_settings.JARVIS_ANTHROPIC_PROMPT_CACHE_TTL,
+                {"5m", "1h"},
+            ),
         )
 
 

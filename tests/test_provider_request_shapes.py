@@ -19,6 +19,54 @@ from llm.types import ImagePart, LLMMessage, LLMRequest, TextPart, ToolCall, Too
 
 
 class AnthropicProviderRequestShapeTests(unittest.TestCase):
+    def test_prompt_caching_uses_top_level_cache_control(self) -> None:
+        provider = AnthropicProvider(
+            settings=AnthropicProviderSettings(prompt_cache_ttl="5m"),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="claude-sonnet-4-6",
+            max_output_tokens=1024,
+            messages=(LLMMessage.text("user", "Hello"),),
+        )
+
+        kwargs = provider._build_messages_create_kwargs(request)
+        self.assertEqual(
+            kwargs["cache_control"],
+            {
+                "type": "ephemeral",
+                "ttl": "5m",
+            },
+        )
+
+    def test_prompt_caching_marks_final_system_block(self) -> None:
+        provider = AnthropicProvider(
+            settings=AnthropicProviderSettings(prompt_cache_ttl="5m"),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="claude-sonnet-4-6",
+            max_output_tokens=1024,
+            messages=(
+                LLMMessage.text("system", "System prompt A"),
+                LLMMessage.text("system", "System prompt B"),
+                LLMMessage.text("user", "Hello"),
+            ),
+        )
+
+        kwargs = provider._build_messages_create_kwargs(request)
+        self.assertEqual(
+            kwargs["system"],
+            [
+                {"type": "text", "text": "System prompt A"},
+                {
+                    "type": "text",
+                    "text": "System prompt B",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                },
+            ],
+        )
+
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(),
@@ -113,6 +161,51 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(
             image_block["source"]["data"],
             base64.b64encode(b"png-bytes").decode("ascii"),
+        )
+
+    def test_normalize_message_response_surfaces_cache_usage_metadata(self) -> None:
+        provider = AnthropicProvider(
+            settings=AnthropicProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="claude-sonnet-4-6",
+            max_output_tokens=1024,
+            messages=(LLMMessage.text("user", "Hello"),),
+        )
+
+        class _FakeCacheCreation:
+            ephemeral_5m_input_tokens = 1200
+            ephemeral_1h_input_tokens = 0
+
+        class _FakeUsage:
+            input_tokens = 10
+            output_tokens = 5
+            cache_read_input_tokens = 1200
+            cache_creation_input_tokens = 1200
+            cache_creation = _FakeCacheCreation()
+
+        class _FakeTextBlock:
+            type = "text"
+            text = "Hi"
+
+        class _FakeResponse:
+            model = "claude-sonnet-4-6"
+            id = "msg_123"
+            stop_reason = "end_turn"
+            content = [_FakeTextBlock()]
+            usage = _FakeUsage()
+
+        response = provider._normalize_message_response(
+            request=request,
+            response=_FakeResponse(),
+        )
+        self.assertEqual(response.provider_metadata["stop_reason"], "end_turn")
+        self.assertEqual(response.provider_metadata["cache_read_input_tokens"], 1200)
+        self.assertEqual(response.provider_metadata["cache_creation_input_tokens"], 1200)
+        self.assertEqual(
+            response.provider_metadata["cache_creation"],
+            {"ephemeral_5m_input_tokens": 1200, "ephemeral_1h_input_tokens": 0},
         )
 
 

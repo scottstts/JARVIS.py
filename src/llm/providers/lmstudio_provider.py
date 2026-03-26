@@ -62,6 +62,7 @@ class _ResolvedResponseRequest:
     request: LLMRequest
     full_input_items: tuple[dict[str, Any], ...]
     full_history_key: tuple[str, ...]
+    previous_response_id: str | None
     payload: dict[str, Any]
 
 
@@ -94,104 +95,135 @@ class LMStudioProvider:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         resolved = await self._resolve_response_request(request, stream=False)
-        data = await self._post_json(
-            endpoint="/responses",
-            payload=resolved.payload,
-            timeout_seconds=resolved.request.timeout_seconds,
-        )
+        data = await self._post_with_stateful_fallback(resolved)
         response = self._normalize_response(request=resolved.request, response_json=data)
         self._remember_stateful_response(resolved=resolved, response=response)
         return response
 
     async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
         resolved = await self._resolve_response_request(request, stream=True)
+        attempt_resolved = resolved
+        retried_without_previous_response_id = False
 
-        tool_name_by_item_id: dict[str, str] = {}
-        call_id_by_item_id: dict[str, str] = {}
-        saw_completion = False
+        while True:
+            emitted_any = False
+            saw_completion = False
+            tool_name_by_item_id: dict[str, str] = {}
+            call_id_by_item_id: dict[str, str] = {}
+            try:
+                async for sse_payload in self._stream_sse_payloads(
+                    endpoint="/responses",
+                    payload=attempt_resolved.payload,
+                    timeout_seconds=attempt_resolved.request.timeout_seconds,
+                ):
+                    if sse_payload == "[DONE]":
+                        continue
 
-        async for sse_payload in self._stream_sse_payloads(
-            endpoint="/responses",
-            payload=resolved.payload,
-            timeout_seconds=resolved.request.timeout_seconds,
-        ):
-            if sse_payload == "[DONE]":
-                continue
+                    emitted_any = True
+                    event = self._decode_stream_event(sse_payload)
+                    event_type = str(event.get("type", ""))
 
-            event = self._decode_stream_event(sse_payload)
-            event_type = str(event.get("type", ""))
+                    if event_type == "response.output_text.delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, str) and delta:
+                            yield TextDeltaEvent(delta=delta)
+                        continue
 
-            if event_type == "response.output_text.delta":
-                delta = event.get("delta")
-                if isinstance(delta, str) and delta:
-                    yield TextDeltaEvent(delta=delta)
-                continue
+                    if event_type in {"response.output_item.added", "response.output_item.done"}:
+                        item = event.get("item")
+                        if isinstance(item, dict) and item.get("type") == "function_call":
+                            item_id = item.get("id")
+                            if isinstance(item_id, str) and item_id:
+                                name = item.get("name")
+                                call_id = item.get("call_id")
+                                if isinstance(name, str) and name:
+                                    tool_name_by_item_id[item_id] = name
+                                if isinstance(call_id, str) and call_id:
+                                    call_id_by_item_id[item_id] = call_id
+                        continue
 
-            if event_type in {"response.output_item.added", "response.output_item.done"}:
-                item = event.get("item")
-                if isinstance(item, dict) and item.get("type") == "function_call":
-                    item_id = item.get("id")
-                    if isinstance(item_id, str) and item_id:
-                        name = item.get("name")
-                        call_id = item.get("call_id")
-                        if isinstance(name, str) and name:
-                            tool_name_by_item_id[item_id] = name
-                        if isinstance(call_id, str) and call_id:
-                            call_id_by_item_id[item_id] = call_id
-                continue
+                    if event_type == "response.function_call_arguments.delta":
+                        item_id = str(event.get("item_id", "")).strip()
+                        arguments_delta = self._normalize_function_call_arguments_chunk(
+                            event.get("delta")
+                        )
+                        if not item_id or arguments_delta is None:
+                            continue
+                        yield ToolCallDeltaEvent(
+                            call_id=call_id_by_item_id.get(item_id, item_id),
+                            tool_name=tool_name_by_item_id.get(item_id),
+                            arguments_delta=arguments_delta,
+                        )
+                        continue
 
-            if event_type == "response.function_call_arguments.delta":
-                item_id = str(event.get("item_id", "")).strip()
-                arguments_delta = self._normalize_function_call_arguments_chunk(event.get("delta"))
-                if not item_id or arguments_delta is None:
-                    continue
-                yield ToolCallDeltaEvent(
-                    call_id=call_id_by_item_id.get(item_id, item_id),
-                    tool_name=tool_name_by_item_id.get(item_id),
-                    arguments_delta=arguments_delta,
-                )
-                continue
+                    if event_type == "response.function_call_arguments.done":
+                        item_id = str(event.get("item_id", "")).strip()
+                        arguments_text = self._normalize_function_call_arguments_chunk(
+                            event.get("arguments")
+                        )
+                        if not item_id or arguments_text is None:
+                            continue
+                        tool_name = event.get("name")
+                        yield ToolCallDeltaEvent(
+                            call_id=call_id_by_item_id.get(item_id, item_id),
+                            tool_name=(
+                                tool_name
+                                if isinstance(tool_name, str)
+                                else tool_name_by_item_id.get(item_id)
+                            ),
+                            arguments_delta=arguments_text,
+                        )
+                        continue
 
-            if event_type == "response.function_call_arguments.done":
-                item_id = str(event.get("item_id", "")).strip()
-                arguments_text = self._normalize_function_call_arguments_chunk(event.get("arguments"))
-                if not item_id or arguments_text is None:
-                    continue
-                tool_name = event.get("name")
-                yield ToolCallDeltaEvent(
-                    call_id=call_id_by_item_id.get(item_id, item_id),
-                    tool_name=tool_name if isinstance(tool_name, str) else tool_name_by_item_id.get(item_id),
-                    arguments_delta=arguments_text,
-                )
-                continue
+                    if event_type == "response.completed":
+                        response_json = event.get("response")
+                        if not isinstance(response_json, dict):
+                            raise ProviderResponseError(
+                                "LM Studio response.completed event did not include a response object."
+                            )
+                        normalized = self._normalize_response(
+                            request=attempt_resolved.request,
+                            response_json=response_json,
+                        )
+                        self._remember_stateful_response(
+                            resolved=attempt_resolved,
+                            response=normalized,
+                        )
+                        if normalized.usage is not None:
+                            yield UsageDeltaEvent(usage=normalized.usage)
+                        yield DoneEvent(response=normalized)
+                        saw_completion = True
+                        continue
 
-            if event_type == "response.completed":
-                response_json = event.get("response")
-                if not isinstance(response_json, dict):
-                    raise ProviderResponseError(
-                        "LM Studio response.completed event did not include a response object."
+                    if event_type == "response.failed":
+                        raise ProviderResponseError(self._extract_response_failed_message(event))
+
+                    if event_type == "error":
+                        raise ProviderResponseError(
+                            self._extract_stream_error_message(event.get("error"))
+                        )
+
+                if not saw_completion:
+                    raise StreamProtocolError(
+                        "LM Studio stream closed without a response.completed event."
                     )
-                normalized = self._normalize_response(
-                    request=resolved.request,
-                    response_json=response_json,
+                return
+            except ProviderBadRequestError as exc:
+                if (
+                    emitted_any
+                    or retried_without_previous_response_id
+                    or not self._should_retry_without_previous_response_id(
+                        exc,
+                        previous_response_id=attempt_resolved.previous_response_id,
+                    )
+                ):
+                    raise
+                self._forget_response_id(attempt_resolved.previous_response_id)
+                attempt_resolved = self._without_previous_response_id(
+                    attempt_resolved,
+                    stream=True,
                 )
-                self._remember_stateful_response(resolved=resolved, response=normalized)
-                if normalized.usage is not None:
-                    yield UsageDeltaEvent(usage=normalized.usage)
-                yield DoneEvent(response=normalized)
-                saw_completion = True
-                continue
-
-            if event_type == "response.failed":
-                raise ProviderResponseError(self._extract_response_failed_message(event))
-
-            if event_type == "error":
-                raise ProviderResponseError(self._extract_stream_error_message(event.get("error")))
-
-        if not saw_completion:
-            raise StreamProtocolError(
-                "LM Studio stream closed without a response.completed event."
-            )
+                retried_without_previous_response_id = True
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         raise UnsupportedCapabilityError("Provider 'lmstudio' does not support embeddings.")
@@ -230,6 +262,57 @@ class LMStudioProvider:
             request=resolved_request,
             full_input_items=full_input_items,
             full_history_key=full_history_key,
+            previous_response_id=previous_response_id,
+            payload=payload,
+        )
+
+    async def _post_with_stateful_fallback(
+        self,
+        resolved: _ResolvedResponseRequest,
+    ) -> dict[str, Any]:
+        attempt_resolved = resolved
+        retried_without_previous_response_id = False
+
+        while True:
+            try:
+                return await self._post_json(
+                    endpoint="/responses",
+                    payload=attempt_resolved.payload,
+                    timeout_seconds=attempt_resolved.request.timeout_seconds,
+                )
+            except ProviderBadRequestError as exc:
+                if (
+                    retried_without_previous_response_id
+                    or not self._should_retry_without_previous_response_id(
+                        exc,
+                        previous_response_id=attempt_resolved.previous_response_id,
+                    )
+                ):
+                    raise
+                self._forget_response_id(attempt_resolved.previous_response_id)
+                attempt_resolved = self._without_previous_response_id(
+                    attempt_resolved,
+                    stream=False,
+                )
+                retried_without_previous_response_id = True
+
+    def _without_previous_response_id(
+        self,
+        resolved: _ResolvedResponseRequest,
+        *,
+        stream: bool,
+    ) -> _ResolvedResponseRequest:
+        payload = self._build_response_payload(
+            resolved.request,
+            input_items=resolved.full_input_items,
+            previous_response_id=None,
+            stream=stream,
+        )
+        return _ResolvedResponseRequest(
+            request=resolved.request,
+            full_input_items=resolved.full_input_items,
+            full_history_key=resolved.full_history_key,
+            previous_response_id=None,
             payload=payload,
         )
 
@@ -871,6 +954,19 @@ class LMStudioProvider:
             while len(self._stateful_response_ids) > _STATEFUL_HISTORY_CACHE_LIMIT:
                 self._stateful_response_ids.popitem(last=False)
 
+    def _forget_response_id(self, response_id: str | None) -> None:
+        if response_id is None:
+            return
+
+        with self._stateful_response_ids_lock:
+            stale_keys = [
+                cache_key
+                for cache_key, cached_response_id in self._stateful_response_ids.items()
+                if cached_response_id == response_id
+            ]
+            for cache_key in stale_keys:
+                self._stateful_response_ids.pop(cache_key, None)
+
     def _response_output_items(self, response: LLMResponse) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         if response.text:
@@ -935,6 +1031,39 @@ class LMStudioProvider:
         if isinstance(value, dict):
             return json.dumps(value)
         return str(value)
+
+    def _should_retry_without_previous_response_id(
+        self,
+        exc: ProviderBadRequestError,
+        *,
+        previous_response_id: str | None,
+    ) -> bool:
+        if previous_response_id is None:
+            return False
+
+        message = str(exc).lower()
+        mentions_response_pointer = any(
+            hint in message
+            for hint in (
+                "previous_response_id",
+                "previous response id",
+                "response_id",
+                "response id",
+            )
+        )
+        if not mentions_response_pointer:
+            return False
+        return any(
+            hint in message
+            for hint in (
+                "not found",
+                "unknown",
+                "missing",
+                "invalid",
+                "expired",
+                "no longer available",
+            )
+        )
 
     def _extract_incomplete_reason(self, incomplete_details: Any) -> str | None:
         if not isinstance(incomplete_details, dict):

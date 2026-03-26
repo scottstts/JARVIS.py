@@ -432,6 +432,83 @@ class LMStudioProviderTests(unittest.TestCase):
             ],
         )
 
+    def test_generate_retries_full_history_when_previous_response_id_is_stale(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+
+        first_request = LLMRequest(
+            model="loaded-model",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        second_request = LLMRequest(
+            model="loaded-model",
+            messages=(
+                LLMMessage.text("user", "hello"),
+                LLMMessage.text("assistant", "Hi there"),
+                LLMMessage.text("user", "Second turn"),
+            ),
+        )
+
+        post_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        responses: list[object] = [
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_1",
+                    model="loaded-model",
+                    text="Hi there",
+                )
+            ),
+            _FakeJsonResponse(
+                {},
+                status_code=400,
+                text='{"error":{"message":"previous_response_id not found"}}',
+            ),
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_2",
+                    model="loaded-model",
+                    text="Recovered",
+                )
+            ),
+        ]
+
+        def fake_post(*args, **kwargs):
+            post_calls.append((args, kwargs))
+            response = responses.pop(0)
+            if isinstance(response, _FakeJsonResponse) and response.status_code >= 400:
+                return response
+            return response
+
+        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+            asyncio.run(provider.generate(first_request))
+            response = asyncio.run(provider.generate(second_request))
+
+        self.assertEqual(response.text, "Recovered")
+        self.assertEqual(post_calls[1][1]["json"]["previous_response_id"], "resp_1")
+        self.assertNotIn("previous_response_id", post_calls[2][1]["json"])
+        self.assertEqual(
+            post_calls[2][1]["json"]["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hi there"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Second turn"}],
+                },
+            ],
+        )
+
     def test_generate_falls_back_to_full_history_when_prefix_does_not_match(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
