@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import settings as app_settings
+from llm.provider_names import LLM_PROVIDER_NAME_SET, LLM_PROVIDER_NAMES_TEXT
 from workspace_paths import resolve_workspace_child
 
 
@@ -33,9 +34,9 @@ def _parse_optional_provider_env(name: str, default: str | None) -> str | None:
     normalized = str(value).strip().lower()
     if not normalized:
         return None
-    if normalized not in {"openai", "anthropic", "gemini", "openrouter"}:
+    if normalized not in LLM_PROVIDER_NAME_SET:
         raise ValueError(
-            f"{name} must be one of: anthropic, gemini, openai, openrouter. Got: {value}"
+            f"{name} must be one of: {LLM_PROVIDER_NAMES_TEXT}. Got: {value}"
         )
     return normalized
 

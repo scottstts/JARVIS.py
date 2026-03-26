@@ -64,6 +64,7 @@ class LLMService:
         if providers is None:
             from .providers.anthropic_provider import AnthropicProvider
             from .providers.gemini_provider import GeminiProvider
+            from .providers.lmstudio_provider import LMStudioProvider
             from .providers.openai_provider import OpenAIProvider
             from .providers.openrouter_provider import OpenRouterProvider
 
@@ -82,6 +83,10 @@ class LLMService:
                 ),
                 OpenRouterProvider(
                     settings=self.settings.openrouter,
+                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                ),
+                LMStudioProvider(
+                    settings=self.settings.lmstudio,
                     default_timeout_seconds=self.settings.request_timeout_seconds,
                 ),
             )
@@ -253,8 +258,10 @@ class LLMService:
                 if max_output_tokens is not None
                 else self.settings.openrouter.max_output_tokens
             )
+        elif provider == "lmstudio":
+            pass
 
-        if model is None:
+        if model is None and provider != "lmstudio":
             raise LLMConfigurationError(
                 f"No chat model configured for provider '{provider}'."
             )

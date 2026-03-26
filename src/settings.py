@@ -101,9 +101,9 @@ JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS: Final = 10_000
 JARVIS_CORE_TIMEZONE: Final = "Europe/Dublin"
 
 # Core LLM routing/runtime.
-# The provider chosen here will determine which API key is needed below
-# 'openai', 'gemini', 'anthropic', 'openrouter'
-JARVIS_LLM_DEFAULT_PROVIDER: Final = "openai"
+# The provider chosen here will determine which provider settings/token are needed below.
+# 'openai', 'gemini', 'anthropic', 'openrouter', 'lmstudio'
+JARVIS_LLM_DEFAULT_PROVIDER: Final = "lmstudio"
 JARVIS_LLM_TIMEOUT_SECONDS: Final = 60.0
 JARVIS_LLM_RETRY_ATTEMPTS: Final = 2
 JARVIS_LLM_RETRY_BACKOFF_SECONDS: Final = 0.5
@@ -184,3 +184,8 @@ JARVIS_OPENROUTER_CHAT_MODEL: Final = "moonshotai/kimi-k2.5"
 OPENROUTER_APP_NAME: Final = "Jarvis"
 JARVIS_OPENROUTER_TEMPERATURE: Final = 1.0
 JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS: Final = 10_000
+
+# LM Studio provider defaults.
+# Host runs use loopback directly; inside Docker the LM Studio provider rewrites
+# loopback hosts to `host.docker.internal` automatically.
+JARVIS_LMSTUDIO_BASE_URL: Final = "http://127.0.0.1:1234"

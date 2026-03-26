@@ -8,10 +8,12 @@ import unittest
 from llm.config import (
     AnthropicProviderSettings,
     GeminiProviderSettings,
+    LMStudioProviderSettings,
     OpenRouterProviderSettings,
 )
 from llm.providers.anthropic_provider import AnthropicProvider
 from llm.providers.gemini_provider import GeminiProvider
+from llm.providers.lmstudio_provider import LMStudioProvider
 from llm.providers.openrouter_provider import OpenRouterProvider
 from llm.types import ImagePart, LLMMessage, LLMRequest, TextPart, ToolCall, ToolDefinition, ToolResultPart
 
@@ -314,6 +316,92 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
         image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
         request = LLMRequest(
             model="minimax/minimax-m2.5",
+            messages=(
+                LLMMessage(
+                    role="user",
+                    parts=(
+                        ImagePart(image_url=image_url),
+                        TextPart(text="Describe this image."),
+                    ),
+                ),
+            ),
+        )
+
+        payload = provider._build_chat_payload(request)
+        content = payload["messages"][0]["content"]
+        image_item = next(item for item in content if item["type"] == "image_url")
+        self.assertEqual(image_item["image_url"]["url"], image_url)
+
+
+class LMStudioProviderRequestShapeTests(unittest.TestCase):
+    def test_multi_turn_history_preserves_assistant_role(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="loaded-model",
+            messages=(
+                LLMMessage.text("system", "System prompt"),
+                LLMMessage.text("user", "Hello"),
+                LLMMessage.text("assistant", "Hi there"),
+                LLMMessage.text("user", "Second turn"),
+            ),
+        )
+
+        payload = provider._build_chat_payload(request)
+        self.assertEqual(payload["messages"][0], {"role": "system", "content": "System prompt"})
+        self.assertEqual(payload["messages"][1], {"role": "user", "content": "Hello"})
+        self.assertEqual(payload["messages"][2], {"role": "assistant", "content": "Hi there"})
+        self.assertEqual(payload["messages"][3], {"role": "user", "content": "Second turn"})
+
+    def test_tool_roundtrip_uses_assistant_tool_calls_and_tool_role_messages(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="loaded-model",
+            messages=(
+                LLMMessage(
+                    role="assistant",
+                    parts=(
+                        ToolCall(
+                            call_id="bash_1",
+                            name="bash",
+                            arguments={"command": "pwd"},
+                            raw_arguments='{"command":"pwd"}',
+                        ),
+                    ),
+                ),
+                LLMMessage(
+                    role="tool",
+                    parts=(
+                        ToolResultPart(
+                            call_id="bash_1",
+                            name="bash",
+                            content="Bash execution result\nstatus: success",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        payload = provider._build_chat_payload(request)
+        self.assertEqual(payload["messages"][0]["role"], "assistant")
+        self.assertEqual(payload["messages"][0]["tool_calls"][0]["id"], "bash_1")
+        self.assertIsNone(payload["messages"][0]["content"])
+        self.assertEqual(payload["messages"][1]["role"], "tool")
+        self.assertEqual(payload["messages"][1]["tool_call_id"], "bash_1")
+
+    def test_image_input_uses_image_url_content_item(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
+        request = LLMRequest(
+            model="loaded-model",
             messages=(
                 LLMMessage(
                     role="user",

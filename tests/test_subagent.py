@@ -110,6 +110,20 @@ class SubagentSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.provider, "gemini")
 
+    def test_reads_lmstudio_provider_override_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(
+                "os.environ",
+                {"JARVIS_SUBAGENT_PROVIDER": "lmstudio"},
+                clear=False,
+            ):
+                settings = SubagentSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(settings.provider, "lmstudio")
+
 
 class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_invoke_returns_session_id_and_catalog_owner_linkage(self) -> None:

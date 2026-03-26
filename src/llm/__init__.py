@@ -5,6 +5,7 @@ from .config import (
     EmbeddingSettings,
     GeminiProviderSettings,
     LLMSettings,
+    LMStudioProviderSettings,
     OpenAIProviderSettings,
     OpenRouterProviderSettings,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "OpenAIProviderSettings",
     "AnthropicProviderSettings",
     "GeminiProviderSettings",
+    "LMStudioProviderSettings",
     "OpenRouterProviderSettings",
     "ProviderAuthenticationError",
     "ProviderBadRequestError",

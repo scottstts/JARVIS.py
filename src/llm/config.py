@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 import settings as app_settings
 
 from .errors import LLMConfigurationError
+from .provider_names import (
+    EMBEDDING_PROVIDER_NAME_SET,
+    EMBEDDING_PROVIDER_NAMES_TEXT,
+    LLM_PROVIDER_NAME_SET,
+    LLM_PROVIDER_NAMES_TEXT,
+)
 
 
 def _normalize_optional_value(value: object) -> str | None:
@@ -118,9 +124,9 @@ class EmbeddingSettings:
     def __post_init__(self) -> None:
         if not self.provider.strip():
             raise LLMConfigurationError("JARVIS_EMBEDDING_PROVIDER cannot be empty.")
-        if self.provider not in {"openai", "gemini", "openrouter"}:
+        if self.provider not in EMBEDDING_PROVIDER_NAME_SET:
             raise LLMConfigurationError(
-                "JARVIS_EMBEDDING_PROVIDER must be one of: openai, gemini, openrouter."
+                f"JARVIS_EMBEDDING_PROVIDER must be one of: {EMBEDDING_PROVIDER_NAMES_TEXT}."
             )
         if not self.model.strip():
             raise LLMConfigurationError("JARVIS_EMBEDDING_MODEL cannot be empty.")
@@ -312,6 +318,24 @@ class OpenRouterProviderSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class LMStudioProviderSettings:
+    base_url: str = "http://localhost:1234"
+
+    def __post_init__(self) -> None:
+        if not self.base_url.strip():
+            raise LLMConfigurationError("JARVIS_LMSTUDIO_BASE_URL cannot be empty.")
+
+    @classmethod
+    def from_env(cls) -> "LMStudioProviderSettings":
+        return cls(
+            base_url=_required_setting(
+                "JARVIS_LMSTUDIO_BASE_URL",
+                app_settings.JARVIS_LMSTUDIO_BASE_URL,
+            ),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class LLMSettings:
     default_provider: str = ""
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings.from_env)
@@ -322,13 +346,14 @@ class LLMSettings:
     anthropic: AnthropicProviderSettings = field(default_factory=AnthropicProviderSettings.from_env)
     gemini: GeminiProviderSettings = field(default_factory=GeminiProviderSettings.from_env)
     openrouter: OpenRouterProviderSettings = field(default_factory=OpenRouterProviderSettings.from_env)
+    lmstudio: LMStudioProviderSettings = field(default_factory=LMStudioProviderSettings.from_env)
 
     def __post_init__(self) -> None:
         if not self.default_provider.strip():
             raise LLMConfigurationError("JARVIS_LLM_DEFAULT_PROVIDER cannot be empty.")
-        if self.default_provider not in {"openai", "anthropic", "gemini", "openrouter"}:
+        if self.default_provider not in LLM_PROVIDER_NAME_SET:
             raise LLMConfigurationError(
-                "JARVIS_LLM_DEFAULT_PROVIDER must be one of: openai, anthropic, gemini, openrouter."
+                f"JARVIS_LLM_DEFAULT_PROVIDER must be one of: {LLM_PROVIDER_NAMES_TEXT}."
             )
         if self.retry_attempts < 0:
             raise LLMConfigurationError("JARVIS_LLM_RETRY_ATTEMPTS must be >= 0.")
@@ -359,4 +384,5 @@ class LLMSettings:
             anthropic=AnthropicProviderSettings.from_env(),
             gemini=GeminiProviderSettings.from_env(),
             openrouter=OpenRouterProviderSettings.from_env(),
+            lmstudio=LMStudioProviderSettings.from_env(),
         )

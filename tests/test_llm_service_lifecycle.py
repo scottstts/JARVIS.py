@@ -52,3 +52,16 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await service.aclose()
         self.assertTrue(provider_one.closed)
         self.assertTrue(provider_two.closed)
+
+    async def test_default_registry_includes_lmstudio_provider(self) -> None:
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="lmstudio",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            )
+        )
+
+        try:
+            self.assertEqual(service.registry.get("lmstudio").name, "lmstudio")
+        finally:
+            await service.aclose()
