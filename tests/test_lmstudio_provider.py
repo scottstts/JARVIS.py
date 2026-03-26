@@ -1,4 +1,4 @@
-"""Unit tests for LM Studio provider discovery and streaming behavior."""
+"""Unit tests for LM Studio provider discovery, statefulness, and streaming."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from llm.types import (
     LLMMessage,
     LLMRequest,
     TextDeltaEvent,
+    ToolCall,
     ToolCallDeltaEvent,
     ToolDefinition,
+    ToolResultPart,
     UsageDeltaEvent,
 )
 
@@ -59,7 +61,7 @@ class _FakeStreamingResponse:
 
 
 class LMStudioProviderTests(unittest.TestCase):
-    def test_stream_generate_discovers_loaded_model_and_uses_local_endpoints(self) -> None:
+    def test_stream_generate_discovers_loaded_model_and_uses_responses_endpoint(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(base_url="http://localhost:1234/v1"),
             default_timeout_seconds=60.0,
@@ -86,58 +88,34 @@ class LMStudioProviderTests(unittest.TestCase):
         )
         stream_response = _FakeStreamingResponse(
             lines=[
-                self._sse_chunk(
+                self._sse_event(
                     {
-                        "id": "gen_123",
-                        "model": "granite-live",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": "Hel"},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                ),
-                "",
-                self._sse_chunk(
-                    {
-                        "id": "gen_123",
-                        "model": "granite-live",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": "lo"},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                ),
-                "",
-                self._sse_chunk(
-                    {
-                        "id": "gen_123",
-                        "model": "granite-live",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                ),
-                "",
-                self._sse_chunk(
-                    {
-                        "id": "gen_123",
-                        "model": "granite-live",
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": 3,
-                            "completion_tokens": 2,
-                            "total_tokens": 5,
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp_123",
+                            "model": "granite-live",
+                            "status": "in_progress",
                         },
+                    }
+                ),
+                "",
+                self._sse_event({"type": "response.output_text.delta", "delta": "Hel"}),
+                "",
+                self._sse_event({"type": "response.output_text.delta", "delta": "lo"}),
+                "",
+                self._sse_event(
+                    {
+                        "type": "response.completed",
+                        "response": self._text_response_payload(
+                            response_id="resp_123",
+                            model="granite-live",
+                            text="Hello",
+                            usage={
+                                "input_tokens": 3,
+                                "output_tokens": 2,
+                                "total_tokens": 5,
+                            },
+                        ),
                     }
                 ),
                 "",
@@ -163,7 +141,7 @@ class LMStudioProviderTests(unittest.TestCase):
                     events = asyncio.run(self._collect_events(provider, request))
 
         self.assertEqual(get_calls[0][0][0], "http://localhost:1234/api/v1/models")
-        self.assertEqual(post_calls[0][0][0], "http://localhost:1234/v1/chat/completions")
+        self.assertEqual(post_calls[0][0][0], "http://localhost:1234/v1/responses")
         self.assertEqual(
             get_calls[0][1]["headers"],
             {"Content-Type": "application/json"},
@@ -173,6 +151,8 @@ class LMStudioProviderTests(unittest.TestCase):
             {"Content-Type": "application/json"},
         )
         self.assertEqual(post_calls[0][1]["json"]["model"], "granite-live")
+        self.assertEqual(post_calls[0][1]["json"]["input"][0]["role"], "user")
+        self.assertTrue(post_calls[0][1]["json"]["store"])
 
         self.assertEqual(
             [event.delta for event in events if isinstance(event, TextDeltaEvent)],
@@ -186,6 +166,7 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(done.response.text, "Hello")
         self.assertEqual(done.response.model, "granite-live")
         self.assertEqual(done.response.finish_reason, "stop")
+        self.assertEqual(done.response.response_id, "resp_123")
         self.assertTrue(stream_response.closed)
 
     def test_loopback_base_url_rewrites_to_host_docker_internal_in_container(self) -> None:
@@ -275,18 +256,7 @@ class LMStudioProviderTests(unittest.TestCase):
         )
         request = LLMRequest(
             messages=(LLMMessage.text("user", "run pwd"),),
-            tools=(
-                ToolDefinition(
-                    name="bash",
-                    description="Run bash.",
-                    input_schema={
-                        "type": "object",
-                        "properties": {"command": {"type": "string"}},
-                        "required": ["command"],
-                        "additionalProperties": False,
-                    },
-                ),
-            ),
+            tools=(self._bash_tool(),),
         )
 
         with patch(
@@ -311,103 +281,256 @@ class LMStudioProviderTests(unittest.TestCase):
             with self.assertRaisesRegex(LLMConfigurationError, "tool-capable"):
                 asyncio.run(provider.generate(request))
 
+    def test_generate_uses_previous_response_id_for_append_only_history(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+
+        first_request = LLMRequest(
+            model="loaded-model",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        second_request = LLMRequest(
+            model="loaded-model",
+            messages=(
+                LLMMessage.text("user", "hello"),
+                LLMMessage.text("assistant", "Hi there"),
+                LLMMessage.text("user", "Second turn"),
+            ),
+        )
+
+        post_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        responses = [
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_1",
+                    model="loaded-model",
+                    text="Hi there",
+                )
+            ),
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_2",
+                    model="loaded-model",
+                    text="Still here",
+                    previous_response_id="resp_1",
+                )
+            ),
+        ]
+
+        def fake_post(*args, **kwargs):
+            post_calls.append((args, kwargs))
+            return responses.pop(0)
+
+        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+            asyncio.run(provider.generate(first_request))
+            asyncio.run(provider.generate(second_request))
+
+        self.assertNotIn("previous_response_id", post_calls[0][1]["json"])
+        self.assertEqual(
+            post_calls[0][1]["json"]["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        )
+        self.assertEqual(post_calls[1][1]["json"]["previous_response_id"], "resp_1")
+        self.assertEqual(
+            post_calls[1][1]["json"]["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Second turn"}],
+                }
+            ],
+        )
+
+    def test_generate_uses_previous_response_id_for_tool_result_followup(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        bash_tool = self._bash_tool()
+
+        first_request = LLMRequest(
+            model="loaded-model",
+            messages=(LLMMessage.text("user", "run pwd"),),
+            tools=(bash_tool,),
+        )
+        second_request = LLMRequest(
+            model="loaded-model",
+            messages=(
+                LLMMessage.text("user", "run pwd"),
+                LLMMessage(
+                    role="assistant",
+                    parts=(
+                        ToolCall(
+                            call_id="bash_1",
+                            name="bash",
+                            arguments={"command": "pwd"},
+                            raw_arguments='{"command":"pwd"}',
+                        ),
+                    ),
+                ),
+                LLMMessage(
+                    role="tool",
+                    parts=(
+                        ToolResultPart(
+                            call_id="bash_1",
+                            name="bash",
+                            content="Bash execution result\nstatus: success",
+                        ),
+                    ),
+                ),
+            ),
+            tools=(bash_tool,),
+        )
+
+        post_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        responses = [
+            _FakeJsonResponse(
+                self._tool_call_response_payload(
+                    response_id="resp_tool_1",
+                    model="loaded-model",
+                    call_id="bash_1",
+                    name="bash",
+                    raw_arguments='{"command":"pwd"}',
+                )
+            ),
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_tool_2",
+                    model="loaded-model",
+                    text="done",
+                    previous_response_id="resp_tool_1",
+                )
+            ),
+        ]
+
+        def fake_post(*args, **kwargs):
+            post_calls.append((args, kwargs))
+            return responses.pop(0)
+
+        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+            asyncio.run(provider.generate(first_request))
+            asyncio.run(provider.generate(second_request))
+
+        self.assertEqual(post_calls[1][1]["json"]["previous_response_id"], "resp_tool_1")
+        self.assertEqual(
+            post_calls[1][1]["json"]["input"],
+            [
+                {
+                    "type": "function_call_output",
+                    "call_id": "bash_1",
+                    "output": "Bash execution result\nstatus: success",
+                }
+            ],
+        )
+
+    def test_generate_falls_back_to_full_history_when_prefix_does_not_match(self) -> None:
+        provider = LMStudioProvider(
+            settings=LMStudioProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+
+        first_request = LLMRequest(
+            model="loaded-model",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        rewritten_history_request = LLMRequest(
+            model="loaded-model",
+            messages=(
+                LLMMessage.text("user", "hello"),
+                LLMMessage.text("assistant", "A different reply"),
+                LLMMessage.text("user", "Second turn"),
+            ),
+        )
+
+        post_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        responses = [
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_1",
+                    model="loaded-model",
+                    text="Hi there",
+                )
+            ),
+            _FakeJsonResponse(
+                self._text_response_payload(
+                    response_id="resp_2",
+                    model="loaded-model",
+                    text="Fresh pass",
+                )
+            ),
+        ]
+
+        def fake_post(*args, **kwargs):
+            post_calls.append((args, kwargs))
+            return responses.pop(0)
+
+        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+            asyncio.run(provider.generate(first_request))
+            asyncio.run(provider.generate(rewritten_history_request))
+
+        self.assertNotIn("previous_response_id", post_calls[1][1]["json"])
+        self.assertEqual(len(post_calls[1][1]["json"]["input"]), 3)
+
     def test_stream_generate_assembles_tool_calls(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
             default_timeout_seconds=60.0,
         )
         request = LLMRequest(
+            model="granite-live",
             messages=(LLMMessage.text("user", "run pwd"),),
-            tools=(
-                ToolDefinition(
-                    name="bash",
-                    description="Run bash.",
-                    input_schema={
-                        "type": "object",
-                        "properties": {"command": {"type": "string"}},
-                        "required": ["command"],
-                        "additionalProperties": False,
-                    },
-                ),
-            ),
+            tools=(self._bash_tool(),),
         )
 
-        model_list_response = _FakeJsonResponse(
-            {
-                "models": [
-                    {
-                        "type": "llm",
-                        "publisher": "ibm",
-                        "key": "granite-4-micro",
-                        "loaded_instances": [{"id": "granite-live"}],
-                        "capabilities": {
-                            "vision": False,
-                            "trained_for_tool_use": True,
-                        },
-                    }
-                ]
-            }
-        )
         stream_response = _FakeStreamingResponse(
             lines=[
-                self._sse_chunk(
+                self._sse_event(
                     {
-                        "id": "gen_456",
-                        "model": "granite-live",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": 0,
-                                            "id": "call_1",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "bash",
-                                                "arguments": '{"command"',
-                                            },
-                                        }
-                                    ]
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "bash",
+                        },
                     }
                 ),
                 "",
-                self._sse_chunk(
+                self._sse_event(
                     {
-                        "id": "gen_456",
-                        "model": "granite-live",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": 0,
-                                            "function": {"arguments": ':"pwd"}'},
-                                        }
-                                    ]
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_1",
+                        "delta": '{"command"',
                     }
                 ),
                 "",
-                self._sse_chunk(
+                self._sse_event(
                     {
-                        "id": "gen_456",
-                        "model": "granite-live",
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "tool_calls",
-                            }
-                        ],
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_1",
+                        "delta": ':"pwd"}',
+                    }
+                ),
+                "",
+                self._sse_event(
+                    {
+                        "type": "response.completed",
+                        "response": self._tool_call_response_payload(
+                            response_id="resp_456",
+                            model="granite-live",
+                            call_id="call_1",
+                            name="bash",
+                            raw_arguments='{"command":"pwd"}',
+                        ),
                     }
                 ),
                 "",
@@ -417,14 +540,10 @@ class LMStudioProviderTests(unittest.TestCase):
         )
 
         with patch(
-            "llm.providers.lmstudio_provider.requests.get",
-            return_value=model_list_response,
+            "llm.providers.lmstudio_provider.requests.post",
+            return_value=stream_response,
         ):
-            with patch(
-                "llm.providers.lmstudio_provider.requests.post",
-                return_value=stream_response,
-            ):
-                events = asyncio.run(self._collect_events(provider, request))
+            events = asyncio.run(self._collect_events(provider, request))
 
         tool_events = [event for event in events if isinstance(event, ToolCallDeltaEvent)]
         self.assertEqual(
@@ -440,59 +559,74 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(done.response.tool_calls[0].name, "bash")
         self.assertEqual(done.response.tool_calls[0].arguments, {"command": "pwd"})
 
-    def test_normalize_chat_response_supports_legacy_function_call_shape(self) -> None:
-        provider = LMStudioProvider(
-            settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
-        )
-        request = LLMRequest(
-            model="granite-live",
-            messages=(LLMMessage.text("user", "run pwd"),),
-            tools=(
-                ToolDefinition(
-                    name="bash",
-                    description="Run bash.",
-                    input_schema={
-                        "type": "object",
-                        "properties": {"command": {"type": "string"}},
-                        "required": ["command"],
-                        "additionalProperties": False,
-                    },
-                ),
-            ),
-        )
-
-        response = provider._normalize_chat_response(
-            request=request,
-            response_json={
-                "id": "resp_123",
-                "model": "granite-live",
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "function_call": {
-                                "name": "bash",
-                                "arguments": '{"command":"pwd"}',
-                            },
-                        },
-                        "finish_reason": "function_call",
-                    }
-                ],
-            },
-        )
-
-        self.assertEqual(response.finish_reason, "tool_calls")
-        self.assertEqual(len(response.tool_calls), 1)
-        self.assertEqual(response.tool_calls[0].name, "bash")
-        self.assertEqual(response.tool_calls[0].arguments, {"command": "pwd"})
-
     async def _collect_events(self, provider: LMStudioProvider, request: LLMRequest) -> list[object]:
         events: list[object] = []
         async for event in provider.stream_generate(request):
             events.append(event)
         return events
 
-    def _sse_chunk(self, payload: dict[str, object]) -> str:
+    def _sse_event(self, payload: dict[str, object]) -> str:
         return f"data: {json.dumps(payload)}"
+
+    def _bash_tool(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="bash",
+            description="Run bash.",
+            input_schema={
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        )
+
+    def _text_response_payload(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        text: str,
+        previous_response_id: str | None = None,
+        usage: dict[str, int] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": response_id,
+            "model": model,
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ],
+        }
+        if previous_response_id is not None:
+            payload["previous_response_id"] = previous_response_id
+        if usage is not None:
+            payload["usage"] = usage
+        return payload
+
+    def _tool_call_response_payload(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        call_id: str,
+        name: str,
+        raw_arguments: str,
+    ) -> dict[str, object]:
+        return {
+            "id": response_id,
+            "model": model,
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": f"item_{call_id}",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": raw_arguments,
+                }
+            ],
+        }

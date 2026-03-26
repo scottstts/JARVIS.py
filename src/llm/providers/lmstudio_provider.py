@@ -1,12 +1,13 @@
-"""LM Studio provider adapter using its local OpenAI-compatible HTTP APIs."""
+"""LM Studio provider adapter using its local OpenAI-compatible Responses API."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import threading
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -49,10 +50,19 @@ from ..types import (
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call
 
 _HOST_DOCKER_INTERNAL = "host.docker.internal"
+_STATEFUL_HISTORY_CACHE_LIMIT = 1024
 
 
 def _running_in_container() -> bool:
     return Path("/.dockerenv").exists()
+
+
+@dataclass(slots=True, frozen=True)
+class _ResolvedResponseRequest:
+    request: LLMRequest
+    full_input_items: tuple[dict[str, Any], ...]
+    full_history_key: tuple[str, ...]
+    payload: dict[str, Any]
 
 
 class LMStudioProvider:
@@ -66,6 +76,8 @@ class LMStudioProvider:
     ) -> None:
         self._settings = settings
         self._default_timeout_seconds = default_timeout_seconds
+        self._stateful_response_ids: OrderedDict[tuple[str, tuple[str, ...]], str] = OrderedDict()
+        self._stateful_response_ids_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -81,97 +93,145 @@ class LMStudioProvider:
         )
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
-        resolved_request = await self._resolve_chat_request(request)
-        payload = self._build_chat_payload(resolved_request, stream=False)
+        resolved = await self._resolve_response_request(request, stream=False)
         data = await self._post_json(
-            endpoint="/chat/completions",
-            payload=payload,
-            timeout_seconds=resolved_request.timeout_seconds,
+            endpoint="/responses",
+            payload=resolved.payload,
+            timeout_seconds=resolved.request.timeout_seconds,
         )
-        return self._normalize_chat_response(request=resolved_request, response_json=data)
+        response = self._normalize_response(request=resolved.request, response_json=data)
+        self._remember_stateful_response(resolved=resolved, response=response)
+        return response
 
     async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
-        resolved_request = await self._resolve_chat_request(request)
-        payload = self._build_chat_payload(resolved_request, stream=True)
-        accumulated_text: list[str] = []
-        streamed_tool_calls: dict[int | str, dict[str, Any]] = {}
-        usage: LLMUsage | None = None
-        response_id: str | None = None
-        response_model = resolved_request.model
-        raw_finish_reason = "unknown"
-        saw_done_sentinel = False
-        saw_terminal_choice = False
+        resolved = await self._resolve_response_request(request, stream=True)
+
+        tool_name_by_item_id: dict[str, str] = {}
+        call_id_by_item_id: dict[str, str] = {}
+        saw_completion = False
 
         async for sse_payload in self._stream_sse_payloads(
-            endpoint="/chat/completions",
-            payload=payload,
-            timeout_seconds=resolved_request.timeout_seconds,
+            endpoint="/responses",
+            payload=resolved.payload,
+            timeout_seconds=resolved.request.timeout_seconds,
         ):
             if sse_payload == "[DONE]":
-                saw_done_sentinel = True
-                break
+                continue
 
-            chunk = self._decode_stream_chunk(sse_payload)
-            response_id = chunk.get("id") or response_id
-            response_model = chunk.get("model") or response_model
+            event = self._decode_stream_event(sse_payload)
+            event_type = str(event.get("type", ""))
 
-            error = chunk.get("error")
-            if error is not None:
-                raise ProviderResponseError(self._extract_stream_error_message(error))
+            if event_type == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str) and delta:
+                    yield TextDeltaEvent(delta=delta)
+                continue
 
-            chunk_usage = self._normalize_usage(chunk.get("usage"))
-            if chunk_usage is not None:
-                usage = chunk_usage
-                yield UsageDeltaEvent(usage=chunk_usage)
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        name = item.get("name")
+                        call_id = item.get("call_id")
+                        if isinstance(name, str) and name:
+                            tool_name_by_item_id[item_id] = name
+                        if isinstance(call_id, str) and call_id:
+                            call_id_by_item_id[item_id] = call_id
+                continue
 
-            choices = chunk.get("choices") or []
-            for fallback_choice_index, choice in enumerate(choices):
-                choice_index = choice.get("index", fallback_choice_index)
-                if choice_index not in {0, None}:
+            if event_type == "response.function_call_arguments.delta":
+                item_id = str(event.get("item_id", "")).strip()
+                arguments_delta = self._normalize_function_call_arguments_chunk(event.get("delta"))
+                if not item_id or arguments_delta is None:
                     continue
+                yield ToolCallDeltaEvent(
+                    call_id=call_id_by_item_id.get(item_id, item_id),
+                    tool_name=tool_name_by_item_id.get(item_id),
+                    arguments_delta=arguments_delta,
+                )
+                continue
 
-                delta = choice.get("delta") or {}
-                text_delta = self._extract_stream_text(delta.get("content"))
-                if text_delta:
-                    accumulated_text.append(text_delta)
-                    yield TextDeltaEvent(delta=text_delta)
+            if event_type == "response.function_call_arguments.done":
+                item_id = str(event.get("item_id", "")).strip()
+                arguments_text = self._normalize_function_call_arguments_chunk(event.get("arguments"))
+                if not item_id or arguments_text is None:
+                    continue
+                tool_name = event.get("name")
+                yield ToolCallDeltaEvent(
+                    call_id=call_id_by_item_id.get(item_id, item_id),
+                    tool_name=tool_name if isinstance(tool_name, str) else tool_name_by_item_id.get(item_id),
+                    arguments_delta=arguments_text,
+                )
+                continue
 
-                for tool_call_event in self._extract_stream_tool_call_events(
-                    self._stream_tool_call_deltas(delta),
-                    tool_call_states=streamed_tool_calls,
-                ):
-                    yield tool_call_event
+            if event_type == "response.completed":
+                response_json = event.get("response")
+                if not isinstance(response_json, dict):
+                    raise ProviderResponseError(
+                        "LM Studio response.completed event did not include a response object."
+                    )
+                normalized = self._normalize_response(
+                    request=resolved.request,
+                    response_json=response_json,
+                )
+                self._remember_stateful_response(resolved=resolved, response=normalized)
+                if normalized.usage is not None:
+                    yield UsageDeltaEvent(usage=normalized.usage)
+                yield DoneEvent(response=normalized)
+                saw_completion = True
+                continue
 
-                finish_reason = choice.get("finish_reason")
-                if finish_reason is not None:
-                    raw_finish_reason = str(finish_reason)
-                    saw_terminal_choice = True
+            if event_type == "response.failed":
+                raise ProviderResponseError(self._extract_response_failed_message(event))
 
-        if not saw_done_sentinel and not saw_terminal_choice:
+            if event_type == "error":
+                raise ProviderResponseError(self._extract_stream_error_message(event.get("error")))
+
+        if not saw_completion:
             raise StreamProtocolError(
-                "LM Studio stream closed without a terminal chunk or [DONE]."
+                "LM Studio stream closed without a response.completed event."
             )
-
-        response = LLMResponse(
-            provider=self.name,
-            model=response_model or resolved_request.model or "",
-            text="".join(accumulated_text),
-            tool_calls=self._extract_tool_calls(
-                message_tool_calls=self._materialize_stream_tool_calls(streamed_tool_calls),
-                request_tools=resolved_request.tools,
-            ),
-            finish_reason=self._map_finish_reason(raw_finish_reason),
-            usage=usage,
-            response_id=response_id,
-            provider_metadata={"finish_reason_raw": raw_finish_reason},
-        )
-        yield DoneEvent(response=response)
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         raise UnsupportedCapabilityError("Provider 'lmstudio' does not support embeddings.")
 
     async def aclose(self) -> None:
         return
+
+    async def _resolve_response_request(
+        self,
+        request: LLMRequest,
+        *,
+        stream: bool,
+    ) -> _ResolvedResponseRequest:
+        resolved_request = await self._resolve_chat_request(request)
+        full_input_items = tuple(
+            item
+            for message in resolved_request.messages
+            for item in self._to_response_input_items(message)
+        )
+        full_history_key = tuple(
+            self._serialize_history_item(item)
+            for item in full_input_items
+        )
+        previous_response_id, prefix_length = self._find_previous_response_id(
+            model=resolved_request.model or "",
+            full_history_key=full_history_key,
+        )
+        input_items = full_input_items[prefix_length:] if previous_response_id else full_input_items
+        payload = self._build_response_payload(
+            resolved_request,
+            input_items=input_items,
+            previous_response_id=previous_response_id,
+            stream=stream,
+        )
+        return _ResolvedResponseRequest(
+            request=resolved_request,
+            full_input_items=full_input_items,
+            full_history_key=full_history_key,
+            payload=payload,
+        )
 
     async def _resolve_chat_request(self, request: LLMRequest) -> LLMRequest:
         if request.model is not None:
@@ -275,20 +335,35 @@ class LMStudioProvider:
             return False
         return bool(capabilities.get("vision"))
 
-    def _build_chat_payload(self, request: LLMRequest, *, stream: bool = False) -> dict[str, Any]:
+    def _build_response_payload(
+        self,
+        request: LLMRequest,
+        *,
+        input_items: Sequence[dict[str, Any]],
+        previous_response_id: str | None,
+        stream: bool,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,
-            "messages": [self._to_lmstudio_message(message) for message in request.messages],
+            "input": list(input_items),
             "stream": stream,
+            "store": True,
+            "parallel_tool_calls": request.parallel_tool_calls,
         }
+        if previous_response_id is not None:
+            payload["previous_response_id"] = previous_response_id
+        if request.instructions is not None:
+            payload["instructions"] = request.instructions
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_output_tokens is not None:
-            payload["max_tokens"] = request.max_output_tokens
+            payload["max_output_tokens"] = request.max_output_tokens
+        if request.metadata is not None:
+            payload["metadata"] = dict(request.metadata)
 
         if request.tools:
-            payload["tools"] = [self._to_lmstudio_tool(tool) for tool in request.tools]
-            payload["tool_choice"] = self._to_lmstudio_tool_choice(request.tool_choice)
+            payload["tools"] = [self._to_response_tool(tool) for tool in request.tools]
+            payload["tool_choice"] = self._to_response_tool_choice(request.tool_choice)
         elif request.tool_choice.mode not in {ToolChoiceMode.AUTO, ToolChoiceMode.NONE}:
             raise LLMConfigurationError(
                 "Specific tool-choice mode requires non-empty request.tools."
@@ -296,42 +371,50 @@ class LMStudioProvider:
 
         return payload
 
-    def _to_lmstudio_message(self, message: LLMMessage) -> dict[str, Any]:
-        role = "system" if message.role in {"system", "developer"} else message.role
-        if role == "tool":
-            return self._to_lmstudio_tool_result_message(message)
+    def _to_response_input_items(self, message: LLMMessage) -> list[dict[str, Any]]:
+        if message.role == "tool":
+            return self._to_response_tool_result_items(message)
 
-        text_parts: list[str] = []
+        role = "system" if message.role == "developer" else message.role
         content: list[dict[str, Any]] = []
-        tool_calls: list[dict[str, Any]] = []
+        tool_call_items: list[dict[str, Any]] = []
+
         for part in message.parts:
             if isinstance(part, TextPart):
-                text_parts.append(part.text)
-                content.append({"type": "text", "text": part.text})
+                text_part_type = "output_text" if message.role == "assistant" else "input_text"
+                content.append(
+                    {
+                        "type": text_part_type,
+                        "text": part.text,
+                    }
+                )
             elif isinstance(part, ImagePart):
+                if message.role == "assistant":
+                    raise LLMConfigurationError(
+                        "LM Studio provider does not support assistant image history items."
+                    )
                 if part.file_id is not None:
                     raise LLMConfigurationError(
                         "LM Studio provider supports image_url, not file_id."
                     )
                 content.append(
                     {
-                        "type": "image_url",
-                        "image_url": {"url": part.image_url},
+                        "type": "input_image",
+                        "image_url": part.image_url,
+                        "detail": part.detail,
                     }
                 )
             elif isinstance(part, ToolCall):
-                if role != "assistant":
+                if message.role != "assistant":
                     raise LLMConfigurationError(
                         "Tool call history can only appear on assistant messages."
                     )
-                tool_calls.append(
+                tool_call_items.append(
                     {
-                        "id": part.call_id,
-                        "type": "function",
-                        "function": {
-                            "name": part.name,
-                            "arguments": part.raw_arguments,
-                        },
+                        "type": "function_call",
+                        "call_id": part.call_id,
+                        "name": part.name,
+                        "arguments": part.raw_arguments,
                     }
                 )
             else:
@@ -339,49 +422,57 @@ class LMStudioProvider:
                     f"Unsupported LM Studio message part type: {type(part).__name__}."
                 )
 
-        payload: dict[str, Any] = {"role": role}
-        if tool_calls:
-            payload["tool_calls"] = tool_calls
-            payload["content"] = "\n\n".join(text_parts) if text_parts else None
-            return payload
-        if len(content) == 1 and content[0]["type"] == "text":
-            payload["content"] = content[0]["text"]
-            return payload
-        payload["content"] = content
-        return payload
-
-    def _to_lmstudio_tool_result_message(self, message: LLMMessage) -> dict[str, Any]:
-        if len(message.parts) != 1 or not isinstance(message.parts[0], ToolResultPart):
-            raise LLMConfigurationError(
-                "Tool-role messages must contain exactly one tool result for LM Studio."
+        items: list[dict[str, Any]] = []
+        if content:
+            items.append(
+                {
+                    "type": "message",
+                    "role": role,
+                    "content": content,
+                }
             )
-        part = message.parts[0]
-        payload: dict[str, Any] = {
-            "role": "tool",
-            "tool_call_id": part.call_id,
-            "content": part.content,
-        }
-        if part.name:
-            payload["name"] = part.name
-        return payload
+        items.extend(tool_call_items)
+        return items
 
-    def _to_lmstudio_tool(self, tool: ToolDefinition) -> dict[str, Any]:
+    def _to_response_tool_result_items(self, message: LLMMessage) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                raise LLMConfigurationError(
+                    "Tool-role messages can only contain tool results for LM Studio."
+                )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": part.call_id,
+                    "output": part.content,
+                }
+            )
+        return items
+
+    def _to_response_tool(self, tool: ToolDefinition) -> dict[str, Any]:
         function_obj: dict[str, Any] = {
+            "type": "function",
             "name": tool.name,
             "parameters": dict(tool.input_schema),
         }
         if tool.description is not None:
             function_obj["description"] = tool.description
-        return {"type": "function", "function": function_obj}
+        if tool.strict:
+            function_obj["strict"] = True
+        return function_obj
 
-    def _to_lmstudio_tool_choice(self, tool_choice: ToolChoice) -> dict[str, Any] | str:
+    def _to_response_tool_choice(self, tool_choice: ToolChoice) -> dict[str, Any] | str:
         if tool_choice.mode == ToolChoiceMode.AUTO:
             return "auto"
         if tool_choice.mode == ToolChoiceMode.REQUIRED:
             return "required"
         if tool_choice.mode == ToolChoiceMode.NONE:
             return "none"
-        return {"type": "function", "function": {"name": tool_choice.tool_name}}
+        return {
+            "type": "function",
+            "name": tool_choice.tool_name,
+        }
 
     async def _get_json(
         self,
@@ -598,174 +689,218 @@ class LMStudioProvider:
             raise ProviderTemporaryError(message)
         raise ProviderBadRequestError(message)
 
-    def _normalize_chat_response(
+    def _normalize_response(
         self,
         *,
         request: LLMRequest,
         response_json: dict[str, Any],
     ) -> LLMResponse:
-        choices = response_json.get("choices", [])
-        choice = choices[0] if choices else {}
-        message = choice.get("message", {})
+        output = response_json.get("output")
+        if not isinstance(output, list):
+            output = []
 
-        text = self._extract_text(message.get("content"))
         tool_calls = self._extract_tool_calls(
-            message_tool_calls=self._message_tool_calls(message),
+            response_output=output,
             request_tools=request.tools,
         )
-
-        finish_reason = str(choice.get("finish_reason", "unknown"))
         usage = self._normalize_usage(response_json.get("usage"))
 
         return LLMResponse(
             provider=self.name,
-            model=response_json.get("model", request.model or ""),
-            text=text,
+            model=str(response_json.get("model") or request.model or ""),
+            text=self._extract_response_text(response_json=response_json, response_output=output),
             tool_calls=tool_calls,
-            finish_reason=self._map_finish_reason(finish_reason),
+            finish_reason=self._infer_finish_reason(
+                response_json=response_json,
+                tool_calls=tool_calls,
+            ),
             usage=usage,
-            response_id=response_json.get("id"),
-            provider_metadata={"finish_reason_raw": finish_reason},
+            response_id=self._normalize_optional_string(response_json.get("id")),
+            provider_metadata={
+                "status": self._normalize_optional_string(response_json.get("status")),
+                "previous_response_id": self._normalize_optional_string(
+                    response_json.get("previous_response_id")
+                ),
+                "incomplete_reason": self._extract_incomplete_reason(
+                    response_json.get("incomplete_details")
+                ),
+            },
         )
 
-    def _extract_text(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if not isinstance(content, list):
-            return ""
+    def _extract_response_text(
+        self,
+        *,
+        response_json: dict[str, Any],
+        response_output: Sequence[dict[str, Any]],
+    ) -> str:
+        output_text = response_json.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
 
         text_parts: list[str] = []
-        for part in content:
-            if not isinstance(part, dict):
+        for item in response_output:
+            if not isinstance(item, dict) or item.get("type") != "message":
                 continue
-            if part.get("type") == "text":
-                text_parts.append(str(part.get("text", "")))
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"output_text", "text"}:
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
         return "".join(text_parts)
 
-    def _extract_stream_text(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        return self._extract_text(content)
-
-    def _stream_tool_call_deltas(self, delta: dict[str, Any]) -> list[dict[str, Any]]:
-        tool_call_deltas = delta.get("tool_calls")
-        if isinstance(tool_call_deltas, list):
-            return tool_call_deltas
-
-        legacy_function_call = delta.get("function_call")
-        if isinstance(legacy_function_call, dict):
-            return [
-                {
-                    "index": 0,
-                    "function": legacy_function_call,
-                }
-            ]
-        return []
-
-    def _extract_stream_tool_call_events(
+    def _extract_tool_calls(
         self,
-        tool_call_deltas: Sequence[dict[str, Any]],
         *,
-        tool_call_states: dict[int | str, dict[str, Any]],
-    ) -> list[ToolCallDeltaEvent]:
-        events: list[ToolCallDeltaEvent] = []
-        for fallback_tool_index, tool_call_delta in enumerate(tool_call_deltas):
-            tool_index = tool_call_delta.get("index", fallback_tool_index)
-            state = tool_call_states.setdefault(
-                tool_index,
-                {
-                    "id": tool_call_delta.get("id") or f"tool_call_{tool_index}",
-                    "name": None,
-                    "arguments_parts": [],
-                },
-            )
-
-            call_id = tool_call_delta.get("id")
-            if call_id:
-                state["id"] = call_id
-
-            function_obj = tool_call_delta.get("function") or {}
-            tool_name = function_obj.get("name")
-            if tool_name:
-                state["name"] = tool_name
-
-            arguments_delta = function_obj.get("arguments")
-            if isinstance(arguments_delta, dict):
-                arguments_delta = json.dumps(arguments_delta)
-            if not arguments_delta:
+        response_output: Sequence[dict[str, Any]],
+        request_tools: Sequence[ToolDefinition],
+    ) -> list[ToolCall]:
+        tool_schemas = build_tool_schema_map(request_tools)
+        parsed_calls: list[ToolCall] = []
+        for index, item in enumerate(response_output):
+            if not isinstance(item, dict) or item.get("type") != "function_call":
                 continue
 
-            arguments_text = str(arguments_delta)
-            state["arguments_parts"].append(arguments_text)
-            events.append(
-                ToolCallDeltaEvent(
-                    call_id=state["id"],
-                    tool_name=state["name"],
-                    arguments_delta=arguments_text,
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+
+            call_id = item.get("call_id") or item.get("id") or f"{name}_{index}"
+            raw_arguments = item.get("arguments", "{}")
+            if isinstance(raw_arguments, dict):
+                raw_arguments = json.dumps(raw_arguments)
+
+            parsed_calls.append(
+                parse_and_validate_tool_call(
+                    call_id=str(call_id),
+                    name=name,
+                    raw_arguments=str(raw_arguments),
+                    tool_schemas=tool_schemas,
                 )
             )
-        return events
-
-    def _materialize_stream_tool_calls(
-        self,
-        streamed_tool_calls: dict[int | str, dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        materialized: list[dict[str, Any]] = []
-        for state in streamed_tool_calls.values():
-            name = state.get("name")
-            if not name:
-                continue
-            materialized.append(
-                {
-                    "id": state["id"],
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": "".join(state["arguments_parts"]),
-                    },
-                }
-            )
-        return materialized
-
-    def _message_tool_calls(self, message: Any) -> list[dict[str, Any]]:
-        if not isinstance(message, dict):
-            return []
-
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list):
-            return tool_calls
-
-        legacy_function_call = message.get("function_call")
-        if isinstance(legacy_function_call, dict):
-            return [
-                {
-                    "id": message.get("tool_call_id") or "tool_call_0",
-                    "type": "function",
-                    "function": legacy_function_call,
-                }
-            ]
-        return []
+        return parsed_calls
 
     def _normalize_usage(self, usage_obj: Any) -> LLMUsage | None:
-        if not usage_obj:
+        if not isinstance(usage_obj, dict):
+            return None
+
+        input_tokens = self._coerce_optional_int(
+            usage_obj.get("input_tokens", usage_obj.get("prompt_tokens"))
+        )
+        output_tokens = self._coerce_optional_int(
+            usage_obj.get("output_tokens", usage_obj.get("completion_tokens"))
+        )
+        total_tokens = self._coerce_optional_int(usage_obj.get("total_tokens"))
+        if input_tokens is None and output_tokens is None and total_tokens is None:
             return None
         return LLMUsage(
-            input_tokens=usage_obj.get("prompt_tokens"),
-            output_tokens=usage_obj.get("completion_tokens"),
-            total_tokens=usage_obj.get("total_tokens"),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
         )
 
-    def _map_finish_reason(self, finish_reason: str | None) -> str:
-        return {
-            "stop": "stop",
-            "tool_calls": "tool_calls",
-            "function_call": "tool_calls",
-            "length": "length",
-            "content_filter": "content_filter",
-            "error": "error",
-        }.get(finish_reason or "unknown", "unknown")
+    def _infer_finish_reason(
+        self,
+        *,
+        response_json: dict[str, Any],
+        tool_calls: Sequence[ToolCall],
+    ) -> str:
+        status = self._normalize_optional_string(response_json.get("status"))
+        if status == "failed":
+            return "error"
+        if status == "incomplete":
+            incomplete_reason = self._extract_incomplete_reason(
+                response_json.get("incomplete_details")
+            )
+            if incomplete_reason == "max_output_tokens":
+                return "length"
+            if incomplete_reason == "content_filter":
+                return "content_filter"
+        if tool_calls:
+            return "tool_calls"
+        if status == "completed":
+            return "stop"
+        return "unknown"
 
-    def _decode_stream_chunk(self, sse_payload: str) -> dict[str, Any]:
+    def _find_previous_response_id(
+        self,
+        *,
+        model: str,
+        full_history_key: tuple[str, ...],
+    ) -> tuple[str | None, int]:
+        if len(full_history_key) < 2:
+            return None, 0
+
+        with self._stateful_response_ids_lock:
+            for prefix_length in range(len(full_history_key) - 1, 0, -1):
+                cache_key = (model, full_history_key[:prefix_length])
+                response_id = self._stateful_response_ids.get(cache_key)
+                if response_id is None:
+                    continue
+                self._stateful_response_ids.move_to_end(cache_key)
+                return response_id, prefix_length
+        return None, 0
+
+    def _remember_stateful_response(
+        self,
+        *,
+        resolved: _ResolvedResponseRequest,
+        response: LLMResponse,
+    ) -> None:
+        if response.response_id is None:
+            return
+
+        response_items = self._response_output_items(response)
+        if not response_items:
+            return
+
+        history_key = resolved.full_history_key + tuple(
+            self._serialize_history_item(item)
+            for item in response_items
+        )
+        model = response.model or resolved.request.model or ""
+        cache_key = (model, history_key)
+
+        with self._stateful_response_ids_lock:
+            self._stateful_response_ids[cache_key] = response.response_id
+            self._stateful_response_ids.move_to_end(cache_key)
+            while len(self._stateful_response_ids) > _STATEFUL_HISTORY_CACHE_LIMIT:
+                self._stateful_response_ids.popitem(last=False)
+
+    def _response_output_items(self, response: LLMResponse) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if response.text:
+            items.append(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": response.text,
+                        }
+                    ],
+                }
+            )
+        for tool_call in response.tool_calls:
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": tool_call.call_id,
+                    "name": tool_call.name,
+                    "arguments": tool_call.raw_arguments,
+                }
+            )
+        return items
+
+    def _serialize_history_item(self, item: dict[str, Any]) -> str:
+        return json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    def _decode_stream_event(self, sse_payload: str) -> dict[str, Any]:
         try:
             chunk = json.loads(sse_payload)
         except json.JSONDecodeError as exc:
@@ -773,6 +908,12 @@ class LMStudioProvider:
         if not isinstance(chunk, dict):
             raise ProviderResponseError("LM Studio returned a non-object streaming chunk.")
         return chunk
+
+    def _extract_response_failed_message(self, event: dict[str, Any]) -> str:
+        response = event.get("response")
+        if isinstance(response, dict):
+            return self._extract_stream_error_message(response.get("error"))
+        return "LM Studio streaming response failed."
 
     def _extract_stream_error_message(self, error: Any) -> str:
         if isinstance(error, str) and error:
@@ -785,6 +926,36 @@ class LMStudioProvider:
             if code is not None:
                 return f"LM Studio streaming error ({code})."
         return "LM Studio streaming response failed."
+
+    def _normalize_function_call_arguments_chunk(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return json.dumps(value)
+        return str(value)
+
+    def _extract_incomplete_reason(self, incomplete_details: Any) -> str | None:
+        if not isinstance(incomplete_details, dict):
+            return None
+        return self._normalize_optional_string(incomplete_details.get("reason"))
+
+    def _normalize_optional_string(self, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    def _coerce_optional_int(self, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _map_request_exception(self, exc: Exception) -> Exception:
         if isinstance(
@@ -809,35 +980,6 @@ class LMStudioProvider:
         if isinstance(exc, requests.RequestException):
             return ProviderResponseError(str(exc))
         return ProviderResponseError(str(exc))
-
-    def _extract_tool_calls(
-        self,
-        *,
-        message_tool_calls: Sequence[dict[str, Any]],
-        request_tools: Sequence[ToolDefinition],
-    ) -> list[ToolCall]:
-        tool_schemas = build_tool_schema_map(request_tools)
-        parsed_calls: list[ToolCall] = []
-        for index, call in enumerate(message_tool_calls):
-            function_obj = call.get("function", {})
-            name = function_obj.get("name")
-            if not name:
-                continue
-
-            call_id = call.get("id") or f"{name}_{index}"
-            raw_arguments = function_obj.get("arguments", "{}")
-            if isinstance(raw_arguments, dict):
-                raw_arguments = json.dumps(raw_arguments)
-
-            parsed_calls.append(
-                parse_and_validate_tool_call(
-                    call_id=call_id,
-                    name=name,
-                    raw_arguments=raw_arguments,
-                    tool_schemas=tool_schemas,
-                )
-            )
-        return parsed_calls
 
 
 def _rewrite_loopback_base_url_for_container(base_url: str) -> str:

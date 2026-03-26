@@ -349,11 +349,49 @@ class LMStudioProviderRequestShapeTests(unittest.TestCase):
             ),
         )
 
-        payload = provider._build_chat_payload(request)
-        self.assertEqual(payload["messages"][0], {"role": "system", "content": "System prompt"})
-        self.assertEqual(payload["messages"][1], {"role": "user", "content": "Hello"})
-        self.assertEqual(payload["messages"][2], {"role": "assistant", "content": "Hi there"})
-        self.assertEqual(payload["messages"][3], {"role": "user", "content": "Second turn"})
+        input_items = [
+            item
+            for message in request.messages
+            for item in provider._to_response_input_items(message)
+        ]
+        payload = provider._build_response_payload(
+            request,
+            input_items=input_items,
+            previous_response_id=None,
+            stream=False,
+        )
+        self.assertEqual(
+            payload["input"][0],
+            {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "System prompt"}],
+            },
+        )
+        self.assertEqual(
+            payload["input"][1],
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            },
+        )
+        self.assertEqual(
+            payload["input"][2],
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there"}],
+            },
+        )
+        self.assertEqual(
+            payload["input"][3],
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Second turn"}],
+            },
+        )
 
     def test_tool_roundtrip_uses_assistant_tool_calls_and_tool_role_messages(self) -> None:
         provider = LMStudioProvider(
@@ -387,12 +425,34 @@ class LMStudioProviderRequestShapeTests(unittest.TestCase):
             ),
         )
 
-        payload = provider._build_chat_payload(request)
-        self.assertEqual(payload["messages"][0]["role"], "assistant")
-        self.assertEqual(payload["messages"][0]["tool_calls"][0]["id"], "bash_1")
-        self.assertIsNone(payload["messages"][0]["content"])
-        self.assertEqual(payload["messages"][1]["role"], "tool")
-        self.assertEqual(payload["messages"][1]["tool_call_id"], "bash_1")
+        input_items = [
+            item
+            for message in request.messages
+            for item in provider._to_response_input_items(message)
+        ]
+        payload = provider._build_response_payload(
+            request,
+            input_items=input_items,
+            previous_response_id=None,
+            stream=False,
+        )
+        self.assertEqual(
+            payload["input"][0],
+            {
+                "type": "function_call",
+                "call_id": "bash_1",
+                "name": "bash",
+                "arguments": '{"command":"pwd"}',
+            },
+        )
+        self.assertEqual(
+            payload["input"][1],
+            {
+                "type": "function_call_output",
+                "call_id": "bash_1",
+                "output": "Bash execution result\nstatus: success",
+            },
+        )
 
     def test_image_input_uses_image_url_content_item(self) -> None:
         provider = LMStudioProvider(
@@ -413,7 +473,17 @@ class LMStudioProviderRequestShapeTests(unittest.TestCase):
             ),
         )
 
-        payload = provider._build_chat_payload(request)
-        content = payload["messages"][0]["content"]
-        image_item = next(item for item in content if item["type"] == "image_url")
-        self.assertEqual(image_item["image_url"]["url"], image_url)
+        input_items = [
+            item
+            for message in request.messages
+            for item in provider._to_response_input_items(message)
+        ]
+        payload = provider._build_response_payload(
+            request,
+            input_items=input_items,
+            previous_response_id=None,
+            stream=False,
+        )
+        content = payload["input"][0]["content"]
+        image_item = next(item for item in content if item["type"] == "input_image")
+        self.assertEqual(image_item["image_url"], image_url)
