@@ -17,7 +17,6 @@
       --soft: #8c7b6d;
       --shadow: 0 18px 45px rgba(72, 49, 20, 0.12);
       --system: #0f7c74;
-      --developer: #6b7a25;
       --user: #1c4870;
       --assistant: #a24f14;
       --tool: #8c2f39;
@@ -394,7 +393,6 @@
     }
 
     .role-system { color: var(--system); }
-    .role-developer { color: var(--developer); }
     .role-user { color: var(--user); }
     .role-assistant { color: var(--assistant); }
     .role-tool { color: var(--tool); }
@@ -565,7 +563,6 @@
     }
 
     .record-card.role-system { border-left-color: color-mix(in srgb, var(--system) 74%, white); }
-    .record-card.role-developer { border-left-color: color-mix(in srgb, var(--developer) 74%, white); }
     .record-card.role-user { border-left-color: color-mix(in srgb, var(--user) 74%, white); }
     .record-card.role-assistant { border-left-color: color-mix(in srgb, var(--assistant) 74%, white); }
     .record-card.role-tool { border-left-color: color-mix(in srgb, var(--tool) 74%, white); }
@@ -1147,7 +1144,6 @@
           <h2>Legend</h2>
           <div class="role-filter-row">
             <span class="badge subtle role-system"><span class="role-dot"></span>system</span>
-            <span class="badge subtle role-developer"><span class="role-dot"></span>developer</span>
             <span class="badge subtle role-user"><span class="role-dot"></span>user</span>
             <span class="badge subtle role-assistant"><span class="role-dot"></span>assistant</span>
             <span class="badge subtle role-tool"><span class="role-dot"></span>tool</span>
@@ -1177,7 +1173,7 @@
 
   <script>
     (() => {
-      const BASE_ROLES = ["system", "developer", "user", "assistant", "tool", "parse-error"];
+      const BASE_ROLES = ["system", "user", "assistant", "tool", "parse-error"];
 
       const state = {
         sourceLabel: "",
@@ -1413,10 +1409,11 @@
         const createdAtMs = createdAt ? Date.parse(createdAt) : null;
         const severity = computeSeverity(record.role, metadata, toolCalls);
 
+        const role = normalizeRole(record.role);
         const normalized = {
           id: record.record_id || `${record.session_id || "session"}-${context.fileLine}`,
           sessionId: record.session_id || "",
-          role: record.role || "unknown",
+          role,
           kind: record.kind || "",
           fileLine: context.fileLine,
           orderIndex: context.orderIndex,
@@ -1432,7 +1429,7 @@
           toolBootstrapKind,
           toolName: metadata.tool_name ? String(metadata.tool_name) : null,
           toolNames,
-          searchText: buildSearchText(record, metadata, toolNames, toolCalls)
+          searchText: buildSearchText(record, metadata, toolNames, toolCalls, role)
         };
 
         return normalized;
@@ -1455,9 +1452,13 @@
         return "normal";
       }
 
-      function buildSearchText(record, metadata, toolNames, toolCalls) {
+      function normalizeRole(role) {
+        return role || "unknown";
+      }
+
+      function buildSearchText(record, metadata, toolNames, toolCalls, normalizedRole) {
         const pieces = [
-          record.role,
+          normalizedRole,
           record.kind,
           record.content,
           record.record_id,

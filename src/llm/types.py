@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Mapping, Sequence, TypeAlias
 
-LLMRole: TypeAlias = Literal["system", "developer", "user", "assistant", "tool"]
+LLMRole: TypeAlias = Literal["system", "user", "assistant", "tool"]
 ImageDetail: TypeAlias = Literal["low", "high", "auto", "original"]
 FinishReason: TypeAlias = Literal[
     "stop",

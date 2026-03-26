@@ -201,12 +201,10 @@ class AnthropicProvider:
         pending_tool_results: list[dict[str, Any]] = []
 
         for message in messages:
-            if message.role in {"system", "developer"}:
+            if message.role == "system":
                 text = _join_text_parts(
                     message.parts,
-                    unsupported_message=(
-                        "System/developer Anthropic history only supports text parts."
-                    ),
+                    unsupported_message=("Anthropic system history only supports text parts."),
                 )
                 if text:
                     system_parts.append(text)

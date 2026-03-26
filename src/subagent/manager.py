@@ -333,7 +333,7 @@ class SubagentManager:
         if not runtimes:
             return (
                 AgentRuntimeMessage(
-                    role="developer",
+                    role="system",
                     metadata={
                         "subagent_status_snapshot": True,
                         "pending_subagent_ids": [],
@@ -379,7 +379,7 @@ class SubagentManager:
 
         return (
             AgentRuntimeMessage(
-                role="developer",
+                role="system",
                 metadata={
                     "subagent_status_snapshot": True,
                     "pending_subagent_ids": pending_subagent_ids,
@@ -519,7 +519,7 @@ class SubagentManager:
         )
         return (
             AgentRuntimeMessage(
-                role="developer",
+                role="system",
                 metadata={
                     "subagent_followup": True,
                     "subagent_id": snapshot.subagent_id,

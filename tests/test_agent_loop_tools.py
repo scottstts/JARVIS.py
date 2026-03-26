@@ -97,6 +97,16 @@ def _is_compaction_request(request: LLMRequest) -> bool:
     )
 
 
+def _has_summary_seed_message(request: LLMRequest) -> bool:
+    return any(
+        message.role == "system"
+        and isinstance(part, TextPart)
+        and "Summarized context from previous session compaction." in part.text
+        for message in request.messages
+        for part in message.parts
+    )
+
+
 def _build_http_fetch_result(
     *,
     requested_url: str,
@@ -893,7 +903,7 @@ class _FakeFollowupPreflightCompactionLLMService:
                 finish_reason="tool_calls",
             )
 
-        if not any(message.role == "developer" for message in request.messages):
+        if not _has_summary_seed_message(request):
             raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
         if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
             raise AssertionError("Expected assistant/tool history to survive follow-up compaction.")
@@ -943,7 +953,7 @@ class _FakeStreamingFollowupOverflowCompactionLLMService:
         if self.stream_calls == 3:
             raise ProviderBadRequestError("context_length_exceeded")
 
-        if not any(message.role == "developer" for message in request.messages):
+        if not _has_summary_seed_message(request):
             raise AssertionError("Expected the compacted streamed follow-up request to include a summary seed.")
         if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
             raise AssertionError("Expected assistant/tool history to survive streamed follow-up compaction.")
@@ -984,7 +994,7 @@ class _FakeFollowupOverflowCompactionLLMService:
         if self.generate_calls == 3:
             raise ProviderBadRequestError("context_length_exceeded")
 
-        if not any(message.role == "developer" for message in request.messages):
+        if not _has_summary_seed_message(request):
             raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
         if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
             raise AssertionError("Expected assistant/tool history to survive follow-up compaction.")
@@ -1097,7 +1107,7 @@ class _FakeCurrentTurnResidualCompactionLLMService:
                 finish_reason="tool_calls",
             )
 
-        if not any(message.role == "developer" for message in request.messages):
+        if not _has_summary_seed_message(request):
             raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
         tool_messages = [message for message in request.messages if message.role == "tool"]
         if len(tool_messages) != 1:
@@ -1476,7 +1486,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             def _estimate_with_followup_overflow(request: LLMRequest) -> int:
                 has_tool_result = any(message.role == "tool" for message in request.messages)
-                has_summary_seed = any(message.role == "developer" for message in request.messages)
+                has_summary_seed = _has_summary_seed_message(request)
                 if has_tool_result and not has_summary_seed:
                     return settings.context_policy.preflight_limit_tokens
                 return 10
@@ -1501,7 +1511,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(result.session_id)
             self.assertTrue(
-                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
             )
             self.assertEqual(new_records[-1].role, "assistant")
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
@@ -1546,7 +1556,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 if not tool_parts:
                     return 10
-                has_summary_seed = any(message.role == "developer" for message in request.messages)
+                has_summary_seed = _has_summary_seed_message(request)
                 if not has_summary_seed:
                     return settings.context_policy.preflight_limit_tokens
                 if max(len(content) for content in tool_parts) >= 2_500:
@@ -1569,7 +1579,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(result.session_id, include_all_turns=True)
             self.assertTrue(
-                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
             )
             new_tool_records = [record for record in new_records if record.role == "tool"]
             self.assertEqual(len(new_tool_records), 1)
@@ -2087,7 +2097,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(result.session_id)
             self.assertTrue(
-                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
             )
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 
@@ -2132,7 +2142,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(done.session_id)
             self.assertTrue(
-                any(record.role == "developer" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
             )
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 

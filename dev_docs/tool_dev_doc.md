@@ -55,7 +55,7 @@ Current rule:
 - high-verbosity `tool_search` may transiently surface matched backed discoverable tools for the rest of the current turn
 - `ToolRegistry.filtered_view(...)` provides agent-scoped visibility so different actor types can share the same registry with different allowed tools
 - the current subagent filtered view hides the built-in memory tools by settings-backed blocklist while still allowing runtime manifest discoverables to remain visible through `tool_search`
-- every executable tool must have an explicit developer-decided subagent allow status from day 1
+- every executable tool must have an explicit subagent allow status decided from day 1
 - in code, do not rely on default agent visibility for new tools; set `allowed_agent_kinds` explicitly on every `RegisteredTool` and every `DiscoverableTool` entry that can activate a backing tool
 - treat subagent allow status as required tool-spec input during implementation, not as a later cleanup once subagent compatibility questions arise
 

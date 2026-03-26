@@ -180,7 +180,7 @@ That means the following fixes automatically cover both:
 
 Subagent-specific runtime messages such as:
 
-- step-in developer messages
+- step-in system messages
 - subagent bash progress system messages
 - subagent orchestration progress notices
 

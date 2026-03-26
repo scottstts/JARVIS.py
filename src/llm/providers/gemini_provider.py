@@ -179,10 +179,10 @@ class GeminiProvider:
         pending_function_responses: list[dict[str, Any]] = []
 
         for message in request.messages:
-            if message.role in {"system", "developer"}:
+            if message.role == "system":
                 text = _join_text_parts(
                     message.parts,
-                    unsupported_message="Gemini system/developer history only supports text parts.",
+                    unsupported_message="Gemini system history only supports text parts.",
                 )
                 if text:
                     system_parts.append(text)

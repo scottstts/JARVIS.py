@@ -309,7 +309,7 @@ When `subagent_invoke` is executed, create a task-specific assignment message th
 - optional context
 - optional deliverable/success criteria if included in the invoke arguments
 
-The dynamic assignment should be injected as a developer or system message after the static subagent prompts.
+The dynamic assignment should be injected as a system message after the static subagent prompts.
 
 ### PROGRAM.md
 
@@ -324,7 +324,7 @@ It should explain:
 
 Important:
 
-- this `PROGRAM.md` addition is part of runtime prompt behavior, not developer documentation
+- this `PROGRAM.md` addition is part of runtime prompt behavior, not implementation documentation
 - write it as operating guidance for the main agent, in the same instruction style as the rest of `PROGRAM.md`
 - do not add redundant implementation explanation or schema dumps there
 - keep it to usage guidelines and decision heuristics only
@@ -794,7 +794,7 @@ The main agent should know what its subagents are doing without requiring the us
 
 The `SubagentManager` should maintain a concise internal activity log for each subagent and a route-level snapshot of all non-disposed subagents.
 
-Before each main-agent turn, inject a transient system or developer runtime message summarizing:
+Before each main-agent turn, inject a transient system runtime message summarizing:
 
 - current active subagents
 - state of each one
@@ -1134,7 +1134,7 @@ This feature is done when all of the following are true:
 
 1. Jarvis can invoke up to seven background subagents through main-agent-only synthetic primitives.
 2. Subagents use the same core loop with different bootstrap/tool/memory configuration.
-3. Functional subagent prompt files exist under `src/subagent/prompts/` and are written as real starter context, not as developer docs.
+3. Functional subagent prompt files exist under `src/subagent/prompts/` and are written as real starter context, not as implementation docs.
 4. `PROGRAM.md` contains high-level subagent usage guidance for the main agent, but not detailed primitive schemas.
 5. Subagents have their own archive storage under `workspace/archive/subagents/`.
 6. Subagents cannot access memory tools.

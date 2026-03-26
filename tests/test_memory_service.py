@@ -669,7 +669,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             memory_bootstrap_records = [
                 record
                 for record in records
-                if record.role == "developer" and record.metadata.get("memory_bootstrap") == "core"
+                if record.role == "system" and record.metadata.get("memory_bootstrap") == "core"
             ]
 
             self.assertEqual(len(memory_bootstrap_records), 1)

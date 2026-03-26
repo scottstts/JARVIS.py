@@ -226,7 +226,7 @@ class OpenRouterProvider:
         return payload
 
     def _to_openrouter_message(self, message: LLMMessage) -> dict[str, Any]:
-        role = "system" if message.role in {"system", "developer"} else message.role
+        role = message.role
         if role == "tool":
             return self._to_openrouter_tool_result_message(message)
 

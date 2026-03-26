@@ -130,7 +130,7 @@ class CompositeMainBootstrapLoader:
         messages = self._base_loader.load_bootstrap_messages()
         messages.append(
             LLMMessage.text(
-                "developer",
+                "system",
                 "Subagent runtime control reference:\n\n" + render_subagent_primitive_docs(),
             )
         )
@@ -975,7 +975,7 @@ class RouteRuntime:
             return ()
         return (
             AgentRuntimeMessage(
-                role="developer",
+                role="system",
                 metadata={
                     "force_no_tools_this_turn": True,
                     "orchestrator_wait_only_update": True,

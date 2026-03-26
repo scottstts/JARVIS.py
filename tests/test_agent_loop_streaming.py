@@ -183,7 +183,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             tool_bootstrap_records = [
                 record
                 for record in records
-                if record.role == "developer" and record.metadata.get("tool_bootstrap") == "basic"
+                if record.role == "system" and record.metadata.get("tool_bootstrap") == "basic"
             ]
             self.assertEqual(len(tool_bootstrap_records), 1)
             serialized_tools = json.loads(tool_bootstrap_records[0].content)

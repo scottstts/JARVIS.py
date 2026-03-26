@@ -68,7 +68,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 tool_bootstrap_records = [
                     record
                     for record in message_records
-                    if record.role == "developer" and record.metadata.get("tool_bootstrap") == "basic"
+                    if record.role == "system" and record.metadata.get("tool_bootstrap") == "basic"
                 ]
                 self.assertEqual(len(tool_bootstrap_records), 1)
                 self.assertIn('"name": "bash"', tool_bootstrap_records[0].content)
@@ -117,7 +117,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 summary_records = [
                     record
                     for record in new_records
-                    if record.role == "developer" and record.metadata.get("summary_seed")
+                    if record.role == "system" and record.metadata.get("summary_seed")
                 ]
                 self.assertEqual(len(summary_records), 1)
                 self.assertTrue(summary_records[0].content.strip())
@@ -156,7 +156,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 tool_bootstrap_records = [
                     record
                     for record in message_records
-                    if record.role == "developer" and record.metadata.get("tool_bootstrap") == "basic"
+                    if record.role == "system" and record.metadata.get("tool_bootstrap") == "basic"
                 ]
                 self.assertEqual(len(tool_bootstrap_records), 1)
                 self.assertEqual(

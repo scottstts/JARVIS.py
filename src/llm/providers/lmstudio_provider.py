@@ -375,7 +375,7 @@ class LMStudioProvider:
         if message.role == "tool":
             return self._to_response_tool_result_items(message)
 
-        role = "system" if message.role == "developer" else message.role
+        role = message.role
         content: list[dict[str, Any]] = []
         tool_call_items: list[dict[str, Any]] = []
 

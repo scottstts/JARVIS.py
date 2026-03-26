@@ -78,7 +78,7 @@ class MemoryReflectionPlanner:
                 model=self._settings.maintenance_model,
                 max_output_tokens=self._settings.maintenance_max_output_tokens,
                 messages=(
-                    LLMMessage.text("developer", prompt),
+                    LLMMessage.text("system", prompt),
                 ),
             )
         )

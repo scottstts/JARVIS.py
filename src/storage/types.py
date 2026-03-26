@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 RecordKind = Literal["message", "compaction"]
-RecordRole = Literal["system", "developer", "user", "assistant", "tool"]
+RecordRole = Literal["system", "user", "assistant", "tool"]
 SessionStatus = Literal["active", "archived"]
 TurnStatus = Literal["in_progress", "completed", "interrupted", "superseded"]
 
@@ -106,7 +106,7 @@ class ConversationRecord:
     def from_dict(cls, data: dict[str, Any]) -> "ConversationRecord":
         raw_role = str(data.get("role", "assistant"))
         role: RecordRole
-        if raw_role in {"system", "developer", "user", "assistant", "tool"}:
+        if raw_role in {"system", "user", "assistant", "tool"}:
             role = raw_role
         else:
             role = "assistant"

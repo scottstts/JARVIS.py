@@ -96,7 +96,7 @@ class BootstrapMessageLoader(Protocol):
 
 @dataclass(slots=True, frozen=True)
 class AgentRuntimeMessage:
-    role: Literal["system", "developer", "user", "assistant", "tool"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -811,10 +811,10 @@ class AgentLoop:
             self._append_turn_record(
                 session_id=session_id,
                 pending_records=pending_records,
-                record=self._build_runtime_message_record(
+                        record=self._build_runtime_message_record(
                     session_id=session_id,
                     message=AgentRuntimeMessage(
-                        role="developer",
+                        role="system",
                         metadata={
                             "orchestrator_monitored_waiting": True,
                             **metadata,
@@ -2116,7 +2116,7 @@ class AgentLoop:
         if tool_bootstrap is not None:
             self._append_message(
                 session_id=session.session_id,
-                role="developer",
+                role="system",
                 content=json.dumps(tool_bootstrap, ensure_ascii=False, indent=2),
                 metadata={
                     _TOOL_BOOTSTRAP_METADATA_KEY: "basic",
@@ -2136,21 +2136,21 @@ class AgentLoop:
             if core_memory_bootstrap.strip():
                 self._append_message(
                     session_id=session.session_id,
-                    role="developer",
+                    role="system",
                     content="Runtime core memory bootstrap:\n\n" + core_memory_bootstrap,
                     metadata={"memory_bootstrap": "core"},
                 )
             if ongoing_memory_bootstrap.strip():
                 self._append_message(
                     session_id=session.session_id,
-                    role="developer",
+                    role="system",
                     content="Runtime ongoing memory bootstrap:\n\n" + ongoing_memory_bootstrap,
                     metadata={"memory_bootstrap": "ongoing"},
                 )
         if summary_text:
             self._append_message(
                 session_id=session.session_id,
-                role="developer",
+                role="system",
                 content=(
                     "Summarized context from previous session compaction.\n"
                     "Use this as prior conversational state:\n\n"
@@ -3114,7 +3114,7 @@ def _record_to_llm_message(
     if bool(record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)):
         return None
 
-    if record.role in {"system", "developer", "user"}:
+    if record.role in {"system", "user"}:
         parts: list[ImagePart | TextPart] = []
         image_part = _record_image_part(record)
         if image_part is not None:

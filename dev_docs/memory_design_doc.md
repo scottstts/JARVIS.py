@@ -901,8 +901,8 @@ Prompt policy note:
 
 ### Bootstrap Message Role
 
-- core memory bootstrap is a `developer` message
-- ongoing memory bootstrap is a `developer` message
+- core memory bootstrap is a `system` message
+- ongoing memory bootstrap is a `system` message
 
 ### Bootstrap Token Budgets
 

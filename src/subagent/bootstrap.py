@@ -35,7 +35,7 @@ def build_assignment_message(
     deliverable: str | None = None,
 ) -> LLMMessage:
     return LLMMessage.text(
-        "developer",
+        "system",
         _render_assignment_text(
             codename=codename,
             subagent_id=subagent_id,
@@ -48,7 +48,7 @@ def build_assignment_message(
 
 def build_step_in_message(*, instructions: str) -> AgentRuntimeMessage:
     return AgentRuntimeMessage(
-        role="developer",
+        role="system",
         metadata={"subagent_step_in": True},
         content=(
             "Updated direction from Jarvis for the next turn.\n\n"
