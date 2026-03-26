@@ -482,7 +482,9 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - validates that the target exists and is a file
 - inspects file bytes and only accepts image types shared across all current provider adapters
 - returns a normalized tool result with `image_attachment` metadata so the agent loop can inject a transient multimodal follow-up message
-- the image attachment is only guaranteed for the immediate tool-follow-up request and is not persisted into stored transcript history
+- on success, the tool result is staged in-memory for the immediate tool-follow-up request and is only persisted after the provider accepts that follow-up
+- if the provider rejects the image input before producing output, the staged success is replaced with a normal failed `view_image` tool result so the model sees the failure and the loop stays alive
+- the image attachment itself is only guaranteed for the immediate tool-follow-up request and is not persisted into stored transcript history
 
 #### Policy
 

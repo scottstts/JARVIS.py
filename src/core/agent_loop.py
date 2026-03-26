@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from llm import (
     ImagePart,
+    LLMConfigurationError,
     LLMMessage,
     LLMRequest,
     LLMResponse,
@@ -25,6 +26,7 @@ from llm import (
     ToolChoice,
     ToolDefinition,
     ToolResultPart,
+    UnsupportedCapabilityError,
 )
 from memory import MemoryService, MemorySettings
 from storage import ConversationRecord, SessionMetadata, SessionStorage
@@ -46,6 +48,11 @@ _OVERFLOW_ERROR_HINTS = (
     "input is too long",
     "context_length_exceeded",
     "exceeds the model",
+)
+_IMAGE_ATTACHMENT_ERROR_HINTS = (
+    "image",
+    "vision",
+    "multimodal",
 )
 _TRANSCRIPT_ONLY_RECORD_METADATA_KEY = "transcript_only"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
@@ -200,6 +207,14 @@ class _ToolExecutionOutcome:
     interrupted: bool = False
     pending_detached_job_ids: frozenset[str] = frozenset()
     pending_subagent_ids: frozenset[str] = frozenset()
+    deferred_tool_successes: tuple["_DeferredToolSuccess", ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class _DeferredToolSuccess:
+    tool_result: ToolExecutionResult
+    tool_record: ConversationRecord
+    extra_records: tuple[ConversationRecord, ...] = ()
 
 
 class AgentLoop:
@@ -674,6 +689,7 @@ class AgentLoop:
         pending_subagent_ids: frozenset[str] = frozenset(),
     ) -> _ToolExecutionOutcome:
         ephemeral_image_records: list[ConversationRecord] = []
+        deferred_tool_successes: list[_DeferredToolSuccess] = []
         current_pending_detached_job_ids = set(pending_detached_job_ids)
         current_pending_subagent_ids = set(pending_subagent_ids)
         for tool_call in current_response.tool_calls:
@@ -689,22 +705,33 @@ class AgentLoop:
                     tool_name=tool_call.name,
                 )
                 if pending_approval is None:
-                    self._append_turn_record(
-                        session_id=session_id,
-                        pending_records=pending_records,
-                        record=self._build_tool_record(
-                            session_id,
-                            tool_result,
-                            turn_id=turn_id,
-                        ),
+                    tool_record = self._build_tool_record(
+                        session_id,
+                        tool_result,
+                        turn_id=turn_id,
                     )
-                    ephemeral_image_records.extend(
+                    attachment_records = tuple(
                         self._build_ephemeral_image_records_from_tool_result(
                             session_id,
                             tool_result,
                             turn_id=turn_id,
                         )
                     )
+                    if tool_result.ok and attachment_records:
+                        deferred_tool_successes.append(
+                            _DeferredToolSuccess(
+                                tool_result=tool_result,
+                                tool_record=tool_record,
+                                extra_records=attachment_records,
+                            )
+                        )
+                    else:
+                        self._append_turn_record(
+                            session_id=session_id,
+                            pending_records=pending_records,
+                            record=tool_record,
+                        )
+                        ephemeral_image_records.extend(attachment_records)
                     _update_pending_detached_job_ids(
                         current_pending_detached_job_ids,
                         tool_result,
@@ -761,6 +788,116 @@ class AgentLoop:
         return _ToolExecutionOutcome(
             pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
             pending_subagent_ids=frozenset(current_pending_subagent_ids),
+            deferred_tool_successes=tuple(deferred_tool_successes),
+        )
+
+    def _build_followup_attempt_request(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        pending_detached_job_ids: Sequence[str],
+        pending_subagent_ids: Sequence[str],
+        turn_id: str,
+        extra_records: Sequence[ConversationRecord] = (),
+    ) -> tuple[LLMRequest, int]:
+        if pending_detached_job_ids or pending_subagent_ids:
+            return self._build_orchestrator_monitored_waiting_request(
+                session_id=session_id,
+                base_records=base_records,
+                pending_records=pending_records,
+                pending_detached_job_ids=pending_detached_job_ids,
+                pending_subagent_ids=pending_subagent_ids,
+                turn_id=turn_id,
+                extra_records=extra_records,
+            )
+        return self._build_followup_request(
+            base_records=base_records,
+            pending_records=pending_records,
+            extra_records=extra_records,
+        )
+
+    def _deferred_tool_success_records(
+        self,
+        deferred_tool_successes: Sequence[_DeferredToolSuccess],
+    ) -> tuple[ConversationRecord, ...]:
+        records: list[ConversationRecord] = []
+        for deferred in deferred_tool_successes:
+            records.append(deferred.tool_record)
+            records.extend(deferred.extra_records)
+        return tuple(records)
+
+    def _commit_deferred_tool_successes(
+        self,
+        *,
+        session_id: str,
+        pending_records: list[ConversationRecord],
+        deferred_tool_successes: Sequence[_DeferredToolSuccess],
+    ) -> None:
+        for deferred in deferred_tool_successes:
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=deferred.tool_record,
+            )
+            for record in deferred.extra_records:
+                self._append_turn_record(
+                    session_id=session_id,
+                    pending_records=pending_records,
+                    record=record,
+                )
+
+    def _persist_failed_deferred_tool_successes(
+        self,
+        *,
+        session_id: str,
+        pending_records: list[ConversationRecord],
+        deferred_tool_successes: Sequence[_DeferredToolSuccess],
+        error_message: str,
+        turn_id: str,
+    ) -> None:
+        for deferred in deferred_tool_successes:
+            failed_result = self._build_failed_image_attachment_tool_result(
+                deferred.tool_result,
+                error_message=error_message,
+            )
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=self._build_tool_record(
+                    session_id,
+                    failed_result,
+                    turn_id=turn_id,
+                ),
+            )
+
+    def _build_failed_image_attachment_tool_result(
+        self,
+        tool_result: ToolExecutionResult,
+        *,
+        error_message: str,
+    ) -> ToolExecutionResult:
+        reason = error_message.strip() or "The image attachment could not be used."
+        metadata = dict(tool_result.metadata)
+        metadata.pop("image_attachment", None)
+        metadata["error"] = reason
+
+        title = "View image failed" if tool_result.name == "view_image" else (
+            f"{tool_result.name.replace('_', ' ').capitalize()} failed"
+        )
+        lines = [title]
+        raw_path = str(metadata.get("path", "")).strip()
+        if raw_path:
+            lines.append(f"path: {raw_path}")
+        lines.append(f"reason: {reason}")
+
+        return ToolExecutionResult(
+            call_id=tool_result.call_id,
+            name=tool_result.name,
+            ok=False,
+            content="\n".join(lines),
+            metadata=metadata,
         )
 
     def _build_followup_request(
@@ -799,6 +936,7 @@ class AgentLoop:
         pending_detached_job_ids: Sequence[str],
         pending_subagent_ids: Sequence[str],
         turn_id: str,
+        extra_records: Sequence[ConversationRecord] = (),
     ) -> tuple[LLMRequest, int]:
         metadata: dict[str, Any] = {}
         if pending_detached_job_ids:
@@ -828,6 +966,7 @@ class AgentLoop:
             base_records=base_records,
             pending_records=pending_records,
             allow_tools=False,
+            extra_records=extra_records,
         )
 
     def _build_tool_round_limit_record(
@@ -1250,8 +1389,10 @@ class AgentLoop:
                     break
 
                 followup_compaction_attempted = False
+                deferred_tool_successes: tuple[_DeferredToolSuccess, ...] = ()
                 try:
                     ephemeral_image_records: list[ConversationRecord] = []
+                    staged_image_tool_successes: list[_DeferredToolSuccess] = []
                     approval_rejected = False
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
                     current_pending_subagent_ids = set(pending_subagent_ids)
@@ -1268,22 +1409,33 @@ class AgentLoop:
                                 tool_name=tool_call.name,
                             )
                             if pending_approval is None:
-                                self._append_turn_record(
-                                    session_id=session.session_id,
-                                    pending_records=pending_records,
-                                    record=self._build_tool_record(
-                                        session.session_id,
-                                        tool_result,
-                                        turn_id=turn_id,
-                                    ),
+                                tool_record = self._build_tool_record(
+                                    session.session_id,
+                                    tool_result,
+                                    turn_id=turn_id,
                                 )
-                                ephemeral_image_records.extend(
+                                attachment_records = tuple(
                                     self._build_ephemeral_image_records_from_tool_result(
                                         session.session_id,
                                         tool_result,
                                         turn_id=turn_id,
                                     )
                                 )
+                                if tool_result.ok and attachment_records:
+                                    staged_image_tool_successes.append(
+                                        _DeferredToolSuccess(
+                                            tool_result=tool_result,
+                                            tool_record=tool_record,
+                                            extra_records=attachment_records,
+                                        )
+                                    )
+                                else:
+                                    self._append_turn_record(
+                                        session_id=session.session_id,
+                                        pending_records=pending_records,
+                                        record=tool_record,
+                                    )
+                                    ephemeral_image_records.extend(attachment_records)
                                 _update_pending_detached_job_ids(
                                     current_pending_detached_job_ids,
                                     tool_result,
@@ -1372,11 +1524,24 @@ class AgentLoop:
                             break
 
                     pending_records.extend(ephemeral_image_records)
+                    deferred_tool_successes = tuple(staged_image_tool_successes)
                     pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
                     pending_subagent_ids = frozenset(current_pending_subagent_ids)
                     if approval_rejected:
+                        if deferred_tool_successes:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
                         break
                     if self._stop_requested(turn_id):
+                        if deferred_tool_successes:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
                         interrupted = self._interrupt_turn(
                             session_id=session.session_id,
                             turn_id=turn_id,
@@ -1392,23 +1557,22 @@ class AgentLoop:
                             interrupted=True,
                         )
                         return
-                    if pending_detached_job_ids or pending_subagent_ids:
-                        request, final_estimated_input_tokens = (
-                            self._build_orchestrator_monitored_waiting_request(
-                                session_id=session.session_id,
-                                base_records=base_records,
-                                pending_records=pending_records,
-                                pending_detached_job_ids=pending_detached_job_ids,
-                                pending_subagent_ids=pending_subagent_ids,
-                                turn_id=turn_id,
-                            )
-                        )
-                    else:
-                        request, final_estimated_input_tokens = self._build_followup_request(
-                            base_records=base_records,
-                            pending_records=pending_records,
-                        )
+                    request, final_estimated_input_tokens = self._build_followup_attempt_request(
+                        session_id=session.session_id,
+                        base_records=base_records,
+                        pending_records=pending_records,
+                        pending_detached_job_ids=pending_detached_job_ids,
+                        pending_subagent_ids=pending_subagent_ids,
+                        turn_id=turn_id,
+                        extra_records=self._deferred_tool_success_records(deferred_tool_successes),
+                    )
                 except ContextBudgetError:
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
                     (
                         session,
                         base_records,
@@ -1430,8 +1594,17 @@ class AgentLoop:
                     noticed_followup_tool_call_ids: set[str] = set()
                     emitted_any = False
                     streamed_followup_text = ""
+                    deferred_committed = False
                     try:
                         async for event in self._llm_service.stream_generate(request):
+                            if deferred_tool_successes and not deferred_committed:
+                                self._commit_deferred_tool_successes(
+                                    session_id=session.session_id,
+                                    pending_records=pending_records,
+                                    deferred_tool_successes=deferred_tool_successes,
+                                )
+                                deferred_tool_successes = ()
+                                deferred_committed = True
                             if event.type == "text_delta":
                                 emitted_any = True
                                 if event.delta:
@@ -1480,13 +1653,72 @@ class AgentLoop:
                                     return
                             elif event.type == "done":
                                 streamed_response = event.response
+                        if deferred_tool_successes and not deferred_committed:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
+                            deferred_tool_successes = ()
                         break
+                    except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
+                        if (
+                            not deferred_tool_successes
+                            or not _is_image_attachment_request_error(exc)
+                        ):
+                            raise
+                        self._persist_failed_deferred_tool_successes(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                            error_message=str(exc),
+                            turn_id=turn_id,
+                        )
+                        deferred_tool_successes = ()
+                        request, final_estimated_input_tokens = self._build_followup_attempt_request(
+                            session_id=session.session_id,
+                            base_records=base_records,
+                            pending_records=pending_records,
+                            pending_detached_job_ids=pending_detached_job_ids,
+                            pending_subagent_ids=pending_subagent_ids,
+                            turn_id=turn_id,
+                        )
+                        continue
                     except ProviderBadRequestError as exc:
+                        if (
+                            deferred_tool_successes
+                            and not emitted_any
+                            and _is_image_attachment_request_error(exc)
+                        ):
+                            self._persist_failed_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                                error_message=str(exc),
+                                turn_id=turn_id,
+                            )
+                            deferred_tool_successes = ()
+                            request, final_estimated_input_tokens = self._build_followup_attempt_request(
+                                session_id=session.session_id,
+                                base_records=base_records,
+                                pending_records=pending_records,
+                                pending_detached_job_ids=pending_detached_job_ids,
+                                pending_subagent_ids=pending_subagent_ids,
+                                turn_id=turn_id,
+                            )
+                            continue
                         if (
                             not _is_context_overflow_error(exc)
                             or emitted_any
                         ):
                             raise
+                        if deferred_tool_successes:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
+                            deferred_tool_successes = ()
                         if followup_compaction_attempted:
                             raise ContextBudgetError(
                                 _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
@@ -1886,7 +2118,14 @@ class AgentLoop:
                 )
                 pending_detached_job_ids = tool_execution_outcome.pending_detached_job_ids
                 pending_subagent_ids = tool_execution_outcome.pending_subagent_ids
+                deferred_tool_successes = tool_execution_outcome.deferred_tool_successes
                 if tool_execution_outcome.interrupted:
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
                     return (
                         current_session,
                         current_response,
@@ -1897,6 +2136,12 @@ class AgentLoop:
                         (),
                     )
                 if tool_execution_outcome.approval_rejected:
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
                     approval_rejected = True
                     current_response = replace(
                         current_response,
@@ -1917,6 +2162,12 @@ class AgentLoop:
                     )
                     break
                 if self._stop_requested(turn_id):
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
                     return (
                         current_session,
                         current_response,
@@ -1926,23 +2177,22 @@ class AgentLoop:
                         approval_rejected,
                         (),
                     )
-                if pending_detached_job_ids or pending_subagent_ids:
-                    request, current_estimated_input_tokens = (
-                        self._build_orchestrator_monitored_waiting_request(
-                            session_id=current_session.session_id,
-                            base_records=current_base_records,
-                            pending_records=pending_records,
-                            pending_detached_job_ids=pending_detached_job_ids,
-                            pending_subagent_ids=pending_subagent_ids,
-                            turn_id=turn_id,
-                        )
-                    )
-                else:
-                    request, current_estimated_input_tokens = self._build_followup_request(
-                        base_records=current_base_records,
-                        pending_records=pending_records,
-                    )
+                request, current_estimated_input_tokens = self._build_followup_attempt_request(
+                    session_id=current_session.session_id,
+                    base_records=current_base_records,
+                    pending_records=pending_records,
+                    pending_detached_job_ids=pending_detached_job_ids,
+                    pending_subagent_ids=pending_subagent_ids,
+                    turn_id=turn_id,
+                    extra_records=self._deferred_tool_success_records(deferred_tool_successes),
+                )
             except ContextBudgetError:
+                if deferred_tool_successes:
+                    self._commit_deferred_tool_successes(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        deferred_tool_successes=deferred_tool_successes,
+                    )
                 (
                     current_session,
                     current_base_records,
@@ -1962,10 +2212,67 @@ class AgentLoop:
             while True:
                 try:
                     current_response = await self._llm_service.generate(request)
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
                     break
+                except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
+                    if (
+                        not deferred_tool_successes
+                        or not _is_image_attachment_request_error(exc)
+                    ):
+                        raise
+                    self._persist_failed_deferred_tool_successes(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        deferred_tool_successes=deferred_tool_successes,
+                        error_message=str(exc),
+                        turn_id=turn_id,
+                    )
+                    deferred_tool_successes = ()
+                    request, current_estimated_input_tokens = self._build_followup_attempt_request(
+                        session_id=current_session.session_id,
+                        base_records=current_base_records,
+                        pending_records=pending_records,
+                        pending_detached_job_ids=pending_detached_job_ids,
+                        pending_subagent_ids=pending_subagent_ids,
+                        turn_id=turn_id,
+                    )
+                    continue
                 except ProviderBadRequestError as exc:
+                    if (
+                        deferred_tool_successes
+                        and _is_image_attachment_request_error(exc)
+                    ):
+                        self._persist_failed_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                            error_message=str(exc),
+                            turn_id=turn_id,
+                        )
+                        deferred_tool_successes = ()
+                        request, current_estimated_input_tokens = self._build_followup_attempt_request(
+                            session_id=current_session.session_id,
+                            base_records=current_base_records,
+                            pending_records=pending_records,
+                            pending_detached_job_ids=pending_detached_job_ids,
+                            pending_subagent_ids=pending_subagent_ids,
+                            turn_id=turn_id,
+                        )
+                        continue
                     if not _is_context_overflow_error(exc):
                         raise
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
+                        deferred_tool_successes = ()
                     if followup_compaction_attempted:
                         raise ContextBudgetError(
                             _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
@@ -3008,6 +3315,22 @@ def _update_pending_subagent_ids(
 def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:
     message = str(exc).lower()
     return any(hint in message for hint in _OVERFLOW_ERROR_HINTS)
+
+
+def _is_image_attachment_request_error(exc: Exception) -> bool:
+    if isinstance(exc, ProviderBadRequestError) and _is_context_overflow_error(exc):
+        return False
+    if not isinstance(
+        exc,
+        (
+            LLMConfigurationError,
+            ProviderBadRequestError,
+            UnsupportedCapabilityError,
+        ),
+    ):
+        return False
+    message = str(exc).lower()
+    return any(hint in message for hint in _IMAGE_ATTACHMENT_ERROR_HINTS)
 
 
 def _records_to_llm_messages(

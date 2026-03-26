@@ -23,6 +23,7 @@ from core import (
 from llm import (
     DoneEvent,
     ImagePart,
+    LLMConfigurationError,
     LLMRequest,
     LLMResponse,
     ToolDefinition,
@@ -436,6 +437,179 @@ class _FakeViewImageLLMService:
 
     async def stream_generate(self, request: LLMRequest):
         raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeViewImageFailureLLMService:
+    def __init__(self, expected_image_bytes: bytes) -> None:
+        self._expected_image_bytes = expected_image_bytes
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="view_image_1",
+                        name="view_image",
+                        arguments={"path": "temp/sample.png", "detail": "high"},
+                        raw_arguments='{"path":"temp/sample.png","detail":"high"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if self.generate_calls == 2:
+            assistant_message = request.messages[-3]
+            tool_message = request.messages[-2]
+            if assistant_message.role != "assistant":
+                raise AssertionError("Expected assistant tool-call message before tool result.")
+            if tool_message.role != "tool":
+                raise AssertionError("Expected tool result message before follow-up model call.")
+            tool_result_parts = [
+                part for part in tool_message.parts if isinstance(part, ToolResultPart)
+            ]
+            if len(tool_result_parts) != 1:
+                raise AssertionError("Expected one tool result part before follow-up model call.")
+            attachment_message = request.messages[-1]
+            if attachment_message.role != "user":
+                raise AssertionError("Expected transient user attachment message before follow-up.")
+            if "Image attachment prepared" not in tool_result_parts[0].content:
+                raise AssertionError("Expected optimistic view_image success before provider rejection.")
+            image_parts = [
+                part for part in attachment_message.parts if isinstance(part, ImagePart)
+            ]
+            if len(image_parts) != 1:
+                raise AssertionError("Expected one image attachment part in follow-up history.")
+            payload = image_parts[0].data_url_payload()
+            if payload is None:
+                raise AssertionError("Expected attachment image to be encoded as a data URL.")
+            _media_type, data_base64 = payload
+            if b64decode(data_base64) != self._expected_image_bytes:
+                raise AssertionError("Attachment bytes did not match the workspace file.")
+            raise LLMConfigurationError("Current model does not support image inputs.")
+
+        if len(request.messages) < 2:
+            raise AssertionError("Expected the recovered follow-up to end with a tool error.")
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before recovered tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected the recovered follow-up to end with a tool error.")
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one recovered tool result part before follow-up model call.")
+        if tool_result_parts[0].is_error is not True:
+            raise AssertionError("Expected recovered view_image tool result to be marked as an error.")
+        if "Current model does not support image inputs." not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to include the provider error.")
+        if any(
+            isinstance(part, ImagePart)
+            for message in request.messages
+            for part in message.parts
+        ):
+            raise AssertionError("Recovered follow-up request should not retain the image attachment.")
+        return _build_response("Image unavailable.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeStreamingViewImageFailureLLMService:
+    def __init__(self, expected_image_bytes: bytes) -> None:
+        self._expected_image_bytes = expected_image_bytes
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generation is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.stream_calls == 1:
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="view_image_1",
+                            name="view_image",
+                            arguments={"path": "temp/sample.png", "detail": "high"},
+                            raw_arguments='{"path":"temp/sample.png","detail":"high"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        if self.stream_calls == 2:
+            assistant_message = request.messages[-3]
+            tool_message = request.messages[-2]
+            if assistant_message.role != "assistant":
+                raise AssertionError("Expected assistant tool-call message before tool result.")
+            if tool_message.role != "tool":
+                raise AssertionError("Expected tool result message before follow-up model call.")
+            tool_result_parts = [
+                part for part in tool_message.parts if isinstance(part, ToolResultPart)
+            ]
+            if len(tool_result_parts) != 1:
+                raise AssertionError("Expected one tool result part before follow-up model call.")
+            attachment_message = request.messages[-1]
+            if attachment_message.role != "user":
+                raise AssertionError("Expected transient user attachment message before follow-up.")
+            if "Image attachment prepared" not in tool_result_parts[0].content:
+                raise AssertionError("Expected optimistic view_image success before provider rejection.")
+            image_parts = [
+                part for part in attachment_message.parts if isinstance(part, ImagePart)
+            ]
+            if len(image_parts) != 1:
+                raise AssertionError("Expected one image attachment part in follow-up history.")
+            payload = image_parts[0].data_url_payload()
+            if payload is None:
+                raise AssertionError("Expected attachment image to be encoded as a data URL.")
+            _media_type, data_base64 = payload
+            if b64decode(data_base64) != self._expected_image_bytes:
+                raise AssertionError("Attachment bytes did not match the workspace file.")
+            raise LLMConfigurationError("Current model does not support image inputs.")
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before recovered tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected recovered tool result message before follow-up model call.")
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one recovered tool result part before follow-up model call.")
+        if tool_result_parts[0].is_error is not True:
+            raise AssertionError("Expected recovered view_image tool result to be marked as an error.")
+        if "Current model does not support image inputs." not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to include the provider error.")
+        if any(
+            isinstance(part, ImagePart)
+            for message in request.messages
+            for part in message.parts
+        ):
+            raise AssertionError("Recovered follow-up request should not retain the image attachment.")
+        yield DoneEvent(response=_build_response("Image unavailable."))
 
 
 class _FakeFilePatchLLMService:
@@ -2176,6 +2350,72 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "view_image")
             self.assertIn("Image attachment prepared", message_records[-2].content)
             self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
+
+    async def test_handle_user_input_converts_view_image_provider_rejection_into_tool_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            image_path = settings.workspace_dir / "temp" / "sample.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_bytes = b"\x89PNG\r\n\x1a\nfake_png_payload"
+            image_path.write_bytes(image_bytes)
+
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeViewImageFailureLLMService(image_bytes),
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input(
+                "Inspect the image at local_path: temp/sample.png."
+            )
+
+            self.assertEqual(result.response_text, "Image unavailable.")
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "view_image")
+            self.assertNotIn("Image attachment prepared", message_records[-2].content)
+            self.assertIn("View image failed", message_records[-2].content)
+            self.assertIn("Current model does not support image inputs.", message_records[-2].content)
+            self.assertFalse(message_records[-2].metadata["ok"])
+
+    async def test_stream_user_input_converts_view_image_provider_rejection_into_tool_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            image_path = settings.workspace_dir / "temp" / "sample.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_bytes = b"\x89PNG\r\n\x1a\nfake_png_payload"
+            image_path.write_bytes(image_bytes)
+
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeStreamingViewImageFailureLLMService(image_bytes),
+                settings=settings,
+                storage=storage,
+            )
+
+            events = [event async for event in loop.stream_user_input(
+                "Inspect the image at local_path: temp/sample.png."
+            )]
+
+            done_events = [event for event in events if isinstance(event, AgentTurnDoneEvent)]
+            self.assertEqual(len(done_events), 1)
+            self.assertEqual(done_events[0].response_text, "Image unavailable.")
+
+            records = storage.load_records(done_events[0].session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "user")
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-2].role, "tool")
+            self.assertEqual(message_records[-1].role, "assistant")
+            self.assertIn("View image failed", message_records[-2].content)
+            self.assertIn("Current model does not support image inputs.", message_records[-2].content)
+            self.assertFalse(message_records[-2].metadata["ok"])
 
     async def test_handle_user_input_executes_file_patch_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
