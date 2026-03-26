@@ -114,7 +114,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
             self.assertEqual(done.command, "/new")
 
-    async def test_handle_user_input_injects_transient_turn_datetime_context(self) -> None:
+    async def test_handle_user_input_persists_turn_datetime_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -155,12 +155,15 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertLess(context_index, user_index)
 
-            persisted_records = storage.load_records(result.session_id)
-            self.assertFalse(
-                any(
-                    "System context auto-appended for this turn only." in record.content
-                    for record in persisted_records
-                )
+            persisted_records = [
+                record
+                for record in storage.load_records(result.session_id)
+                if record.metadata.get("turn_context") == "datetime"
+            ]
+            self.assertEqual(len(persisted_records), 1)
+            self.assertIn(
+                "System context auto-appended for this turn only.",
+                persisted_records[0].content,
             )
 
     async def test_handle_user_input_logs_basic_tool_bootstrap_into_transcript_only(self) -> None:

@@ -47,13 +47,15 @@ _OVERFLOW_ERROR_HINTS = (
     "context_length_exceeded",
     "exceeds the model",
 )
-_TRANSIENT_RECORD_METADATA_KEY = "transient"
 _TRANSCRIPT_ONLY_RECORD_METADATA_KEY = "transcript_only"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
+_EPHEMERAL_IMAGE_INPUT_METADATA_KEY = "ephemeral_image_input"
 _TURN_CONTEXT_METADATA_KEY = "turn_context"
 _TURN_ID_METADATA_KEY = "turn_id"
 _INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
 _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
+_UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY = "unexecuted_tool_call_notice"
+_ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
@@ -71,6 +73,10 @@ _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
 _APPROVAL_REJECTED_TEXT = "Approval request was rejected. I did not execute the action."
 _PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
 _TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
+_TURN_ORPHANED_RECOVERY_RECORD_TEXT = (
+    "This turn ended unexpectedly before it completed. Treat any partial assistant output "
+    "above as incomplete."
+)
 _ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT = (
     "Background work is being monitored by the orchestrator, not by proactive model polling. "
     "Do not call more tools in this response. Do not claim the task is finished while any listed "
@@ -92,7 +98,6 @@ class BootstrapMessageLoader(Protocol):
 class AgentRuntimeMessage:
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str
-    transient: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -387,6 +392,7 @@ class AgentLoop:
             return False
         if self._storage.get_session(target_session_id) is None:
             return False
+        self._reconcile_orphaned_turns(target_session_id)
 
         self._append_message(
             session_id=target_session_id,
@@ -400,6 +406,7 @@ class AgentLoop:
         await self._ensure_memory_runtime_ready()
         active = self._storage.get_active_session()
         if active is not None:
+            self._reconcile_orphaned_turns(active.session_id)
             return active.session_id
         session = await self._start_session(start_reason=start_reason)
         return session.session_id
@@ -529,8 +536,13 @@ class AgentLoop:
             turn_context_text=turn_context_text,
             interruption_notice_text=interruption_notice_text,
             runtime_messages=turn_runtime_messages,
+            turn_id=turn_id,
         )
         self._begin_turn(session_id=session.session_id, turn_id=turn_id)
+        self._persist_records(
+            session_id=session.session_id,
+            records=pending_records,
+        )
         if user_text is not None:
             user_record = self._build_message_record(
                 session_id=session.session_id,
@@ -581,6 +593,7 @@ class AgentLoop:
                     command=command_override,
                     compaction_performed=did_compaction,
                     response_text=response.text,
+                    unexecuted_tool_names=tuple(call.name for call in response.tool_calls),
                 )
 
             base_records = self._storage.load_records(session.session_id)
@@ -591,6 +604,7 @@ class AgentLoop:
                 followup_compacted,
                 interrupted,
                 approval_rejected,
+                interrupted_unexecuted_tool_names,
             ) = await self._execute_followup_tool_rounds(
                 session=session,
                 base_records=base_records,
@@ -610,6 +624,7 @@ class AgentLoop:
                     command=command_override,
                     compaction_performed=did_compaction,
                     response_text=final_response.text,
+                    unexecuted_tool_names=interrupted_unexecuted_tool_names,
                 )
 
             self._persist_successful_turn(
@@ -658,7 +673,7 @@ class AgentLoop:
         pending_detached_job_ids: frozenset[str] = frozenset(),
         pending_subagent_ids: frozenset[str] = frozenset(),
     ) -> _ToolExecutionOutcome:
-        transient_records: list[ConversationRecord] = []
+        ephemeral_image_records: list[ConversationRecord] = []
         current_pending_detached_job_ids = set(pending_detached_job_ids)
         current_pending_subagent_ids = set(pending_subagent_ids)
         for tool_call in current_response.tool_calls:
@@ -683,10 +698,11 @@ class AgentLoop:
                             turn_id=turn_id,
                         ),
                     )
-                    transient_records.extend(
-                        self._build_transient_records_from_tool_result(
+                    ephemeral_image_records.extend(
+                        self._build_ephemeral_image_records_from_tool_result(
                             session_id,
                             tool_result,
+                            turn_id=turn_id,
                         )
                     )
                     _update_pending_detached_job_ids(
@@ -741,7 +757,7 @@ class AgentLoop:
                     )
                 tool_context = replace(tool_context, approved_action=pending_approval)
 
-        pending_records.extend(transient_records)
+        pending_records.extend(ephemeral_image_records)
         return _ToolExecutionOutcome(
             pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
             pending_subagent_ids=frozenset(current_pending_subagent_ids),
@@ -779,9 +795,10 @@ class AgentLoop:
         *,
         session_id: str,
         base_records: Sequence[ConversationRecord],
-        pending_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
         pending_detached_job_ids: Sequence[str],
         pending_subagent_ids: Sequence[str],
+        turn_id: str,
     ) -> tuple[LLMRequest, int]:
         metadata: dict[str, Any] = {}
         if pending_detached_job_ids:
@@ -790,22 +807,27 @@ class AgentLoop:
         if pending_subagent_ids:
             metadata["subagents_pending"] = True
             metadata["pending_subagent_ids"] = list(pending_subagent_ids)
-        extra_records = (
-            self._build_runtime_message_record(
+        if not any(record.metadata.get("orchestrator_monitored_waiting") for record in pending_records):
+            self._append_turn_record(
                 session_id=session_id,
-                message=AgentRuntimeMessage(
-                    role="developer",
-                    transient=True,
-                    metadata=metadata,
-                    content=_ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT,
+                pending_records=pending_records,
+                record=self._build_runtime_message_record(
+                    session_id=session_id,
+                    message=AgentRuntimeMessage(
+                        role="developer",
+                        metadata={
+                            "orchestrator_monitored_waiting": True,
+                            **metadata,
+                        },
+                        content=_ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT,
+                    ),
+                    turn_id=turn_id,
                 ),
-            ),
-        )
+            )
         return self._build_followup_request(
             base_records=base_records,
             pending_records=pending_records,
             allow_tools=False,
-            extra_records=extra_records,
         )
 
     def _build_tool_round_limit_record(
@@ -813,6 +835,7 @@ class AgentLoop:
         *,
         session_id: str,
         attempted_round: int,
+        turn_id: str,
     ) -> ConversationRecord:
         max_rounds = self._tool_settings.max_tool_rounds_per_turn
         return self._build_message_record(
@@ -825,11 +848,11 @@ class AgentLoop:
                 "state what remains, and ask the user to continue if more tool work is needed."
             ),
             metadata={
-                _TRANSIENT_RECORD_METADATA_KEY: True,
                 _TOOL_ROUND_LIMIT_METADATA_KEY: True,
                 "attempted_round": attempted_round,
                 "max_rounds": max_rounds,
             },
+            turn_id=turn_id,
         )
 
     def _build_request(
@@ -857,12 +880,27 @@ class AgentLoop:
         base_records: Sequence[ConversationRecord],
         pending_records: list[ConversationRecord],
         attempted_round: int,
+        unexecuted_tool_names: Sequence[str],
+        turn_id: str,
     ) -> tuple[LLMRequest, int]:
-        pending_records.append(
-            self._build_tool_round_limit_record(
+        if unexecuted_tool_names:
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=self._build_unexecuted_tool_call_note_record(
+                    session_id=session_id,
+                    tool_names=unexecuted_tool_names,
+                    turn_id=turn_id,
+                ),
+            )
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=self._build_tool_round_limit_record(
                 session_id=session_id,
                 attempted_round=attempted_round,
-            )
+                turn_id=turn_id,
+            ),
         )
         request = self._build_request(
             list(base_records) + pending_records,
@@ -897,6 +935,7 @@ class AgentLoop:
         base_records: Sequence[ConversationRecord],
         pending_records: list[ConversationRecord],
         attempted_round: int,
+        unexecuted_tool_names: Sequence[str],
         turn_id: str,
     ) -> tuple[LLMResponse, int]:
         request, estimated_input_tokens = self._build_tool_round_limit_recovery_request(
@@ -904,6 +943,8 @@ class AgentLoop:
             base_records=base_records,
             pending_records=pending_records,
             attempted_round=attempted_round,
+            unexecuted_tool_names=unexecuted_tool_names,
+            turn_id=turn_id,
         )
         response = await self._llm_service.generate(request)
         normalized = self._normalize_tool_round_limit_recovery_response(response)
@@ -925,6 +966,7 @@ class AgentLoop:
         base_records: Sequence[ConversationRecord],
         pending_records: list[ConversationRecord],
         attempted_round: int,
+        unexecuted_tool_names: Sequence[str],
         turn_id: str,
     ) -> tuple[list[AgentTurnStreamEvent], LLMResponse, int]:
         request, estimated_input_tokens = self._build_tool_round_limit_recovery_request(
@@ -932,6 +974,8 @@ class AgentLoop:
             base_records=base_records,
             pending_records=pending_records,
             attempted_round=attempted_round,
+            unexecuted_tool_names=unexecuted_tool_names,
+            turn_id=turn_id,
         )
         streamed_response: LLMResponse | None = None
         recovery_events: list[AgentTurnStreamEvent] = []
@@ -999,8 +1043,13 @@ class AgentLoop:
             turn_context_text=turn_context_text,
             interruption_notice_text=interruption_notice_text,
             runtime_messages=turn_runtime_messages,
+            turn_id=turn_id,
         )
         self._begin_turn(session_id=session.session_id, turn_id=turn_id)
+        self._persist_records(
+            session_id=session.session_id,
+            records=pending_records,
+        )
         if user_text is not None:
             user_record = self._build_message_record(
                 session_id=session.session_id,
@@ -1021,14 +1070,12 @@ class AgentLoop:
             final_estimated_input_tokens = estimated_input_tokens
             noticed_initial_tool_call_ids: set[str] = set()
             streamed_initial_text = ""
-            persisted_initial_text_prefix: str | None = None
 
             while True:
                 streamed_response: LLMResponse | None = None
                 emitted_any = False
                 noticed_initial_tool_call_ids = set()
                 streamed_initial_text = ""
-                persisted_initial_text_prefix = None
                 try:
                     async for event in self._llm_service.stream_generate(request):
                         if event.type == "text_delta":
@@ -1041,7 +1088,15 @@ class AgentLoop:
                                 )
                         elif event.type == "tool_call_delta":
                             emitted_any = True
-                            if persisted_initial_text_prefix is None and streamed_initial_text:
+                            tool_name = str(event.tool_name or "").strip()
+                            call_id = event.call_id.strip()
+                            if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
+                                noticed_initial_tool_call_ids.add(call_id)
+                                yield AgentToolCallEvent(
+                                    session_id=session.session_id,
+                                    tool_names=(tool_name,),
+                                )
+                            if self._stop_requested(turn_id) and tool_name and call_id:
                                 partial_record = self._build_streamed_assistant_text_record(
                                     session_id=session.session_id,
                                     text=streamed_initial_text,
@@ -1053,27 +1108,13 @@ class AgentLoop:
                                         pending_records=pending_records,
                                         record=partial_record,
                                     )
-                                    persisted_initial_text_prefix = streamed_initial_text
-                            tool_name = str(event.tool_name or "").strip()
-                            call_id = event.call_id.strip()
-                            if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
-                                noticed_initial_tool_call_ids.add(call_id)
-                                yield AgentToolCallEvent(
-                                    session_id=session.session_id,
-                                    tool_names=(tool_name,),
-                                )
-                            if (
-                                self._stop_requested(turn_id)
-                                and persisted_initial_text_prefix is not None
-                                and tool_name
-                                and call_id
-                            ):
                                 interrupted = self._interrupt_turn(
                                     session_id=session.session_id,
                                     turn_id=turn_id,
                                     command=command_override,
                                     compaction_performed=did_compaction,
                                     response_text=streamed_initial_text,
+                                    unexecuted_tool_names=(tool_name,),
                                 )
                                 yield AgentTurnDoneEvent(
                                     session_id=interrupted.session_id,
@@ -1122,7 +1163,6 @@ class AgentLoop:
                 session_id=session.session_id,
                 response=initial_response,
                 turn_id=turn_id,
-                persisted_text_prefix=persisted_initial_text_prefix,
             )
             if final_initial_record is not None:
                 self._append_turn_record(
@@ -1152,6 +1192,7 @@ class AgentLoop:
                     command=command_override,
                     compaction_performed=did_compaction,
                     response_text=initial_response.text,
+                    unexecuted_tool_names=tuple(call.name for call in initial_response.tool_calls),
                 )
                 yield AgentTurnDoneEvent(
                     session_id=interrupted.session_id,
@@ -1176,6 +1217,7 @@ class AgentLoop:
                         command=command_override,
                         compaction_performed=did_compaction,
                         response_text=current_response.text,
+                        unexecuted_tool_names=tuple(call.name for call in current_response.tool_calls),
                     )
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
@@ -1197,6 +1239,9 @@ class AgentLoop:
                         base_records=base_records,
                         pending_records=pending_records,
                         attempted_round=tool_rounds,
+                        unexecuted_tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
                         turn_id=turn_id,
                     )
                     for recovery_event in recovery_events:
@@ -1206,7 +1251,7 @@ class AgentLoop:
 
                 followup_compaction_attempted = False
                 try:
-                    transient_records: list[ConversationRecord] = []
+                    ephemeral_image_records: list[ConversationRecord] = []
                     approval_rejected = False
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
                     current_pending_subagent_ids = set(pending_subagent_ids)
@@ -1232,10 +1277,11 @@ class AgentLoop:
                                         turn_id=turn_id,
                                     ),
                                 )
-                                transient_records.extend(
-                                    self._build_transient_records_from_tool_result(
+                                ephemeral_image_records.extend(
+                                    self._build_ephemeral_image_records_from_tool_result(
                                         session.session_id,
                                         tool_result,
+                                        turn_id=turn_id,
                                     )
                                 )
                                 _update_pending_detached_job_ids(
@@ -1325,7 +1371,7 @@ class AgentLoop:
                         if approval_rejected:
                             break
 
-                    pending_records.extend(transient_records)
+                    pending_records.extend(ephemeral_image_records)
                     pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
                     pending_subagent_ids = frozenset(current_pending_subagent_ids)
                     if approval_rejected:
@@ -1354,6 +1400,7 @@ class AgentLoop:
                                 pending_records=pending_records,
                                 pending_detached_job_ids=pending_detached_job_ids,
                                 pending_subagent_ids=pending_subagent_ids,
+                                turn_id=turn_id,
                             )
                         )
                     else:
@@ -1383,7 +1430,6 @@ class AgentLoop:
                     noticed_followup_tool_call_ids: set[str] = set()
                     emitted_any = False
                     streamed_followup_text = ""
-                    persisted_followup_text_prefix: str | None = None
                     try:
                         async for event in self._llm_service.stream_generate(request):
                             if event.type == "text_delta":
@@ -1396,7 +1442,15 @@ class AgentLoop:
                                     )
                             elif event.type == "tool_call_delta":
                                 emitted_any = True
-                                if persisted_followup_text_prefix is None and streamed_followup_text:
+                                tool_name = str(event.tool_name or "").strip()
+                                call_id = event.call_id.strip()
+                                if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
+                                    noticed_followup_tool_call_ids.add(call_id)
+                                    yield AgentToolCallEvent(
+                                        session_id=session.session_id,
+                                        tool_names=(tool_name,),
+                                    )
+                                if self._stop_requested(turn_id) and tool_name and call_id:
                                     partial_record = self._build_streamed_assistant_text_record(
                                         session_id=session.session_id,
                                         text=streamed_followup_text,
@@ -1408,27 +1462,13 @@ class AgentLoop:
                                             pending_records=pending_records,
                                             record=partial_record,
                                         )
-                                        persisted_followup_text_prefix = streamed_followup_text
-                                tool_name = str(event.tool_name or "").strip()
-                                call_id = event.call_id.strip()
-                                if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
-                                    noticed_followup_tool_call_ids.add(call_id)
-                                    yield AgentToolCallEvent(
-                                        session_id=session.session_id,
-                                        tool_names=(tool_name,),
-                                    )
-                                if (
-                                    self._stop_requested(turn_id)
-                                    and persisted_followup_text_prefix is not None
-                                    and tool_name
-                                    and call_id
-                                ):
                                     interrupted = self._interrupt_turn(
                                         session_id=session.session_id,
                                         turn_id=turn_id,
                                         command=command_override,
                                         compaction_performed=did_compaction,
                                         response_text=streamed_followup_text,
+                                        unexecuted_tool_names=(tool_name,),
                                     )
                                     yield AgentTurnDoneEvent(
                                         session_id=interrupted.session_id,
@@ -1478,7 +1518,6 @@ class AgentLoop:
                     session_id=session.session_id,
                     response=current_response,
                     turn_id=turn_id,
-                    persisted_text_prefix=persisted_followup_text_prefix,
                 )
                 if final_followup_record is not None:
                     self._append_turn_record(
@@ -1508,6 +1547,7 @@ class AgentLoop:
                         command=command_override,
                         compaction_performed=did_compaction,
                         response_text=current_response.text,
+                        unexecuted_tool_names=tuple(call.name for call in current_response.tool_calls),
                     )
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
@@ -1580,6 +1620,8 @@ class AgentLoop:
         session = self._storage.get_session(force_session_id) if force_session_id else None
         if session is None:
             session = await self._ensure_active_session()
+        self._reconcile_orphaned_turns(session.session_id)
+        session = self._storage.get_session(session.session_id) or session
 
         did_compaction = False
         if session.pending_reactive_compaction:
@@ -1760,11 +1802,13 @@ class AgentLoop:
         turn_context_text: str,
         interruption_notice_text: str | None,
         runtime_messages: Sequence[AgentRuntimeMessage],
+        turn_id: str | None = None,
     ) -> list[ConversationRecord]:
         pending_records = [
             self._build_turn_context_record(
                 session_id=session_id,
                 turn_context_text=turn_context_text,
+                turn_id=turn_id,
             )
         ]
         for message in runtime_messages:
@@ -1772,6 +1816,7 @@ class AgentLoop:
                 self._build_runtime_message_record(
                     session_id=session_id,
                     message=message,
+                    turn_id=turn_id,
                 )
             )
         if interruption_notice_text is not None:
@@ -1779,6 +1824,7 @@ class AgentLoop:
                 self._build_interruption_notice_record(
                     session_id=session_id,
                     text=interruption_notice_text,
+                    turn_id=turn_id,
                 )
             )
         return pending_records
@@ -1794,7 +1840,7 @@ class AgentLoop:
         turn_id: str,
         pending_detached_job_ids: frozenset[str] = frozenset(),
         pending_subagent_ids: frozenset[str] = frozenset(),
-    ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool]:
+    ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool, tuple[str, ...]]:
         tool_rounds = 0
         did_compaction = False
         approval_rejected = False
@@ -1810,6 +1856,7 @@ class AgentLoop:
                     did_compaction,
                     True,
                     approval_rejected,
+                    tuple(call.name for call in current_response.tool_calls),
                 )
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
@@ -1819,6 +1866,9 @@ class AgentLoop:
                         base_records=current_base_records,
                         pending_records=pending_records,
                         attempted_round=tool_rounds,
+                        unexecuted_tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
                         turn_id=turn_id,
                     )
                 )
@@ -1844,6 +1894,7 @@ class AgentLoop:
                         did_compaction,
                         True,
                         approval_rejected,
+                        (),
                     )
                 if tool_execution_outcome.approval_rejected:
                     approval_rejected = True
@@ -1873,6 +1924,7 @@ class AgentLoop:
                         did_compaction,
                         True,
                         approval_rejected,
+                        (),
                     )
                 if pending_detached_job_ids or pending_subagent_ids:
                     request, current_estimated_input_tokens = (
@@ -1882,6 +1934,7 @@ class AgentLoop:
                             pending_records=pending_records,
                             pending_detached_job_ids=pending_detached_job_ids,
                             pending_subagent_ids=pending_subagent_ids,
+                            turn_id=turn_id,
                         )
                     )
                 else:
@@ -1958,6 +2011,7 @@ class AgentLoop:
             did_compaction,
             False,
             approval_rejected,
+            (),
         )
 
     async def _compact_followup_and_rebuild_request(
@@ -2017,7 +2071,7 @@ class AgentLoop:
                 raise ContextBudgetError(_FOLLOWUP_RETRY_PREFLIGHT_FAILED_TEXT)
 
         for record in rebound_pending_records:
-            if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+            if _record_is_ephemeral_image_input(record):
                 continue
             self._storage.append_record(compacted.session_id, record)
         self._active_turn_id = turn_id
@@ -2297,7 +2351,7 @@ class AgentLoop:
             session_id=session_id,
             role="assistant",
             content=text,
-            metadata={"stream_checkpoint": "text_before_tool_call"},
+            metadata={"interrupted_stream_fragment": True},
             turn_id=turn_id,
         )
 
@@ -2307,24 +2361,12 @@ class AgentLoop:
         session_id: str,
         response: LLMResponse,
         turn_id: str,
-        persisted_text_prefix: str | None,
     ) -> ConversationRecord | None:
-        normalized = response
-        if persisted_text_prefix:
-            if response.text == persisted_text_prefix:
-                if not response.tool_calls:
-                    return None
-                normalized = replace(response, text="")
-            elif response.text.startswith(persisted_text_prefix):
-                normalized = replace(
-                    response,
-                    text=response.text[len(persisted_text_prefix):],
-                )
-        if not normalized.text and not normalized.tool_calls:
+        if not response.text and not response.tool_calls:
             return None
         return self._build_assistant_record(
             session_id,
-            normalized,
+            response,
             turn_id=turn_id,
         )
 
@@ -2359,15 +2401,16 @@ class AgentLoop:
         *,
         session_id: str,
         turn_context_text: str,
+        turn_id: str | None = None,
     ) -> ConversationRecord:
         return self._build_message_record(
             session_id=session_id,
             role="system",
             content=turn_context_text,
             metadata={
-                _TRANSIENT_RECORD_METADATA_KEY: True,
                 _TURN_CONTEXT_METADATA_KEY: "datetime",
             },
+            turn_id=turn_id,
         )
 
     def _build_interruption_notice_record(
@@ -2375,15 +2418,16 @@ class AgentLoop:
         *,
         session_id: str,
         text: str,
+        turn_id: str | None = None,
     ) -> ConversationRecord:
         return self._build_message_record(
             session_id=session_id,
             role="system",
             content=text,
             metadata={
-                _TRANSIENT_RECORD_METADATA_KEY: True,
                 _INTERRUPTION_NOTICE_METADATA_KEY: True,
             },
+            turn_id=turn_id,
         )
 
     def _build_runtime_message_record(
@@ -2391,15 +2435,14 @@ class AgentLoop:
         *,
         session_id: str,
         message: AgentRuntimeMessage,
+        turn_id: str | None = None,
     ) -> ConversationRecord:
-        metadata = dict(message.metadata)
-        if message.transient:
-            metadata[_TRANSIENT_RECORD_METADATA_KEY] = True
         return self._build_message_record(
             session_id=session_id,
             role=message.role,
             content=message.content,
-            metadata=metadata,
+            metadata=dict(message.metadata),
+            turn_id=turn_id,
         )
 
     def _serialize_basic_tool_bootstrap(self) -> list[dict[str, Any]] | None:
@@ -2441,10 +2484,12 @@ class AgentLoop:
             context=context,
         )
 
-    def _build_transient_records_from_tool_result(
+    def _build_ephemeral_image_records_from_tool_result(
         self,
         session_id: str,
         result: ToolExecutionResult,
+        *,
+        turn_id: str,
     ) -> list[ConversationRecord]:
         records: list[ConversationRecord] = []
         attachment = result.metadata.get("image_attachment")
@@ -2464,7 +2509,7 @@ class AgentLoop:
                         role="user",
                         content=content,
                         metadata={
-                            _TRANSIENT_RECORD_METADATA_KEY: True,
+                            _EPHEMERAL_IMAGE_INPUT_METADATA_KEY: True,
                             _IMAGE_INPUT_METADATA_KEY: {
                                 "path": path,
                                 "media_type": media_type,
@@ -2472,10 +2517,57 @@ class AgentLoop:
                             },
                             "source_tool": result.name,
                         },
+                        turn_id=turn_id,
                     )
                 )
 
         return records
+
+    def _build_unexecuted_tool_call_note_record(
+        self,
+        *,
+        session_id: str,
+        tool_names: Sequence[str],
+        turn_id: str,
+    ) -> ConversationRecord:
+        ordered_tool_names = list(_ordered_unique_names(tool_names))
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=_unexecuted_tool_call_note_text(ordered_tool_names),
+            metadata={
+                _UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY: True,
+                "tool_names": ordered_tool_names,
+            },
+            turn_id=turn_id,
+        )
+
+    def _build_orphaned_turn_recovery_record(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> ConversationRecord:
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=_TURN_ORPHANED_RECOVERY_RECORD_TEXT,
+            metadata={
+                _ORPHANED_TURN_RECOVERY_METADATA_KEY: True,
+            },
+            turn_id=turn_id,
+        )
+
+    def _persist_records(
+        self,
+        *,
+        session_id: str,
+        records: Sequence[ConversationRecord],
+    ) -> None:
+        for record in records:
+            if _record_is_ephemeral_image_input(record):
+                continue
+            self._storage.append_record(session_id, record)
 
     def _append_message(
         self,
@@ -2492,6 +2584,63 @@ class AgentLoop:
             metadata=metadata,
         )
         self._storage.append_record(session_id, record)
+
+    def _reconcile_orphaned_turns(self, session_id: str) -> None:
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return
+
+        orphaned_turn_ids = [
+            turn_id
+            for turn_id, status in session.turn_states.items()
+            if status == "in_progress" and turn_id != self._active_turn_id
+        ]
+        for turn_id in orphaned_turn_ids:
+            self._reconcile_orphaned_turn(session_id=session_id, turn_id=turn_id)
+
+    def _reconcile_orphaned_turn(self, *, session_id: str, turn_id: str) -> None:
+        turn_records = [
+            record
+            for record in self._storage.load_records(session_id, include_all_turns=True)
+            if str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip() == turn_id
+        ]
+        if not turn_records:
+            self._storage.set_turn_status(
+                session_id,
+                turn_id=turn_id,
+                status="interrupted",
+            )
+            return
+
+        if not any(_record_is_unexecuted_tool_call_notice(record) for record in turn_records):
+            unresolved_tool_names = _collect_unexecuted_tool_call_names(turn_records)
+            if unresolved_tool_names:
+                self._storage.append_record(
+                    session_id,
+                    self._build_unexecuted_tool_call_note_record(
+                        session_id=session_id,
+                        tool_names=unresolved_tool_names,
+                        turn_id=turn_id,
+                    ),
+                )
+
+        if not any(
+            record.metadata.get(_ORPHANED_TURN_RECOVERY_METADATA_KEY, False)
+            for record in turn_records
+        ):
+            self._storage.append_record(
+                session_id,
+                self._build_orphaned_turn_recovery_record(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                ),
+            )
+
+        self._storage.set_turn_status(
+            session_id,
+            turn_id=turn_id,
+            status="interrupted",
+        )
 
     def _begin_turn(self, *, session_id: str, turn_id: str) -> None:
         self._storage.set_turn_status(
@@ -2651,7 +2800,7 @@ class AgentLoop:
         record: ConversationRecord,
     ) -> None:
         pending_records.append(record)
-        if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+        if _record_is_ephemeral_image_input(record):
             return
         self._storage.append_record(session_id, record)
 
@@ -2663,7 +2812,17 @@ class AgentLoop:
         command: str | None,
         compaction_performed: bool,
         response_text: str,
+        unexecuted_tool_names: Sequence[str] = (),
     ) -> AgentTurnResult:
+        if unexecuted_tool_names:
+            self._storage.append_record(
+                session_id,
+                self._build_unexecuted_tool_call_note_record(
+                    session_id=session_id,
+                    tool_names=unexecuted_tool_names,
+                    turn_id=turn_id,
+                ),
+            )
         interruption_record = self._build_message_record(
             session_id=session_id,
             role="system",
@@ -2732,7 +2891,7 @@ class AgentLoop:
         self,
         record: ConversationRecord,
     ) -> ConversationRecord:
-        if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+        if _record_is_ephemeral_image_input(record):
             return record
         if record.role not in {"user", "assistant", "tool"}:
             return record
@@ -2854,6 +3013,11 @@ def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:
 def _records_to_llm_messages(
     records: Sequence[ConversationRecord],
 ) -> tuple[LLMMessage, ...]:
+    # Replayable transcript records are the source of truth for rebuilding
+    # LLMRequest.messages. Non-image prompt-visible records must persist.
+    # Ephemeral image attachments are the only accepted non-persisted prompt
+    # input. transcript_only records are archived but intentionally excluded
+    # from replay.
     messages: list[LLMMessage] = []
     pending_assistant: ConversationRecord | None = None
     pending_tool_records: list[ConversationRecord] = []
@@ -2887,16 +3051,14 @@ def _records_to_llm_messages(
             _append_record(tool_record)
         _clear_pending()
 
-    def _flush_unresolved_pending() -> None:
+    def _raise_unresolved_pending() -> None:
         if pending_assistant is None:
             return
-        _append_record(pending_assistant, include_tool_calls=False)
-        messages.append(
-            _build_unexecuted_tool_call_note_message(
-                pending_tool_names,
-            )
+        unresolved_names = ", ".join(pending_tool_names) or "(unknown tools)"
+        raise RuntimeError(
+            "Encountered assistant tool calls without matching tool results or an explicit "
+            f"unexecuted-tool-call notice in transcript replay: {unresolved_names}."
         )
-        _clear_pending()
 
     for record in records:
         if record.kind != "message":
@@ -2914,6 +3076,12 @@ def _records_to_llm_messages(
             _append_record(record)
             continue
 
+        if _record_is_unexecuted_tool_call_notice(record):
+            _append_record(pending_assistant, include_tool_calls=False)
+            _append_record(record)
+            _clear_pending()
+            continue
+
         if record.role == "tool":
             call_id = str(record.metadata.get("call_id", "")).strip()
             if call_id and call_id in pending_call_ids:
@@ -2923,7 +3091,7 @@ def _records_to_llm_messages(
                     _flush_resolved_pending()
                 continue
 
-        _flush_unresolved_pending()
+        _raise_unresolved_pending()
         if call_specs:
             pending_assistant = record
             pending_tool_records = []
@@ -2933,7 +3101,7 @@ def _records_to_llm_messages(
         _append_record(record)
 
     if pending_assistant is not None:
-        _flush_unresolved_pending()
+        _raise_unresolved_pending()
 
     return tuple(messages)
 
@@ -3039,26 +3207,6 @@ def _ordered_unique_names(names: Sequence[str] | list[str] | tuple[str, ...] | A
     return tuple(ordered)
 
 
-def _build_unexecuted_tool_call_note_message(
-    tool_names: Sequence[str],
-) -> LLMMessage:
-    if tool_names:
-        names_text = ", ".join(tool_names)
-        text = (
-            "The previous turn was interrupted before these proposed tool calls were executed: "
-            f"{names_text}. Treat them as not run."
-        )
-    else:
-        text = (
-            "The previous turn was interrupted before the assistant's proposed tool calls were executed. "
-            "Treat them as not run."
-        )
-    return LLMMessage(
-        role="system",
-        parts=(TextPart(text=text),),
-    )
-
-
 def _collect_activated_discoverable_tool_names(
     records: Sequence[ConversationRecord],
 ) -> tuple[str, ...]:
@@ -3121,7 +3269,7 @@ def _record_image_part(record: ConversationRecord) -> ImagePart | None:
 
 
 def _carry_forward_soft_limit(record: ConversationRecord) -> int | None:
-    if bool(record.metadata.get(_TRANSIENT_RECORD_METADATA_KEY, False)):
+    if _record_is_ephemeral_image_input(record):
         return None
     if record.role == "tool":
         return 1_800
@@ -3172,3 +3320,78 @@ def _copy_record_with_content(
         kind=record.kind,
         metadata=metadata,
     )
+
+
+def _unexecuted_tool_call_note_text(tool_names: Sequence[str]) -> str:
+    ordered_tool_names = _ordered_unique_names(tool_names)
+    if ordered_tool_names:
+        names_text = ", ".join(ordered_tool_names)
+        return (
+            "The previous turn was interrupted before these proposed tool calls were executed: "
+            f"{names_text}. Treat them as not run."
+        )
+    return (
+        "The previous turn was interrupted before the assistant's proposed tool calls were executed. "
+        "Treat them as not run."
+    )
+
+
+def _collect_unexecuted_tool_call_names(
+    records: Sequence[ConversationRecord],
+) -> tuple[str, ...]:
+    pending_call_ids: set[str] = set()
+    pending_tool_names: tuple[str, ...] = ()
+    unexecuted_names: list[str] = []
+
+    def _flush_pending() -> None:
+        nonlocal pending_call_ids, pending_tool_names
+        for tool_name in pending_tool_names:
+            if tool_name not in unexecuted_names:
+                unexecuted_names.append(tool_name)
+        pending_call_ids = set()
+        pending_tool_names = ()
+
+    for record in records:
+        if record.kind != "message":
+            continue
+
+        call_specs = _assistant_tool_call_specs(record)
+        if call_specs:
+            if pending_call_ids:
+                _flush_pending()
+            pending_call_ids = {call_id for call_id, _name in call_specs}
+            pending_tool_names = tuple(
+                _ordered_unique_names(name for _call_id, name in call_specs)
+            )
+            continue
+
+        if not pending_call_ids:
+            continue
+
+        if _record_is_unexecuted_tool_call_notice(record):
+            pending_call_ids = set()
+            pending_tool_names = ()
+            continue
+
+        if record.role == "tool":
+            call_id = str(record.metadata.get("call_id", "")).strip()
+            if call_id and call_id in pending_call_ids:
+                pending_call_ids.remove(call_id)
+                if not pending_call_ids:
+                    pending_tool_names = ()
+                continue
+
+        _flush_pending()
+
+    if pending_call_ids:
+        _flush_pending()
+
+    return tuple(unexecuted_names)
+
+
+def _record_is_ephemeral_image_input(record: ConversationRecord) -> bool:
+    return bool(record.metadata.get(_EPHEMERAL_IMAGE_INPUT_METADATA_KEY, False))
+
+
+def _record_is_unexecuted_tool_call_notice(record: ConversationRecord) -> bool:
+    return bool(record.metadata.get(_UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY, False))

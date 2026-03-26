@@ -915,7 +915,6 @@ class RouteRuntime:
             lines.append(guidance)
         return AgentRuntimeMessage(
             role="system",
-            transient=False,
             metadata={
                 "bash_job_progress_update": True,
                 "notice_kind": _MAIN_BASH_PROGRESS_NOTICE_KIND,
@@ -959,7 +958,6 @@ class RouteRuntime:
         aggregated_recommendation = self._aggregate_recommendations(recommendations)
         return AgentRuntimeMessage(
             role="system",
-            transient=False,
             metadata={
                 "subagent_progress_update": True,
                 "notice_kind": _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND,
@@ -978,7 +976,6 @@ class RouteRuntime:
         return (
             AgentRuntimeMessage(
                 role="developer",
-                transient=True,
                 metadata={
                     "force_no_tools_this_turn": True,
                     "orchestrator_wait_only_update": True,

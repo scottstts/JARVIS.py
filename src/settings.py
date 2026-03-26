@@ -103,7 +103,7 @@ JARVIS_CORE_TIMEZONE: Final = "Europe/Dublin"
 # Core LLM routing/runtime.
 # The provider chosen here will determine which provider settings/token are needed below.
 # 'openai', 'gemini', 'anthropic', 'openrouter', 'lmstudio'
-JARVIS_LLM_DEFAULT_PROVIDER: Final = "lmstudio"
+JARVIS_LLM_DEFAULT_PROVIDER: Final = "openai"
 JARVIS_LLM_TIMEOUT_SECONDS: Final = 60.0
 JARVIS_LLM_RETRY_ATTEMPTS: Final = 2
 JARVIS_LLM_RETRY_BACKOFF_SECONDS: Final = 0.5

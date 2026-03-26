@@ -696,6 +696,49 @@ class _FakeToolSearchActivationLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FakeDiscoverableActivationTurnBoundaryLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+
+        if self.generate_calls == 1:
+            if names != _EXPECTED_BASIC_TOOL_NAMES:
+                raise AssertionError(
+                    f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+                )
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="tool_search_1",
+                        name="tool_search",
+                        arguments={"query": "archive", "verbosity": "high"},
+                        raw_arguments='{"query":"archive","verbosity":"high"}',
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if self.generate_calls == 2:
+            expected = _EXPECTED_BASIC_TOOL_NAMES + ["archive"]
+            if names != expected:
+                raise AssertionError(f"Expected {expected} tools to be registered, got {names}.")
+            return _build_response("Archive tool surfaced.")
+
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                "Discoverable activation should stay current-turn-only and must not persist "
+                f"into a later user turn; got tools {names}."
+            )
+        return _build_response("New turn.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _FakeToolRegisterApprovalLLMService:
     def __init__(self) -> None:
         self.stream_calls = 0
@@ -1168,6 +1211,68 @@ class _InterruptedCompletedToolContinuationLLMService:
         )
 
 
+class _OrphanedTurnRecoveryLLMService:
+    def __init__(self, *, expect_unexecuted_tool_notice: bool) -> None:
+        self.expect_unexecuted_tool_notice = expect_unexecuted_tool_notice
+        self.generate_requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_requests.append(request)
+        if not any(
+            isinstance(part, TextPart) and part.text == "Continue after recovery."
+            for message in request.messages
+            if message.role == "user"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected the new user message in the recovered-turn request.")
+        if not any(
+            isinstance(part, TextPart) and part.text == "Work in progress."
+            for message in request.messages
+            if message.role == "user"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected the orphaned turn user message to remain in replay.")
+        if not any(
+            isinstance(part, TextPart) and part.text == "Partial answer."
+            for message in request.messages
+            if message.role == "assistant"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected the orphaned turn assistant text to remain in replay.")
+        if not any(
+            isinstance(part, TextPart)
+            and "ended unexpectedly before it completed" in part.text
+            for message in request.messages
+            if message.role == "system"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected a persisted orphaned-turn recovery note in replay.")
+        if self.expect_unexecuted_tool_notice:
+            if any(
+                isinstance(part, ToolCall)
+                for message in request.messages
+                if message.role == "assistant"
+                for part in message.parts
+            ):
+                raise AssertionError(
+                    "Recovered orphaned turns should not replay unresolved assistant tool calls."
+                )
+            if not any(
+                isinstance(part, TextPart)
+                and "Treat them as not run." in part.text
+                for message in request.messages
+                if message.role == "system"
+                for part in message.parts
+            ):
+                raise AssertionError(
+                    "Expected a persisted unexecuted-tool-call notice during orphaned-turn recovery."
+                )
+        return _build_response("continued")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _StopMidToolCallStreamingLLMService:
     def __init__(self) -> None:
         self.tool_call_started = asyncio.Event()
@@ -1240,7 +1345,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             assistant_records = [record for record in message_records if record.role == "assistant"]
             self.assertEqual(len(assistant_records), 4)
             self.assertEqual(assistant_records[-1].content, "Final answer without more tools.")
-            self.assertFalse(any(record.metadata.get("tool_round_limit") for record in message_records))
+            self.assertTrue(any(record.metadata.get("tool_round_limit") for record in message_records))
 
     async def test_stream_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1296,7 +1401,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "bash")
             self.assertIn("Bash execution result", message_records[-2].content)
 
-    async def test_handle_user_input_adds_transient_notice_when_bash_foreground_is_promoted(
+    async def test_handle_user_input_handles_bash_foreground_promotion(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1646,9 +1751,14 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             records = storage.load_records(done.session_id)
             message_records = [record for record in records if record.kind == "message"]
-            self.assertEqual([record.role for record in message_records[-3:]], ["user", "assistant", "system"])
-            self.assertEqual(message_records[-2].content, "I'll use Python for this.")
-            self.assertEqual(message_records[-2].metadata.get("tool_calls"), None)
+            self.assertEqual(
+                [record.role for record in message_records[-4:]],
+                ["user", "assistant", "system", "system"],
+            )
+            self.assertEqual(message_records[-3].content, "I'll use Python for this.")
+            self.assertEqual(message_records[-3].metadata.get("tool_calls"), None)
+            self.assertTrue(message_records[-2].metadata.get("unexecuted_tool_call_notice"))
+            self.assertIn("Treat them as not run.", message_records[-2].content)
             self.assertFalse(any(record.role == "tool" for record in message_records))
 
     async def test_next_turn_normalizes_unexecuted_interrupted_tool_calls(self) -> None:
@@ -1730,6 +1840,153 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             result = await loop.handle_user_input("continue")
             self.assertEqual(result.response_text, "continued after tool")
             self.assertEqual(len(llm_service.generate_requests), 1)
+
+    async def test_handle_user_input_recovers_orphaned_in_progress_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            setup_loop = AgentLoop(
+                llm_service=_FakeToolLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+            session_id = await setup_loop.prepare_session()
+            turn_id = "orphan_turn"
+            storage.append_record(
+                session_id,
+                setup_loop._build_message_record(
+                    session_id=session_id,
+                    role="user",
+                    content="Work in progress.",
+                    turn_id=turn_id,
+                ),
+            )
+            storage.append_record(
+                session_id,
+                setup_loop._build_message_record(
+                    session_id=session_id,
+                    role="assistant",
+                    content="Partial answer.",
+                    turn_id=turn_id,
+                ),
+            )
+            storage.set_turn_status(
+                session_id,
+                turn_id=turn_id,
+                status="in_progress",
+            )
+
+            loop = AgentLoop(
+                llm_service=_OrphanedTurnRecoveryLLMService(
+                    expect_unexecuted_tool_notice=False
+                ),
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input("Continue after recovery.")
+
+            self.assertEqual(result.response_text, "continued")
+            session = storage.get_session(session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.turn_states[turn_id], "interrupted")  # type: ignore[index]
+
+            all_records = storage.load_records(session_id, include_all_turns=True)
+            recovered_records = [
+                record
+                for record in all_records
+                if str(record.metadata.get("turn_id", "")).strip() == turn_id
+            ]
+            self.assertEqual(
+                [record.role for record in recovered_records[-3:]],
+                ["user", "assistant", "system"],
+            )
+            self.assertTrue(
+                recovered_records[-1].metadata.get("orphaned_turn_recovery")
+            )
+            self.assertIn(
+                "ended unexpectedly before it completed",
+                recovered_records[-1].content,
+            )
+
+    async def test_handle_user_input_recovers_orphaned_unexecuted_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            setup_loop = AgentLoop(
+                llm_service=_FakeToolLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+            session_id = await setup_loop.prepare_session()
+            turn_id = "orphan_tool_turn"
+            storage.append_record(
+                session_id,
+                setup_loop._build_message_record(
+                    session_id=session_id,
+                    role="user",
+                    content="Work in progress.",
+                    turn_id=turn_id,
+                ),
+            )
+            storage.append_record(
+                session_id,
+                setup_loop._build_message_record(
+                    session_id=session_id,
+                    role="assistant",
+                    content="Partial answer.",
+                    metadata={
+                        "tool_calls": [
+                            {
+                                "call_id": "bash_1",
+                                "name": "bash",
+                                "arguments": {"command": "printf hi"},
+                                "raw_arguments": '{"command":"printf hi"}',
+                                "provider_metadata": {},
+                            }
+                        ]
+                    },
+                    turn_id=turn_id,
+                ),
+            )
+            storage.set_turn_status(
+                session_id,
+                turn_id=turn_id,
+                status="in_progress",
+            )
+
+            loop = AgentLoop(
+                llm_service=_OrphanedTurnRecoveryLLMService(
+                    expect_unexecuted_tool_notice=True
+                ),
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input("Continue after recovery.")
+
+            self.assertEqual(result.response_text, "continued")
+            session = storage.get_session(session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.turn_states[turn_id], "interrupted")  # type: ignore[index]
+
+            all_records = storage.load_records(session_id, include_all_turns=True)
+            recovered_records = [
+                record
+                for record in all_records
+                if str(record.metadata.get("turn_id", "")).strip() == turn_id
+            ]
+            self.assertEqual(
+                [record.role for record in recovered_records[-4:]],
+                ["user", "assistant", "system", "system"],
+            )
+            self.assertTrue(
+                recovered_records[-2].metadata.get("unexecuted_tool_call_notice")
+            )
+            self.assertIn("Treat them as not run.", recovered_records[-2].content)
+            self.assertTrue(
+                recovered_records[-1].metadata.get("orphaned_turn_recovery")
+            )
 
     async def test_stream_user_input_stops_after_large_tool_batch_without_compacting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2119,6 +2376,63 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 message_records[-2].metadata["activated_discoverable_tool_names"],
                 ["archive"],
             )
+
+    async def test_handle_user_input_keeps_discoverable_activation_current_turn_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(settings.workspace_dir)
+            )
+
+            async def _archive_executor(**kwargs):
+                raise AssertionError("archive should not be executed in this test.")
+
+            registry.register(
+                RegisteredTool(
+                    name="archive",
+                    exposure="discoverable",
+                    definition=ToolDefinition(
+                        name="archive",
+                        description="Archive workspace files.",
+                        input_schema={
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                            },
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    ),
+                    executor=_archive_executor,
+                )
+            )
+            registry.register_discoverable(
+                DiscoverableTool(
+                    name="archive",
+                    aliases=("zip_tools",),
+                    purpose="List, extract, and create archive formats inside the workspace.",
+                    detailed_description="Use this to inspect or manipulate zip and tar archives.",
+                    usage={"arguments": [{"name": "path", "type": "string"}]},
+                    metadata={"family": "filesystem"},
+                    backing_tool_name="archive",
+                )
+            )
+
+            loop = AgentLoop(
+                llm_service=_FakeDiscoverableActivationTurnBoundaryLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+            )
+
+            first_result = await loop.handle_user_input("Find an archive tool.")
+            second_result = await loop.handle_user_input("Continue.")
+
+            self.assertEqual(first_result.response_text, "Archive tool surfaced.")
+            self.assertEqual(second_result.response_text, "New turn.")
 
     async def test_stream_user_input_emits_approval_request_and_resumes_after_tool_register_approval(
         self,

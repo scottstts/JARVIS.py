@@ -49,7 +49,6 @@ def build_assignment_message(
 def build_step_in_message(*, instructions: str) -> AgentRuntimeMessage:
     return AgentRuntimeMessage(
         role="developer",
-        transient=False,
         metadata={"subagent_step_in": True},
         content=(
             "Updated direction from Jarvis for the next turn.\n\n"
