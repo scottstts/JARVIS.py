@@ -64,7 +64,6 @@ To use the built package instead, build it from the `jarvis_runtime` container:
 
 ```bash
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv build"
-
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv tool install dist/jarvis-0.1.0-py3-none-any.whl"
 docker compose exec jarvis_runtime bash -lc "jarvis"
 ```
