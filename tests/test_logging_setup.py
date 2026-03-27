@@ -7,7 +7,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from logging_setup import (
+from jarvis.logging_setup import (
     CollapseTelegramDraftRequestFilter,
     SensitiveDataFormatter,
     _redact_sensitive_text,
@@ -108,7 +108,7 @@ class LoggingSetupTests(unittest.TestCase):
             httpx_logger.setLevel(logging.INFO)
             httpcore_logger.setLevel(logging.INFO)
 
-            with patch("logging_setup.logging.basicConfig") as basic_config:
+            with patch("jarvis.logging_setup.logging.basicConfig") as basic_config:
                 configure_application_logging()
 
             basic_config.assert_called_once_with(
@@ -128,7 +128,7 @@ class LoggingSetupTests(unittest.TestCase):
         root_logger.handlers = [handler]
 
         try:
-            with patch("logging_setup.logging.basicConfig") as basic_config:
+            with patch("jarvis.logging_setup.logging.basicConfig") as basic_config:
                 configure_application_logging()
 
             basic_config.assert_called_once_with(

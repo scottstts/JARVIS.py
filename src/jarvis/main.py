@@ -1,0 +1,137 @@
+"""Main system entrypoint for running gateway and Telegram UI together."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from dataclasses import replace
+
+import uvicorn
+
+from jarvis.gateway import GatewaySettings, create_app
+from jarvis.logging_setup import configure_application_logging, get_application_logger
+from jarvis.runtime_env import load_docker_secrets_if_present
+from jarvis.ui.telegram import UISettings, run_telegram_ui
+
+LOGGER = get_application_logger(__name__)
+
+
+async def run_system(
+    *,
+    gateway_settings: GatewaySettings | None = None,
+    ui_settings: UISettings | None = None,
+) -> None:
+    resolved_gateway_settings = gateway_settings or GatewaySettings.from_env()
+    resolved_ui_settings = _bind_ui_to_gateway(
+        ui_settings or UISettings.from_env(),
+        resolved_gateway_settings,
+    )
+
+    app = create_app(gateway_settings=resolved_gateway_settings)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app=app,
+            host=resolved_gateway_settings.host,
+            port=resolved_gateway_settings.port,
+            lifespan="on",
+            access_log=False,
+        )
+    )
+
+    server_task = asyncio.create_task(server.serve(), name="jarvis-gateway")
+    ui_task: asyncio.Task[None] | None = None
+
+    try:
+        await _wait_for_gateway_start(
+            server,
+            server_task,
+            startup_timeout_seconds=resolved_ui_settings.gateway_connect_timeout_seconds,
+        )
+        LOGGER.info(
+            "Gateway ready on %s; starting Telegram UI.",
+            resolved_ui_settings.gateway_ws_base_url,
+        )
+        ui_task = asyncio.create_task(
+            run_telegram_ui(resolved_ui_settings),
+            name="jarvis-ui",
+        )
+
+        done, _pending = await asyncio.wait(
+            {server_task, ui_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if server_task in done:
+            server_exception = server_task.exception()
+            if server_exception is not None:
+                raise server_exception
+            LOGGER.info("Gateway server exited; shutting down Telegram UI.")
+
+        if ui_task in done:
+            ui_exception = ui_task.exception()
+            if ui_exception is not None:
+                raise ui_exception
+            LOGGER.info("Telegram UI exited; shutting down gateway server.")
+    finally:
+        if ui_task is not None and not ui_task.done():
+            ui_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await ui_task
+
+        if not server_task.done():
+            server.should_exit = True
+            with suppress(asyncio.CancelledError):
+                await server_task
+
+
+def main() -> None:
+    load_docker_secrets_if_present()
+    configure_application_logging()
+    try:
+        asyncio.run(run_system())
+    except KeyboardInterrupt:
+        LOGGER.info("Shutdown requested via Ctrl+C; exiting cleanly.")
+
+
+async def _wait_for_gateway_start(
+    server: uvicorn.Server,
+    server_task: asyncio.Task[None],
+    *,
+    startup_timeout_seconds: float,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + startup_timeout_seconds
+    while not server.started:
+        if server_task.done():
+            server_exception = server_task.exception()
+            if server_exception is not None:
+                raise server_exception
+            raise RuntimeError("Gateway server exited before startup completed.")
+        if asyncio.get_running_loop().time() >= deadline:
+            server.should_exit = True
+            raise TimeoutError("Gateway server did not start before startup timeout expired.")
+        await asyncio.sleep(0.01)
+
+
+def _bind_ui_to_gateway(
+    ui_settings: UISettings,
+    gateway_settings: GatewaySettings,
+) -> UISettings:
+    gateway_ws_base_url = _gateway_ws_base_url(gateway_settings)
+    if ui_settings.gateway_ws_base_url != gateway_ws_base_url:
+        LOGGER.info(
+            "Using local gateway websocket URL %s for combined system run.",
+            gateway_ws_base_url,
+        )
+    return replace(ui_settings, gateway_ws_base_url=gateway_ws_base_url)
+
+
+def _gateway_ws_base_url(gateway_settings: GatewaySettings) -> str:
+    host = gateway_settings.host.strip()
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    websocket_path = gateway_settings.websocket_path
+    return f"ws://{host}:{gateway_settings.port}{websocket_path}"
+
+
+if __name__ == "__main__":
+    main()

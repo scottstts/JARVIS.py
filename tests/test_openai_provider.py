@@ -7,12 +7,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from llm.config import OpenAIProviderSettings
-from llm.errors import ToolCallValidationError
-from llm.providers.openai_provider import OpenAIProvider
-from llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
-from tools.basic.file_patch.tool import build_file_patch_tool
-from tools.config import ToolSettings
+from jarvis.llm.config import OpenAIProviderSettings
+from jarvis.llm.errors import ToolCallValidationError
+from jarvis.llm.providers.openai_provider import OpenAIProvider
+from jarvis.llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
+from jarvis.tools.basic.file_patch.tool import build_file_patch_tool
+from jarvis.tools.config import ToolSettings
 
 
 class OpenAIProviderRequestShapeTests(unittest.TestCase):
@@ -249,8 +249,8 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
 
 class GeminiNormalizationRegressionTests(unittest.TestCase):
     def test_gemini_normalization_does_not_require_response_text_accessor(self) -> None:
-        from llm.config import GeminiProviderSettings
-        from llm.providers.gemini_provider import GeminiProvider
+        from jarvis.llm.config import GeminiProviderSettings
+        from jarvis.llm.providers.gemini_provider import GeminiProvider
 
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),

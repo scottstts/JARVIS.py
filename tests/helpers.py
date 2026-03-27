@@ -6,7 +6,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from core.config import ContextPolicySettings, CoreSettings
+from jarvis.core.config import ContextPolicySettings, CoreSettings
 
 
 def build_core_settings(

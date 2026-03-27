@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ui.telegram.config import UIConfigurationError, UISettings
+from jarvis.ui.telegram.config import UIConfigurationError, UISettings
 
 
 class UISettingsTests(unittest.TestCase):
@@ -99,7 +99,7 @@ class UISettingsTests(unittest.TestCase):
                 "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID": "777",
             },
             clear=True,
-        ), patch("workspace_paths._running_in_container", return_value=False):
+        ), patch("jarvis.workspace_paths._running_in_container", return_value=False):
             with self.assertRaisesRegex(
                 UIConfigurationError,
                 "AGENT_WORKSPACE must be explicitly set for host runs",
@@ -115,7 +115,7 @@ class UISettingsTests(unittest.TestCase):
                 "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
             },
             clear=True,
-        ), patch("workspace_paths._running_in_container", return_value=False):
+        ), patch("jarvis.workspace_paths._running_in_container", return_value=False):
             settings = UISettings.from_env()
         self.assertEqual(settings.telegram_temp_dir, Path("/tmp/jarvis-host-workspace/temp"))
 

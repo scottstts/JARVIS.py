@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from gateway.protocol import ProtocolError, parse_client_event
+from jarvis.gateway.protocol import ProtocolError, parse_client_event
 
 
 class GatewayProtocolTests(unittest.TestCase):

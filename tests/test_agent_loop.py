@@ -7,12 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import settings as app_settings
+from jarvis import settings as app_settings
 
-from core import AgentLoop
-from llm import LLMService
-from runtime_env import load_docker_secrets_if_present
-from storage import SessionStorage
+from jarvis.core import AgentLoop
+from jarvis.llm import LLMService
+from jarvis.runtime_env import load_docker_secrets_if_present
+from jarvis.storage import SessionStorage
 from tests.helpers import build_core_settings
 
 

@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 from types import SimpleNamespace
 
-from ui.telegram.api import DraftMessage, TelegramAPIError, TelegramRemoteFile
-from ui.telegram.bot import (
+from jarvis.ui.telegram.api import DraftMessage, TelegramAPIError, TelegramRemoteFile
+from jarvis.ui.telegram.bot import (
     IncomingTelegramApprovalCallback,
     IncomingTelegramFile,
     IncomingTextMessage,
@@ -26,8 +26,8 @@ from ui.telegram.bot import (
     route_id_for_chat,
     split_telegram_message,
 )
-from ui.telegram.config import UISettings
-from ui.telegram.gateway_client import (
+from jarvis.ui.telegram.config import UISettings
+from jarvis.ui.telegram.gateway_client import (
     GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,

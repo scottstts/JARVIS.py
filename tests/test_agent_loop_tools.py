@@ -11,16 +11,16 @@ from base64 import b64decode
 from pathlib import Path
 from unittest.mock import patch
 
-import settings as app_settings
+from jarvis import settings as app_settings
 
-from core import (
+from jarvis.core import (
     AgentApprovalRequestEvent,
     AgentAssistantMessageEvent,
     AgentLoop,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
 )
-from llm import (
+from jarvis.llm import (
     DoneEvent,
     ImagePart,
     LLMConfigurationError,
@@ -35,9 +35,9 @@ from llm import (
     ToolCallDeltaEvent,
     ToolResultPart,
 )
-from storage import SessionStorage
+from jarvis.storage import SessionStorage
 from tests.helpers import build_core_settings
-from tools import (
+from jarvis.tools import (
     DiscoverableTool,
     RegisteredTool,
     ToolExecutionResult,
@@ -46,7 +46,7 @@ from tools import (
     ToolRuntime,
     ToolSettings,
 )
-from tools.basic.web_fetch.tool import HTTPFetchResult
+from jarvis.tools.basic.web_fetch.tool import HTTPFetchResult
 
 _EXPECTED_BASIC_TOOL_NAMES = [
     "bash",
@@ -1666,7 +1666,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 return 10
 
             with patch(
-                "core.agent_loop.estimate_request_input_tokens",
+                "jarvis.core.agent_loop.estimate_request_input_tokens",
                 side_effect=_estimate_with_followup_overflow,
             ):
                 result = await loop.handle_user_input("Write hello into note.txt.")
@@ -1738,7 +1738,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 return 10
 
             with patch(
-                "core.agent_loop.estimate_request_input_tokens",
+                "jarvis.core.agent_loop.estimate_request_input_tokens",
                 side_effect=_estimate_current_turn_overflow,
             ):
                 result = await loop.handle_user_input("Use the large tool.")
@@ -2218,7 +2218,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 return [event async for event in loop.stream_user_input("Use the large tool.")]
 
             with patch(
-                "core.agent_loop.estimate_request_input_tokens",
+                "jarvis.core.agent_loop.estimate_request_input_tokens",
                 side_effect=_estimate_with_tool_overflow,
             ):
                 task = asyncio.create_task(_collect_events())
@@ -2514,7 +2514,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 return {"message_id": 7, "chat_id": 123}
 
             with patch(
-                "tools.basic.send_file.tool.send_telegram_file",
+                "jarvis.tools.basic.send_file.tool.send_telegram_file",
                 side_effect=_fake_send_telegram_file,
             ):
                 result = await loop.handle_user_input("Send me the report file.")
@@ -2543,7 +2543,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with patch(
-                "tools.basic.web_fetch.tool._fetch_http_text",
+                "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
                 return_value=tier1_result,
             ):
                 result = await loop.handle_user_input("Fetch https://example.com/docs for me.")

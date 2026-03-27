@@ -51,26 +51,32 @@ COPY --from=node_runtime /usr/local/bin/corepack /usr/local/bin/corepack
 COPY --from=node_runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=node_runtime /usr/local/include/node /usr/local/include/node
 
-RUN python -m pip install --no-cache-dir uv ruff
+RUN python -m pip install --no-cache-dir uv
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
+    VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:${PATH}"
+
+RUN printf '%s\n' \
+    'export VIRTUAL_ENV=/opt/venv' \
+    'export PATH="/opt/venv/bin:${PATH}"' \
+    > /etc/profile.d/jarvis-venv.sh
 
 WORKDIR /tmp/jarvis-deps
 COPY pyproject.toml uv.lock ./
-COPY src ./src
-RUN uv sync --frozen --no-install-project \
-  && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" pytest \
-  && export JARVIS_PYTHON_TOOL_PACKAGES="$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('jarvis_settings', 'src/settings.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); print(' '.join(module.JARVIS_TOOL_CENTRAL_PYTHON_STARTER_PACKAGES))")" \
-  && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" ${JARVIS_PYTHON_TOOL_PACKAGES}
+RUN uv sync --locked --no-dev --no-install-project --no-editable
 
 WORKDIR /app
+COPY pyproject.toml uv.lock ./
 COPY src ./src
 
-ENV PYTHONPATH=/app/src
+RUN uv sync --locked --no-dev --no-editable \
+  && export JARVIS_PYTHON_TOOL_PACKAGES="$(${UV_PROJECT_ENVIRONMENT}/bin/python -c "from jarvis import settings as module; print(' '.join(module.JARVIS_TOOL_CENTRAL_PYTHON_STARTER_PACKAGES))")" \
+  && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" ${JARVIS_PYTHON_TOOL_PACKAGES}
+
 WORKDIR /workspace
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "-m", "tool_runtime_service"]
+CMD ["jarvis-tool-runtime"]

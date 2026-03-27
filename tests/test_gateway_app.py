@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from core import (
+from jarvis.core import (
     AgentAssistantMessageEvent,
     AgentApprovalRequestEvent,
     AgentTextDeltaEvent,
@@ -16,9 +16,9 @@ from core import (
     AgentTurnDoneEvent,
     ContextBudgetError,
 )
-from gateway import GatewaySettings, create_app
-from gateway.app import _send_json_if_open
-from llm import ProviderTimeoutError
+from jarvis.gateway import GatewaySettings, create_app
+from jarvis.gateway.app import _send_json_if_open
+from jarvis.llm import ProviderTimeoutError
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from tests.helpers import build_core_settings
@@ -94,7 +94,7 @@ class GatewayAppTests(unittest.TestCase):
     def test_default_app_lifespan_healthchecks_remote_tool_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                "gateway.app.ensure_remote_tool_runtime_healthy",
+                "jarvis.gateway.app.ensure_remote_tool_runtime_healthy",
                 new=AsyncMock(),
             ) as healthcheck:
                 with patch.dict(

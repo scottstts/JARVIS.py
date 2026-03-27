@@ -8,26 +8,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core import (
+from jarvis.core import (
     AgentApprovalRequestEvent,
     AgentAssistantMessageEvent,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
 )
-from gateway.bash_job_supervisor import BashJobNotice
-from gateway.route_events import (
+from jarvis.gateway.bash_job_supervisor import BashJobNotice
+from jarvis.gateway.route_events import (
     RouteApprovalRequestEvent,
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
 )
-from llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent
-from subagent.manager import SubagentManager
-from subagent.runtime import SubagentRuntime
-from subagent.settings import SubagentSettings
-from subagent.storage import SubagentCatalogStorage
-from subagent.types import SubagentCatalogEntry
+from jarvis.llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent
+from jarvis.subagent.manager import SubagentManager
+from jarvis.subagent.runtime import SubagentRuntime
+from jarvis.subagent.settings import SubagentSettings
+from jarvis.subagent.storage import SubagentCatalogStorage
+from jarvis.subagent.types import SubagentCatalogEntry
 from tests.helpers import build_core_settings
-from tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolSettings
+from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolSettings
 
 
 def _build_response(text: str) -> LLMResponse:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from ui.telegram.formatting import render_markdown_to_telegram_html
+from jarvis.ui.telegram.formatting import render_markdown_to_telegram_html
 
 
 class TelegramFormattingTests(unittest.TestCase):

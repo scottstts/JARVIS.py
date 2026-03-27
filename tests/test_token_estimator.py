@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from core.token_estimator import estimate_request_input_tokens
-from llm import ImagePart, LLMMessage, LLMRequest
+from jarvis.core.token_estimator import estimate_request_input_tokens
+from jarvis.llm import ImagePart, LLMMessage, LLMRequest
 
 
 class TokenEstimatorTests(unittest.TestCase):

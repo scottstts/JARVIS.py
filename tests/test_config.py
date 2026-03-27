@@ -7,11 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import settings as app_settings
+from jarvis import settings as app_settings
 
-from core.config import ContextPolicySettings, CoreSettings
-from core.errors import CoreConfigurationError
-from gateway import GatewaySettings
+from jarvis.core.config import ContextPolicySettings, CoreSettings
+from jarvis.core.errors import CoreConfigurationError
+from jarvis.gateway import GatewaySettings
 
 
 class ContextPolicySettingsTests(unittest.TestCase):
@@ -62,7 +62,7 @@ class CoreSettingsTests(unittest.TestCase):
             os.environ,
             {},
             clear=True,
-        ), patch("workspace_paths._running_in_container", return_value=False):
+        ), patch("jarvis.workspace_paths._running_in_container", return_value=False):
             with self.assertRaisesRegex(
                 CoreConfigurationError,
                 "AGENT_WORKSPACE must be explicitly set for host runs",
@@ -76,7 +76,7 @@ class CoreSettingsTests(unittest.TestCase):
                 "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
             },
             clear=True,
-        ), patch("workspace_paths._running_in_container", return_value=False):
+        ), patch("jarvis.workspace_paths._running_in_container", return_value=False):
             settings = CoreSettings.from_env()
 
         self.assertEqual(settings.workspace_dir, Path("/tmp/jarvis-host-workspace"))

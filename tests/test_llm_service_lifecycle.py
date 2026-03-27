@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from llm.config import EmbeddingSettings, LLMSettings
-from llm.protocols import ProviderCapabilities
-from llm.service import LLMService
+from jarvis.llm.config import EmbeddingSettings, LLMSettings
+from jarvis.llm.protocols import ProviderCapabilities
+from jarvis.llm.service import LLMService
 
 
 class _FakeProvider:

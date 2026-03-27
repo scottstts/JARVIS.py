@@ -7,10 +7,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-from llm.config import OpenRouterProviderSettings
-from llm.errors import ProviderResponseError
-from llm.providers.openrouter_provider import OpenRouterProvider
-from llm.types import (
+from jarvis.llm.config import OpenRouterProviderSettings
+from jarvis.llm.errors import ProviderResponseError
+from jarvis.llm.providers.openrouter_provider import OpenRouterProvider
+from jarvis.llm.types import (
     DoneEvent,
     LLMMessage,
     LLMRequest,
@@ -123,7 +123,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             return response
 
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
-            with patch("llm.providers.openrouter_provider.requests.post", side_effect=fake_post):
+            with patch("jarvis.llm.providers.openrouter_provider.requests.post", side_effect=fake_post):
                 events = asyncio.run(self._collect_events(provider, request))
 
         self.assertTrue(captured_request["stream"])
@@ -237,7 +237,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
             with patch(
-                "llm.providers.openrouter_provider.requests.post",
+                "jarvis.llm.providers.openrouter_provider.requests.post",
                 return_value=response,
             ):
                 events = asyncio.run(self._collect_events(provider, request))
@@ -303,7 +303,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
             with patch(
-                "llm.providers.openrouter_provider.requests.post",
+                "jarvis.llm.providers.openrouter_provider.requests.post",
                 return_value=response,
             ):
                 events = asyncio.run(self._collect_events(provider, request))
@@ -348,7 +348,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
             with patch(
-                "llm.providers.openrouter_provider.requests.post",
+                "jarvis.llm.providers.openrouter_provider.requests.post",
                 return_value=response,
             ):
                 with self.assertRaisesRegex(ProviderResponseError, "Upstream failed"):

@@ -22,13 +22,15 @@ Docker Compose should create `~/.jarvis/workspace/` on first run; if it does not
 
 `~/.jarvis/workspace/` will be the workspace dir for the agent. This dir on your host OS will be bind mounted in the containers as `workspace/` dir.
 
+This repo is strict container-first for Python: do not create or use a host-side `.venv`; run `uv` against the project only inside the `dev` container.
+
 ### Deposit Secrets & Settings
 
 Jarvis needs LLMs to power the agent and external services for certain agent tools
 
 Set up secrets by creating files under `secrets/`. The full expected list is in [`secrets/README.md`](secrets/README.md).
 
-[`src/settings.py`](src/settings.py) contains non-secret settings for Jarvis. The default can work out of the box fine. For LLM providers and models, change them as you like.
+[`src/jarvis/settings.py`](src/jarvis/settings.py) contains non-secret settings for Jarvis. The default can work out of the box fine. For LLM providers and models, change them as you like.
 
 In telegram BotFather, add commands:
 
@@ -43,6 +45,13 @@ compact - compact current session
 Run Jarvis inside the `dev` container:
 
 ```bash
-docker compose exec dev bash
-uv run python -m main
+docker compose exec dev bash -lc "cd /repo && uv sync --locked --group dev"
+docker compose exec dev bash -lc "cd /repo && uv run jarvis"
+```
+
+For tests and linting, use the same container-managed environment:
+
+```bash
+docker compose exec dev bash -lc "cd /repo && uv run pytest"
+docker compose exec dev bash -lc "cd /repo && uv run ruff check ."
 ```

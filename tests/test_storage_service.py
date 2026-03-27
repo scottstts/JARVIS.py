@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from storage import ConversationRecord, SessionStorage
+from jarvis.storage import ConversationRecord, SessionStorage
 
 
 class SessionStorageTests(unittest.TestCase):

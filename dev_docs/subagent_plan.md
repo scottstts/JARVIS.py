@@ -12,7 +12,7 @@ The goal is that a new Codex agent can pick up this file and implement the entir
 
 This plan covers:
 
-- the `src/subagent/` subsystem
+- the `src/jarvis/subagent/` subsystem
 - the required `AgentLoop` refactors so subagents can reuse the existing loop
 - main-agent-only subagent control primitives with tool-call semantics
 - subagent starter context prompt files as runtime prompt assets
@@ -36,7 +36,7 @@ This plan does not cover:
 
 These are the settled design decisions and should be implemented exactly as follows.
 
-1. Subagents are their own subsystem under `src/subagent/`, not a tool under `src/tools/`.
+1. Subagents are their own subsystem under `src/jarvis/subagent/`, not a tool under `src/jarvis/tools/`.
 2. The main agent controls subagents through core runtime primitives that behave like tool calls, but these primitives are not part of the normal tool registry.
 3. Only the Jarvis main agent may invoke subagents.
 4. Nested subagents are forbidden. A subagent must not be able to invoke another subagent.
@@ -46,10 +46,10 @@ These are the settled design decisions and should be implemented exactly as foll
 7. Codenames must be unique among active subagents.
 8. A codename may be reused only after the prior holder has been disposed.
 9. A subagent uses the same underlying `AgentLoop` engine as the main agent.
-10. A subagent does not reuse the starter files in `src/identities/`.
-11. A subagent has its own starter context built from static prompt files under `src/subagent/` plus the main-agent-written task assignment.
-12. General behavioral guidance about when Jarvis should use subagents belongs in `src/identities/PROGRAM.md`.
-13. Detailed invocation and control usage docs for the subagent primitives belong in `src/subagent/` and are dynamically injected into the main agent bootstrap context.
+10. A subagent does not reuse the starter files in `src/jarvis/identities/`.
+11. A subagent has its own starter context built from static prompt files under `src/jarvis/subagent/` plus the main-agent-written task assignment.
+12. General behavioral guidance about when Jarvis should use subagents belongs in `src/jarvis/identities/PROGRAM.md`.
+13. Detailed invocation and control usage docs for the subagent primitives belong in `src/jarvis/subagent/` and are dynamically injected into the main agent bootstrap context.
 14. Subagents must not receive memory bootstrap.
 15. Subagents must not perform memory reflection.
 16. Subagents must not have access to memory tools.
@@ -101,7 +101,7 @@ Subagents should not have a separate bespoke reasoning engine. They should reuse
 
 Introduce a new route-scoped runtime object. Recommended file:
 
-- `src/gateway/route_runtime.py`
+- `src/jarvis/gateway/route_runtime.py`
 
 Responsibilities:
 
@@ -139,11 +139,11 @@ Refactor goals:
 
 ### 3. Subagent Manager
 
-Introduce a dedicated manager under `src/subagent/` that owns all subagent lifecycle behavior.
+Introduce a dedicated manager under `src/jarvis/subagent/` that owns all subagent lifecycle behavior.
 
 Recommended file:
 
-- `src/subagent/manager.py`
+- `src/jarvis/subagent/manager.py`
 
 Responsibilities:
 
@@ -177,46 +177,46 @@ This is the unified transport for:
 
 Recommended new files:
 
-- `src/subagent/__init__.py`
-- `src/subagent/types.py`
-- `src/subagent/manager.py`
-- `src/subagent/runtime.py`
-- `src/subagent/primitives.py`
-- `src/subagent/bootstrap.py`
-- `src/subagent/storage.py`
-- `src/subagent/codenames.py`
-- `src/subagent/prompts/SYSTEM.md`
-- `src/subagent/prompts/OPERATING_RULES.md`
-- `src/gateway/route_runtime.py`
-- `src/gateway/route_events.py`
+- `src/jarvis/subagent/__init__.py`
+- `src/jarvis/subagent/types.py`
+- `src/jarvis/subagent/manager.py`
+- `src/jarvis/subagent/runtime.py`
+- `src/jarvis/subagent/primitives.py`
+- `src/jarvis/subagent/bootstrap.py`
+- `src/jarvis/subagent/storage.py`
+- `src/jarvis/subagent/codenames.py`
+- `src/jarvis/subagent/prompts/SYSTEM.md`
+- `src/jarvis/subagent/prompts/OPERATING_RULES.md`
+- `src/jarvis/gateway/route_runtime.py`
+- `src/jarvis/gateway/route_events.py`
 
 Potential additional helper files if useful:
 
-- `src/subagent/settings.py`
-- `src/subagent/status.py`
+- `src/jarvis/subagent/settings.py`
+- `src/jarvis/subagent/status.py`
 
 ## Existing Files Expected To Change
 
-- `src/core/agent_loop.py`
-- `src/core/identities.py`
-- `src/core/__init__.py`
-- `src/gateway/session_router.py`
-- `src/gateway/app.py`
-- `src/gateway/protocol.py`
-- `src/ui/telegram/gateway_client.py`
-- `src/ui/telegram/bot.py`
-- `src/ui/telegram/__init__.py`
-- `src/tools/registry.py`
-- `src/tools/types.py`
-- `src/tools/basic/tool_search/tool.py`
-- `src/settings.py`
-- `src/identities/PROGRAM.md`
+- `src/jarvis/core/agent_loop.py`
+- `src/jarvis/core/identities.py`
+- `src/jarvis/core/__init__.py`
+- `src/jarvis/gateway/session_router.py`
+- `src/jarvis/gateway/app.py`
+- `src/jarvis/gateway/protocol.py`
+- `src/jarvis/ui/telegram/gateway_client.py`
+- `src/jarvis/ui/telegram/bot.py`
+- `src/jarvis/ui/telegram/__init__.py`
+- `src/jarvis/tools/registry.py`
+- `src/jarvis/tools/types.py`
+- `src/jarvis/tools/basic/tool_search/tool.py`
+- `src/jarvis/settings.py`
+- `src/jarvis/identities/PROGRAM.md`
 - `notes/notes.md`
 
 Storage model changes may also touch:
 
-- `src/storage/types.py`
-- `src/storage/service.py`
+- `src/jarvis/storage/types.py`
+- `src/jarvis/storage/service.py`
 
 Only change those if useful. Do not force subagent relations into the generic session store if a dedicated subagent catalog is cleaner.
 
@@ -258,7 +258,7 @@ For the main agent:
 
 For a subagent:
 
-- use static prompt files from `src/subagent/prompts/`
+- use static prompt files from `src/jarvis/subagent/prompts/`
 - append a generated task assignment written by the main agent when the subagent is invoked
 - disable memory bootstrap
 - disable memory reflection
@@ -278,8 +278,8 @@ Enforce no nested subagents at two layers:
 
 Recommended files:
 
-- `src/subagent/prompts/SYSTEM.md`
-- `src/subagent/prompts/OPERATING_RULES.md`
+- `src/jarvis/subagent/prompts/SYSTEM.md`
+- `src/jarvis/subagent/prompts/OPERATING_RULES.md`
 
 Important:
 
@@ -287,8 +287,8 @@ Important:
 - write them as prompt/instruction files for the agent to actually consume
 - do not fill them with redundant explanatory prose meant for developers
 - keep them concise, directive, and appropriate for model starter context
-- when in doubt about tone and structure, inspect the existing prompt files in `src/identities/` and follow that style
-- do not copy `src/identities/` content verbatim; write only what is appropriate for subagent behavior
+- when in doubt about tone and structure, inspect the existing prompt files in `src/jarvis/identities/` and follow that style
+- do not copy `src/jarvis/identities/` content verbatim; write only what is appropriate for subagent behavior
 
 These should describe:
 
@@ -313,7 +313,7 @@ The dynamic assignment should be injected as a system message after the static s
 
 ### PROGRAM.md
 
-Update `src/identities/PROGRAM.md` with high-level usage guidance only.
+Update `src/jarvis/identities/PROGRAM.md` with high-level usage guidance only.
 
 It should explain:
 
@@ -328,7 +328,7 @@ Important:
 - write it as operating guidance for the main agent, in the same instruction style as the rest of `PROGRAM.md`
 - do not add redundant implementation explanation or schema dumps there
 - keep it to usage guidelines and decision heuristics only
-- specific invocation details, argument patterns, and control semantics belong in the subagent primitive docs injected from `src/subagent/`, not in `PROGRAM.md`
+- specific invocation details, argument patterns, and control semantics belong in the subagent primitive docs injected from `src/jarvis/subagent/`, not in `PROGRAM.md`
 
 ## Subagent Primitive Design
 
@@ -342,7 +342,7 @@ Recommended primitive names:
 - `subagent_step_in`
 - `subagent_dispose`
 
-These definitions should be created in `src/subagent/primitives.py`.
+These definitions should be created in `src/jarvis/subagent/primitives.py`.
 
 The same module should also expose human-readable docs that can be injected into the main agent bootstrap, so the runtime docs stay in sync with the actual schemas.
 
@@ -883,7 +883,7 @@ The user does not interact directly with subagents. All user-facing agent conver
 
 ## Settings Additions
 
-Add subagent runtime settings to `src/settings.py`.
+Add subagent runtime settings to `src/jarvis/settings.py`.
 
 Recommended settings:
 
@@ -894,7 +894,7 @@ Recommended settings:
 - `JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT`
   - small integer to bound how many recent noteworthy subagent events are injected into the main turn snapshot
 
-If implementing separate settings dataclasses is useful, add them under `src/subagent/` or the relevant config module.
+If implementing separate settings dataclasses is useful, add them under `src/jarvis/subagent/` or the relevant config module.
 
 ## Recommended Implementation Order
 
@@ -948,7 +948,7 @@ Tasks:
 Exit criteria:
 
 - main-agent behavior is unchanged
-- a subagent-configured loop can be instantiated without using `src/identities/`
+- a subagent-configured loop can be instantiated without using `src/jarvis/identities/`
 
 ### Phase 4: Subagent Storage and Manager
 
@@ -1043,7 +1043,7 @@ Tasks:
 Related doc reminder:
 
 - after the implementation is complete, review the existing docs under `dev_docs/` and update any document that now describes outdated gateway, loop, tool-visibility, storage, or prompt-bootstrap behavior
-- this is a post-implementation documentation sync task, not a substitute for the required runtime prompt files under `src/subagent/` or the required `PROGRAM.md` behavior update
+- this is a post-implementation documentation sync task, not a substitute for the required runtime prompt files under `src/jarvis/subagent/` or the required `PROGRAM.md` behavior update
 
 ## Testing Plan
 
@@ -1112,11 +1112,11 @@ Add automated tests for the following.
 
 Do not build a second reasoning loop. The existing `AgentLoop` should remain the single loop implementation and become configurable.
 
-### Avoid Overloading `src/tools/`
+### Avoid Overloading `src/jarvis/tools/`
 
-Do not implement subagents as a normal basic or discoverable tool in `src/tools/`.
+Do not implement subagents as a normal basic or discoverable tool in `src/jarvis/tools/`.
 
-The control primitives should be synthetic core runtime definitions owned by `src/subagent/`.
+The control primitives should be synthetic core runtime definitions owned by `src/jarvis/subagent/`.
 
 ### Prefer Generated Primitive Docs
 
@@ -1134,7 +1134,7 @@ This feature is done when all of the following are true:
 
 1. Jarvis can invoke up to seven background subagents through main-agent-only synthetic primitives.
 2. Subagents use the same core loop with different bootstrap/tool/memory configuration.
-3. Functional subagent prompt files exist under `src/subagent/prompts/` and are written as real starter context, not as implementation docs.
+3. Functional subagent prompt files exist under `src/jarvis/subagent/prompts/` and are written as real starter context, not as implementation docs.
 4. `PROGRAM.md` contains high-level subagent usage guidance for the main agent, but not detailed primitive schemas.
 5. Subagents have their own archive storage under `workspace/archive/subagents/`.
 6. Subagents cannot access memory tools.

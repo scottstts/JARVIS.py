@@ -1,0 +1,15 @@
+.codex/
+.git/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+assets/
+dev_docs/
+notes/
+secrets/
+tests/
+utils/

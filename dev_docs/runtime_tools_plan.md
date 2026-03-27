@@ -32,7 +32,7 @@ The target outcome is:
 - Installing/building a tool and registering a tool both require explicit user approval.
 - Approval must have real session state and a Telegram inline keyboard approve/reject flow.
 - The `bash` approval detector should be moderately aggressive: strong enough to catch common install/build/system-mutation commands, but not so aggressive that ordinary shell use becomes constantly noisy.
-- Add `BASH_DANGEROUSLY_SKIP_PERMISSION` to [src/settings.py](/Users/scott/Documents/Projects/Python/Jarvis/src/settings.py), default `False`. When `True`, the built-in `bash` approval detector is bypassed entirely.
+- Add `BASH_DANGEROUSLY_SKIP_PERMISSION` to [src/jarvis/settings.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/settings.py), default `False`. When `True`, the built-in `bash` approval detector is bypassed entirely.
 - If the user rejects an approval request, the current turn stops waiting and the system remains idle until the next user-initiated message.
 
 ## High-Level Design
@@ -53,7 +53,7 @@ Runtime tools are not added to the built-in executable registry in code. They ex
 
 ### 2. Built-in discoverables and runtime discoverables stay separate internally
 
-The current built-in discoverable catalog in [src/tools/registry.py](/Users/scott/Documents/Projects/Python/Jarvis/src/tools/registry.py) should remain the source for repo-defined discoverables.
+The current built-in discoverable catalog in [src/jarvis/tools/registry.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/tools/registry.py) should remain the source for repo-defined discoverables.
 
 Runtime discoverables should be loaded separately from `/workspace/runtime_tools/` and merged at `tool_search` execution time. This avoids:
 
@@ -117,7 +117,7 @@ That rule is what makes `/workspace/runtime_tools/*.json` portable instead of be
 
 Add a new basic tool at:
 
-- `src/tools/basic/tool_register/`
+- `src/jarvis/tools/basic/tool_register/`
 
 Responsibilities:
 
@@ -170,7 +170,7 @@ Recommended internal approval request payload:
 - `inspection_url`
 - `manifest_hash`
 
-This approval subsystem may live in `src/core/` or `src/tools/`, but it should not be directly model-callable as a separate tool.
+This approval subsystem may live in `src/jarvis/core/` or `src/jarvis/tools/`, but it should not be directly model-callable as a separate tool.
 
 ## Approval Model
 
@@ -178,7 +178,7 @@ This approval subsystem may live in `src/core/` or `src/tools/`, but it should n
 
 Approval state should be explicit and persisted.
 
-Add session-level approval metadata in [src/storage/types.py](/Users/scott/Documents/Projects/Python/Jarvis/src/storage/types.py) and [src/storage/service.py](/Users/scott/Documents/Projects/Python/Jarvis/src/storage/service.py).
+Add session-level approval metadata in [src/jarvis/storage/types.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/storage/types.py) and [src/jarvis/storage/service.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/storage/service.py).
 
 Implemented persisted shape:
 
@@ -227,7 +227,7 @@ Planned end-to-end flow:
 
 ### 1. Sandbox model changes
 
-The current `bash` tool in [src/tools/basic/bash/tool.py](/Users/scott/Documents/Projects/Python/Jarvis/src/tools/basic/bash/tool.py) uses a workspace-only mount model.
+The current `bash` tool in [src/jarvis/tools/basic/bash/tool.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/tools/basic/bash/tool.py) uses a workspace-only mount model.
 
 Change it to a broad-access blacklist model while still keeping:
 
@@ -292,7 +292,7 @@ Recommended behavior:
 
 ### 3. Settings
 
-Add a new runtime setting in [src/settings.py](/Users/scott/Documents/Projects/Python/Jarvis/src/settings.py):
+Add a new runtime setting in [src/jarvis/settings.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/settings.py):
 
 - `BASH_DANGEROUSLY_SKIP_PERMISSION: Final = False`
 
@@ -310,7 +310,7 @@ This setting is explicitly dangerous and should be documented that way.
 
 ## Dynamic Runtime Tool Loading
 
-Create a runtime tool loader module under `src/tools/` that:
+Create a runtime tool loader module under `src/jarvis/tools/` that:
 
 - reads `/workspace/runtime_tools/*.json`
 - validates each manifest
@@ -322,12 +322,12 @@ This loader should be called inside the `tool_search` execution path, not only a
 
 Likely new modules:
 
-- `src/tools/runtime_tools.py`
-- `src/tools/runtime_tool_manifest.py`
+- `src/jarvis/tools/runtime_tools.py`
+- `src/jarvis/tools/runtime_tool_manifest.py`
 
 ## `tool_search` Changes
 
-Modify [src/tools/basic/tool_search/tool.py](/Users/scott/Documents/Projects/Python/Jarvis/src/tools/basic/tool_search/tool.py) so each search merges:
+Modify [src/jarvis/tools/basic/tool_search/tool.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/tools/basic/tool_search/tool.py) so each search merges:
 
 - built-in discoverables from the registry
 - runtime discoverables loaded from `/workspace/runtime_tools/`
@@ -351,16 +351,16 @@ Search ranking should treat built-in and runtime discoverables uniformly.
 
 Approval requires a new stream event type across core, gateway, and UI.
 
-Add a new core event in [src/core/agent_loop.py](/Users/scott/Documents/Projects/Python/Jarvis/src/core/agent_loop.py):
+Add a new core event in [src/jarvis/core/agent_loop.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/core/agent_loop.py):
 
 - `AgentApprovalRequestEvent`
 
 Extend:
 
-- [src/core/__init__.py](/Users/scott/Documents/Projects/Python/Jarvis/src/core/__init__.py)
-- [src/gateway/protocol.py](/Users/scott/Documents/Projects/Python/Jarvis/src/gateway/protocol.py)
-- [src/gateway/app.py](/Users/scott/Documents/Projects/Python/Jarvis/src/gateway/app.py)
-- [src/ui/telegram/gateway_client.py](/Users/scott/Documents/Projects/Python/Jarvis/src/ui/telegram/gateway_client.py)
+- [src/jarvis/core/__init__.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/core/__init__.py)
+- [src/jarvis/gateway/protocol.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/gateway/protocol.py)
+- [src/jarvis/gateway/app.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/gateway/app.py)
+- [src/jarvis/ui/telegram/gateway_client.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/ui/telegram/gateway_client.py)
 
 New gateway protocol events:
 
@@ -387,7 +387,7 @@ New gateway protocol events:
 
 The approval lifecycle should live in the agent loop, not only in the UI.
 
-Add an approval manager inside [src/core/agent_loop.py](/Users/scott/Documents/Projects/Python/Jarvis/src/core/agent_loop.py) or as a small dedicated helper module.
+Add an approval manager inside [src/jarvis/core/agent_loop.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/core/agent_loop.py) or as a small dedicated helper module.
 
 Responsibilities:
 
@@ -412,7 +412,7 @@ If the user rejects:
 
 ## Telegram UI Changes
 
-The current Telegram client only polls `"message"` updates in [src/ui/telegram/api.py](/Users/scott/Documents/Projects/Python/Jarvis/src/ui/telegram/api.py). It must be extended to support inline keyboard approval UX.
+The current Telegram client only polls `"message"` updates in [src/jarvis/ui/telegram/api.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/ui/telegram/api.py). It must be extended to support inline keyboard approval UX.
 
 Required Telegram additions:
 
@@ -423,8 +423,8 @@ Required Telegram additions:
 
 Primary files:
 
-- [src/ui/telegram/api.py](/Users/scott/Documents/Projects/Python/Jarvis/src/ui/telegram/api.py)
-- [src/ui/telegram/bot.py](/Users/scott/Documents/Projects/Python/Jarvis/src/ui/telegram/bot.py)
+- [src/jarvis/ui/telegram/api.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/ui/telegram/api.py)
+- [src/jarvis/ui/telegram/bot.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/ui/telegram/bot.py)
 
 Planned UI behavior:
 
@@ -446,14 +446,14 @@ Route resolution should be derived from the Telegram chat/message context rather
 
 ## Policy Changes
 
-Update [src/tools/policy.py](/Users/scott/Documents/Projects/Python/Jarvis/src/tools/policy.py) to support:
+Update [src/jarvis/tools/policy.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/tools/policy.py) to support:
 
 - `tool_register`
 - revised `bash` approval checks
 
 Add per-tool policy packages for:
 
-- `src/tools/basic/tool_register/policy.py`
+- `src/jarvis/tools/basic/tool_register/policy.py`
 
 `tool_register` policy should require a valid approval token every time.
 
@@ -463,9 +463,9 @@ Session storage changes are needed for durable approval state and auditability.
 
 Update:
 
-- [src/storage/types.py](/Users/scott/Documents/Projects/Python/Jarvis/src/storage/types.py)
-- [src/storage/service.py](/Users/scott/Documents/Projects/Python/Jarvis/src/storage/service.py)
-- approval-related record creation in [src/core/agent_loop.py](/Users/scott/Documents/Projects/Python/Jarvis/src/core/agent_loop.py)
+- [src/jarvis/storage/types.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/storage/types.py)
+- [src/jarvis/storage/service.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/storage/service.py)
+- approval-related record creation in [src/jarvis/core/agent_loop.py](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/core/agent_loop.py)
 
 Transcript expectations:
 
@@ -479,7 +479,7 @@ Transcript expectations:
 Update:
 
 - [dev_docs/tool_dev_doc.md](/Users/scott/Documents/Projects/Python/Jarvis/dev_docs/tool_dev_doc.md)
-- [src/identities/PROGRAM.md](/Users/scott/Documents/Projects/Python/Jarvis/src/identities/PROGRAM.md)
+- [src/jarvis/identities/PROGRAM.md](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/identities/PROGRAM.md)
 - optionally [notes/notes.md](/Users/scott/Documents/Projects/Python/Jarvis/notes/notes.md) if implementation decisions become relevant memory for later agents
 
 Documentation changes should cover:
@@ -540,7 +540,7 @@ Required coverage:
 
 Recommended build order:
 
-1. Add manifest models and runtime tool loader under `src/tools/`.
+1. Add manifest models and runtime tool loader under `src/jarvis/tools/`.
 2. Add `tool_register` basic tool with manifest validation and atomic file writes.
 3. Update `tool_search` to merge runtime tool manifests dynamically.
 4. Rework `bash` sandbox from workspace-only to blacklist-based path hiding.
@@ -552,7 +552,7 @@ Recommended build order:
 10. Extend Telegram API client and bot for inline keyboard approvals and callback queries.
 11. Tighten `bash` approval enforcement for moderately aggressive install/build/system-mutation detection.
 12. Enforce approval inside `tool_register` for exact manifest payloads.
-13. Update [src/identities/PROGRAM.md](/Users/scott/Documents/Projects/Python/Jarvis/src/identities/PROGRAM.md) `Tool Uses` guidance so the agent can discover, register, and use runtime tools correctly.
+13. Update [src/jarvis/identities/PROGRAM.md](/Users/scott/Documents/Projects/Python/Jarvis/src/jarvis/identities/PROGRAM.md) `Tool Uses` guidance so the agent can discover, register, and use runtime tools correctly.
 14. Update docs and complete end-to-end tests.
 
 ## Acceptance Criteria

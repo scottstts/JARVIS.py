@@ -7,10 +7,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-from llm.config import LMStudioProviderSettings
-from llm.errors import LLMConfigurationError
-from llm.providers.lmstudio_provider import LMStudioProvider
-from llm.types import (
+from jarvis.llm.config import LMStudioProviderSettings
+from jarvis.llm.errors import LLMConfigurationError
+from jarvis.llm.providers.lmstudio_provider import LMStudioProvider
+from jarvis.llm.types import (
     DoneEvent,
     LLMMessage,
     LLMRequest,
@@ -135,9 +135,9 @@ class LMStudioProviderTests(unittest.TestCase):
             post_calls.append((args, kwargs))
             return stream_response
 
-        with patch("llm.providers.lmstudio_provider._running_in_container", return_value=False):
-            with patch("llm.providers.lmstudio_provider.requests.get", side_effect=fake_get):
-                with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+        with patch("jarvis.llm.providers.lmstudio_provider._running_in_container", return_value=False):
+            with patch("jarvis.llm.providers.lmstudio_provider.requests.get", side_effect=fake_get):
+                with patch("jarvis.llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
                     events = asyncio.run(self._collect_events(provider, request))
 
         self.assertEqual(get_calls[0][0][0], "http://localhost:1234/api/v1/models")
@@ -175,7 +175,7 @@ class LMStudioProviderTests(unittest.TestCase):
             default_timeout_seconds=60.0,
         )
 
-        with patch("llm.providers.lmstudio_provider._running_in_container", return_value=True):
+        with patch("jarvis.llm.providers.lmstudio_provider._running_in_container", return_value=True):
             self.assertEqual(
                 provider._server_base_url(),
                 "http://host.docker.internal:1234",
@@ -189,7 +189,7 @@ class LMStudioProviderTests(unittest.TestCase):
         request = LLMRequest(messages=(LLMMessage.text("user", "hello"),))
 
         with patch(
-            "llm.providers.lmstudio_provider.requests.get",
+            "jarvis.llm.providers.lmstudio_provider.requests.get",
             return_value=_FakeJsonResponse(
                 {
                     "models": [
@@ -218,7 +218,7 @@ class LMStudioProviderTests(unittest.TestCase):
         request = LLMRequest(messages=(LLMMessage.text("user", "hello"),))
 
         with patch(
-            "llm.providers.lmstudio_provider.requests.get",
+            "jarvis.llm.providers.lmstudio_provider.requests.get",
             return_value=_FakeJsonResponse(
                 {
                     "models": [
@@ -260,7 +260,7 @@ class LMStudioProviderTests(unittest.TestCase):
         )
 
         with patch(
-            "llm.providers.lmstudio_provider.requests.get",
+            "jarvis.llm.providers.lmstudio_provider.requests.get",
             return_value=_FakeJsonResponse(
                 {
                     "models": [
@@ -323,7 +323,7 @@ class LMStudioProviderTests(unittest.TestCase):
             post_calls.append((args, kwargs))
             return responses.pop(0)
 
-        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+        with patch("jarvis.llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
             asyncio.run(provider.generate(first_request))
             asyncio.run(provider.generate(second_request))
 
@@ -416,7 +416,7 @@ class LMStudioProviderTests(unittest.TestCase):
             post_calls.append((args, kwargs))
             return responses.pop(0)
 
-        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+        with patch("jarvis.llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
             asyncio.run(provider.generate(first_request))
             asyncio.run(provider.generate(second_request))
 
@@ -481,7 +481,7 @@ class LMStudioProviderTests(unittest.TestCase):
                 return response
             return response
 
-        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+        with patch("jarvis.llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
             asyncio.run(provider.generate(first_request))
             response = asyncio.run(provider.generate(second_request))
 
@@ -550,7 +550,7 @@ class LMStudioProviderTests(unittest.TestCase):
             post_calls.append((args, kwargs))
             return responses.pop(0)
 
-        with patch("llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
+        with patch("jarvis.llm.providers.lmstudio_provider.requests.post", side_effect=fake_post):
             asyncio.run(provider.generate(first_request))
             asyncio.run(provider.generate(rewritten_history_request))
 
@@ -617,7 +617,7 @@ class LMStudioProviderTests(unittest.TestCase):
         )
 
         with patch(
-            "llm.providers.lmstudio_provider.requests.post",
+            "jarvis.llm.providers.lmstudio_provider.requests.post",
             return_value=stream_response,
         ):
             events = asyncio.run(self._collect_events(provider, request))

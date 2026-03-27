@@ -9,7 +9,7 @@ It is intentionally explicit. If a detail is written here, implementation should
 This document is about the runtime memory system.
 
 - Runtime memory files live under `/workspace/memory/`
-- Memory implementation code lives under `src/memory/`
+- Memory implementation code lives under `src/jarvis/memory/`
 - Transcript storage remains separate under `/workspace/archive/transcripts/`
 - Identity bootstrap files remain separate under `/workspace/identities/`
 
@@ -23,11 +23,11 @@ It is not a single monolithic subsystem.
 
 It is a distributed concern with one coordinated design:
 
-- `src/identities/` provides pinned procedural/bootstrap instruction memory
-- `src/storage/` provides raw episodic evidence in archived transcripts
-- `src/memory/` provides long-term semantic, ongoing, and graph-oriented memory orchestration
-- `src/tools/` provides the agent-facing memory control surface
-- `src/core/` decides when memory is injected and when maintenance/reflection runs
+- `src/jarvis/identities/` provides pinned procedural/bootstrap instruction memory
+- `src/jarvis/storage/` provides raw episodic evidence in archived transcripts
+- `src/jarvis/memory/` provides long-term semantic, ongoing, and graph-oriented memory orchestration
+- `src/jarvis/tools/` provides the agent-facing memory control surface
+- `src/jarvis/core/` decides when memory is injected and when maintenance/reflection runs
 
 ## Core Principles
 
@@ -1120,7 +1120,7 @@ Soft sweep examples:
 
 These sweeps are safety nets, not the primary maintenance model.
 
-All maintenance operations that require an LLM call must use a separate maintenance-model configuration from `src/settings.py`.
+All maintenance operations that require an LLM call must use a separate maintenance-model configuration from `src/jarvis/settings.py`.
 They must not be implicitly tied to the main chat model used to power the live agent turn.
 
 This includes:
@@ -1161,7 +1161,7 @@ Method details:
 - SQLite row updates: local computation and indexing only
 - FTS refresh: local computation and indexing only
 - graph relation refresh: local computation and indexing only
-- embeddings for changed chunks, facts, and relations: separate embedding calls through `src/llm/`
+- embeddings for changed chunks, facts, and relations: separate embedding calls through `src/jarvis/llm/`
 - no LLM generation calls occur in immediate sync maintenance
 - this same sync path is used to reconcile out-of-band edits made by a human or external system
 
@@ -1187,7 +1187,7 @@ Reflection output is a structured action set:
 Method details:
 
 - transcript evidence loading: local computation only
-- candidate extraction and memory action planning: separate LLM call through the maintenance LLM settings in `src/settings.py`
+- candidate extraction and memory action planning: separate LLM call through the maintenance LLM settings in `src/jarvis/settings.py`
 - validation of the proposed action set: local computation only
 - writes for approved actions: local computation through the dedicated memory write path
 - sidecar refresh for changed documents: local computation plus embedding calls for changed indexed content
@@ -1238,7 +1238,7 @@ This prevents compaction from being the only summarization layer.
 Method details:
 
 - session evidence loading: local computation only
-- final reflection plan: separate LLM call through the maintenance LLM settings in `src/settings.py`
+- final reflection plan: separate LLM call through the maintenance LLM settings in `src/jarvis/settings.py`
 - validation and policy gating: local computation only
 - memory writes: local computation through the dedicated memory write path
 - sidecar refresh: local computation plus embedding calls for changed indexed content
@@ -1283,21 +1283,21 @@ Per-job method details:
 
 - reviews recent daily logs as a staging layer and merges redundant or closely related daily material
 - may promote stable daily material into `ongoing/` or queue it for later core review
-- method: local computation plus separate LLM consolidation call through the maintenance LLM settings in `src/settings.py`
+- method: local computation plus separate LLM consolidation call through the maintenance LLM settings in `src/jarvis/settings.py`
 - embedding calls: only if promoted or rewritten indexed content changes
 - LLM calls: yes
 
 `refresh_ongoing_summaries`
 
 - rewrites or tightens ongoing summaries from their current facts, relations, and recent daily support
-- method: local computation plus separate LLM summarization call through the maintenance LLM settings in `src/settings.py`
+- method: local computation plus separate LLM summarization call through the maintenance LLM settings in `src/jarvis/settings.py`
 - embedding calls: only if summary-bearing documents change
 - LLM calls: yes
 
 `refresh_core_summaries`
 
 - rewrites or tightens core summaries to keep them compact, stable, and bootstrap-efficient
-- method: local computation plus separate LLM summarization call through the maintenance LLM settings in `src/settings.py`
+- method: local computation plus separate LLM summarization call through the maintenance LLM settings in `src/jarvis/settings.py`
 - embedding calls: only if summary-bearing documents change
 - LLM calls: yes
 
@@ -1312,7 +1312,7 @@ Per-job method details:
 
 - reviews active ongoing documents whose `review_after` is due
 - decides whether to refresh, split, merge, close, or leave unchanged
-- method: local computation plus separate LLM review call through the maintenance LLM settings in `src/settings.py`
+- method: local computation plus separate LLM review call through the maintenance LLM settings in `src/jarvis/settings.py`
 - embedding calls: only if a document changes
 - LLM calls: yes
 
@@ -1320,7 +1320,7 @@ Per-job method details:
 
 - reviews active core documents whose `review_after` is due
 - decides whether they remain core-worthy, need refresh, should demote, or should expire
-- method: local computation plus separate LLM review call through the maintenance LLM settings in `src/settings.py`
+- method: local computation plus separate LLM review call through the maintenance LLM settings in `src/jarvis/settings.py`
 - embedding calls: only if a document changes
 - LLM calls: yes
 
@@ -1506,7 +1506,7 @@ It does not copy whole transcript files into memory.
 
 ## Embeddings
 
-Embeddings are produced through the existing embedding path in `src/llm/`.
+Embeddings are produced through the existing embedding path in `src/jarvis/llm/`.
 
 Memory embedding settings should be configurable separately from chat settings only if we later need that.
 For now, the memory subsystem uses the global embedding provider and model already configured for Jarvis.
@@ -1564,9 +1564,9 @@ Maintenance-model rule:
 - any maintenance operation that requires an LLM call must resolve that call from the dedicated maintenance settings above
 - it must not implicitly inherit the main agent chat provider or chat model
 
-## `src/memory/` Module Layout
+## `src/jarvis/memory/` Module Layout
 
-The implementation code under `src/memory/` should be split like this:
+The implementation code under `src/jarvis/memory/` should be split like this:
 
 - `config.py`
 - `types.py`
@@ -1692,7 +1692,7 @@ The memory system does not aim to:
 ## Open Design Decisions Explicitly Settled By This Doc
 
 1. Canonical runtime memory lives under `/workspace/memory/`
-2. Memory code lives under `src/memory/`
+2. Memory code lives under `src/jarvis/memory/`
 3. Dedicated memory tools are required even though Markdown is canonical
 4. Jarvis uses dedicated memory tools rather than generic file-tool fallback, while out-of-band edits must still be detected and reconciled
 5. SQLite is a derived index and maintenance substrate, not a second source of truth

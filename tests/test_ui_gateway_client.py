@@ -6,7 +6,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from ui.telegram.gateway_client import (
+from jarvis.ui.telegram.gateway_client import (
     GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
@@ -64,7 +64,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
 
         with patch(
-            "ui.telegram.gateway_client._resolve_websocket_connect",
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
         ):
             events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
@@ -91,7 +91,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
 
         with patch(
-            "ui.telegram.gateway_client._resolve_websocket_connect",
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
         ):
             stop_requested = await client.request_stop(route_id="tg_1")
@@ -129,7 +129,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
 
         with patch(
-            "ui.telegram.gateway_client._resolve_websocket_connect",
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
         ):
             events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
@@ -150,7 +150,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
 
         with patch(
-            "ui.telegram.gateway_client._resolve_websocket_connect",
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
         ):
             resolved = await client.submit_approval(
@@ -180,7 +180,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
 
         with patch(
-            "ui.telegram.gateway_client._resolve_websocket_connect",
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
         ):
             with self.assertRaises(GatewayBridgeError) as context:
@@ -195,7 +195,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("connect failed for ws://localhost:8080/ws/tg_123")
 
         with patch(
-            "ui.telegram.gateway_client._resolve_websocket_connect",
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=fail_connect,
         ):
             with self.assertRaises(GatewayBridgeError) as context:

@@ -6,10 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import AgentLoop
-from llm import EmbeddingResponse, LLMResponse, LLMUsage
-from memory import MemoryService, MemorySettings
-from storage import SessionStorage
+from jarvis.core import AgentLoop
+from jarvis.llm import EmbeddingResponse, LLMResponse, LLMUsage
+from jarvis.memory import MemoryService, MemorySettings
+from jarvis.storage import SessionStorage
 from tests.helpers import build_core_settings
 
 

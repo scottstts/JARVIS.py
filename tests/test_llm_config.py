@@ -6,10 +6,10 @@ import os
 import unittest
 from unittest.mock import patch
 
-import settings as app_settings
+from jarvis import settings as app_settings
 
-from llm.config import EmbeddingSettings, LLMSettings, LMStudioProviderSettings
-from llm.errors import LLMConfigurationError
+from jarvis.llm.config import EmbeddingSettings, LLMSettings, LMStudioProviderSettings
+from jarvis.llm.errors import LLMConfigurationError
 
 
 class LMStudioConfigTests(unittest.TestCase):

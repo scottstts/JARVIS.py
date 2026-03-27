@@ -5,17 +5,17 @@ from __future__ import annotations
 import base64
 import unittest
 
-from llm.config import (
+from jarvis.llm.config import (
     AnthropicProviderSettings,
     GeminiProviderSettings,
     LMStudioProviderSettings,
     OpenRouterProviderSettings,
 )
-from llm.providers.anthropic_provider import AnthropicProvider
-from llm.providers.gemini_provider import GeminiProvider
-from llm.providers.lmstudio_provider import LMStudioProvider
-from llm.providers.openrouter_provider import OpenRouterProvider
-from llm.types import ImagePart, LLMMessage, LLMRequest, TextPart, ToolCall, ToolDefinition, ToolResultPart
+from jarvis.llm.providers.anthropic_provider import AnthropicProvider
+from jarvis.llm.providers.gemini_provider import GeminiProvider
+from jarvis.llm.providers.lmstudio_provider import LMStudioProvider
+from jarvis.llm.providers.openrouter_provider import OpenRouterProvider
+from jarvis.llm.types import ImagePart, LLMMessage, LLMRequest, TextPart, ToolCall, ToolDefinition, ToolResultPart
 
 
 class AnthropicProviderRequestShapeTests(unittest.TestCase):

@@ -10,25 +10,25 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from core import (
+from jarvis.core import (
     AgentAssistantMessageEvent,
     AgentTextDeltaEvent,
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
-from gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
-from gateway.route_events import RouteAssistantMessageEvent, RouteSystemNoticeEvent
-from gateway.route_runtime import (
+from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
+from jarvis.gateway.route_events import RouteAssistantMessageEvent, RouteSystemNoticeEvent
+from jarvis.gateway.route_runtime import (
     RouteEventBus,
     RouteRuntime,
     _RouteTurnRequest,
     _tool_result_for_payload,
 )
-from gateway.session_router import SessionRouter, validate_route_id
-from subagent.types import SubagentSnapshot
+from jarvis.gateway.session_router import SessionRouter, validate_route_id
+from jarvis.subagent.types import SubagentSnapshot
 from tests.helpers import build_core_settings
-from tools import ToolSettings
-from tools.basic.bash.jobs import BashJobRecord, claim_job_owner, create_background_job
+from jarvis.tools import ToolSettings
+from jarvis.tools.basic.bash.jobs import BashJobRecord, claim_job_owner, create_background_job
 
 
 class _TrackingLoop:

@@ -5,8 +5,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-import gateway.__main__ as gateway_main
-from gateway import GatewaySettings
+import jarvis.gateway.__main__ as gateway_main
+from jarvis.gateway import GatewaySettings
 
 
 class GatewayMainEntrypointTests(unittest.TestCase):
@@ -18,12 +18,12 @@ class GatewayMainEntrypointTests(unittest.TestCase):
             max_message_chars=32_000,
         )
 
-        with patch("gateway.__main__.GatewaySettings.from_env", return_value=settings):
-            with patch("gateway.__main__.uvicorn.run") as run:
+        with patch("jarvis.gateway.__main__.GatewaySettings.from_env", return_value=settings):
+            with patch("jarvis.gateway.__main__.uvicorn.run") as run:
                 gateway_main.main()
 
         run.assert_called_once_with(
-            "gateway.app:build_asgi_app",
+            "jarvis.gateway.app:build_asgi_app",
             factory=True,
             host="127.0.0.1",
             port=8080,

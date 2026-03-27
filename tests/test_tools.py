@@ -16,9 +16,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from jsonschema import Draft202012Validator
-from llm import ToolCall, ToolDefinition
-from memory import MemoryService, MemorySettings
-from tools import (
+from jarvis.llm import ToolCall, ToolDefinition
+from jarvis.memory import MemoryService, MemorySettings
+from jarvis.tools import (
     DiscoverableTool,
     RegisteredTool,
     ToolExecutionContext,
@@ -27,23 +27,23 @@ from tools import (
     ToolRuntime,
     ToolSettings,
 )
-from tools.remote_runtime_client import RemoteToolRuntimeClient, RemoteToolRuntimeError
-from tools.basic.memory_write.tool import build_memory_write_tool
-from tools.basic.tool_search import build_tool_search_tool
-from tools.basic.memory_search.tool import _format_memory_search_result
-from tools.runtime_tool_manifest import (
+from jarvis.tools.remote_runtime_client import RemoteToolRuntimeClient, RemoteToolRuntimeError
+from jarvis.tools.basic.memory_write.tool import build_memory_write_tool
+from jarvis.tools.basic.tool_search import build_tool_search_tool
+from jarvis.tools.basic.memory_search.tool import _format_memory_search_result
+from jarvis.tools.runtime_tool_manifest import (
     dump_runtime_tool_manifest,
     runtime_tool_manifest_path,
     validate_runtime_tool_manifest_payload,
 )
-from tools.runtime_tools import load_runtime_tool_catalog
-from tools.basic.bash.local_executor import (
+from jarvis.tools.runtime_tools import load_runtime_tool_catalog
+from jarvis.tools.basic.bash.local_executor import (
     _build_scrubbed_environment,
     DirectBashToolExecutor,
     format_bash_tool_description,
 )
-from tools.basic.bash.jobs import load_job, sweep_job_artifacts
-from tools.basic.web_fetch.tool import (
+from jarvis.tools.basic.bash.jobs import load_job, sweep_job_artifacts
+from jarvis.tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     HTTPFetchResult,
     MarkdownConversionResult,
@@ -262,7 +262,7 @@ class ToolSettingsTests(unittest.TestCase):
             os.environ,
             {},
             clear=True,
-        ), patch("workspace_paths._running_in_container", return_value=False):
+        ), patch("jarvis.workspace_paths._running_in_container", return_value=False):
             with self.assertRaisesRegex(
                 ValueError,
                 "AGENT_WORKSPACE must be explicitly set for host runs",
@@ -276,7 +276,7 @@ class ToolSettingsTests(unittest.TestCase):
                 "AGENT_WORKSPACE": "/tmp/jarvis-host-workspace",
             },
             clear=True,
-        ), patch("workspace_paths._running_in_container", return_value=False):
+        ), patch("jarvis.workspace_paths._running_in_container", return_value=False):
             settings = ToolSettings.from_env()
 
         self.assertEqual(settings.workspace_dir, Path("/tmp/jarvis-host-workspace"))
@@ -895,7 +895,7 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
             settings = ToolSettings.from_workspace_dir(Path("/workspace"))
 
         client = RemoteToolRuntimeClient(settings)
-        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+        with patch("jarvis.tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
             result = await client.execute(
                 tool_name="bash",
                 call_id="call_1",
@@ -967,7 +967,7 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
             settings = ToolSettings.from_workspace_dir(Path("/workspace"))
 
         client = RemoteToolRuntimeClient(settings)
-        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+        with patch("jarvis.tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
             await client.execute(
                 tool_name="bash",
                 call_id="call_timeout",
@@ -1017,7 +1017,7 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
             settings = ToolSettings.from_workspace_dir(Path("/workspace"))
 
         client = RemoteToolRuntimeClient(settings)
-        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+        with patch("jarvis.tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
             await client.execute(
                 tool_name="bash",
                 call_id="call_timeout_clamped",
@@ -1064,7 +1064,7 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
             settings = ToolSettings.from_workspace_dir(Path("/workspace"))
 
         client = RemoteToolRuntimeClient(settings)
-        with patch("tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+        with patch("jarvis.tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
             with self.assertRaises(RemoteToolRuntimeError):
                 await client.execute(
                     tool_name="bash",
@@ -2941,7 +2941,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             request_hash = approval_result.metadata["approval_request"]["request_hash"]
 
             with patch(
-                "tools.discoverable.email.tool.smtplib.SMTP_SSL",
+                "jarvis.tools.discoverable.email.tool.smtplib.SMTP_SSL",
                 _FakeSMTPSSL,
             ):
                 result = await runtime.execute(
@@ -3517,7 +3517,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return {"message_id": 9, "chat_id": 123}
 
         with patch(
-            "tools.basic.send_file.tool.send_telegram_file",
+            "jarvis.tools.basic.send_file.tool.send_telegram_file",
             side_effect=_fake_send_telegram_file,
         ):
             result = await self.runtime.execute(
@@ -3606,7 +3606,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-openai-key"}, clear=False):
             with patch(
-                "tools.discoverable.generate_edit_image.tool.OpenAI",
+                "jarvis.tools.discoverable.generate_edit_image.tool.OpenAI",
                 _FakeOpenAIClient,
             ):
                 result = await self.runtime.execute(
@@ -3714,7 +3714,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
             with patch(
-                "tools.discoverable.generate_edit_image.tool.genai.Client",
+                "jarvis.tools.discoverable.generate_edit_image.tool.genai.Client",
                 _FakeGeminiClient,
             ):
                 result = await self.runtime.execute(
@@ -3818,7 +3818,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
             with patch(
-                "tools.discoverable.generate_edit_image.tool.genai.Client",
+                "jarvis.tools.discoverable.generate_edit_image.tool.genai.Client",
                 _FakeGeminiClient,
             ):
                 result = await self.runtime.execute(
@@ -3884,7 +3884,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-openai-key"}, clear=False):
             with patch(
-                "tools.discoverable.transcribe.tool.OpenAI",
+                "jarvis.tools.discoverable.transcribe.tool.OpenAI",
                 _FakeOpenAIClient,
             ):
                 result = await self.runtime.execute(
@@ -3938,7 +3938,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("OpenAI client should not be created for oversized audio.")
 
         with patch(
-            "tools.discoverable.transcribe.tool.OpenAI",
+            "jarvis.tools.discoverable.transcribe.tool.OpenAI",
             _FailIfCalledOpenAIClient,
         ):
             result = await self.runtime.execute(
@@ -4017,7 +4017,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
             with patch(
-                "tools.discoverable.youtube.tool.genai.Client",
+                "jarvis.tools.discoverable.youtube.tool.genai.Client",
                 _FakeGeminiClient,
             ):
                 result = await self.runtime.execute(
@@ -4122,7 +4122,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
             with patch(
-                "tools.discoverable.youtube.tool.genai.Client",
+                "jarvis.tools.discoverable.youtube.tool.genai.Client",
                 _FakeGeminiClient,
             ):
                 result = await self.runtime.execute(
@@ -4181,11 +4181,11 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         with patch(
-            "tools.discoverable.youtube.tool.subprocess.run",
+            "jarvis.tools.discoverable.youtube.tool.subprocess.run",
             side_effect=_fake_curl_run,
         ):
             with patch(
-                "tools.discoverable.youtube.tool.genai.Client",
+                "jarvis.tools.discoverable.youtube.tool.genai.Client",
                 _FailIfCalledGeminiClient,
             ):
                 result = await self.runtime.execute(
@@ -4240,7 +4240,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch(
-            "tools.discoverable.youtube.tool.subprocess.run",
+            "jarvis.tools.discoverable.youtube.tool.subprocess.run",
             side_effect=_fake_curl_run,
         ):
             result = await self.runtime.execute(
@@ -4336,7 +4336,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-brave-key"}, clear=False):
-            with patch("tools.basic.web_search.tool.requests.get", side_effect=_fake_requests_get):
+            with patch("jarvis.tools.basic.web_search.tool.requests.get", side_effect=_fake_requests_get):
                 result = await self.runtime.execute(
                     tool_call=ToolCall(
                         call_id="call_web_search",
@@ -4374,7 +4374,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_web_search_returns_api_error_details(self) -> None:
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-brave-key"}, clear=False):
             with patch(
-                "tools.basic.web_search.tool.requests.get",
+                "jarvis.tools.basic.web_search.tool.requests.get",
                 return_value=_FakeWebSearchResponse(
                     status_code=429,
                     payload={"error": {"detail": "rate limit exceeded"}},
@@ -4595,7 +4595,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.basic.web_fetch.tool._fetch_http_text",
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
             return_value=tier1_result,
         ) as fetch_mock:
             result = await self.runtime.execute(
@@ -4635,11 +4635,11 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.basic.web_fetch.tool._fetch_http_text",
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
             side_effect=[tier1_result, tier2_result],
         ) as fetch_mock:
             with patch(
-                "tools.basic.web_fetch.tool._convert_html_to_markdown",
+                "jarvis.tools.basic.web_fetch.tool._convert_html_to_markdown",
                 return_value=converted_result,
             ) as convert_mock:
                 result = await self.runtime.execute(
@@ -4692,15 +4692,15 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.basic.web_fetch.tool._fetch_http_text",
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
             side_effect=[tier1_result, tier2_result],
         ) as fetch_mock:
             with patch(
-                "tools.basic.web_fetch.tool._convert_html_to_markdown",
+                "jarvis.tools.basic.web_fetch.tool._convert_html_to_markdown",
                 side_effect=[low_signal_markdown, rendered_markdown],
             ) as convert_mock:
                 with patch(
-                    "tools.basic.web_fetch.tool._render_page_html",
+                    "jarvis.tools.basic.web_fetch.tool._render_page_html",
                     new=AsyncMock(return_value=rendered_result),
                 ) as render_mock:
                     result = await self.runtime.execute(
@@ -4745,9 +4745,9 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "web_fetch does not allow private, loopback, or reserved IP targets."
                 )
 
-        with patch("tools.basic.web_fetch.tool.async_playwright", return_value=manager):
+        with patch("jarvis.tools.basic.web_fetch.tool.async_playwright", return_value=manager):
             with patch(
-                "tools.basic.web_fetch.tool._validate_public_url",
+                "jarvis.tools.basic.web_fetch.tool._validate_public_url",
                 side_effect=validate_public_url,
             ):
                 result = await _render_page_html(
@@ -4777,9 +4777,9 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "web_fetch does not allow private, loopback, or reserved IP targets."
                 )
 
-        with patch("tools.basic.web_fetch.tool.async_playwright", return_value=manager):
+        with patch("jarvis.tools.basic.web_fetch.tool.async_playwright", return_value=manager):
             with patch(
-                "tools.basic.web_fetch.tool._validate_public_url",
+                "jarvis.tools.basic.web_fetch.tool._validate_public_url",
                 side_effect=validate_public_url,
             ):
                 with self.assertRaisesRegex(RuntimeError, "blocked final URL"):
@@ -4802,7 +4802,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "tools.basic.web_fetch.tool._fetch_http_text",
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
             side_effect=[tier1_result, tier2_result],
         ):
             with patch.dict(

@@ -1,0 +1,333 @@
+# Jarvis Project Structure
+
+## Purpose
+
+This document describes the current intended repo structure after the `uv` packaging refactor.
+
+Use this as the default map of the project when deciding where new code, tests, docs, or container changes should go.
+
+If this document and the code ever disagree, treat the code as source of truth and update this file.
+
+## Core Rules
+
+- The project is strict container-first for Python.
+- The installable Python package lives under `src/jarvis/`.
+- Do not add new repo-root Python entrypoint shims.
+- Add runtime entrypoints through `pyproject.toml` `[project.scripts]`.
+- Run `uv` only inside the `dev` container against `/repo`.
+- The `tool_runtime` container does not mount the repo; it runs the installed package from its image.
+
+## High-Level Repo Layout
+
+```text
+.
+├── pyproject.toml
+├── uv.lock
+├── README.md
+├── docker-compose.yml
+├── Dockerfile.dev
+├── Dockerfile.tool_runtime
+├── src/
+│   └── jarvis/
+├── tests/
+├── dev_docs/
+├── notes/
+├── secrets/
+├── assets/
+├── utils/
+└── vendor/
+```
+
+## Root-Level Responsibilities
+
+### Packaging and dependency files
+
+- `pyproject.toml`
+  - package metadata
+  - build-system configuration
+  - `uv` dependency declarations
+  - script entrypoints
+  - tool config for `pytest` and `ruff`
+- `uv.lock`
+  - locked dependency graph for container builds and `uv sync`
+
+### Container/runtime files
+
+- `docker-compose.yml`
+  - defines the `dev` and `tool_runtime` services
+  - mounts `/repo` only into `dev`
+  - mounts the shared `/workspace` into both services
+- `Dockerfile.dev`
+  - Linux development environment
+  - installs `uv`
+  - prepares `/opt/venv`
+  - intended for `uv run ...` against the bind-mounted repo
+- `Dockerfile.tool_runtime`
+  - isolated runtime image for the HTTP tool runtime service
+  - installs the `jarvis` package into `/opt/venv`
+  - does not rely on `PYTHONPATH`
+
+### Documentation and reference files
+
+- `README.md`
+  - developer/operator quickstart
+- `dev_docs/`
+  - design docs, implementation plans, and subsystem docs
+- `notes/notes.md`
+  - concise running notes and lessons learned for future agents
+- `.codex/AGENTS.md`
+  - project-wide coding and workflow rules for coding agents
+
+### Supporting directories
+
+- `tests/`
+  - automated test suite
+- `secrets/`
+  - local secret-file inputs for Docker Compose
+- `assets/`
+  - repo assets such as images
+- `utils/`
+  - supporting utilities/scripts that are not part of the installable package
+- `vendor/`
+  - vendored third-party source/assets used during builds
+  - currently includes `vendor/sqlite-vec/`
+
+## Installable Package Layout
+
+All runtime Python code lives under `src/jarvis/`.
+
+```text
+src/jarvis/
+├── __init__.py
+├── __main__.py
+├── main.py
+├── settings.py
+├── runtime_env.py
+├── logging_setup.py
+├── workspace_paths.py
+├── core/
+├── gateway/
+├── identities/
+├── llm/
+├── memory/
+├── storage/
+├── subagent/
+├── tool_runtime_service/
+├── tools/
+└── ui/
+```
+
+### Package entrypoints and top-level support modules
+
+- `__main__.py`
+  - package-level `python -m jarvis` support
+- `main.py`
+  - combined runtime entrypoint for running gateway + UI together
+  - backs the `jarvis` script
+- `settings.py`
+  - non-secret runtime defaults and environment-backed settings
+- `runtime_env.py`
+  - Docker secret loading and runtime environment bootstrap
+- `logging_setup.py`
+  - application logging configuration
+- `workspace_paths.py`
+  - shared workspace path helpers
+
+## Subpackage Responsibilities
+
+### `src/jarvis/core/`
+
+Core agent loop, command handling, compaction, token estimation, and identity/bootstrap loading.
+
+Also contains packaged prompt resources under `core/prompts/`.
+
+### `src/jarvis/gateway/`
+
+Starlette websocket gateway and route/session coordination.
+
+Key responsibilities:
+
+- websocket protocol
+- route runtime lifecycle
+- session routing
+- route event publication
+- detached bash-job observation
+
+### `src/jarvis/identities/`
+
+Source-controlled identity/bootstrap prompt files:
+
+- `PROGRAM.md`
+- `REACTOR.md`
+- `USER.md`
+- `ARMOR.md`
+
+These files are part of the installed package, but at runtime the `dev` container also copies them into `/workspace/identities/` for the agent to consume from the shared workspace.
+
+### `src/jarvis/llm/`
+
+Provider-agnostic LLM interfaces and provider adapters.
+
+Includes:
+
+- shared config
+- request/response types
+- validation
+- service lifecycle
+- provider implementations under `llm/providers/`
+
+### `src/jarvis/memory/`
+
+Long-term memory subsystem.
+
+Includes:
+
+- canonical Markdown memory
+- dirty scanning
+- indexing
+- retrieval
+- maintenance
+- reflection
+- graph handling
+- memory-specific config and types
+
+### `src/jarvis/storage/`
+
+Conversation/session persistence and related storage types.
+
+### `src/jarvis/subagent/`
+
+Subagent runtime, lifecycle management, storage, prompts, and settings.
+
+Packaged prompt resources live under `subagent/prompts/`.
+
+### `src/jarvis/tool_runtime_service/`
+
+HTTP service used by the isolated `tool_runtime` container.
+
+This package is what the `jarvis-tool-runtime` entrypoint runs.
+
+### `src/jarvis/tools/`
+
+Agent tool system.
+
+Top-level responsibilities:
+
+- tool registry
+- runtime abstraction
+- policy interface
+- runtime manifest handling
+- remote runtime client
+
+Substructure:
+
+- `tools/basic/`
+  - always-available built-in tools
+- `tools/discoverable/`
+  - discoverable executable tools and docs-only discoverables
+
+### `src/jarvis/ui/`
+
+User-facing interfaces.
+
+Current implementation:
+
+- `ui/telegram/`
+  - Telegram API client
+  - bot bridge
+  - gateway client
+  - formatting and config
+
+The `jarvis-ui` entrypoint runs the UI-only path.
+
+## Tests Layout
+
+The `tests/` directory is repo-root, separate from `src/`, and imports the installed package namespace (`jarvis.*`).
+
+General rules:
+
+- keep tests near the subsystem they exercise by filename and naming
+- add new tests under `tests/`, not inside `src/jarvis/`
+- test package imports should target `jarvis...`, not old flat top-level module names
+
+## Runtime vs Repo Data
+
+It is important to keep repo structure and runtime workspace structure separate.
+
+### Repo-controlled code and resources
+
+Examples:
+
+- `src/jarvis/...`
+- `tests/...`
+- `dev_docs/...`
+- `notes/notes.md`
+
+### Runtime workspace data
+
+Examples inside `/workspace`:
+
+- transcript archives
+- memory state
+- copied identities
+- temporary files
+- tool artifacts
+- subagent archives
+
+Do not mix runtime-generated data back into `src/jarvis/`.
+
+## `uv` and Entry Point Model
+
+The project is a normal installable Python package named `jarvis`.
+
+Current script entrypoints:
+
+- `jarvis`
+- `jarvis-gateway`
+- `jarvis-tool-runtime`
+- `jarvis-ui`
+
+When adding a new runnable component:
+
+1. add the module under `src/jarvis/`
+2. expose a `main()` when appropriate
+3. register the script in `pyproject.toml`
+4. update docs if the new entrypoint is user-facing
+
+## Where New Code Should Go
+
+### Add code under `src/jarvis/` when it is:
+
+- runtime application code
+- package-owned prompts/resources
+- config or path helpers for the app
+- testable logic used by the runtime
+
+### Add code under `tests/` when it is:
+
+- unit, integration, or regression coverage
+
+### Add docs under `dev_docs/` when they are:
+
+- subsystem design docs
+- implementation plans
+- architecture or layout documentation
+
+### Add notes under `notes/notes.md` when they are:
+
+- short lessons learned
+- sharp design constraints
+- implementation gotchas for future agents
+
+## Non-Structural Local Artifacts
+
+You may see local/generated directories such as:
+
+- `__pycache__/`
+- `.pytest_cache/`
+- `.ruff_cache/`
+- `.venv/`
+- `src/jarvis.egg-info/`
+- `.DS_Store`
+
+These are not part of the intended project structure and should not drive design decisions.

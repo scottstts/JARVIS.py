@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This is the running source of truth for the `src/tools/` suite.
+This is the running source of truth for the `src/jarvis/tools/` suite.
 
 Update this document whenever:
 
@@ -18,10 +18,10 @@ Keep this doc structured and status-oriented. It is meant to be updated througho
 
 ### Tool Packages
 
-- Basic tools live in `src/tools/basic/<tool_name>/`
-- Discoverable executable tools live in `src/tools/discoverable/<tool_name>/`
-- Shared cross-tool interfaces stay at the top level of `src/tools/`
-- Synthetic core runtime primitives such as subagent control live outside `src/tools/`; they are defined under `src/subagent/` and injected by the route runtime rather than registered as normal tools
+- Basic tools live in `src/jarvis/tools/basic/<tool_name>/`
+- Discoverable executable tools live in `src/jarvis/tools/discoverable/<tool_name>/`
+- Shared cross-tool interfaces stay at the top level of `src/jarvis/tools/`
+- Synthetic core runtime primitives such as subagent control live outside `src/jarvis/tools/`; they are defined under `src/jarvis/subagent/` and injected by the route runtime rather than registered as normal tools
 - Current shared top-level modules:
   - `registry.py`
   - `runtime.py`
@@ -126,7 +126,7 @@ Use this when the discoverable capability should eventually become an actual cal
 
 Required wiring:
 
-1. Create the discoverable executable tool package under `src/tools/discoverable/<tool_name>/`.
+1. Create the discoverable executable tool package under `src/jarvis/tools/discoverable/<tool_name>/`.
 2. Implement the executor and `build_<tool_name>_tool(...)` exactly like any other tool.
 3. Set `exposure="discoverable"` on the returned `RegisteredTool`.
 4. Explicitly set the tool's subagent allow status through `allowed_agent_kinds`; never leave this implicit.
@@ -134,7 +134,7 @@ Required wiring:
 6. Register a separate discoverable catalog entry with `registry.register_discoverable(DiscoverableTool(...))`.
 7. Explicitly set the discoverable entry's `allowed_agent_kinds` to match the intended subagent allow status when it maps to a backing tool.
 8. Set `backing_tool_name` on the discoverable entry to the executable tool name.
-9. Add the policy branch in `src/tools/policy.py`.
+9. Add the policy branch in `src/jarvis/tools/policy.py`.
 
 Important:
 
@@ -220,8 +220,8 @@ Current runtime-tool rules:
 - runtime tools are merged into `tool_search` results at execution time, not startup
 - runtime tools are usually used through existing operators such as `bash`
 - runtime tool registration happens through the basic `tool_register` tool
-- runtime tool manifests are validated by `src/tools/runtime_tool_manifest.py`
-- runtime tool loading is handled by `src/tools/runtime_tools.py`
+- runtime tool manifests are validated by `src/jarvis/tools/runtime_tool_manifest.py`
+- runtime tool loading is handled by `src/jarvis/tools/runtime_tools.py`
 
 Current runtime manifest shape:
 
@@ -282,9 +282,9 @@ Important runtime behavior:
 
 Structure:
 
-- `src/tools/policy.py` is the universal policy interface/router
-- each basic tool owns its own policy logic under `src/tools/basic/<tool_name>/policy.py`
-- each discoverable executable tool owns its own policy logic under `src/tools/discoverable/<tool_name>/policy.py`
+- `src/jarvis/tools/policy.py` is the universal policy interface/router
+- each basic tool owns its own policy logic under `src/jarvis/tools/basic/<tool_name>/policy.py`
+- each discoverable executable tool owns its own policy logic under `src/jarvis/tools/discoverable/<tool_name>/policy.py`
 
 Current active policy:
 
@@ -301,7 +301,7 @@ Current standard:
 - tool results are stored as structured records plus metadata
 - approval requests and approval decisions are stored as structured records plus metadata
 - internal tool-call payloads are not sent to user-facing Telegram output
-- follow-up tool rounds are rebuilt into provider-native request shapes inside `src/llm/`
+- follow-up tool rounds are rebuilt into provider-native request shapes inside `src/jarvis/llm/`
 - `tool_search` may attach discoverable-activation metadata to its tool result
 - only current-turn pending tool results can activate discoverable tools; activations do not persist across turns
 - detached bash jobs are no longer correctness-coupled to model polling; once `bash` returns a running `job_id`, that tool round is complete
@@ -354,7 +354,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/bash/`
+- Package: `src/jarvis/tools/basic/bash/`
 - Purpose: run bash commands inside the isolated `tool_runtime` container with `/workspace` as the shared handoff boundary
 
 #### Input Schema
@@ -424,7 +424,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/file_patch/`
+- Package: `src/jarvis/tools/basic/file_patch/`
 - Purpose: perform structured one-file text edits through explicit patch operations instead of shell editing
 
 #### Input Schema
@@ -468,7 +468,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/view_image/`
+- Package: `src/jarvis/tools/basic/view_image/`
 - Purpose: attach a local workspace image to the next model turn so multimodal providers can inspect it through a single tool path
 
 #### Input Schema
@@ -501,7 +501,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/send_file/`
+- Package: `src/jarvis/tools/basic/send_file/`
 - Purpose: send a local workspace file to the user through the Telegram file-send interface
 
 #### Input Schema
@@ -514,7 +514,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - resolves relative paths from `/workspace`
 - validates that the target exists and is a file
-- uses the Telegram file-send interface already implemented under `src/ui/telegram/`
+- uses the Telegram file-send interface already implemented under `src/jarvis/ui/telegram/`
 - prefers the active Telegram route when available and falls back to the configured owner chat when route context is unavailable
 - returns a normalized tool result with delivery metadata including the resolved Telegram chat id when available
 
@@ -534,7 +534,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/web_search/`
+- Package: `src/jarvis/tools/basic/web_search/`
 - Purpose: run a basic Brave web search query and return normalized web results for current information gathering
 
 #### Input Schema
@@ -567,7 +567,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/web_fetch/`
+- Package: `src/jarvis/tools/basic/web_fetch/`
 - Purpose: fetch a specific web page and return clean markdown through a markdown-first three-tier strategy
 
 #### Input Schema
@@ -601,7 +601,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/tool_search/`
+- Package: `src/jarvis/tools/basic/tool_search/`
 - Purpose: search the discoverable catalog at low or high verbosity and optionally surface backed discoverable tools for the current turn
 
 #### Input Schema
@@ -632,7 +632,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/memory_search/`
+- Package: `src/jarvis/tools/basic/memory_search/`
 - Purpose: search canonical runtime memory through lexical, semantic, graph, or hybrid retrieval before opening or mutating memory
 
 #### Input Schema
@@ -666,7 +666,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/memory_get/`
+- Package: `src/jarvis/tools/basic/memory_get/`
 - Purpose: open a full canonical memory document or one named section after discovery
 
 #### Input Schema
@@ -697,7 +697,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `basic`
-- Package: `src/tools/basic/memory_write/`
+- Package: `src/jarvis/tools/basic/memory_write/`
 - Purpose: create or update canonical memory documents through validated structured operations instead of generic file edits
 
 #### Input Schema
@@ -741,7 +741,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/memory_admin/`
+- Package: `src/jarvis/tools/discoverable/memory_admin/`
 - Purpose: run manual reindex, integrity, maintenance, embedding-rebuild, and bootstrap-preview actions when the user explicitly asks for memory administration
 
 #### Input Schema
@@ -777,7 +777,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/generate_edit_image/`
+- Package: `src/jarvis/tools/discoverable/generate_edit_image/`
 - Purpose: generate a new image from a prompt or edit an existing workspace image through Gemini or OpenAI after discovery through `tool_search`
 
 #### Input Schema
@@ -825,7 +825,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/transcribe/`
+- Package: `src/jarvis/tools/discoverable/transcribe/`
 - Purpose: transcribe spoken audio from one workspace media file to plain text through OpenAI after discovery through `tool_search`
 
 #### Input Schema
@@ -860,7 +860,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/youtube/`
+- Package: `src/jarvis/tools/discoverable/youtube/`
 - Purpose: understand one or more public YouTube videos by URL through Gemini after discovery through `tool_search`
 
 #### Input Schema
@@ -899,7 +899,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/email/`
+- Package: `src/jarvis/tools/discoverable/email/`
 - Purpose: send one email through the configured SMTP account after discovery through `tool_search`
 
 #### Input Schema
@@ -938,7 +938,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Status: implemented
 - Exposure: `discoverable`
-- Package: `src/tools/discoverable/ffmpeg/`
+- Package: `src/jarvis/tools/discoverable/ffmpeg/`
 - Purpose: help the agent discover that ffmpeg and ffprobe are already installed and should be used through the basic `bash` tool
 
 #### Discoverable Entry

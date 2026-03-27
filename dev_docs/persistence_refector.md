@@ -8,7 +8,7 @@ The goal is:
 
 - keep replayable transcript history as the source of truth for rebuilding `LLMRequest.messages`
 - persist every non-image prompt-visible record that should affect later replay
-- let provider adapters in `src/llm/providers/` translate unified replayed history into provider-native payloads
+- let provider adapters in `src/jarvis/llm/providers/` translate unified replayed history into provider-native payloads
 - avoid avoidable provider cache misses caused by transcript/replay drift
 
 This document is about unified replayable history, not about persisting provider-native wire JSON.
@@ -25,19 +25,19 @@ Applies to:
 
 Primary code:
 
-- `src/core/agent_loop.py`
-- `src/storage/service.py`
-- `src/llm/providers/`
-- `src/gateway/route_runtime.py`
-- `src/subagent/manager.py`
-- `src/subagent/bootstrap.py`
+- `src/jarvis/core/agent_loop.py`
+- `src/jarvis/storage/service.py`
+- `src/jarvis/llm/providers/`
+- `src/jarvis/gateway/route_runtime.py`
+- `src/jarvis/subagent/manager.py`
+- `src/jarvis/subagent/bootstrap.py`
 
 ## Core Rules
 
 1. Replayable transcript records are the source of truth for rebuilding `LLMRequest.messages`.
 2. Non-image prompt-visible records must persist.
 3. `transcript_only` means archived but intentionally excluded from replay.
-4. Provider quirks stay in `src/llm/providers/`.
+4. Provider quirks stay in `src/jarvis/llm/providers/`.
 5. If replay would require inventing prompt-visible content, that is a bug unless the behavior is explicitly documented as a non-replay feature.
 
 ## Implemented Behavior

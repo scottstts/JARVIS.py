@@ -21,7 +21,7 @@ This plan is based on:
 
 - `dev_docs/memory_design_doc.md`
 - `.codex/AGENTS.md`
-- the current implementation under `src/memory/`, `src/tools/basic/memory_*`, `src/tools/discoverable/memory_admin/`, `src/core/agent_loop.py`, and `src/identities/PROGRAM.md`
+- the current implementation under `src/jarvis/memory/`, `src/jarvis/tools/basic/memory_*`, `src/jarvis/tools/discoverable/memory_admin/`, `src/jarvis/core/agent_loop.py`, and `src/jarvis/identities/PROGRAM.md`
 - current project notes in `notes/notes.md`
 
 Important project rule:
@@ -90,27 +90,27 @@ These are not the main purpose of the pass, but they should be fixed while touch
 1. `demote` currently duplicates instead of migrating.
    - Current behavior: `MemoryService._migrate_document()` only archives the source document when `operation == "promote"`.
    - Intended fix: `demote` must also archive or remove the source active document so the memory does not exist in two active places.
-   - File: `src/memory/service.py`
+   - File: `src/jarvis/memory/service.py`
 
 2. Search can return synthetic section paths that `memory_get` cannot open.
    - Current behavior: semantic and graph retrieval can return `section_path="facts"` or `section_path="relations"`, but `memory_get` only understands body sections.
    - Intended fix: `memory_get` must support synthetic sections for `facts` and `relations`, or search must stop returning section paths it cannot resolve. The preferred fix is to support synthetic sections.
-   - Files: `src/memory/service.py`, `src/tools/basic/memory_get/tool.py`
+   - Files: `src/jarvis/memory/service.py`, `src/jarvis/tools/basic/memory_get/tool.py`
 
 3. `access_log.chunk_id` is currently populated with `section_path`, not the actual chunk id.
    - This will corrupt any later usage-based ranking or analytics.
    - Intended fix: store the real chunk id when available. If the result is a synthetic fact or relation hit, store a structured synthetic id instead of a section label.
-   - Files: `src/memory/service.py`, `src/memory/types.py`, `src/memory/index_db.py`
+   - Files: `src/jarvis/memory/service.py`, `src/jarvis/memory/types.py`, `src/jarvis/memory/index_db.py`
 
 4. Recency scoring uses filesystem `mtime` instead of document `updated_at`.
    - The design says recency should come from memory metadata, not host file timestamps.
    - Intended fix: use indexed `updated_at` from the candidate/document row during fusion.
-   - Files: `src/memory/retrieval.py`, `src/memory/index_db.py`, possibly `src/memory/types.py`
+   - Files: `src/jarvis/memory/retrieval.py`, `src/jarvis/memory/index_db.py`, possibly `src/jarvis/memory/types.py`
 
 5. `memory_get` accesses are not logged.
    - If later ranking uses access history, opening a memory document must count.
    - Intended fix: add access logging for `memory_get` and use correct identifiers.
-   - Files: `src/memory/service.py`, `src/memory/index_db.py`
+   - Files: `src/jarvis/memory/service.py`, `src/jarvis/memory/index_db.py`
 
 ## Phase 1: Retrieval Quality Foundation
 
@@ -156,8 +156,8 @@ Important constraint:
 
 Files to change:
 
-- `src/memory/retrieval.py`
-- `src/memory/index_db.py`
+- `src/jarvis/memory/retrieval.py`
+- `src/jarvis/memory/index_db.py`
 
 Acceptance criteria:
 
@@ -194,9 +194,9 @@ Required changes:
 
 Files to change:
 
-- `src/memory/index_db.py`
-- `src/memory/retrieval.py`
-- `src/memory/types.py`
+- `src/jarvis/memory/index_db.py`
+- `src/jarvis/memory/retrieval.py`
+- `src/jarvis/memory/types.py`
 
 Acceptance criteria:
 
@@ -239,8 +239,8 @@ Those belong in Phase 4 unless the next agent also implements population of thos
 
 Files to change:
 
-- `src/memory/retrieval.py`
-- `src/memory/index_db.py`
+- `src/jarvis/memory/retrieval.py`
+- `src/jarvis/memory/index_db.py`
 
 Acceptance criteria:
 
@@ -260,9 +260,9 @@ Implementation intent:
 
 Files to change:
 
-- `src/memory/retrieval.py`
-- `src/memory/config.py`
-- `src/memory/index_db.py`
+- `src/jarvis/memory/retrieval.py`
+- `src/jarvis/memory/config.py`
+- `src/jarvis/memory/index_db.py`
 
 Acceptance criteria:
 
@@ -291,9 +291,9 @@ Recommended behavior:
 
 Files to change:
 
-- `src/memory/graph.py`
-- `src/memory/index_db.py`
-- possibly `src/memory/retrieval.py`
+- `src/jarvis/memory/graph.py`
+- `src/jarvis/memory/index_db.py`
+- possibly `src/jarvis/memory/retrieval.py`
 
 Acceptance criteria:
 
@@ -319,9 +319,9 @@ Implementation intent:
 
 Files to change:
 
-- `src/tools/basic/memory_write/tool.py`
-- `src/memory/service.py`
-- `src/memory/types.py`
+- `src/jarvis/tools/basic/memory_write/tool.py`
+- `src/jarvis/memory/service.py`
+- `src/jarvis/memory/types.py`
 - tests
 
 Acceptance criteria:
@@ -357,9 +357,9 @@ Do not rely on tool metadata being visible to the model.
 
 Files to change:
 
-- `src/tools/basic/memory_search/tool.py`
-- `src/memory/index_db.py`
-- `src/memory/types.py`
+- `src/jarvis/tools/basic/memory_search/tool.py`
+- `src/jarvis/memory/index_db.py`
+- `src/jarvis/memory/types.py`
 
 Acceptance criteria:
 
@@ -390,8 +390,8 @@ Required changes:
 
 Files to change:
 
-- `src/tools/basic/memory_get/tool.py`
-- `src/memory/service.py`
+- `src/jarvis/tools/basic/memory_get/tool.py`
+- `src/jarvis/memory/service.py`
 
 Acceptance criteria:
 
@@ -431,8 +431,8 @@ Required changes:
 
 Files to change:
 
-- `src/memory/bootstrap.py`
-- `src/memory/service.py`
+- `src/jarvis/memory/bootstrap.py`
+- `src/jarvis/memory/service.py`
 
 Acceptance criteria:
 
@@ -460,7 +460,7 @@ Add guidance for:
 
 Files to change:
 
-- `src/identities/PROGRAM.md`
+- `src/jarvis/identities/PROGRAM.md`
 
 Acceptance criteria:
 
@@ -509,8 +509,8 @@ Exact intention:
 
 Files to change:
 
-- `src/memory/reflection.py`
-- `src/memory/service.py`
+- `src/jarvis/memory/reflection.py`
+- `src/jarvis/memory/service.py`
 - tests
 
 Acceptance criteria:
@@ -539,8 +539,8 @@ Required changes:
 
 Files to change:
 
-- `src/memory/service.py`
-- `src/memory/maintenance.py`
+- `src/jarvis/memory/service.py`
+- `src/jarvis/memory/maintenance.py`
 
 Acceptance criteria:
 
@@ -565,8 +565,8 @@ Required changes:
 
 Files to change:
 
-- `src/memory/service.py`
-- `src/memory/maintenance.py`
+- `src/jarvis/memory/service.py`
+- `src/jarvis/memory/maintenance.py`
 
 Acceptance criteria:
 
@@ -592,8 +592,8 @@ Exact instruction:
 
 Files to change:
 
-- `src/memory/service.py`
-- `src/memory/maintenance.py`
+- `src/jarvis/memory/service.py`
+- `src/jarvis/memory/maintenance.py`
 
 Acceptance criteria:
 
@@ -624,8 +624,8 @@ Implementation intent:
 
 Files likely involved:
 
-- `src/memory/index_db.py`
-- `src/memory/retrieval.py`
+- `src/jarvis/memory/index_db.py`
+- `src/jarvis/memory/retrieval.py`
 - tests that exercise semantic search and hybrid ranking
 - Docker/build files only if live verification shows semantic retrieval is broken again
 
@@ -651,8 +651,8 @@ This is a separate step from the cheap modifiers in Phase 1.
 
 Files likely involved:
 
-- `src/memory/index_db.py`
-- `src/memory/service.py`
+- `src/jarvis/memory/index_db.py`
+- `src/jarvis/memory/service.py`
 - possibly maintenance/reconciliation paths
 
 ### 17. Add Retrieval Fallback Planning Only After Baseline Retrieval Is Strong
@@ -674,8 +674,8 @@ If implemented later:
 
 Files likely involved:
 
-- `src/memory/retrieval.py`
-- possibly a small helper in `src/memory/`
+- `src/jarvis/memory/retrieval.py`
+- possibly a small helper in `src/jarvis/memory/`
 
 ### 18. Only Revisit Chunk Weighting If Search Noise Persists
 
@@ -693,8 +693,8 @@ If revisited later:
 
 File:
 
-- `src/memory/chunker.py`
-- `src/memory/index_db.py`
+- `src/jarvis/memory/chunker.py`
+- `src/jarvis/memory/index_db.py`
 
 ## Test Plan
 
@@ -760,17 +760,17 @@ After implementation, manually check these behaviors in a real runtime session:
 
 The next agent will likely need to touch:
 
-- `src/memory/retrieval.py`
-- `src/memory/index_db.py`
-- `src/memory/graph.py`
-- `src/memory/service.py`
-- `src/memory/bootstrap.py`
-- `src/memory/reflection.py`
-- `src/memory/config.py`
-- `src/tools/basic/memory_search/tool.py`
-- `src/tools/basic/memory_get/tool.py`
-- `src/tools/basic/memory_write/tool.py`
-- `src/identities/PROGRAM.md`
+- `src/jarvis/memory/retrieval.py`
+- `src/jarvis/memory/index_db.py`
+- `src/jarvis/memory/graph.py`
+- `src/jarvis/memory/service.py`
+- `src/jarvis/memory/bootstrap.py`
+- `src/jarvis/memory/reflection.py`
+- `src/jarvis/memory/config.py`
+- `src/jarvis/tools/basic/memory_search/tool.py`
+- `src/jarvis/tools/basic/memory_get/tool.py`
+- `src/jarvis/tools/basic/memory_write/tool.py`
+- `src/jarvis/identities/PROGRAM.md`
 - `tests/test_memory_service.py`
 - `tests/test_tools.py`
 

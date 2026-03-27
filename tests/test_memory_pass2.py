@@ -10,11 +10,11 @@ import unittest
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from llm import EmbeddingRequest, EmbeddingResponse, LLMResponse, LLMUsage
-from memory import MemoryService, MemorySettings, SearchCandidate
-from memory.bootstrap import render_core_bootstrap, render_ongoing_bootstrap
-from memory.retrieval import _fuse_candidates
-from storage.types import ConversationRecord
+from jarvis.llm import EmbeddingRequest, EmbeddingResponse, LLMResponse, LLMUsage
+from jarvis.memory import MemoryService, MemorySettings, SearchCandidate
+from jarvis.memory.bootstrap import render_core_bootstrap, render_ongoing_bootstrap
+from jarvis.memory.retrieval import _fuse_candidates
+from jarvis.storage.types import ConversationRecord
 
 
 class _FakeEmbeddingReflectionLLM:

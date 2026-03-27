@@ -1,9 +1,13 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "repo"
+name = "jarvis"
 version = "0.1.0"
-description = "Add your description here"
+description = "A personal AI assistant runtime built from scratch."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "anthropic>=0.84.0",
     "google-genai>=1.66.0",
@@ -19,3 +23,37 @@ dependencies = [
     "uvicorn>=0.38.0",
     "websockets>=15.0.1",
 ]
+
+[project.scripts]
+jarvis = "jarvis.main:main"
+jarvis-gateway = "jarvis.gateway.__main__:main"
+jarvis-tool-runtime = "jarvis.tool_runtime_service.__main__:main"
+jarvis-ui = "jarvis.ui.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.15.7",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+jarvis = [
+    "core/prompts/*.md",
+    "identities/*.md",
+    "subagent/prompts/*.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"

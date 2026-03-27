@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from core.commands import parse_user_command
+from jarvis.core.commands import parse_user_command
 
 
 class ParseUserCommandTests(unittest.TestCase):

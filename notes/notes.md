@@ -3,38 +3,38 @@
 - Anthropic config now supports `JARVIS_ANTHROPIC_EFFORT` and model-aware thinking behavior (adaptive/effort only applied where model support exists).
 - Gemini thinking is model-aware: `gemini-3*` uses `thinking_level`, while `gemini-2.5*` uses `thinking_budget`.
 - Embeddings are now globally configured via `JARVIS_EMBEDDING_PROVIDER` and `JARVIS_EMBEDDING_MODEL`, decoupled from chat provider selection.
-- Added a custom `src/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
-- Implemented file-backed `src/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
-- Session bootstrap now injects `src/identities/PROGRAM.md`, `src/identities/REACTOR.md`, `src/identities/USER.md`, and `src/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
+- Added a custom `src/jarvis/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
+- Implemented file-backed `src/jarvis/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
+- Session bootstrap now injects `src/jarvis/identities/PROGRAM.md`, `src/jarvis/identities/REACTOR.md`, `src/jarvis/identities/USER.md`, and `src/jarvis/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
 - Compaction policy is now provider-agnostic and driven by global environment settings: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
 - Preflight token estimation no longer counts inline image base64 payloads as text; image inputs now use small detail-based heuristic token costs instead.
 - Follow-up tool rounds now compact and continue on a new session when the follow-up request overflows preflight budget or gets a provider context-length error before any streamed follow-up output is emitted.
-- Compaction prompt is externalized to `src/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
+- Compaction prompt is externalized to `src/jarvis/core/prompts/COMPACTION.md` and loaded from disk by the compactor.
 - Added tests under `tests/` including real-provider AgentLoop integration tests (no mocked LLM for loop behavior) plus command/config/storage unit tests.
-- Added Starlette websocket gateway under src/gateway with route-scoped SessionRouter, one AgentLoop per route, and JSON events (ready, assistant_message, error).
+- Added Starlette websocket gateway under `src/jarvis/gateway/` with route-scoped SessionRouter, one AgentLoop per route, and JSON events (ready, assistant_message, error).
 - Added real token streaming path in core AgentLoop and gateway websocket (`assistant_delta` events + final `assistant_message` done event), including overflow-compaction retry support for streaming turns.
 - Added explicit provider/client lifecycle cleanup (`aclose`) across LLMService and providers, and wired real integration tests to close services to avoid event-loop-closed teardown warnings.
-- Added `src/ui/` Telegram bridge that long-polls Bot API, forwards messages to gateway websocket per-chat route (`tg_<chat_id>`), and streams assistant deltas via `sendMessageDraft` before final `sendMessage`.
-- Added `src/main.py` as the combined runtime entrypoint: it starts the gateway in-process, binds the Telegram UI to that local gateway, and shuts both down together.
-- Added repo-root `main.py` bootstrap so `uv run -m main` works with the current `src/` layout without extra `PYTHONPATH` setup.
+- Added `src/jarvis/ui/` Telegram bridge that long-polls Bot API, forwards messages to gateway websocket per-chat route (`tg_<chat_id>`), and streams assistant deltas via `sendMessageDraft` before final `sendMessage`.
+- Added `src/jarvis/main.py` as the combined runtime entrypoint: it starts the gateway in-process, binds the Telegram UI to that local gateway, and shuts both down together.
+- The canonical combined runtime entrypoint is the installable `jarvis` script from the `src/jarvis/` package; the old repo-root `main.py` shim has been removed.
 - Fixed OpenAI multi-turn chat history shaping: assistant transcript messages must be resent to the Responses API as `output_text`, not `input_text`, or turn two fails with a 400.
 - Renamed host/container workspace envs to avoid Docker confusion: `AGENT_ROOT` is the host bind-mount source for compose, while `AGENT_WORKSPACE` is the in-container app workspace path used to derive workspace child paths.
 - Host runtime config now fails fast unless `AGENT_WORKSPACE` is explicitly set; `/workspace` remains a container-only default, and host runs should point `AGENT_WORKSPACE` at the real host workspace path.
 - Route transcript archives now live under `/workspace/archive/transcripts/<route_id>/`; the old `/workspace/storage/routes/` runtime path is retired.
 - Telegram draft streaming can hit Bot API 429 flood control; parse `retry_after`, pause drafts per chat for that interval, and still send the final assistant message.
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
-- Telegram UI code now lives under `src/ui/telegram/`, while top-level `ui` remains only a compatibility shim/entrypoint.
-- Non-secret runtime defaults now live in `src/settings.py`; runtime secrets are now loaded separately from Docker secret files.
+- Telegram UI code now lives under `src/jarvis/ui/telegram/` inside the installable `jarvis` package; there is no remaining top-level `ui` package shim.
+- Non-secret runtime defaults now live in `src/jarvis/settings.py`; runtime secrets are now loaded separately from Docker secret files.
 - Telegram UI can be restricted to a single owner by setting `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; unauthorized private messages are ignored without a reply.
 - Telegram file messages now download the original attachment into `JARVIS_UI_TELEGRAM_TEMP_DIR` (default `/workspace/temp`), inject a metadata-only user message pointing at that local path, and expose an owner-file send interface for future agent tools. **important:** this file send telegram interface (for agent to send files to user's telegram) will be used later for agent's send_file tool implementation.
-- In docker compose added command to copy src/identities/. to /workspace/identities/, and wire the agent runtime to use /workspace/identities/ for starter files instead
-- Added `src/tools/` with a registry/runtime/policy split and exposure classes (`basic` vs `discoverable`); only the `bash` tool is actually registered and auto-exposed right now.
+- In docker compose added command to copy src/jarvis/identities/. to /workspace/identities/, and wire the agent runtime to use /workspace/identities/ for starter files instead
+- Added `src/jarvis/tools/` with a registry/runtime/policy split and exposure classes (`basic` vs `discoverable`); only the `bash` tool is actually registered and auto-exposed right now.
 - Bash tool now runs inside `bubblewrap` with `/workspace` as the only user-controlled data mount, a scrubbed minimal environment, and no `/repo` or `/run/secrets` access; command parsing is reduced to thin validation only.
 - `Dockerfile.dev` now explicitly installs `file`, `ripgrep`, `zip`, and `unzip` so the sandboxed bash tool can cover common inspection and archive workflows without separate tools.
-- Tool-specific code now lives under `src/tools/basic/<tool_name>/` for basic tools and will live under `src/tools/discoverable/<tool_name>/` for discoverable executable tools, while `src/tools/policy.py` stays as the universal policy interface/router.
+- Tool-specific code now lives under `src/jarvis/tools/basic/<tool_name>/` for basic tools and will live under `src/jarvis/tools/discoverable/<tool_name>/` for discoverable executable tools, while `src/jarvis/tools/policy.py` stays as the universal policy interface/router.
 - Gemini tool declarations must use `parameters_json_schema` instead of `parameters`; otherwise schemas with `additionalProperties: false` cause a 400 from the Gemini API.
 - OpenAI strict function schemas require every property to appear in `required`; optional fields must be represented as nullable in the outbound schema, and returned `null` values for omitted optionals should be normalized away before validating against the original tool schema.
-- Tool follow-up rounds now rebuild structured assistant tool calls and tool results into provider-native request shapes in `src/llm/`, so internal tool-call payloads no longer leak into user-facing Telegram replies.
+- Tool follow-up rounds now rebuild structured assistant tool calls and tool results into provider-native request shapes in `src/jarvis/llm/`, so internal tool-call payloads no longer leak into user-facing Telegram replies.
 - Gemini tool-call history must preserve `thought_signature`; store it in provider metadata as base64 and restore it to bytes on the follow-up request.
 - `view_image` is the single workspace-image path for multimodal turns: it prepares a transient local-file attachment that all four provider adapters consume without persisting image bytes into transcript storage.
 - `send_file` is now a basic tool: it only allows explicit non-`.env` files inside `/workspace`, and it routes Telegram delivery through the existing UI file-send path using the active `tg_<chat_id>` route when available.
@@ -43,7 +43,7 @@
 - Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
-- Agent-facing Python now goes only through the basic `bash` tool using the central `/opt/venv` environment, and the curated starter package list lives in `src/settings.py` for `Dockerfile.tool_runtime` image builds.
+- Agent-facing Python now goes only through the basic `bash` tool using the central `/opt/venv` environment, and the curated starter package list lives in `src/jarvis/settings.py` for `Dockerfile.tool_runtime` image builds.
 - `file_patch` is a basic single-file UTF-8 text editing tool with structured operations (`write`, `replace`, `insert_before`, `insert_after`, `delete`), exact-once literal matching, workspace-only paths, and atomic final writes.
 - Prompting guidance for `file_patch`: prefer one `write` for broad rewrites, one patch call for modest targeted edits, and only split across multiple patch calls when a single payload would become too large or unreliable.
 - The bash output cap is now `40_000` chars by default so long single-file reads, such as prose/document patching flows, usually fit in one tool round instead of forcing multiple chunked reads.
@@ -57,9 +57,9 @@
 - Runtime secret bootstrap now loads non-empty files from Docker secrets at `/run/secrets` into process env, and repo-root `.env` is no longer used at startup.
 - `docker-compose.yml` now sources secrets from repo-local ignored files under `secrets/`, so fill those files before rebuilding/running the dev container.
 - Telegram owner gating now comes from the Docker secret file `secrets/JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`, not from `.env`.
-- The combined `src/main.py` entrypoint now swallows `KeyboardInterrupt` and logs a clean Ctrl+C shutdown message instead of printing a traceback.
+- The combined `src/jarvis/main.py` entrypoint now swallows `KeyboardInterrupt` and logs a clean Ctrl+C shutdown message instead of printing a traceback.
 - Telegram Bot API calls now use `httpx.AsyncClient` instead of `requests` in worker threads, so long-poll shutdown is cancellation-friendly and Ctrl+C should stop much faster.
-- Identities bootstrap is now a single-container flow: the `dev` service copies `/repo/src/identities/.` into `/workspace/identities/` during startup, and there is no separate `init-identities` compose service.
+- Identities bootstrap is now a single-container flow: the `dev` service copies `/repo/src/jarvis/identities/.` into `/workspace/identities/` during startup, and there is no separate `init-identities` compose service.
 - The dev container `shm_size` is intentionally `12gb`; Docker Desktop disk-image size remains a host-level setting outside repo control.
 - Telegram UI is now fail-closed on `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; the bot only accepts canonical private-user updates from that owner and rejects bot/sender_chat/mismatched private-chat updates.
 - The gateway default bind is now `127.0.0.1`, and `web_fetch` Playwright blocks non-public browser subrequests plus revalidates the final navigated URL before returning rendered HTML.
@@ -75,7 +75,7 @@
 - The `bash` sandbox now mounts the full host `/etc` read-only so dynamically linked CLI tools can follow loader config and `/etc/alternatives` symlink chains without exposing writable system state.
 - Transcript persistence is now milestone-based with per-turn status metadata; normal history loading includes `completed` and `interrupted` turns, hides only `in_progress`/`superseded` turns, normalizes dangling interrupted tool-call tails into a system note during prompt build, `/stop` is cooperative at assistant/tool-step boundaries, and current-turn follow-up compaction can intentionally include and compact the in-progress turn when needed.
 - Streamed assistant text is now checkpointed when tool-call streaming begins, so if `/stop` interrupts during tool-call JSON generation the finished assistant text is still persisted while the incomplete tool call is omitted.
-- Added the first full `src/memory/` stack with canonical Markdown under `/workspace/memory`, a derived SQLite sidecar under `/workspace/memory/.index`, deterministic bootstrap rendering, checksum-based dirty reconciliation, and dedicated `memory_search` / `memory_get` / `memory_write` / `memory_admin` tools.
+- Added the first full `src/jarvis/memory/` stack with canonical Markdown under `/workspace/memory`, a derived SQLite sidecar under `/workspace/memory/.index`, deterministic bootstrap rendering, checksum-based dirty reconciliation, and dedicated `memory_search` / `memory_get` / `memory_write` / `memory_admin` tools.
 - `sqlite-vec` currently loads in degraded mode in the dev container (`wrong ELF class: ELFCLASS32`), so the memory subsystem intentionally falls back to lexical + graph retrieval and marks semantic search disabled instead of failing the runtime.
 - Agent session bootstrap now injects runtime memory as system messages after the four identity files and before any compaction summary seed, while post-turn reflection and pre-compaction flush route through the shared memory service when a real `LLMService` is in use.
 - Simple core/ongoing memories that only provide `summary` now seed searchable `Summary` body content, and stale indexed docs with frontmatter summary but zero chunks are opportunistically reindexed on access.
@@ -93,7 +93,7 @@
 - Image split rule: the `dev` container should only keep packages needed to run the Jarvis app, while agent-facing utilities like `rg`, `curl`, `zip`, `unzip`, and `ffmpeg` belong in `tool_runtime`.
 - `bash` now executes directly in the isolated `tool_runtime` container over internal HTTP, and all agent-facing Python work goes through that same bash surface using the central `/opt/venv`.
 - Subagent design is now settled in `dev_docs/subagent_plan.md`: main-agent-only synthetic subagent primitives, no subagent memory access, separate `/workspace/archive/subagents/` storage, and a unified persistent route websocket for both normal turns and background subagent events.
-- Subagent system is now implemented: `RouteRuntime` supervises one main loop plus background subagents, main-agent-only synthetic control primitives live under `src/subagent/`, subagents use separate `/workspace/archive/subagents/<route_id>/...` storage with owner session/turn linkage, and Telegram receives only minimal agent-attributed lifecycle/tool/approval notices over the persistent route websocket.
+- Subagent system is now implemented: `RouteRuntime` supervises one main loop plus background subagents, main-agent-only synthetic control primitives live under `src/jarvis/subagent/`, subagents use separate `/workspace/archive/subagents/<route_id>/...` storage with owner session/turn linkage, and Telegram receives only minimal agent-attributed lifecycle/tool/approval notices over the persistent route websocket.
 - Subagent built-in tool filtering now also blocks `send_file`, so Telegram file delivery remains main-agent-only while runtime manifest discoverables still stay visible to subagents.
 - Telegram UI should never surface app-internal failure text to chat; gateway/websocket/bridge/download errors are log-only, and Telegram output must stay limited to normal app-flow messages.
 - Session transcripts now log the raw session-start basic `ToolDefinition` payloads as transcript-only system records for audit, so the stored JSONL reflects the same basic tool schema/description data the agent received in `LLMRequest.tools`.
@@ -111,3 +111,5 @@
 - LM Studio statefulness now stays provider-local: the provider uses `/v1/responses`, caches prior response ids against canonicalized full history, and reuses `previous_response_id` only for exact append-only continuations, including tool-result follow-up turns, without any core agent-loop changes.
 - LM Studio stateful lineage should now transparently recover from stale `previous_response_id` cache entries (for example after an LM Studio reset) by dropping that cached id and retrying the request once with full history.
 - Auto-injected Jarvis context now uses `system` only across main loop, subagent loop, runtime notices, and memory reflection.
+- Jarvis is now packaged as a real `uv` project under `src/jarvis/` with `pyproject` scripts for the combined runtime, gateway, tool runtime, and UI entrypoints.
+- The repo is now strict container-first for Python: no host `.venv`, `uv` commands run in `dev`, and the isolated `tool_runtime` image installs the package instead of relying on `PYTHONPATH`.

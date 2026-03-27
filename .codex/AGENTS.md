@@ -1,15 +1,14 @@
 # Jarvis Dev
 
-This is a Python project for building a personal AI system similar to OpenClaw. This project will be built from scratch and not related to OpenClaw. However, some design choices will be taking inspirations from OpenClaw
+This is a Python project for building a personal AI system Jarvis
 
-## Design
+### Specific Docs for Different System Development
 
-See dev_docs/design.md for design choices. Note that this document will be updated by me as we go because certain design choices might not be fully decided at a given point. However:
+Inside dev_docs/ dir, there are docs for different system development for Jarvis. e.g., project_structure.md for the current repo/package layout; tool_dev_doc.md, runtime_tools_plan.md, tool_runtime_isolation_plan.md for agent tool related development; memory_design_doc.md, memory_pass_2.md for agent memory related dev.
 
-1. I may have code implemented different from what design.md says, that most likely means that i decided to deviate from design.md in actual implementation but didn't update it to reflect acutal implementation. In that case, treat code as the source of truth.
-2. The design.md at any given point might not have complete design. That could either mean certain parts of the design is not in place yet or certain design details of a part is not in place yet.
+Some of the docs are implementation plans, some are ad hoc documentations. All of them should be accurate reflection of the implmenented code. These docs can reveal underlying design choices and intentions beyond what the code can tell you. So whenever you are working on a specific system, check first if there are docs that you can read to understand more about the system you're about to work on.
 
-So treat this document as a helper doc hinting you what has been built and what we're still building out, but not as a definitive documentation.
+After new implementation, always update docs here to make sure they are up to date and have no stale references
 
 ## Development Workflow (MacOS + Docker Runtime)
 
@@ -39,7 +38,7 @@ The repo is still bind-mounted into `dev` (`Jarvis/` on macOS ↔ `/repo` in the
 - Codex operates here by default.
 
 **Inside container (Linux):**
-- `uv venv`, `uv pip install ...`, `uv run ...`
+- `uv sync --locked --group dev`, `uv add ...`, `uv run ...`
 - Run the agent program, tests, scripts, etc.
 - Anything that needs the Linux runtime environment.
 
@@ -76,21 +75,26 @@ docker compose exec dev bash -lc "cd /repo && <COMMAND>"
 First-time setup (or after dependency changes):
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv venv"
+docker compose exec dev bash -lc "cd /repo && uv sync --locked --group dev"
 docker compose exec dev bash -lc "cd /repo && uv add <deps>"
+docker compose exec dev bash -lc "cd /repo && uv add --group dev <deps>"
 ```
 
 Then run normally:
 
 ```bash
+docker compose exec dev bash -lc "cd /repo && uv run jarvis"
+docker compose exec dev bash -lc "cd /repo && uv run pytest"
+docker compose exec dev bash -lc "cd /repo && uv run ruff check ."
 docker compose exec dev bash -lc "cd /repo && uv run <...>"
 ```
 
-### Specific Docs for Different System Development
+The project is strict container-first:
 
-Inside dev_docs/ dir, there are docs for different system development for Jarvis. e.g., tool_dev_doc.md, runtime_tools_plan.md, tool_runtime_isolation_plan.md for agent tool related development; memory_design_doc.md, memory_pass_2.md for agent memory related dev.
-
-Some of the docs are implementation plans, some are ad hoc documentations. All of them should be accurate reflection of the implmenented code. These docs can reveal underlying design choices and intentions beyond what the code can tell you. So whenever you are working on a specific system, check first if there are docs that you can read to understand more about the system you're about to work on.
+- do not create or use a host-side `.venv`
+- do not run `uv` against the repo on macOS
+- the managed environment lives inside the containers at `/opt/venv`
+- the installable package lives under `src/jarvis/`
 
 ## Dev Rules and Preferences
 
@@ -98,12 +102,13 @@ Some of the docs are implementation plans, some are ad hoc documentations. All o
 - Use pytest for testing
 - Build production grade code, **BUT** avoid excessive abstraction layers
 - all source code go into src/ dir
+- the primary installable package lives under `src/jarvis/`
 - make sure code is modular inside src/
 - do NOT git commit code, I will **always** do that myself
 - throughout the implementation, you will constantly ask me design choice questions like "option ABC, which do you want". This is because I'm not sure about some design choices yet, so constantly offer me options, alternatives, and challenge me when something doesn't seem to make obvious sense.
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
 - No need to delete __pycache__/
-- agent system runtime settings live in src/settings.py, and only secrets (api keys, bot tokens, etc.) need to be in secrets/
+- agent system runtime settings live in `src/jarvis/settings.py`, and only secrets (api keys, bot tokens, etc.) need to be in `secrets/`
 - After testing, **clean up** any testing artifacts inside the ~/.jarvis/workspace/ dir. The artifacts i refer to are the folders inside workspace/ like this: `~/.jarvis/workspace/jarvis-test-_gmb1oo6/`
 
 **Important:** A design related rule but i put it here because it's very important and applies globally: Jarvis should maximumly aim for cache hit when using LLM providers, so no transient messages, all messages need to be persisted in transcript for later context build to ensure cache hit. one exception is images, the raw image data bytes will not persist in transcript for storage reason. This does not mean transcript is exactly the same as what is sent out to providers. Provider-specific quirks are isolated in provider clients, the agent loop sees translated unified i/o. See `dev_docs/persistence_refector.md` for details of the persistence and cache hit design rules.

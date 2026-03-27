@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
-from llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent, TextPart
-from storage import SessionStorage
+from jarvis.core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
+from jarvis.llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent, TextPart
+from jarvis.storage import SessionStorage
 from tests.helpers import build_core_settings
 
 

@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from ui.telegram.api import (
+from jarvis.ui.telegram.api import (
     DraftMessage,
     TelegramAPIError,
     TelegramBotAPIClient,

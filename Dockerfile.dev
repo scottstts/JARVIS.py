@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
   && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir uv ruff
+RUN python -m pip install --no-cache-dir uv
 
 # (Optional but handy) common python dev env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -21,7 +21,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /tmp/jarvis-deps
 COPY pyproject.toml uv.lock ./
-COPY src/settings.py ./src/settings.py
 COPY vendor/sqlite-vec ./vendor/sqlite-vec
 
 RUN mkdir -p /opt/sqlite-vec \
@@ -30,12 +29,11 @@ RUN mkdir -p /opt/sqlite-vec \
        -o /opt/sqlite-vec/vec0.so \
        -lm \
   && python -c "import os, sqlite3; conn = sqlite3.connect(':memory:'); conn.enable_load_extension(True); conn.load_extension('/opt/sqlite-vec/vec0'); conn.enable_load_extension(False); version = conn.execute('select vec_version()').fetchone()[0]; expected = os.environ['SQLITE_VEC_VENDOR_VERSION']; assert version == expected, (version, expected)" \
-  && uv sync --frozen --no-install-project \
-  && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" pytest \
+  && uv sync --locked --group dev --no-install-project \
   && python -m playwright install --with-deps chromium
 
-# Work in the mounted workspace by default
-WORKDIR /workspace
+# Work in the mounted repo by default
+WORKDIR /repo
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]
