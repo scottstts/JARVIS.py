@@ -6,7 +6,6 @@ ARG YQ_VERSION=v4.50.1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
-    bubblewrap \
     ca-certificates \
     cmake \
     curl \

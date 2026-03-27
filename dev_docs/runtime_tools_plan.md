@@ -231,7 +231,7 @@ The current `bash` tool in [src/jarvis/tools/basic/bash/tool.py](/Users/scott/Do
 
 Change it to a broad-access blacklist model while still keeping:
 
-- `bubblewrap`
+- the dedicated `tool_runtime` container boundary (if run via `bash` tool)
 - scrubbed environment
 - no shell startup files
 - explicit timeout handling
