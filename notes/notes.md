@@ -112,5 +112,5 @@
 - LM Studio statefulness now stays provider-local: the provider uses `/v1/responses`, caches prior response ids against canonicalized full history, and reuses `previous_response_id` only for exact append-only continuations, including tool-result follow-up turns, without any core agent-loop changes.
 - LM Studio stateful lineage should now transparently recover from stale `previous_response_id` cache entries (for example after an LM Studio reset) by dropping that cached id and retrying the request once with full history.
 - Auto-injected Jarvis context now uses `system` only across main loop, subagent loop, runtime notices, and memory reflection.
-- Jarvis is now packaged as a real `uv` project under `src/jarvis/` with `pyproject` scripts for the combined runtime, gateway, tool runtime, and UI entrypoints.
+- Jarvis is now packaged as a real `uv` project under `src/jarvis/`; `pyproject.toml` keeps only the real user-facing `jarvis` script, while internal processes use module invocation instead of extra project scripts.
 - The repo is now strict container-first for Python: no host `.venv`, `uv` commands run in `dev`, and the isolated `tool_runtime` image installs the package instead of relying on `PYTHONPATH`.

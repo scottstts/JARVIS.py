@@ -40,7 +40,9 @@ stop - pause Jarvis
 compact - compact current session
 ```
 
-### Run Jarvis
+## Run Jarvis
+
+### Run Dev
 
 Run Jarvis inside the `dev` container:
 
@@ -54,4 +56,24 @@ For tests and linting, use the same container-managed environment:
 ```bash
 docker compose exec dev bash -lc "cd /repo && uv run pytest"
 docker compose exec dev bash -lc "cd /repo && uv run ruff check ."
+```
+
+### Build & Run App
+
+To use the built package instead, build it from the `dev` container:
+
+```bash
+docker compose exec dev bash -lc "cd /repo && uv build"
+```
+
+This creates artifacts under `dist/`:
+
+- `dist/jarvis-<version>.tar.gz`
+- `dist/jarvis-<version>-py3-none-any.whl`
+
+To run the built distribution, install one of those artifacts into an environment and then run the installed `jarvis` command:
+
+```bash
+docker compose exec dev bash -lc "cd /repo && uv tool install dist/jarvis-0.1.0-py3-none-any.whl"
+docker compose exec dev bash -lc "jarvis"
 ```

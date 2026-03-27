@@ -519,11 +519,11 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("uv pip install --python /opt/venv/bin/python", description)
         self.assertIn("`rg`, `jq`, `yq`", description)
         self.assertIn("`node`, `npm`, `npx`, and `corepack`", description)
-        self.assertIn("user approval is typically required", description)
+        self.assertIn("user approval is required", description)
         self.assertIn("install packages or tools", description)
         self.assertIn("system-level mutations outside `/workspace`", description)
         self.assertIn("approval_summary", description)
-        self.assertIn("prefer bare `python`/`python3`", description)
+        self.assertIn("use bare `python`/`python3`", description)
 
 
 class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):

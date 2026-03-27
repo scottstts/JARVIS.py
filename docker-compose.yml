@@ -56,7 +56,9 @@ services:
       JARVIS_TOOL_RUNTIME_SERVICE_PORT: 8081
     working_dir: /workspace
     command:
-      - jarvis-tool-runtime
+      - python
+      - -m
+      - jarvis.tool_runtime_service
     healthcheck:
       test:
         - CMD

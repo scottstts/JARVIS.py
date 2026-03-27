@@ -205,7 +205,7 @@ Packaged prompt resources live under `subagent/prompts/`.
 
 HTTP service used by the isolated `tool_runtime` container.
 
-This package is what the `jarvis-tool-runtime` entrypoint runs.
+This package is launched inside the runtime container via `python -m jarvis.tool_runtime_service`.
 
 ### `src/jarvis/tools/`
 
@@ -237,8 +237,6 @@ Current implementation:
   - bot bridge
   - gateway client
   - formatting and config
-
-The `jarvis-ui` entrypoint runs the UI-only path.
 
 ## Tests Layout
 
@@ -280,19 +278,17 @@ Do not mix runtime-generated data back into `src/jarvis/`.
 
 The project is a normal installable Python package named `jarvis`.
 
-Current script entrypoints:
+Current project script entrypoint:
 
 - `jarvis`
-- `jarvis-gateway`
-- `jarvis-tool-runtime`
-- `jarvis-ui`
 
 When adding a new runnable component:
 
 1. add the module under `src/jarvis/`
 2. expose a `main()` when appropriate
-3. register the script in `pyproject.toml`
-4. update docs if the new entrypoint is user-facing
+3. only add a `pyproject.toml` script if it is a real user-facing entrypoint
+4. otherwise prefer explicit module invocation for internal/container-only processes
+5. update docs if the new entrypoint is user-facing
 
 ## Where New Code Should Go
 
