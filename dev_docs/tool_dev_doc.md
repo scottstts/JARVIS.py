@@ -379,6 +379,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - runs bash with `--noprofile --norc`
 - clears the environment and sets only a minimal runtime env (`PATH`, `HOME`, `PWD`, `TMPDIR`, `LANG`, `LC_ALL`, `VIRTUAL_ENV`, `UV_PROJECT_ENVIRONMENT`, `PIP_REQUIRE_VIRTUALENV`)
 - prepends `/opt/venv/bin` to `PATH` so bare `python` and `python3` resolve to the central agent venv
+- the agent-facing tool description now explicitly reminds the model about common preinstalled runtime CLIs such as `rg`, `jq`, `yq`, `curl`, `wget`, `git`, `ffmpeg`, `sqlite3`, `zip`, `unzip`, `file`, `ps`, `ip`, `lsof`, `strace`, `shellcheck`, and GNU `parallel`, plus `node`, `npm`, `npx`, and `corepack`
 - keeps the `tool_runtime` container network available so tools like `curl` can still work
 - `set -o pipefail` is enabled
 - default foreground timeout is `120s`

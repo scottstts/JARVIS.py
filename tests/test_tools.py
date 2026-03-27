@@ -505,7 +505,10 @@ class ToolSettingsTests(unittest.TestCase):
 
         description = format_bash_tool_description(settings).lower()
 
-        self.assertIn("including built-in python", description)
+        self.assertIn("built-ins:", description)
+        self.assertIn("python:", description)
+        self.assertIn("long-running jobs:", description)
+        self.assertIn("approvals and installation:", description)
         self.assertIn("central `/opt/venv` environment", description)
         self.assertIn("mode='background'", description)
         self.assertIn("mode='status'", description)
@@ -514,12 +517,13 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("detached jobs are monitored by the orchestrator", description)
         self.assertIn("proactive polling", description)
         self.assertIn("uv pip install --python /opt/venv/bin/python", description)
+        self.assertIn("`rg`, `jq`, `yq`", description)
+        self.assertIn("`node`, `npm`, `npx`, and `corepack`", description)
         self.assertIn("user approval is typically required", description)
         self.assertIn("install packages or tools", description)
-        self.assertIn("curl|bash", description)
-        self.assertIn("/usr/local/bin", description)
+        self.assertIn("system-level mutations outside `/workspace`", description)
         self.assertIn("approval_summary", description)
-        self.assertIn("python - <<'py'", description)
+        self.assertIn("prefer bare `python`/`python3`", description)
 
 
 class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
