@@ -42,9 +42,9 @@ compact - compact current session
 
 ## Run Jarvis
 
-### Run `jarvis_runtime`
+### Run Dev
 
-Run Jarvis inside the `jarvis_runtime` container:
+Run dev inside the `jarvis_runtime` container:
 
 ```bash
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv sync --locked --group dev"
@@ -64,16 +64,7 @@ To use the built package instead, build it from the `jarvis_runtime` container:
 
 ```bash
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv build"
-```
 
-This creates artifacts under `dist/`:
-
-- `dist/jarvis-<version>.tar.gz`
-- `dist/jarvis-<version>-py3-none-any.whl`
-
-To run the built distribution, install one of those artifacts into an environment and then run the installed `jarvis` command:
-
-```bash
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv tool install dist/jarvis-0.1.0-py3-none-any.whl"
 docker compose exec jarvis_runtime bash -lc "jarvis"
 ```
