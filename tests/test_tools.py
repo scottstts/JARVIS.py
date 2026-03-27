@@ -67,6 +67,15 @@ _CENTRAL_PYTHON_RUNTIME_AVAILABLE = (
     _REMOTE_TOOL_RUNTIME_CONFIGURED
     or _CENTRAL_PYTHON_INTERPRETER.exists()
 )
+_BASH_RUNTIME_SKIP_REASON = (
+    "bash runtime tests require a local bash binary or configured remote tool_runtime"
+)
+_REMOTE_TOOL_RUNTIME_SKIP_REASON = (
+    "remote tool_runtime integration is only configured in jarvis_runtime"
+)
+_FFMPEG_BASH_RUNTIME_SKIP_REASON = (
+    "ffmpeg bash runtime tests require local ffmpeg or configured remote tool_runtime"
+)
 _SAMPLE_JPEG_BASE64 = (
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
     "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIy"
@@ -2274,7 +2283,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_executes_pwd_inside_workspace(self) -> None:
         result = await self.runtime.execute(
@@ -2294,7 +2303,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_writes_file_inside_workspace(self) -> None:
         result = await self.runtime.execute(
@@ -2335,7 +2344,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _REMOTE_TOOL_RUNTIME_CONFIGURED,
-        "remote tool_runtime integration is only available in the dev container",
+        _REMOTE_TOOL_RUNTIME_SKIP_REASON,
     )
     async def test_remote_bash_foreground_soft_timeout_promotes_to_background(self) -> None:
         started_at = time.monotonic()
@@ -2387,7 +2396,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_background_job_lifecycle(self) -> None:
         start_result = await self.runtime.execute(
@@ -2451,7 +2460,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_background_job_can_be_cancelled(self) -> None:
         start_result = await self.runtime.execute(
@@ -2498,7 +2507,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _FFMPEG_BASH_RUNTIME_AVAILABLE,
-        "ffmpeg bash runtime is only available in the dev container when ffmpeg is installed",
+        _FFMPEG_BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_can_execute_ffmpeg_when_installed(self) -> None:
         result = await self.runtime.execute(
@@ -2516,7 +2525,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_requires_approval_for_system_write_command(self) -> None:
         result = await self.runtime.execute(
@@ -2683,7 +2692,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_returns_policy_error_for_null_byte_command(self) -> None:
         result = await self.runtime.execute(
@@ -2702,7 +2711,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_cannot_read_repo(self) -> None:
         result = await self.runtime.execute(
@@ -2721,7 +2730,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_cannot_read_run_secrets(self) -> None:
         result = await self.runtime.execute(
@@ -2999,7 +3008,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,
-        "bash runtime is only available in the dev container",
+        _BASH_RUNTIME_SKIP_REASON,
     )
     async def test_bash_scrubs_environment(self) -> None:
         with patch.dict(

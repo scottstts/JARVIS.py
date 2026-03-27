@@ -1,9 +1,9 @@
 services:
-  dev:
+  jarvis_runtime:
     build:
       context: .
-      dockerfile: Dockerfile.dev
-    container_name: jarvis
+      dockerfile: Dockerfile.jarvis_runtime
+    container_name: jarvis_runtime
     depends_on:
       - tool_runtime
     shm_size: 512m

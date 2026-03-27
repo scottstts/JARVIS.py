@@ -52,7 +52,7 @@ What is currently limiting effectiveness:
 
 Operational note to keep in mind:
 
-- Semantic retrieval is now operational in the current dev container/runtime path, so tuning should assume true hybrid retrieval is available.
+- Semantic retrieval is now operational in the current `jarvis_runtime` container/runtime path, so tuning should assume true hybrid retrieval is available.
 - Degraded lexical-plus-graph fallback still matters because the design intentionally supports semantic-disabled runtime conditions.
 
 ## Scope And Constraints
@@ -631,7 +631,7 @@ Files likely involved:
 
 Acceptance criteria:
 
-- In the dev container, a live hybrid memory search reports `semantic_disabled=false` once embeddings exist.
+- In the `jarvis_runtime` container, a live hybrid memory search reports `semantic_disabled=false` once embeddings exist.
 - A weak-lexical but strong-semantic query can retrieve the expected memory.
 - Semantic scores are meaningful enough to influence final ranking.
 

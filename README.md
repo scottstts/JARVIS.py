@@ -22,7 +22,7 @@ Docker Compose should create `~/.jarvis/workspace/` on first run; if it does not
 
 `~/.jarvis/workspace/` will be the workspace dir for the agent. This dir on your host OS will be bind mounted in the containers as `workspace/` dir.
 
-This repo is strict container-first for Python: do not create or use a host-side `.venv`; run `uv` against the project only inside the `dev` container.
+This repo is strict container-first for Python: do not create or use a host-side `.venv`; run `uv` against the project only inside the `jarvis_runtime` container.
 
 ### Deposit Secrets & Settings
 
@@ -42,28 +42,28 @@ compact - compact current session
 
 ## Run Jarvis
 
-### Run Dev
+### Run `jarvis_runtime`
 
-Run Jarvis inside the `dev` container:
+Run Jarvis inside the `jarvis_runtime` container:
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv sync --locked --group dev"
-docker compose exec dev bash -lc "cd /repo && uv run jarvis"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv sync --locked --group dev"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run jarvis"
 ```
 
 For tests and linting, use the same container-managed environment:
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv run pytest"
-docker compose exec dev bash -lc "cd /repo && uv run ruff check ."
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run pytest"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run ruff check ."
 ```
 
 ### Build & Run App
 
-To use the built package instead, build it from the `dev` container:
+To use the built package instead, build it from the `jarvis_runtime` container:
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv build"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv build"
 ```
 
 This creates artifacts under `dist/`:
@@ -74,6 +74,6 @@ This creates artifacts under `dist/`:
 To run the built distribution, install one of those artifacts into an environment and then run the installed `jarvis` command:
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv tool install dist/jarvis-0.1.0-py3-none-any.whl"
-docker compose exec dev bash -lc "jarvis"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv tool install dist/jarvis-0.1.0-py3-none-any.whl"
+docker compose exec jarvis_runtime bash -lc "jarvis"
 ```

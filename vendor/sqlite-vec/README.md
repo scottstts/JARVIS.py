@@ -21,6 +21,6 @@ Licensing:
 
 Build usage:
 
-- `Dockerfile.dev` compiles `/opt/sqlite-vec/vec0.so` from this vendored source during image build
+- `Dockerfile.jarvis_runtime` compiles `/opt/sqlite-vec/vec0.so` from this vendored source during image build
 - the build fails unless SQLite can load that compiled extension and `select vec_version()` returns the pinned version
 - runtime code prefers `/opt/sqlite-vec/vec0.so` explicitly before falling back to the Python package loader

@@ -288,7 +288,7 @@ Structure:
 
 Current active policy:
 
-- `bash` is policy-checked in `dev` and then executed in the isolated `tool_runtime` container over internal HTTP; it scrubs the environment, forces agent-facing Python usage through the central `/opt/venv` environment, supports foreground and background job modes, enforces approval for install/build/system-mutation commands, and hard-denies pointless or harmful container-admin commands even inside `tool_runtime` unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
+- `bash` is policy-checked in `jarvis_runtime` and then executed in the isolated `tool_runtime` container over internal HTTP; it scrubs the environment, forces agent-facing Python usage through the central `/opt/venv` environment, supports foreground and background job modes, enforces approval for install/build/system-mutation commands, and hard-denies pointless or harmful container-admin commands even inside `tool_runtime` unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
 - `tool_register` always requires exact-action approval and binds approval to the manifest payload hash
@@ -371,7 +371,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Executor Behavior
 
-- policy is evaluated in `dev`, but execution happens in the sibling `tool_runtime` container over internal HTTP
+- policy is evaluated in `jarvis_runtime`, but execution happens in the sibling `tool_runtime` container over internal HTTP
 - runs directly in the `tool_runtime` container rather than inside a second inner sandbox layer
 - mounts the shared workspace at `/workspace`
 - the project repo is not mounted there, so `/repo` is absent by construction

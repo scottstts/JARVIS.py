@@ -19,21 +19,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PATH="/opt/venv/bin:${PATH}"
 
-WORKDIR /tmp/jarvis-deps
-COPY pyproject.toml uv.lock ./
+WORKDIR /repo
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
 COPY vendor/sqlite-vec ./vendor/sqlite-vec
 
 RUN mkdir -p /opt/sqlite-vec \
   && gcc -O3 -fPIC -shared \
-       "/tmp/jarvis-deps/vendor/sqlite-vec/${SQLITE_VEC_VENDOR_VERSION}/amalgamation/sqlite-vec.c" \
+       "/repo/vendor/sqlite-vec/${SQLITE_VEC_VENDOR_VERSION}/amalgamation/sqlite-vec.c" \
        -o /opt/sqlite-vec/vec0.so \
        -lm \
   && python -c "import os, sqlite3; conn = sqlite3.connect(':memory:'); conn.enable_load_extension(True); conn.load_extension('/opt/sqlite-vec/vec0'); conn.enable_load_extension(False); version = conn.execute('select vec_version()').fetchone()[0]; expected = os.environ['SQLITE_VEC_VENDOR_VERSION']; assert version == expected, (version, expected)" \
-  && uv sync --locked --group dev --no-install-project \
+  && uv sync --locked --group dev \
   && python -m playwright install --with-deps chromium
-
-# Work in the mounted repo by default
-WORKDIR /repo
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]

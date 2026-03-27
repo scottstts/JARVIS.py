@@ -19,7 +19,7 @@ After new implementation, always update docs here to make sure they are up to da
 
 The runtime is now split across two sibling containers in the same compose project:
 
-- `dev`
+- `jarvis_runtime`
   - runs the Jarvis app
   - mounts the repo at `/repo`
   - mounts the shared workspace at `/workspace`
@@ -28,7 +28,7 @@ The runtime is now split across two sibling containers in the same compose proje
   - mounts the shared workspace at `/workspace`
   - does **not** mount `/repo`
 
-The repo is still bind-mounted into `dev` (`Jarvis/` on macOS ↔ `/repo` in the container), so changes are bidirectional. Treat `/repo` as the same project folder, just viewed from Linux.
+The repo is still bind-mounted into `jarvis_runtime` (`Jarvis/` on macOS ↔ `/repo` in the container), so changes are bidirectional. Treat `/repo` as the same project folder, just viewed from Linux.
 
 ### Where to do what
 
@@ -44,11 +44,11 @@ The repo is still bind-mounted into `dev` (`Jarvis/` on macOS ↔ `/repo` in the
 
 Tool note:
 
-- `bash` no longer executes inside `dev`; it is remotely executed in the isolated `tool_runtime` container through the app.
+- `bash` no longer executes inside `jarvis_runtime`; it is remotely executed in the isolated `tool_runtime` container through the app.
 
 ### Standard commands (run from macOS terminal)
 
-* Start/refresh the dev container
+* Start/refresh the `jarvis_runtime` container
 
 ```bash
 docker compose up -d --build
@@ -57,7 +57,7 @@ docker compose up -d --build
 * Run an interactive Linux shell (when needed)
 
 ```bash
-docker compose exec dev bash
+docker compose exec jarvis_runtime bash
 ```
 
 Inside the container, the repo is at `/repo`.
@@ -67,7 +67,7 @@ Inside the container, the repo is at `/repo`.
 Use this pattern whenever you need to run code without opening an interactive shell:
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && <COMMAND>"
+docker compose exec jarvis_runtime bash -lc "cd /repo && <COMMAND>"
 ```
 
 ### Dependency management (uv) — inside the container only
@@ -75,18 +75,18 @@ docker compose exec dev bash -lc "cd /repo && <COMMAND>"
 First-time setup (or after dependency changes):
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv sync --locked --group dev"
-docker compose exec dev bash -lc "cd /repo && uv add <deps>"
-docker compose exec dev bash -lc "cd /repo && uv add --group dev <deps>"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv sync --locked --group dev"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv add <deps>"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv add --group dev <deps>"
 ```
 
 Then run normally:
 
 ```bash
-docker compose exec dev bash -lc "cd /repo && uv run jarvis"
-docker compose exec dev bash -lc "cd /repo && uv run pytest"
-docker compose exec dev bash -lc "cd /repo && uv run ruff check ."
-docker compose exec dev bash -lc "cd /repo && uv run <...>"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run jarvis"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run pytest"
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run ruff check ."
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run <...>"
 ```
 
 The project is strict container-first:

@@ -1,4 +1,4 @@
-Docker Compose mounts these files into the `dev` container at `/run/secrets/<NAME>`.
+Docker Compose mounts these files into the `jarvis_runtime` container at `/run/secrets/<NAME>`.
 
 Fill in the files you actually need for your current provider/runtime setup.
 Blank files are ignored by the runtime secret loader.

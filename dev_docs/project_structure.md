@@ -14,7 +14,7 @@ If this document and the code ever disagree, treat the code as source of truth a
 - The installable Python package lives under `src/jarvis/`.
 - Do not add new repo-root Python entrypoint shims.
 - Add runtime entrypoints through `pyproject.toml` `[project.scripts]`.
-- Run `uv` only inside the `dev` container against `/repo`.
+- Run `uv` only inside the `jarvis_runtime` container against `/repo`.
 - The `tool_runtime` container does not mount the repo; it runs the installed package from its image.
 
 ## High-Level Repo Layout
@@ -25,7 +25,7 @@ If this document and the code ever disagree, treat the code as source of truth a
 ├── uv.lock
 ├── README.md
 ├── docker-compose.yml
-├── Dockerfile.dev
+├── Dockerfile.jarvis_runtime
 ├── Dockerfile.tool_runtime
 ├── src/
 │   └── jarvis/
@@ -54,10 +54,10 @@ If this document and the code ever disagree, treat the code as source of truth a
 ### Container/runtime files
 
 - `docker-compose.yml`
-  - defines the `dev` and `tool_runtime` services
-  - mounts `/repo` only into `dev`
+  - defines the `jarvis_runtime` and `tool_runtime` services
+  - mounts `/repo` only into `jarvis_runtime`
   - mounts the shared `/workspace` into both services
-- `Dockerfile.dev`
+- `Dockerfile.jarvis_runtime`
   - Linux development environment
   - installs `uv`
   - prepares `/opt/venv`
@@ -162,7 +162,7 @@ Source-controlled identity/bootstrap prompt files:
 - `USER.md`
 - `ARMOR.md`
 
-These files are part of the installed package, but at runtime the `dev` container also copies them into `/workspace/identities/` for the agent to consume from the shared workspace.
+These files are part of the installed package, but at runtime the `jarvis_runtime` container also copies them into `/workspace/identities/` for the agent to consume from the shared workspace.
 
 ### `src/jarvis/llm/`
 
