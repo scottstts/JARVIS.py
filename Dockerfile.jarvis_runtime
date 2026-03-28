@@ -14,15 +14,22 @@ RUN python -m pip install --no-cache-dir uv
 # (Optional but handy) common python dev env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     SQLITE_VEC_VENDOR_VERSION=v0.1.7-alpha.10 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PATH="/opt/venv/bin:${PATH}"
+    PATH="/usr/local/bin:/root/.local/bin:/opt/venv/bin:${PATH}"
 
 WORKDIR /repo
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 COPY vendor/sqlite-vec ./vendor/sqlite-vec
+COPY utils/jarvis_shell_wrapper.sh /usr/local/bin/jarvis
+
+RUN chmod +x /usr/local/bin/jarvis \
+  && printf '%s\n' \
+       'export PATH="/usr/local/bin:/root/.local/bin:/opt/venv/bin:${PATH}"' \
+       > /etc/profile.d/jarvis-path.sh
 
 RUN mkdir -p /opt/sqlite-vec \
   && gcc -O3 -fPIC -shared \
@@ -31,7 +38,7 @@ RUN mkdir -p /opt/sqlite-vec \
        -lm \
   && python -c "import os, sqlite3; conn = sqlite3.connect(':memory:'); conn.enable_load_extension(True); conn.load_extension('/opt/sqlite-vec/vec0'); conn.enable_load_extension(False); version = conn.execute('select vec_version()').fetchone()[0]; expected = os.environ['SQLITE_VEC_VENDOR_VERSION']; assert version == expected, (version, expected)" \
   && uv sync --locked --group dev \
-  && python -m playwright install --with-deps chromium
+  && "${UV_PROJECT_ENVIRONMENT}/bin/python" -m playwright install --with-deps chromium
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]

@@ -13,3 +13,5 @@ notes/
 secrets/
 tests/
 utils/
+!utils/
+!utils/jarvis_shell_wrapper.sh

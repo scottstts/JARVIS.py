@@ -62,10 +62,20 @@ docker compose exec jarvis_runtime bash -lc "cd /repo && uv run ruff check ."
 
 ### Build & Run App
 
-To use the built package instead, build it from the `jarvis_runtime` container:
+To build and install the packaged artifact into `jarvis_runtime`, run this on host:
 
 ```bash
-docker compose exec jarvis_runtime bash -lc "cd /repo && uv build"
-docker compose exec jarvis_runtime bash -lc "cd /repo && uv tool install dist/jarvis-0.1.0-py3-none-any.whl"
+bash utils/install_build.sh
+```
+
+To force a fresh rebuild and reinstall:
+
+```bash
+bash utils/install_build.sh --reinstall
+```
+
+Run installed artifact with:
+
+```bash
 docker compose exec jarvis_runtime bash -lc "jarvis"
 ```

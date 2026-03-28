@@ -61,6 +61,7 @@ If this document and the code ever disagree, treat the code as source of truth a
   - Linux development environment
   - installs `uv`
   - prepares `/opt/venv`
+  - installs a `/usr/local/bin/jarvis` shell wrapper that prefers the tool-installed artifact when present
   - intended for `uv run ...` against the bind-mounted repo
 - `Dockerfile.tool_runtime`
   - isolated runtime image for the HTTP tool runtime service
@@ -89,6 +90,8 @@ If this document and the code ever disagree, treat the code as source of truth a
 - `utils/`
   - supporting utilities/scripts that are not part of the installable package
   - includes `settings_gui.html`, a Chrome-oriented metadata-driven settings renderer copied into `/workspace/settings/`
+  - includes `install_build.sh`, a helper that execs into `jarvis_runtime` from the host and ensures the built wheel is installed when needed
+  - includes `jarvis_shell_wrapper.sh`, the container-level `jarvis` wrapper installed into `/usr/local/bin/`
 - `vendor/`
   - vendored third-party source/assets used during builds
   - currently includes `vendor/sqlite-vec/`
