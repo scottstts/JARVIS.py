@@ -1,0 +1,1987 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Jarvis Settings</title>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Exo+2:wght@300;400;600;700&family=Share+Tech+Mono&display=swap');
+
+      :root {
+        color-scheme: dark;
+        --bg-deep: #020c18;
+        --panel: rgba(3, 14, 32, 0.94);
+        --panel-strong: rgba(4, 17, 40, 0.98);
+        --panel-soft: rgba(0, 16, 40, 0.54);
+        --border: rgba(0, 190, 240, 0.11);
+        --border-bright: rgba(0, 210, 255, 0.38);
+        --text: #8ec5de;
+        --muted: #3a6880;
+        --accent: #00ccff;
+        --accent-strong: #00a8e0;
+        --accent-soft: rgba(0, 204, 255, 0.07);
+        --success: #00e5a8;
+        --warning: #e0a020;
+        --danger: #ff3a4a;
+        --shadow: 0 32px 90px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(0, 180, 230, 0.07);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Exo 2", system-ui, sans-serif;
+        font-weight: 400;
+        color: var(--text);
+        background:
+          repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 3px,
+            rgba(0, 180, 255, 0.012) 3px,
+            rgba(0, 180, 255, 0.012) 4px
+          ),
+          radial-gradient(ellipse 65% 45% at 8% 6%, rgba(0, 130, 210, 0.13) 0%, transparent 70%),
+          radial-gradient(ellipse 45% 55% at 94% 96%, rgba(0, 60, 140, 0.09) 0%, transparent 65%),
+          linear-gradient(160deg, var(--bg-deep) 0%, #010810 55%, #020c1a);
+      }
+
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        border: 0;
+        border-radius: 3px;
+        padding: 10px 20px;
+        font-weight: 700;
+        font-family: "Exo 2", sans-serif;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        font-size: 0.8rem;
+        cursor: pointer;
+        transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease, background 160ms ease;
+        position: relative;
+      }
+
+      button:hover:not(:disabled) {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.32;
+      }
+
+      .primary {
+        color: #020c18;
+        background: linear-gradient(135deg, var(--accent) 0%, #0094cc 100%);
+        box-shadow: 0 0 18px rgba(0, 204, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      }
+
+      .primary:hover:not(:disabled) {
+        box-shadow: 0 0 32px rgba(0, 204, 255, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      }
+
+      .secondary {
+        color: var(--accent);
+        background: transparent;
+        border: 1px solid rgba(0, 204, 255, 0.28);
+      }
+
+      .secondary:hover:not(:disabled) {
+        background: rgba(0, 204, 255, 0.07);
+        border-color: rgba(0, 204, 255, 0.55);
+        box-shadow: 0 0 14px rgba(0, 204, 255, 0.18);
+      }
+
+      .danger {
+        color: #ffe0e4;
+        background: linear-gradient(135deg, #a01828, #c82030);
+        box-shadow: 0 0 12px rgba(255, 40, 60, 0.22);
+      }
+
+      .danger:hover:not(:disabled) {
+        box-shadow: 0 0 24px rgba(255, 40, 60, 0.42);
+      }
+
+      /* ── SHELL ──────────────────────────────────────── */
+      .shell {
+        width: min(1340px, calc(100vw - 28px));
+        margin: 18px auto 28px;
+        padding: 20px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        backdrop-filter: blur(20px);
+        box-shadow: var(--shadow);
+        position: relative;
+      }
+
+      .shell::before,
+      .shell::after {
+        content: "";
+        position: absolute;
+        width: 28px;
+        height: 28px;
+        border-color: rgba(0, 204, 255, 0.55);
+        border-style: solid;
+        pointer-events: none;
+      }
+
+      .shell::before {
+        top: -1px;
+        left: -1px;
+        border-width: 2px 0 0 2px;
+        border-radius: 6px 0 0 0;
+      }
+
+      .shell::after {
+        bottom: -1px;
+        right: -1px;
+        border-width: 0 2px 2px 0;
+        border-radius: 0 0 6px 0;
+      }
+
+      /* ── HERO ──────────────────────────────────────── */
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.95fr);
+        gap: 16px;
+        align-items: stretch;
+        position: sticky;
+        top: 12px;
+        z-index: 40;
+        padding-bottom: 10px;
+        background: linear-gradient(180deg, rgba(2, 12, 26, 0.98) 0%, rgba(2, 12, 26, 0.94) 78%, rgba(2, 12, 26, 0) 100%);
+        backdrop-filter: blur(12px);
+      }
+
+      .hero-main,
+      .hero-side {
+        padding: 22px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--panel-strong);
+        position: relative;
+        overflow: hidden;
+      }
+
+      .hero-main::after,
+      .hero-side::after {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 1px;
+        background: linear-gradient(90deg, var(--accent) 0%, rgba(0, 204, 255, 0.2) 60%, transparent 100%);
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font-family: "Orbitron", sans-serif;
+        font-size: clamp(1.9rem, 4vw, 3.4rem);
+        font-weight: 900;
+        line-height: 0.95;
+        letter-spacing: 0.02em;
+        background: linear-gradient(135deg, #e0f4ff 15%, var(--accent) 80%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .hero-copy,
+      .meta-copy,
+      .section-copy,
+      .group-copy,
+      .field-copy {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.55;
+        font-size: 0.9rem;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      .warning-banner {
+        display: none;
+        margin-top: 16px;
+        padding: 12px 16px;
+        border: 1px solid rgba(224, 160, 32, 0.28);
+        border-left: 2px solid var(--warning);
+        border-radius: 3px;
+        background: rgba(224, 160, 32, 0.07);
+        color: var(--warning);
+        line-height: 1.5;
+        font-size: 0.88rem;
+      }
+
+      .warning-banner.visible {
+        display: block;
+      }
+
+      /* ── META CARDS ──────────────────────────────── */
+      .meta-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .meta-card {
+        padding: 12px 16px;
+        border: 1px solid var(--border);
+        border-left: 2px solid rgba(0, 204, 255, 0.38);
+        border-radius: 3px;
+        background: rgba(0, 18, 44, 0.75);
+      }
+
+      .meta-label {
+        display: block;
+        margin-bottom: 5px;
+        color: var(--accent);
+        font-family: "Orbitron", sans-serif;
+        font-size: 0.62rem;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        opacity: 0.65;
+      }
+
+      .meta-value {
+        min-height: 1.4em;
+        word-break: break-word;
+        font-size: 0.88rem;
+        color: var(--text);
+      }
+
+      .status-success {
+        color: var(--success);
+      }
+
+      .status-warning {
+        color: var(--warning);
+      }
+
+      .status-danger {
+        color: var(--danger);
+      }
+
+      /* ── DROPZONE ─────────────────────────────────── */
+      .dropzone {
+        margin: 16px 0;
+        padding: 32px;
+        border: 1px dashed rgba(0, 204, 255, 0.22);
+        border-radius: 6px;
+        background: rgba(0, 22, 52, 0.35);
+        cursor: pointer;
+        text-align: center;
+        transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease;
+      }
+
+      .dropzone:hover {
+        border-color: rgba(0, 204, 255, 0.44);
+        background: rgba(0, 28, 60, 0.55);
+      }
+
+      .dropzone.active {
+        border-color: var(--accent);
+        border-style: solid;
+        background: rgba(0, 36, 72, 0.65);
+        box-shadow: 0 0 36px rgba(0, 204, 255, 0.12), inset 0 0 40px rgba(0, 204, 255, 0.04);
+      }
+
+      .dropzone.compact {
+        padding: 16px 20px;
+        text-align: left;
+      }
+
+      .dropzone h2 {
+        margin: 0 0 8px;
+        font-family: "Orbitron", sans-serif;
+        font-size: 1rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        color: var(--text);
+      }
+
+      .dropzone p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.55;
+        font-size: 0.88rem;
+      }
+
+      .dropzone strong {
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      /* ── NAV ──────────────────────────────────────── */
+      .nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 0 0 16px;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        background: rgba(0, 14, 34, 0.72);
+      }
+
+      .nav[hidden] {
+        display: none;
+      }
+
+      .nav a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6px 16px;
+        border-radius: 2px;
+        border: 1px solid rgba(0, 204, 255, 0.18);
+        background: rgba(0, 204, 255, 0.04);
+        color: var(--accent);
+        font-family: "Orbitron", sans-serif;
+        font-size: 0.64rem;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        text-decoration: none;
+        transition: background 160ms, border-color 160ms, box-shadow 160ms;
+      }
+
+      .nav a:hover {
+        background: rgba(0, 204, 255, 0.1);
+        border-color: rgba(0, 204, 255, 0.48);
+        box-shadow: 0 0 10px rgba(0, 204, 255, 0.18);
+      }
+
+      /* ── SETTINGS LAYOUT ──────────────────────────── */
+      .settings-layout {
+        display: grid;
+        gap: 14px;
+      }
+
+      .settings-layout[hidden] {
+        display: none;
+      }
+
+      /* ── SECTION CARD ─────────────────────────────── */
+      .section-card {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: rgba(3, 15, 36, 0.82);
+        overflow: hidden;
+        position: relative;
+      }
+
+      .section-card::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 1px;
+        background: linear-gradient(90deg, var(--accent) 0%, rgba(0, 204, 255, 0.18) 55%, transparent 100%);
+      }
+
+      .section-head {
+        padding: 18px 20px 8px;
+      }
+
+      .section-title {
+        margin: 0 0 6px;
+        font-family: "Orbitron", sans-serif;
+        font-size: 0.95rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text);
+      }
+
+      .section-body {
+        display: grid;
+        gap: 12px;
+        padding: 6px 16px 16px;
+      }
+
+      /* ── GROUP CARD ───────────────────────────────── */
+      .group-card {
+        border: 1px solid rgba(0, 190, 240, 0.09);
+        border-radius: 4px;
+        background: rgba(4, 19, 44, 0.72);
+        padding: 14px;
+      }
+
+      .group-card[data-depth="2"] {
+        background: rgba(5, 22, 50, 0.88);
+        border-color: rgba(0, 190, 240, 0.06);
+      }
+
+      .group-head {
+        margin-bottom: 12px;
+      }
+
+      .group-title {
+        margin: 0 0 4px;
+        font-family: "Orbitron", sans-serif;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: rgba(0, 204, 255, 0.65);
+      }
+
+      /* ── FIELD ROW ────────────────────────────────── */
+      .field-grid {
+        display: grid;
+        gap: 10px;
+      }
+
+      .field-row {
+        display: grid;
+        grid-template-columns: minmax(210px, 0.92fr) minmax(0, 1.4fr);
+        gap: 14px;
+        align-items: start;
+        padding: 14px;
+        border: 1px solid rgba(0, 190, 240, 0.07);
+        border-radius: 3px;
+        background: rgba(0, 14, 36, 0.52);
+        transition: border-color 160ms ease, background 160ms ease;
+      }
+
+      .field-row:hover {
+        border-color: rgba(0, 204, 255, 0.14);
+        background: rgba(0, 18, 44, 0.7);
+      }
+
+      .field-title {
+        margin: 0 0 4px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        color: var(--text);
+        letter-spacing: 0.02em;
+      }
+
+      .field-path {
+        display: inline-block;
+        margin-top: 8px;
+        color: rgba(0, 204, 255, 0.32);
+        font-family: "Share Tech Mono", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.68rem;
+        letter-spacing: 0.04em;
+      }
+
+      .control-wrap {
+        display: grid;
+        gap: 8px;
+      }
+
+      /* ── INPUTS ───────────────────────────────────── */
+      input[type="text"],
+      input[type="url"],
+      input[type="number"],
+      select,
+      textarea {
+        width: 100%;
+        min-height: 44px;
+        padding: 10px 14px;
+        border: 1px solid rgba(0, 190, 240, 0.16);
+        border-radius: 3px;
+        background: rgba(0, 10, 28, 0.82);
+        color: var(--text);
+        font-family: "Exo 2", sans-serif;
+        outline: none;
+        transition: border-color 160ms ease, box-shadow 160ms ease;
+      }
+
+      input[type="text"]:focus,
+      input[type="url"]:focus,
+      input[type="number"]:focus,
+      select:focus,
+      textarea:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px rgba(0, 204, 255, 0.12), 0 0 14px rgba(0, 204, 255, 0.09);
+      }
+
+      textarea {
+        min-height: 132px;
+        resize: vertical;
+        line-height: 1.55;
+      }
+
+      input:disabled,
+      select:disabled,
+      textarea:disabled {
+        opacity: 0.36;
+        background: rgba(0, 8, 22, 0.65);
+        cursor: not-allowed;
+      }
+
+      /* ── NULL TOGGLE ──────────────────────────────── */
+      .null-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 0.88rem;
+        cursor: pointer;
+      }
+
+      /* ── BOOLEAN SWITCH ───────────────────────────── */
+      .switch-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .switch {
+        position: relative;
+        display: inline-flex;
+        width: 56px;
+        height: 28px;
+      }
+
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+
+      .slider {
+        position: absolute;
+        inset: 0;
+        border-radius: 999px;
+        background: rgba(0, 50, 90, 0.65);
+        border: 1px solid rgba(0, 190, 240, 0.18);
+        transition: background 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+      }
+
+      .slider::before {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: #3a6880;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+        transition: transform 160ms ease, background 160ms ease;
+      }
+
+      .switch input:checked + .slider {
+        background: rgba(0, 90, 150, 0.75);
+        border-color: var(--accent);
+        box-shadow: 0 0 16px rgba(0, 204, 255, 0.35);
+      }
+
+      .switch input:checked + .slider::before {
+        transform: translateX(28px);
+        background: var(--accent);
+      }
+
+      /* ── NUMBER STEPPER ───────────────────────────── */
+      .number-wrap {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        gap: 6px;
+        align-items: center;
+      }
+
+      .stepper {
+        min-width: 40px;
+        min-height: 44px;
+        padding: 0;
+        border-radius: 3px;
+        font-size: 1.15rem;
+        line-height: 1;
+      }
+
+      /* ── LIST EDITOR ──────────────────────────────── */
+      .list-editor {
+        display: grid;
+        gap: 10px;
+      }
+
+      .list-items {
+        display: grid;
+        gap: 6px;
+      }
+
+      .list-item {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .list-item button {
+        padding: 8px 14px;
+        font-size: 0.75rem;
+      }
+
+      /* ── CODE ─────────────────────────────────────── */
+      code {
+        font-family: "Share Tech Mono", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.88em;
+        color: var(--accent);
+        background: rgba(0, 204, 255, 0.07);
+        padding: 1px 6px;
+        border-radius: 2px;
+        border: 1px solid rgba(0, 204, 255, 0.14);
+      }
+
+      /* ── RESPONSIVE ───────────────────────────────── */
+      @media (max-width: 1120px) {
+        .hero {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 860px) {
+        .shell {
+          width: min(100vw - 14px, 100%);
+          margin: 10px auto 18px;
+          padding: 12px;
+          border-radius: 6px;
+        }
+
+        .hero-main,
+        .hero-side,
+        .section-card,
+        .group-card {
+          border-radius: 4px;
+        }
+
+        .field-row {
+          grid-template-columns: 1fr;
+        }
+
+        .number-wrap {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero-main">
+          <h1>Jarvis Settings</h1>
+          <p class="hero-copy">Open or drop a <code>settings.yml</code> file to edit it.</p>
+          <div class="toolbar">
+            <button id="openButton" class="primary" type="button">Open Settings File</button>
+            <button id="saveButton" class="primary" type="button" disabled>Save</button>
+            <button id="saveAsButton" class="secondary" type="button" disabled>Save As</button>
+            <button id="clearButton" class="secondary" type="button" disabled>Clear</button>
+          </div>
+          <div id="warningBanner" class="warning-banner" role="status"></div>
+        </div>
+
+        <aside class="hero-side">
+          <div class="meta-list">
+            <div class="meta-card">
+              <span class="meta-label">File</span>
+              <div id="fileName" class="meta-value">No file loaded</div>
+            </div>
+            <div class="meta-card">
+              <span class="meta-label">Status</span>
+              <div id="saveState" class="meta-value">Ready</div>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section id="dropzone" class="dropzone" tabindex="0">
+        <h2 id="dropzoneTitle">Drop <code>settings.yml</code> Here</h2>
+        <p id="dropzoneCopy">Drop a file here or click to open one.</p>
+      </section>
+
+      <nav id="sectionNav" class="nav" aria-label="Settings sections" hidden></nav>
+      <section id="settingsRoot" class="settings-layout" hidden></section>
+    </main>
+
+    <input id="fileInput" type="file" accept=".yml,.yaml,text/yaml" hidden>
+
+    <script>
+      const HEADER_LINES = [
+        "# Jarvis non-secret runtime settings and UI metadata.",
+        "# The HTML settings page renders this file directly and saves updated values back into it.",
+        "# API keys, bot tokens, and similar secrets stay outside this file.",
+        "",
+      ];
+      const NULL_SENTINEL = "__NULL__";
+      const SUPPORTED_FIELD_TYPES = new Set([
+        "text",
+        "url",
+        "textarea",
+        "integer",
+        "float",
+        "boolean",
+        "select",
+        "list",
+      ]);
+
+      const openButton = document.getElementById("openButton");
+      const saveButton = document.getElementById("saveButton");
+      const saveAsButton = document.getElementById("saveAsButton");
+      const clearButton = document.getElementById("clearButton");
+      const warningBanner = document.getElementById("warningBanner");
+      const fileName = document.getElementById("fileName");
+      const saveState = document.getElementById("saveState");
+      const dropzone = document.getElementById("dropzone");
+      const dropzoneTitle = document.getElementById("dropzoneTitle");
+      const dropzoneCopy = document.getElementById("dropzoneCopy");
+      const sectionNav = document.getElementById("sectionNav");
+      const settingsRoot = document.getElementById("settingsRoot");
+      const fileInput = document.getElementById("fileInput");
+
+      let fileHandle = null;
+      let loadedFileName = "";
+      let loadedDocument = null;
+      let hasUnsavedChanges = false;
+
+      function isPlainObject(value) {
+        return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+      }
+
+      function cloneValue(value) {
+        if (Array.isArray(value)) {
+          return value.map(cloneValue);
+        }
+        if (isPlainObject(value)) {
+          const clone = {};
+          for (const [key, item] of Object.entries(value)) {
+            clone[key] = cloneValue(item);
+          }
+          return clone;
+        }
+        return value;
+      }
+
+      function joinPath(pathSegments) {
+        return pathSegments.join(".");
+      }
+
+      function slugify(value) {
+        return value.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+      }
+
+      function humanizeKey(value) {
+        return value
+          .replace(/_/g, " ")
+          .replace(/\b\w/g, (match) => match.toUpperCase());
+      }
+
+      function setStatus(message, tone = "") {
+        saveState.textContent = message;
+        saveState.className = "meta-value";
+        if (tone) {
+          saveState.classList.add(`status-${tone}`);
+        }
+      }
+
+      function setWarning(message) {
+        warningBanner.textContent = message;
+        warningBanner.classList.toggle("visible", Boolean(message));
+      }
+
+      function updateButtons() {
+        const hasDocument = loadedDocument !== null;
+        saveButton.disabled = !hasDocument || fileHandle === null;
+        saveAsButton.disabled = !hasDocument;
+        clearButton.disabled = !hasDocument;
+      }
+
+      function updateFileLabel() {
+        fileName.textContent = loadedFileName || "No file loaded";
+      }
+
+      function showEmptyState() {
+        settingsRoot.hidden = true;
+        sectionNav.hidden = true;
+        sectionNav.innerHTML = "";
+        settingsRoot.innerHTML = "";
+        dropzone.classList.remove("compact");
+        dropzoneTitle.innerHTML = 'Drop <code>settings.yml</code> Here';
+        dropzoneCopy.textContent = "Drop a file here or click to open one.";
+      }
+
+      function showLoadedState() {
+        settingsRoot.hidden = false;
+        sectionNav.hidden = false;
+        dropzone.classList.add("compact");
+        dropzoneTitle.innerHTML = 'Drop Another <code>settings.yml</code>';
+        dropzoneCopy.textContent = "Drop a file to replace the current one.";
+      }
+
+      function markDirty() {
+        hasUnsavedChanges = true;
+        setStatus("Unsaved changes", "warning");
+      }
+
+      function stripInlineComment(line) {
+        let inSingle = false;
+        let inDouble = false;
+        let escaped = false;
+        let output = "";
+        for (let index = 0; index < line.length; index += 1) {
+          const char = line[index];
+          if (escaped) {
+            output += char;
+            escaped = false;
+            continue;
+          }
+          if (char === "\\" && inDouble) {
+            output += char;
+            escaped = true;
+            continue;
+          }
+          if (char === "'" && !inDouble) {
+            inSingle = !inSingle;
+            output += char;
+            continue;
+          }
+          if (char === "\"" && !inSingle) {
+            inDouble = !inDouble;
+            output += char;
+            continue;
+          }
+          if (char === "#" && !inSingle && !inDouble) {
+            break;
+          }
+          output += char;
+        }
+        return output.trimEnd();
+      }
+
+      function parseScalar(raw) {
+        const value = stripInlineComment(raw).trim();
+        if (value === "null") {
+          return null;
+        }
+        if (value === "true") {
+          return true;
+        }
+        if (value === "false") {
+          return false;
+        }
+        if (value === "[]") {
+          return [];
+        }
+        if (value === "{}") {
+          return {};
+        }
+        if (/^-?\d+$/.test(value)) {
+          return Number.parseInt(value, 10);
+        }
+        if (/^-?(?:\d+\.\d+|\d+\.|\.\d+)$/.test(value)) {
+          return Number.parseFloat(value);
+        }
+        if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+          if (value.startsWith("\"")) {
+            return JSON.parse(value);
+          }
+          return value.slice(1, -1).replace(/''/g, "'");
+        }
+        return value;
+      }
+
+      function nextMeaningfulLine(lines, startIndex) {
+        for (let index = startIndex; index < lines.length; index += 1) {
+          const raw = lines[index];
+          if (!raw.trim() || raw.trim().startsWith("#")) {
+            continue;
+          }
+          return {
+            text: raw,
+            indent: raw.match(/^ */)[0].length,
+            trimmed: raw.trim(),
+          };
+        }
+        return null;
+      }
+
+      function parseYaml(text) {
+        const root = {};
+        const stack = [{ indent: -1, value: root }];
+        const lines = text.replace(/\t/g, "    ").split(/\r?\n/);
+
+        for (let index = 0; index < lines.length; index += 1) {
+          const rawLine = lines[index];
+          const trimmed = rawLine.trim();
+          if (!trimmed || trimmed.startsWith("#")) {
+            continue;
+          }
+
+          const indent = rawLine.match(/^ */)[0].length;
+          while (stack.length > 1 && indent <= stack[stack.length - 1].indent) {
+            stack.pop();
+          }
+
+          const current = stack[stack.length - 1].value;
+          if (trimmed.startsWith("- ")) {
+            if (!Array.isArray(current)) {
+              throw new Error(`List item is not inside a list on line ${index + 1}.`);
+            }
+            current.push(parseScalar(trimmed.slice(2)));
+            continue;
+          }
+
+          const separator = trimmed.indexOf(":");
+          if (separator === -1) {
+            throw new Error(`Expected a key/value pair on line ${index + 1}.`);
+          }
+
+          const key = trimmed.slice(0, separator).trim();
+          const rest = trimmed.slice(separator + 1).trim();
+          if (!isPlainObject(current)) {
+            throw new Error(`Mapping entry is not inside an object on line ${index + 1}.`);
+          }
+
+          if (rest === "") {
+            const upcoming = nextMeaningfulLine(lines, index + 1);
+            const child = upcoming && upcoming.indent > indent && upcoming.trimmed.startsWith("- ") ? [] : {};
+            current[key] = child;
+            stack.push({ indent, value: child });
+          } else {
+            current[key] = parseScalar(rest);
+          }
+        }
+
+        return root;
+      }
+
+      function formatScalar(value) {
+        if (value === null) {
+          return "null";
+        }
+        if (typeof value === "boolean") {
+          return value ? "true" : "false";
+        }
+        if (typeof value === "number") {
+          return Number.isFinite(value) ? String(value) : "0";
+        }
+        return JSON.stringify(String(value));
+      }
+
+      function serializeNode(value, indent) {
+        const spaces = " ".repeat(indent);
+        if (Array.isArray(value)) {
+          if (value.length === 0) {
+            return [`${spaces}[]`];
+          }
+          return value.map((item) => `${spaces}- ${formatScalar(item)}`);
+        }
+
+        const lines = [];
+        const entries = Object.entries(value);
+        entries.forEach(([key, item], entryIndex) => {
+          if (Array.isArray(item)) {
+            if (item.length === 0) {
+              lines.push(`${spaces}${key}: []`);
+            } else {
+              lines.push(`${spaces}${key}:`);
+              lines.push(...item.map((child) => `${" ".repeat(indent + 2)}- ${formatScalar(child)}`));
+            }
+          } else if (isPlainObject(item)) {
+            const childEntries = Object.entries(item);
+            if (childEntries.length === 0) {
+              lines.push(`${spaces}${key}: {}`);
+            } else {
+              lines.push(`${spaces}${key}:`);
+              lines.push(...serializeNode(item, indent + 2));
+            }
+          } else {
+            lines.push(`${spaces}${key}: ${formatScalar(item)}`);
+          }
+
+          if (indent === 0 && entryIndex < entries.length - 1) {
+            lines.push("");
+          }
+        });
+        return lines;
+      }
+
+      function serializeYaml(settingsDocument) {
+        return [...HEADER_LINES, ...serializeNode(settingsDocument, 0)].join("\n") + "\n";
+      }
+
+      function validateDocument(documentNode) {
+        if (!isPlainObject(documentNode) || Object.keys(documentNode).length === 0) {
+          throw new Error("Top-level YAML must be a mapping with at least one settings section.");
+        }
+
+        const errors = [];
+        for (const [sectionKey, sectionNode] of Object.entries(documentNode)) {
+          validateContainerNode(sectionNode, [sectionKey], errors);
+        }
+
+        if (errors.length > 0) {
+          throw new Error(errors.join(" "));
+        }
+      }
+
+      function validateContainerNode(node, pathSegments, errors) {
+        const pathLabel = joinPath(pathSegments);
+        if (!isPlainObject(node)) {
+          errors.push(`Section '${pathLabel}' must be a mapping.`);
+          return;
+        }
+
+        const hasFields = Object.prototype.hasOwnProperty.call(node, "fields");
+        const hasGroups = Object.prototype.hasOwnProperty.call(node, "groups");
+        if (!hasFields && !hasGroups) {
+          errors.push(`Section '${pathLabel}' must define 'fields' or 'groups'.`);
+          return;
+        }
+
+        if (hasFields) {
+          if (!isPlainObject(node.fields)) {
+            errors.push(`Section '${pathLabel}.fields' must be a mapping.`);
+          } else {
+            for (const [fieldKey, fieldNode] of Object.entries(node.fields)) {
+              validateFieldNode(fieldNode, [...pathSegments, fieldKey], errors);
+            }
+          }
+        }
+
+        if (hasGroups) {
+          if (!isPlainObject(node.groups)) {
+            errors.push(`Section '${pathLabel}.groups' must be a mapping.`);
+          } else {
+            for (const [groupKey, groupNode] of Object.entries(node.groups)) {
+              validateContainerNode(groupNode, [...pathSegments, groupKey], errors);
+            }
+          }
+        }
+      }
+
+      function validateFieldNode(node, pathSegments, errors) {
+        const pathLabel = joinPath(pathSegments);
+        if (!isPlainObject(node)) {
+          errors.push(`Field '${pathLabel}' must be a mapping.`);
+          return;
+        }
+        if (typeof node.type !== "string" || !node.type.trim()) {
+          errors.push(`Field '${pathLabel}' must define a non-empty string 'type'.`);
+          return;
+        }
+        if (!Object.prototype.hasOwnProperty.call(node, "value")) {
+          errors.push(`Field '${pathLabel}' must define 'value'.`);
+          return;
+        }
+        if (!SUPPORTED_FIELD_TYPES.has(node.type)) {
+          errors.push(`Field '${pathLabel}' uses unsupported type '${node.type}'.`);
+          return;
+        }
+        if (node.type === "select" && !Array.isArray(node.options)) {
+          errors.push(`Field '${pathLabel}' must define 'options' as a list for select fields.`);
+        }
+        if (node.type === "list" && !Array.isArray(node.value)) {
+          errors.push(`Field '${pathLabel}' must store list values as a YAML list.`);
+        }
+      }
+
+      function encodeSelectOption(value) {
+        return JSON.stringify(value);
+      }
+
+      function decodeSelectOption(value) {
+        return JSON.parse(value);
+      }
+
+      function ensureSelectOption(selectElement, rawValue) {
+        const encodedValue = encodeSelectOption(rawValue);
+        if (Array.from(selectElement.options).some((option) => option.value === encodedValue)) {
+          return encodedValue;
+        }
+        const customOption = document.createElement("option");
+        customOption.value = encodedValue;
+        customOption.textContent = `Custom: ${String(rawValue)}`;
+        selectElement.append(customOption);
+        return encodedValue;
+      }
+
+      function syncNullableScalar(fieldNode, inputElement, toggleInput) {
+        inputElement.disabled = toggleInput.checked;
+        if (toggleInput.checked) {
+          fieldNode.value = null;
+        } else if (fieldNode.value === null) {
+          fieldNode.value = "";
+        }
+      }
+
+      function createBooleanControl(fieldNode) {
+        const wrap = document.createElement("div");
+        wrap.className = "switch-row";
+
+        const switchLabel = document.createElement("label");
+        switchLabel.className = "switch";
+
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = Boolean(fieldNode.value);
+        input.addEventListener("change", () => {
+          fieldNode.value = input.checked;
+          stateText.textContent = input.checked ? "Enabled" : "Disabled";
+          markDirty();
+        });
+
+        const slider = document.createElement("span");
+        slider.className = "slider";
+        switchLabel.append(input, slider);
+
+        const stateText = document.createElement("span");
+        stateText.textContent = input.checked ? "Enabled" : "Disabled";
+
+        wrap.append(switchLabel, stateText);
+        return wrap;
+      }
+
+      function createListItemInput(itemType, value) {
+        const input = document.createElement("input");
+        input.type = itemType === "url" ? "url" : itemType === "integer" || itemType === "float" ? "number" : "text";
+        if (itemType === "integer") {
+          input.step = "1";
+        }
+        if (itemType === "float") {
+          input.step = "0.1";
+        }
+        input.value = value === null || value === undefined ? "" : String(value);
+        return input;
+      }
+
+      function coerceListValue(itemType, rawValue) {
+        if (itemType === "integer") {
+          return Number.parseInt(rawValue, 10);
+        }
+        if (itemType === "float") {
+          return Number.parseFloat(rawValue);
+        }
+        return rawValue;
+      }
+
+      function createListControl(fieldNode) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "list-editor";
+
+        const listItems = document.createElement("div");
+        listItems.className = "list-items";
+
+        const addButton = document.createElement("button");
+        addButton.className = "secondary";
+        addButton.type = "button";
+        addButton.textContent = "Add Item";
+
+        const itemType = typeof fieldNode.item_type === "string" ? fieldNode.item_type : "text";
+
+        function syncListValues() {
+          const values = Array.from(listItems.querySelectorAll("input"))
+            .map((input) => input.value.trim())
+            .filter((value) => value !== "")
+            .map((value) => coerceListValue(itemType, value));
+          fieldNode.value = values;
+          markDirty();
+        }
+
+        function addListItem(value = "") {
+          const row = document.createElement("div");
+          row.className = "list-item";
+
+          const input = createListItemInput(itemType, value);
+          input.addEventListener("input", syncListValues);
+          input.addEventListener("change", syncListValues);
+
+          const removeButton = document.createElement("button");
+          removeButton.className = "danger";
+          removeButton.type = "button";
+          removeButton.textContent = "Remove";
+          removeButton.addEventListener("click", () => {
+            row.remove();
+            syncListValues();
+          });
+
+          row.append(input, removeButton);
+          listItems.append(row);
+        }
+
+        const values = Array.isArray(fieldNode.value) ? fieldNode.value : [];
+        if (values.length === 0) {
+          addListItem("");
+        } else {
+          values.forEach((item) => addListItem(item));
+        }
+
+        addButton.addEventListener("click", () => {
+          addListItem("");
+          markDirty();
+        });
+
+        wrapper.append(listItems, addButton);
+        return wrapper;
+      }
+
+      function createSelectControl(fieldNode) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "control-wrap";
+
+        const select = document.createElement("select");
+        if (fieldNode.nullable) {
+          const unsetOption = document.createElement("option");
+          unsetOption.value = NULL_SENTINEL;
+          unsetOption.textContent = "Unset";
+          select.append(unsetOption);
+        }
+
+        for (const optionValue of fieldNode.options) {
+          const option = document.createElement("option");
+          option.value = encodeSelectOption(optionValue);
+          option.textContent = String(optionValue);
+          select.append(option);
+        }
+
+        const currentValue = fieldNode.value;
+        if (currentValue === null && fieldNode.nullable) {
+          select.value = NULL_SENTINEL;
+        } else {
+          const encoded = ensureSelectOption(select, currentValue);
+          select.value = encoded;
+        }
+
+        select.addEventListener("change", () => {
+          fieldNode.value = fieldNode.nullable && select.value === NULL_SENTINEL
+            ? null
+            : decodeSelectOption(select.value);
+          markDirty();
+        });
+
+        wrapper.append(select);
+        return wrapper;
+      }
+
+      function createNumberControl(fieldNode, fieldType) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "control-wrap";
+
+        const row = document.createElement("div");
+        row.className = "number-wrap";
+        const configuredStep = typeof fieldNode.step === "number" && fieldNode.step > 0
+          ? fieldNode.step
+          : (fieldType === "float" ? 0.1 : 1);
+
+        const minus = document.createElement("button");
+        minus.className = "secondary stepper";
+        minus.type = "button";
+        minus.textContent = "−";
+
+        const plus = document.createElement("button");
+        plus.className = "secondary stepper";
+        plus.type = "button";
+        plus.textContent = "+";
+
+        const input = document.createElement("input");
+        input.type = "number";
+        input.step = fieldType === "float" ? "any" : "1";
+        if (fieldNode.min !== undefined) {
+          input.min = String(fieldNode.min);
+        }
+        if (fieldNode.max !== undefined) {
+          input.max = String(fieldNode.max);
+        }
+        if (!fieldNode.nullable) {
+          input.required = true;
+        }
+
+        if (fieldNode.value !== null && fieldNode.value !== undefined) {
+          input.value = String(fieldNode.value);
+        }
+
+        function normalizeNumber(value) {
+          if (fieldType === "integer") {
+            return Math.trunc(value);
+          }
+
+          const candidates = [configuredStep, fieldNode.min, fieldNode.max]
+            .filter((item) => typeof item === "number" && Number.isFinite(item))
+            .map((item) => {
+              const text = String(item);
+              return text.includes(".") ? text.split(".")[1].length : 0;
+            });
+          const decimals = Math.max(0, ...candidates);
+          return Number(value.toFixed(decimals));
+        }
+
+        function clampNumber(value) {
+          let nextValue = value;
+          if (typeof fieldNode.min === "number") {
+            nextValue = Math.max(fieldNode.min, nextValue);
+          }
+          if (typeof fieldNode.max === "number") {
+            nextValue = Math.min(fieldNode.max, nextValue);
+          }
+          return normalizeNumber(nextValue);
+        }
+
+        function assignFromInput() {
+          if (input.value === "") {
+            if (fieldNode.nullable) {
+              fieldNode.value = null;
+            }
+            return;
+          }
+          const parsed = Number(input.value);
+          if (Number.isNaN(parsed)) {
+            return;
+          }
+          fieldNode.value = normalizeNumber(parsed);
+        }
+
+        function syncDirty() {
+          assignFromInput();
+          markDirty();
+        }
+
+        function nudgeNumber(direction) {
+          const parsedCurrent = input.value === "" ? Number.NaN : Number(input.value);
+          let baseValue;
+          if (Number.isNaN(parsedCurrent)) {
+            if (typeof fieldNode.value === "number" && Number.isFinite(fieldNode.value)) {
+              baseValue = fieldNode.value;
+            } else if (typeof fieldNode.min === "number") {
+              baseValue = fieldNode.min;
+            } else {
+              baseValue = 0;
+            }
+          } else {
+            baseValue = parsedCurrent;
+          }
+
+          const nextValue = clampNumber(baseValue + (configuredStep * direction));
+          input.value = String(nextValue);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+
+        input.addEventListener("input", syncDirty);
+        input.addEventListener("change", syncDirty);
+
+        minus.addEventListener("click", () => {
+          nudgeNumber(-1);
+        });
+        plus.addEventListener("click", () => {
+          nudgeNumber(1);
+        });
+
+        row.append(minus, input, plus);
+        wrapper.append(row);
+
+        if (fieldNode.nullable) {
+          const unsetToggle = document.createElement("label");
+          unsetToggle.className = "null-toggle";
+
+          const toggleInput = document.createElement("input");
+          toggleInput.type = "checkbox";
+          toggleInput.checked = fieldNode.value === null || fieldNode.value === undefined;
+
+          const toggleText = document.createElement("span");
+          toggleText.textContent = "Unset";
+
+          function syncNullState() {
+            const isUnset = toggleInput.checked;
+            input.disabled = isUnset;
+            minus.disabled = isUnset;
+            plus.disabled = isUnset;
+            fieldNode.value = isUnset ? null : fieldNode.value;
+          }
+
+          toggleInput.addEventListener("change", () => {
+            syncNullState();
+            markDirty();
+          });
+
+          if (toggleInput.checked) {
+            input.value = "";
+          }
+          syncNullState();
+          unsetToggle.append(toggleInput, toggleText);
+          wrapper.append(unsetToggle);
+        }
+
+        return wrapper;
+      }
+
+      function createScalarControl(fieldNode, inputType) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "control-wrap";
+
+        const input = inputType === "textarea" ? document.createElement("textarea") : document.createElement("input");
+        if (inputType !== "textarea") {
+          input.type = inputType;
+        }
+
+        if (!fieldNode.nullable) {
+          input.required = true;
+        }
+
+        if (fieldNode.value !== null && fieldNode.value !== undefined) {
+          input.value = String(fieldNode.value);
+        }
+
+        function syncValue() {
+          if (fieldNode.nullable && input.disabled) {
+            fieldNode.value = null;
+            return;
+          }
+          fieldNode.value = input.value;
+        }
+
+        input.addEventListener("input", () => {
+          syncValue();
+          markDirty();
+        });
+        input.addEventListener("change", () => {
+          syncValue();
+          markDirty();
+        });
+
+        wrapper.append(input);
+
+        if (fieldNode.nullable) {
+          const unsetToggle = document.createElement("label");
+          unsetToggle.className = "null-toggle";
+
+          const toggleInput = document.createElement("input");
+          toggleInput.type = "checkbox";
+          toggleInput.checked = fieldNode.value === null || fieldNode.value === undefined;
+
+          const toggleText = document.createElement("span");
+          toggleText.textContent = "Unset";
+
+          function syncNullState() {
+            input.disabled = toggleInput.checked;
+            fieldNode.value = toggleInput.checked ? null : input.value;
+          }
+
+          toggleInput.addEventListener("change", () => {
+            syncNullState();
+            markDirty();
+          });
+
+          if (toggleInput.checked) {
+            input.value = "";
+          }
+          syncNullState();
+          unsetToggle.append(toggleInput, toggleText);
+          wrapper.append(unsetToggle);
+        }
+
+        return wrapper;
+      }
+
+      function createControl(fieldNode) {
+        if (fieldNode.type === "boolean") {
+          return createBooleanControl(fieldNode);
+        }
+        if (fieldNode.type === "select") {
+          return createSelectControl(fieldNode);
+        }
+        if (fieldNode.type === "list") {
+          return createListControl(fieldNode);
+        }
+        if (fieldNode.type === "integer" || fieldNode.type === "float") {
+          return createNumberControl(fieldNode, fieldNode.type);
+        }
+        if (fieldNode.type === "textarea") {
+          return createScalarControl(fieldNode, "textarea");
+        }
+        if (fieldNode.type === "url") {
+          return createScalarControl(fieldNode, "url");
+        }
+        return createScalarControl(fieldNode, "text");
+      }
+
+      function renderFieldRow(fieldKey, fieldNode, pathSegments) {
+        const row = document.createElement("div");
+        row.className = "field-row";
+
+        const copy = document.createElement("div");
+        const title = document.createElement("h4");
+        title.className = "field-title";
+        title.textContent = typeof fieldNode.label === "string" && fieldNode.label.trim()
+          ? fieldNode.label
+          : humanizeKey(fieldKey);
+
+        copy.append(title);
+
+        if (typeof fieldNode.description === "string" && fieldNode.description.trim()) {
+          const description = document.createElement("p");
+          description.className = "field-copy";
+          description.textContent = fieldNode.description;
+          copy.append(description);
+        }
+
+        const pathPill = document.createElement("span");
+        pathPill.className = "field-path";
+        pathPill.textContent = joinPath([...pathSegments, fieldKey]);
+        copy.append(pathPill);
+
+        row.append(copy, createControl(fieldNode));
+        return row;
+      }
+
+      function renderFieldGrid(fieldsNode, pathSegments) {
+        const fieldGrid = document.createElement("div");
+        fieldGrid.className = "field-grid";
+        for (const [fieldKey, fieldNode] of Object.entries(fieldsNode)) {
+          fieldGrid.append(renderFieldRow(fieldKey, fieldNode, pathSegments));
+        }
+        return fieldGrid;
+      }
+
+      function renderGroup(groupKey, groupNode, pathSegments, depth) {
+        const card = document.createElement("div");
+        card.className = "group-card";
+        card.dataset.depth = String(depth);
+
+        const head = document.createElement("div");
+        head.className = "group-head";
+
+        const title = document.createElement("h3");
+        title.className = "group-title";
+        title.textContent = typeof groupNode.title === "string" && groupNode.title.trim()
+          ? groupNode.title
+          : humanizeKey(groupKey);
+        head.append(title);
+
+        if (typeof groupNode.description === "string" && groupNode.description.trim()) {
+          const copy = document.createElement("p");
+          copy.className = "group-copy";
+          copy.textContent = groupNode.description;
+          head.append(copy);
+        }
+
+        card.append(head);
+
+        if (isPlainObject(groupNode.fields) && Object.keys(groupNode.fields).length > 0) {
+          card.append(renderFieldGrid(groupNode.fields, pathSegments));
+        }
+
+        if (isPlainObject(groupNode.groups)) {
+          for (const [childGroupKey, childGroupNode] of Object.entries(groupNode.groups)) {
+            card.append(renderGroup(childGroupKey, childGroupNode, [...pathSegments, childGroupKey], depth + 1));
+          }
+        }
+
+        return card;
+      }
+
+      function renderSection(sectionKey, sectionNode) {
+        const sectionCard = document.createElement("section");
+        sectionCard.className = "section-card";
+        sectionCard.id = slugify(sectionKey);
+
+        const sectionHead = document.createElement("div");
+        sectionHead.className = "section-head";
+
+        const sectionTitle = document.createElement("h2");
+        sectionTitle.className = "section-title";
+        sectionTitle.textContent = typeof sectionNode.title === "string" && sectionNode.title.trim()
+          ? sectionNode.title
+          : humanizeKey(sectionKey);
+        sectionHead.append(sectionTitle);
+
+        if (typeof sectionNode.description === "string" && sectionNode.description.trim()) {
+          const sectionCopy = document.createElement("p");
+          sectionCopy.className = "section-copy";
+          sectionCopy.textContent = sectionNode.description;
+          sectionHead.append(sectionCopy);
+        }
+
+        const sectionBody = document.createElement("div");
+        sectionBody.className = "section-body";
+
+        if (isPlainObject(sectionNode.fields) && Object.keys(sectionNode.fields).length > 0) {
+          sectionBody.append(renderFieldGrid(sectionNode.fields, [sectionKey]));
+        }
+
+        if (isPlainObject(sectionNode.groups)) {
+          for (const [groupKey, groupNode] of Object.entries(sectionNode.groups)) {
+            sectionBody.append(renderGroup(groupKey, groupNode, [sectionKey, groupKey], 1));
+          }
+        }
+
+        sectionCard.append(sectionHead, sectionBody);
+        return sectionCard;
+      }
+
+      function renderDocument() {
+        sectionNav.innerHTML = "";
+        settingsRoot.innerHTML = "";
+
+        for (const [sectionKey, sectionNode] of Object.entries(loadedDocument)) {
+          const navLink = document.createElement("a");
+          navLink.href = `#${slugify(sectionKey)}`;
+          navLink.textContent = typeof sectionNode.title === "string" && sectionNode.title.trim()
+            ? sectionNode.title
+            : humanizeKey(sectionKey);
+          sectionNav.append(navLink);
+          settingsRoot.append(renderSection(sectionKey, sectionNode));
+        }
+
+        showLoadedState();
+      }
+
+      async function ensureDiscardIsSafe() {
+        if (!hasUnsavedChanges) {
+          return true;
+        }
+        return window.confirm("Discard unsaved changes and load another settings file?");
+      }
+
+      async function loadFromText(text, name, handle = null) {
+        const parsed = parseYaml(text);
+        validateDocument(parsed);
+
+        loadedDocument = parsed;
+        fileHandle = handle;
+        loadedFileName = name;
+        hasUnsavedChanges = false;
+
+        renderDocument();
+        updateFileLabel();
+        updateButtons();
+
+        if (handle === null) {
+          setWarning("Loaded without write access. Use Save As.");
+          setStatus("Loaded", "warning");
+        } else {
+          setWarning("");
+          setStatus("Loaded", "success");
+        }
+      }
+
+      async function extractDroppedFile(transfer) {
+        if (transfer.items && transfer.items.length > 0) {
+          for (const item of transfer.items) {
+            if (item.kind !== "file") {
+              continue;
+            }
+            if (typeof item.getAsFileSystemHandle === "function") {
+              const handle = await item.getAsFileSystemHandle();
+              if (handle && handle.kind === "file" && /\.ya?ml$/i.test(handle.name)) {
+                const file = await handle.getFile();
+                return { file, handle, name: handle.name };
+              }
+            }
+          }
+        }
+
+        const file = Array.from(transfer.files || []).find((candidate) => /\.ya?ml$/i.test(candidate.name));
+        if (!file) {
+          return null;
+        }
+        return { file, handle: null, name: file.name };
+      }
+
+      async function openSettingsFile() {
+        if (!(await ensureDiscardIsSafe())) {
+          return;
+        }
+
+        if (window.showOpenFilePicker) {
+          const [handle] = await window.showOpenFilePicker({
+            types: [
+              {
+                description: "YAML settings",
+                accept: {
+                  "text/yaml": [".yml", ".yaml"],
+                },
+              },
+            ],
+            excludeAcceptAllOption: false,
+            multiple: false,
+          });
+          const file = await handle.getFile();
+          const rawText = await file.text();
+          await loadFromText(rawText, handle.name, handle);
+          return;
+        }
+
+        fileInput.value = "";
+        fileInput.click();
+      }
+
+      function ensureDocumentLoaded() {
+        if (!loadedDocument) {
+          throw new Error("Load a settings file first.");
+        }
+      }
+
+      function validateVisibleInputs() {
+        const controls = settingsRoot.querySelectorAll("input, select, textarea");
+        for (const control of controls) {
+          if (typeof control.reportValidity === "function" && !control.reportValidity()) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      async function saveSettingsFile() {
+        ensureDocumentLoaded();
+        if (!fileHandle) {
+          throw new Error("This file was loaded without direct write access. Use Save As.");
+        }
+        if (!validateVisibleInputs()) {
+          throw new Error("Fix the highlighted fields before saving.");
+        }
+
+        const yamlText = serializeYaml(loadedDocument);
+        const writable = await fileHandle.createWritable();
+        await writable.write(yamlText);
+        await writable.close();
+        hasUnsavedChanges = false;
+        setStatus("Saved", "success");
+      }
+
+      function downloadFallback(name, contents) {
+        const blob = new Blob([contents], { type: "text/yaml" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      async function saveSettingsAs() {
+        ensureDocumentLoaded();
+        if (!validateVisibleInputs()) {
+          throw new Error("Fix the highlighted fields before saving.");
+        }
+
+        const yamlText = serializeYaml(loadedDocument);
+        const suggestedName = loadedFileName || "settings.yml";
+
+        if (window.showSaveFilePicker) {
+          const handle = await window.showSaveFilePicker({
+            suggestedName,
+            types: [
+              {
+                description: "YAML settings",
+                accept: {
+                  "text/yaml": [".yml", ".yaml"],
+                },
+              },
+            ],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(yamlText);
+          await writable.close();
+          fileHandle = handle;
+          loadedFileName = handle.name;
+          hasUnsavedChanges = false;
+          updateFileLabel();
+          updateButtons();
+          setWarning("");
+          setStatus("Saved", "success");
+          return;
+        }
+
+        downloadFallback(suggestedName, yamlText);
+        hasUnsavedChanges = false;
+        setStatus("Downloaded YAML copy", "success");
+      }
+
+      async function clearLoadedFile() {
+        if (!(await ensureDiscardIsSafe())) {
+          return;
+        }
+        fileHandle = null;
+        loadedFileName = "";
+        loadedDocument = null;
+        hasUnsavedChanges = false;
+        updateFileLabel();
+        updateButtons();
+        setWarning("");
+        setStatus("Ready");
+        showEmptyState();
+      }
+
+      openButton.addEventListener("click", async () => {
+        try {
+          await openSettingsFile();
+        } catch (error) {
+          if (error && error.name === "AbortError") {
+            setStatus("Open cancelled", "warning");
+            return;
+          }
+          setStatus(`Open failed: ${error.message}`, "danger");
+        }
+      });
+
+      saveButton.addEventListener("click", async () => {
+        try {
+          await saveSettingsFile();
+        } catch (error) {
+          setStatus(`Save failed: ${error.message}`, "danger");
+        }
+      });
+
+      saveAsButton.addEventListener("click", async () => {
+        try {
+          await saveSettingsAs();
+        } catch (error) {
+          if (error && error.name === "AbortError") {
+            setStatus("Save As cancelled", "warning");
+            return;
+          }
+          setStatus(`Save As failed: ${error.message}`, "danger");
+        }
+      });
+
+      clearButton.addEventListener("click", async () => {
+        try {
+          await clearLoadedFile();
+        } catch (error) {
+          setStatus(`Clear failed: ${error.message}`, "danger");
+        }
+      });
+
+      fileInput.addEventListener("change", async () => {
+        try {
+          if (!(await ensureDiscardIsSafe())) {
+            fileInput.value = "";
+            return;
+          }
+          const [file] = Array.from(fileInput.files || []);
+          if (!file) {
+            return;
+          }
+          const rawText = await file.text();
+          await loadFromText(rawText, file.name, null);
+        } catch (error) {
+          setStatus(`Open failed: ${error.message}`, "danger");
+        } finally {
+          fileInput.value = "";
+        }
+      });
+
+      function activateDropzone() {
+        dropzone.classList.add("active");
+      }
+
+      function deactivateDropzone() {
+        dropzone.classList.remove("active");
+      }
+
+      ["dragenter", "dragover"].forEach((eventName) => {
+        window.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          activateDropzone();
+        });
+      });
+
+      ["dragleave", "drop"].forEach((eventName) => {
+        window.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          if (eventName === "dragleave" && event.relatedTarget) {
+            return;
+          }
+          deactivateDropzone();
+        });
+      });
+
+      dropzone.addEventListener("dragenter", (event) => {
+        event.preventDefault();
+        activateDropzone();
+      });
+
+      dropzone.addEventListener("dragover", (event) => {
+        event.preventDefault();
+        activateDropzone();
+      });
+
+      dropzone.addEventListener("dragleave", (event) => {
+        event.preventDefault();
+        if (dropzone.contains(event.relatedTarget)) {
+          return;
+        }
+        deactivateDropzone();
+      });
+
+      dropzone.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        deactivateDropzone();
+        try {
+          if (!(await ensureDiscardIsSafe())) {
+            return;
+          }
+          const dropped = await extractDroppedFile(event.dataTransfer);
+          if (!dropped) {
+            throw new Error("Drop a .yml or .yaml file.");
+          }
+          const rawText = await dropped.file.text();
+          await loadFromText(rawText, dropped.name, dropped.handle);
+        } catch (error) {
+          setStatus(`Drop failed: ${error.message}`, "danger");
+        }
+      });
+
+      dropzone.addEventListener("click", () => {
+        openButton.click();
+      });
+
+      dropzone.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openButton.click();
+        }
+      });
+
+      document.addEventListener("keydown", async (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+          event.preventDefault();
+          try {
+            if (fileHandle) {
+              await saveSettingsFile();
+            } else if (loadedDocument) {
+              await saveSettingsAs();
+            }
+          } catch (error) {
+            setStatus(`Save failed: ${error.message}`, "danger");
+          }
+        }
+      });
+
+      window.addEventListener("beforeunload", (event) => {
+        if (!hasUnsavedChanges) {
+          return;
+        }
+        event.preventDefault();
+        event.returnValue = "";
+      });
+
+      showEmptyState();
+      updateButtons();
+      updateFileLabel();
+    </script>
+  </body>
+</html>

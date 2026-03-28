@@ -88,6 +88,7 @@ If this document and the code ever disagree, treat the code as source of truth a
   - repo assets such as images
 - `utils/`
   - supporting utilities/scripts that are not part of the installable package
+  - includes `settings_gui.html`, a Chrome-oriented metadata-driven settings renderer copied into `/workspace/settings/`
 - `vendor/`
   - vendored third-party source/assets used during builds
   - currently includes `vendor/sqlite-vec/`
@@ -102,6 +103,7 @@ src/jarvis/
 ├── __main__.py
 ├── main.py
 ├── settings.py
+├── settings.yml
 ├── runtime_env.py
 ├── logging_setup.py
 ├── workspace_paths.py
@@ -125,7 +127,11 @@ src/jarvis/
   - combined runtime entrypoint for running gateway + UI together
   - backs the `jarvis` script
 - `settings.py`
-  - non-secret runtime defaults and environment-backed settings
+  - compatibility layer that exports the runtime setting constants consumed by the app
+  - extracts grouped runtime values from metadata-rich `settings.yml` or the workspace override file
+- `settings.yml`
+  - shipped non-secret runtime settings template plus UI metadata
+  - grouped, user-facing YAML source for both the `settings.py` compatibility layer and `settings_gui.html`
 - `runtime_env.py`
   - Docker secret loading and runtime environment bootstrap
 - `logging_setup.py`

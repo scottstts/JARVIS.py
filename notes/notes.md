@@ -3,6 +3,7 @@
 - Anthropic config now supports `JARVIS_ANTHROPIC_EFFORT` and model-aware thinking behavior (adaptive/effort only applied where model support exists).
 - Gemini thinking is model-aware: `gemini-3*` uses `thinking_level`, while `gemini-2.5*` uses `thinking_budget`.
 - Embeddings are now globally configured via `JARVIS_EMBEDDING_PROVIDER` and `JARVIS_EMBEDDING_MODEL`, decoupled from chat provider selection.
+- `src/jarvis/settings.yml` now embeds per-field UI metadata (`label`, `description`, `type`, options, bounds) so `utils/settings_gui.html` can render new settings without hardcoded HTML schema changes.
 - Added a custom `src/jarvis/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
 - Implemented file-backed `src/jarvis/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
 - Session bootstrap now injects `src/jarvis/identities/PROGRAM.md`, `src/jarvis/identities/REACTOR.md`, `src/jarvis/identities/USER.md`, and `src/jarvis/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
@@ -24,7 +25,7 @@
 - Telegram draft streaming can hit Bot API 429 flood control; parse `retry_after`, pause drafts per chat for that interval, and still send the final assistant message.
 - Telegram reply rendering now converts markdown-like model output to Telegram HTML for drafts and final messages, supporting bold, italic, strikethrough, spoilers, inline code, fenced code blocks, links, headings, and blockquotes with plain-text fallback on formatting errors.
 - Telegram UI code now lives under `src/jarvis/ui/telegram/` inside the installable `jarvis` package; there is no remaining top-level `ui` package shim.
-- Non-secret runtime defaults now live in `src/jarvis/settings.py`; runtime secrets are now loaded separately from Docker secret files.
+- Non-secret runtime defaults now ship from `src/jarvis/settings.yml`, while `src/jarvis/settings.py` remains the compatibility layer that exports runtime constants.
 - Telegram UI can be restricted to a single owner by setting `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; unauthorized private messages are ignored without a reply.
 - Telegram file messages now download the original attachment into `JARVIS_UI_TELEGRAM_TEMP_DIR` (default `/workspace/temp`), inject a metadata-only user message pointing at that local path, and expose an owner-file send interface for future agent tools. **important:** this file send telegram interface (for agent to send files to user's telegram) will be used later for agent's send_file tool implementation.
 - In docker compose added command to copy src/jarvis/identities/. to /workspace/identities/, and wire the agent runtime to use /workspace/identities/ for starter files instead
@@ -116,3 +117,4 @@
 - The repo is now strict container-first for Python: no host `.venv`, `uv` commands run in `jarvis_runtime`, and the isolated `tool_runtime` image installs the package instead of relying on `PYTHONPATH`.
 - Docker Compose renamed the app service/container from `dev` to `jarvis_runtime`; `tool_runtime` is unchanged and still hosts bash execution.
 - `Dockerfile.jarvis_runtime` must install the editable `jarvis` project from `/repo` during image build, not a temp path, or the first `uv run jarvis` in a fresh container will uninstall/reinstall the project to retarget it back to the bind-mounted runtime path.
+- Non-secret runtime settings now ship as `src/jarvis/settings.yml`, while `src/jarvis/settings.py` stays as the constant-export compatibility layer and prefers `/workspace/settings/settings.yml` when present.

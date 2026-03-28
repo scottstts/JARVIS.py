@@ -26,11 +26,7 @@ This repo is strict container-first for Python: do not create or use a host-side
 
 ### Deposit Secrets & Settings
 
-Jarvis needs LLMs to power the agent and external services for certain agent tools
-
-Set up secrets by creating files under `secrets/`. The full expected list is in [`secrets/README.md`](secrets/README.md).
-
-[`src/jarvis/settings.py`](src/jarvis/settings.py) contains non-secret settings for Jarvis. The default can work out of the box fine. For LLM providers and models, change them as you like.
+Set up secrets by creating files under `secrets/`. The full expected list and doc URLs are in [`secrets/README.md`](secrets/README.md).
 
 In telegram BotFather, add commands:
 
@@ -39,6 +35,10 @@ new - start a new session
 stop - pause Jarvis
 compact - compact current session
 ```
+
+At container startup time, Jarvis settings YAML is copied to `workspace/settings/settings.yml` if the workspace copy does not already exist. Jarvis reads runtime settings from it. If that YAML file is missing from `workspace/settings/`, Jarvis falls back to the packaged template YAML.
+
+Settings GUI is also available in `workspace/settings/settings_gui.html`. Open or drag in `settings.yml` there, edit the settings in the GUI, and save edited settings.
 
 ## Run Jarvis
 
@@ -50,6 +50,8 @@ Run dev inside the `jarvis_runtime` container:
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv sync --locked --group dev"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run jarvis"
 ```
+
+After changing `~/.jarvis/workspace/settings/settings.yml`, restart the affected runtime processes so they reload the file. If you change tool-runtime settings, restart the containers with `docker compose restart`.
 
 For tests and linting, use the same container-managed environment:
 

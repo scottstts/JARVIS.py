@@ -1,0 +1,922 @@
+# Jarvis non-secret runtime settings and UI metadata.
+# API keys, bot tokens, and similar secrets stay outside this file.
+# Add new settings under a section/group `fields:` mapping.
+# Each field should define `label`, `description`, `type`, and `value`.
+# Use `options` for selects, numeric bounds where needed, and `nullable: true` when null is valid.
+
+# MUST follow this convention for any newly added setting items in the future
+
+gateway:
+  title: "Gateway"
+  description: "Websocket gateway network settings and message-size limits."
+  fields:
+    host:
+      label: "Gateway Host"
+      description: "Bind address for the websocket gateway."
+      type: "text"
+      value: "127.0.0.1"
+    port:
+      label: "Gateway Port"
+      description: "TCP port used by the gateway."
+      type: "integer"
+      min: 1
+      max: 65535
+      step: 1
+      value: 8080
+    websocket_path:
+      label: "Websocket Path"
+      description: "Base path used for websocket routes."
+      type: "text"
+      value: "/ws"
+    max_message_chars:
+      label: "Max Message Characters"
+      description: "Maximum client message size accepted by the gateway."
+      type: "integer"
+      min: 1
+      step: 100
+      value: 32000
+
+workspace:
+  title: "Workspace"
+  description: "Shared runtime directories used by Jarvis inside the container workspace."
+  fields:
+    root:
+      label: "Workspace Root"
+      description: "Main shared workspace path used inside the container."
+      type: "text"
+      value: "/workspace"
+    transcript_archive_dir:
+      label: "Transcript Archive Directory"
+      description: "Route transcript archive root."
+      type: "text"
+      value: "/workspace/archive/transcripts"
+    identities_dir:
+      label: "Identities Directory"
+      description: "Directory containing runtime identity prompt files."
+      type: "text"
+      value: "/workspace/identities"
+    memory_dir:
+      label: "Memory Directory"
+      description: "Memory content root."
+      type: "text"
+      value: "/workspace/memory"
+    memory_index_dir:
+      label: "Memory Index Directory"
+      description: "SQLite/vector index location for memory search."
+      type: "text"
+      value: "/workspace/memory/.index"
+    subagent_archive_dir:
+      label: "Subagent Archive Directory"
+      description: "Persistent archive path for subagent runs."
+      type: "text"
+      value: "/workspace/archive/subagents"
+
+tools:
+  title: "Tool Runtime"
+  description: "Runtime behavior, execution limits, and built-in tool defaults."
+  groups:
+    runtime:
+      title: "Remote Tool Runtime"
+      description: "HTTP connectivity and service bind settings for the isolated tool runtime."
+      fields:
+        base_url:
+          label: "Remote Runtime Base URL"
+          description: "Optional explicit base URL for the remote tool runtime service."
+          type: "text"
+          nullable: true
+          value: null
+        timeout_seconds:
+          label: "Runtime Timeout Seconds"
+          description: "Overall HTTP timeout for remote tool-runtime calls."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 135
+        healthcheck_timeout_seconds:
+          label: "Healthcheck Timeout Seconds"
+          description: "Timeout used when probing tool-runtime health."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 5
+        service_host:
+          label: "Service Host"
+          description: "Bind host used by the tool runtime HTTP server."
+          type: "text"
+          value: "0.0.0.0"
+        service_port:
+          label: "Service Port"
+          description: "Bind port used by the tool runtime HTTP server."
+          type: "integer"
+          min: 1
+          max: 65535
+          step: 1
+          value: 8081
+    bash:
+      title: "Bash Tool"
+      description: "Shell execution defaults, output limits, and background job retention."
+      fields:
+        executable:
+          label: "Shell Executable"
+          description: "Default shell used for bash tool execution."
+          type: "text"
+          value: "/bin/bash"
+        default_timeout_seconds:
+          label: "Default Timeout Seconds"
+          description: "Default timeout for bash tool calls."
+          type: "float"
+          min: 0.1
+          step: 1
+          value: 120
+        max_timeout_seconds:
+          label: "Maximum Timeout Seconds"
+          description: "Hard ceiling for requested bash tool timeouts."
+          type: "float"
+          min: 1
+          step: 10
+          value: 1800
+        foreground_soft_timeout_seconds:
+          label: "Foreground Soft Timeout Seconds"
+          description: "Foreground bash calls promote to jobs after this soft limit."
+          type: "float"
+          min: 0.1
+          step: 1
+          value: 15
+        max_output_chars:
+          label: "Max Output Characters"
+          description: "Output truncation limit for bash tool results."
+          type: "integer"
+          min: 1
+          step: 1000
+          value: 40000
+        job_log_max_bytes:
+          label: "Job Log Max Bytes"
+          description: "Per-job retained log size limit."
+          type: "integer"
+          min: 1
+          step: 1024
+          value: 4194304
+        job_total_storage_budget_bytes:
+          label: "Job Storage Budget Bytes"
+          description: "Total retained storage budget for bash job artifacts."
+          type: "integer"
+          min: 1
+          step: 1024
+          value: 134217728
+        job_retention_seconds:
+          label: "Job Retention Seconds"
+          description: "Retention window for completed or cancelled bash jobs."
+          type: "float"
+          min: 1
+          step: 60
+          value: 86400
+        dangerously_skip_permission:
+          label: "Skip Bash Permission Prompt"
+          description: "Disable bash permission gating. Dangerous and usually not recommended."
+          type: "boolean"
+          value: false
+    python:
+      title: "Python Tooling"
+      description: "Central virtualenv path and starter packages available to tool-side Python work."
+      fields:
+        central_venv:
+          label: "Central Python Virtualenv"
+          description: "Interpreter environment used by Python-oriented tooling."
+          type: "text"
+          value: "/opt/venv"
+        starter_packages:
+          label: "Starter Packages"
+          description: "Python packages installed into the central tool environment."
+          type: "list"
+          value:
+            - "python-dateutil"
+            - "pyyaml"
+            - "pymupdf"
+            - "pandas"
+            - "pillow"
+            - "pydantic"
+            - "jinja2"
+            - "rapidfuzz"
+            - "markdown-it-py"
+            - "feedparser"
+            - "openpyxl"
+            - "python-docx"
+            - "icalendar"
+    limits:
+      title: "Turn Limits"
+      description: "Turn-level tool execution caps enforced by the app."
+      fields:
+        max_rounds_per_turn:
+          label: "Max Tool Rounds Per Turn"
+          description: "Maximum number of tool rounds allowed in a single turn."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 100
+    web_search:
+      title: "Web Search"
+      description: "Defaults for the web search tool."
+      fields:
+        result_count:
+          label: "Web Search Result Count"
+          description: "Default number of web search results returned to the model."
+          type: "integer"
+          min: 1
+          max: 20
+          step: 1
+          value: 10
+        timeout_seconds:
+          label: "Web Search Timeout Seconds"
+          description: "Timeout for outbound web search requests."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 15
+    web_fetch:
+      title: "Web Fetch"
+      description: "Timeouts and response-size caps for fetched web content."
+      fields:
+        timeout_seconds:
+          label: "Web Fetch Timeout Seconds"
+          description: "Timeout for non-browser web fetch calls."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 20
+        playwright_timeout_seconds:
+          label: "Playwright Timeout Seconds"
+          description: "Timeout for browser-backed fetch operations."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 20
+        max_response_bytes:
+          label: "Web Fetch Max Response Bytes"
+          description: "Maximum response size retained from fetched resources."
+          type: "integer"
+          min: 1
+          step: 1024
+          value: 2097152
+        max_markdown_chars:
+          label: "Web Fetch Max Markdown Characters"
+          description: "Maximum markdown length returned from web fetch results."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 20000
+    email:
+      title: "Email Tool"
+      description: "SMTP defaults and attachment limits for outbound email sends."
+      fields:
+        smtp_host:
+          label: "Email SMTP Host"
+          description: "Default SMTP server hostname."
+          type: "text"
+          value: "smtp.gmail.com"
+        smtp_port:
+          label: "Email SMTP Port"
+          description: "Default SMTP server port."
+          type: "integer"
+          min: 1
+          max: 65535
+          step: 1
+          value: 465
+        smtp_security:
+          label: "SMTP Security"
+          description: "Transport security mode for SMTP connections."
+          type: "select"
+          options:
+            - "ssl"
+            - "starttls"
+            - "none"
+          value: "ssl"
+        timeout_seconds:
+          label: "Email Timeout Seconds"
+          description: "Timeout for SMTP operations."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 30
+        max_subject_chars:
+          label: "Email Max Subject Characters"
+          description: "Maximum subject length for composed emails."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 200
+        max_body_chars:
+          label: "Email Max Body Characters"
+          description: "Maximum email body size for composed emails."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 20000
+        max_attachment_count:
+          label: "Email Max Attachment Count"
+          description: "Maximum number of attachments per email send."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 10
+        max_total_attachment_bytes:
+          label: "Email Max Total Attachment Bytes"
+          description: "Maximum combined attachment size for an email send."
+          type: "integer"
+          min: 1
+          step: 1024
+          value: 20971520
+
+ui:
+  title: "User Interface"
+  description: "Telegram bridge settings plus streaming and gateway client behavior for the UI layer."
+  fields:
+    gateway_ws_base_url:
+      label: "Gateway WS Base URL"
+      description: "Optional explicit websocket base URL for the UI bridge."
+      type: "text"
+      nullable: true
+      value: null
+    gateway_connect_timeout_seconds:
+      label: "Gateway Connect Timeout Seconds"
+      description: "Timeout when connecting the UI to the local gateway."
+      type: "float"
+      min: 0.1
+      step: 0.5
+      value: 15
+  groups:
+    telegram:
+      title: "Telegram"
+      description: "Bot API connectivity, polling, and user-facing limits for the Telegram bridge."
+      fields:
+        api_base_url:
+          label: "Telegram API Base URL"
+          description: "Base URL used for Telegram Bot API requests."
+          type: "text"
+          value: "https://api.telegram.org"
+        allowed_user_id:
+          label: "Allowed Telegram User ID"
+          description: "Optional owner restriction for the Telegram bridge."
+          type: "integer"
+          nullable: true
+          min: 1
+          step: 1
+          value: null
+        temp_dir:
+          label: "Telegram Temp Directory"
+          description: "Temporary directory used for Telegram file handling."
+          type: "text"
+          value: "/workspace/temp"
+        poll_timeout_seconds:
+          label: "Poll Timeout Seconds"
+          description: "Timeout value sent to Telegram getUpdates polling."
+          type: "integer"
+          min: 1
+          max: 100
+          step: 1
+          value: 30
+        poll_limit:
+          label: "Poll Limit"
+          description: "Maximum number of Telegram updates pulled per poll."
+          type: "integer"
+          min: 1
+          max: 100
+          step: 1
+          value: 100
+        poll_error_backoff_seconds:
+          label: "Poll Error Backoff Seconds"
+          description: "Delay applied after Telegram polling errors."
+          type: "float"
+          min: 0.1
+          step: 0.5
+          value: 2
+        max_message_chars:
+          label: "Telegram Max Message Characters"
+          description: "Max Telegram message length used by the UI bridge."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 4096
+    streaming:
+      title: "Streaming"
+      description: "Draft update cadence for streaming replies."
+      fields:
+        draft_min_interval_seconds:
+          label: "Draft Min Interval Seconds"
+          description: "Minimum delay between streamed draft updates."
+          type: "float"
+          min: 0
+          step: 0.1
+          value: 1
+        draft_min_chars:
+          label: "Draft Min Characters"
+          description: "Minimum accumulated draft size before the UI sends an update."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 20
+
+core:
+  title: "Core Session Policy"
+  description: "Conversation compaction thresholds, context budgets, and timezone defaults."
+  fields:
+    context_window_tokens:
+      label: "Context Window Tokens"
+      description: "Maximum context window size used for turn budgeting."
+      type: "integer"
+      min: 1
+      step: 1000
+      value: 400000
+    compact_threshold_tokens:
+      label: "Compact Threshold Tokens"
+      description: "Threshold that triggers proactive context compaction."
+      type: "integer"
+      min: 1
+      step: 1000
+      value: 350000
+    compact_reserve_output_tokens:
+      label: "Reserve Output Tokens"
+      description: "Reserved token budget for model output."
+      type: "integer"
+      min: 1
+      step: 1000
+      value: 16000
+    compact_reserve_overhead_tokens:
+      label: "Reserve Overhead Tokens"
+      description: "Extra token reserve used for overhead and safety margin."
+      type: "integer"
+      min: 0
+      step: 1000
+      value: 10000
+    timezone:
+      label: "Core Timezone"
+      description: "IANA timezone name used for turn timestamps and memory logic."
+      type: "text"
+      value: "Europe/Dublin"
+
+llm:
+  title: "LLM Routing"
+  description: "Global provider routing, retries, timeouts, and embedding defaults."
+  fields:
+    default_provider:
+      label: "Default Chat Provider"
+      description: "Default provider used by Jarvis for chat completions."
+      type: "select"
+      options:
+        - "openai"
+        - "anthropic"
+        - "gemini"
+        - "openrouter"
+        - "lmstudio"
+      value: "openai"
+    timeout_seconds:
+      label: "LLM Timeout Seconds"
+      description: "Timeout for outbound LLM requests."
+      type: "float"
+      min: 0.1
+      step: 0.5
+      value: 60
+    retry_attempts:
+      label: "Retry Attempts"
+      description: "Number of retry attempts after transient provider failures."
+      type: "integer"
+      min: 0
+      step: 1
+      value: 2
+    retry_backoff_seconds:
+      label: "Retry Backoff Seconds"
+      description: "Backoff delay applied between LLM retries."
+      type: "float"
+      min: 0
+      step: 0.1
+      value: 0.5
+  groups:
+    embedding:
+      title: "Embeddings"
+      description: "Default embedding provider and model used across memory/search features."
+      fields:
+        provider:
+          label: "Embedding Provider"
+          description: "Provider used for global embedding requests."
+          type: "select"
+          options:
+            - "openai"
+            - "gemini"
+            - "openrouter"
+          value: "openai"
+        model:
+          label: "Embedding Model"
+          description: "Embedding model name used across the app."
+          type: "text"
+          value: "text-embedding-3-small"
+
+memory:
+  title: "Memory"
+  description: "Maintenance, bootstrap, automation, and retrieval defaults for long-term memory."
+  groups:
+    maintenance:
+      title: "Maintenance"
+      description: "Model/provider configuration for maintenance and reflection tasks."
+      fields:
+        provider:
+          label: "Maintenance Provider"
+          description: "Provider used for memory maintenance runs."
+          type: "select"
+          options:
+            - "openai"
+            - "anthropic"
+            - "gemini"
+            - "openrouter"
+            - "lmstudio"
+          value: "openai"
+        model:
+          label: "Maintenance Model"
+          description: "Model used for memory maintenance."
+          type: "text"
+          value: "gpt-5.4-2026-03-05"
+        max_output_tokens:
+          label: "Maintenance Max Output Tokens"
+          description: "Maximum output tokens for memory maintenance runs."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 5000
+    bootstrap:
+      title: "Bootstrap"
+      description: "Token budgets used during memory bootstrap and compaction workflows."
+      fields:
+        max_tokens:
+          label: "Bootstrap Max Tokens"
+          description: "Total budget for memory bootstrap turns."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 5000
+        core_max_tokens:
+          label: "Bootstrap Core Max Tokens"
+          description: "Bootstrap budget reserved for core memories."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 2500
+        ongoing_max_tokens:
+          label: "Bootstrap Ongoing Max Tokens"
+          description: "Bootstrap budget reserved for ongoing memories."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 2500
+    automation:
+      title: "Automation"
+      description: "Automatic reflection and apply behaviors for memory upkeep."
+      fields:
+        enable_reflection:
+          label: "Enable Reflection"
+          description: "Allow the memory system to run reflection passes."
+          type: "boolean"
+          value: true
+        enable_auto_apply_core:
+          label: "Auto Apply Core Memories"
+          description: "Automatically apply promoted core memories."
+          type: "boolean"
+          value: true
+        enable_auto_apply_ongoing:
+          label: "Auto Apply Ongoing Memories"
+          description: "Automatically apply promoted ongoing memories."
+          type: "boolean"
+          value: true
+    retrieval:
+      title: "Retrieval"
+      description: "Hybrid retrieval thresholds and candidate fan-out settings."
+      fields:
+        search_default_top_k:
+          label: "Search Default Top K"
+          description: "Default retrieval result count returned by memory search."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 8
+        daily_lookback_days:
+          label: "Daily Lookback Days"
+          description: "How many days of daily memory entries remain actively visible."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 30
+        graph_default_expand:
+          label: "Graph Default Expand"
+          description: "Default graph traversal depth used during retrieval."
+          type: "integer"
+          min: 0
+          max: 2
+          step: 1
+          value: 1
+        lexical_candidate_count:
+          label: "Lexical Candidate Count"
+          description: "Candidate pool size for lexical retrieval."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 30
+        semantic_candidate_count:
+          label: "Semantic Candidate Count"
+          description: "Candidate pool size for semantic retrieval."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 30
+        graph_candidate_count:
+          label: "Graph Candidate Count"
+          description: "Candidate pool size for graph retrieval."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 20
+        hybrid_result_count:
+          label: "Hybrid Result Count"
+          description: "Final number of results surfaced by hybrid retrieval."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 8
+        semantic_score_floor:
+          label: "Semantic Score Floor"
+          description: "Minimum score used for semantic matches in hybrid retrieval."
+          type: "float"
+          min: 0
+          max: 1
+          step: 0.01
+          value: 0.3
+        semantic_only_score_floor:
+          label: "Semantic Only Score Floor"
+          description: "Minimum score used for semantic-only retrieval results."
+          type: "float"
+          min: 0
+          max: 1
+          step: 0.01
+          value: 0.55
+        weak_result_score_threshold:
+          label: "Weak Result Score Threshold"
+          description: "Threshold below which results are treated as weak."
+          type: "float"
+          min: 0
+          max: 1
+          step: 0.01
+          value: 0.45
+        fallback_max_queries:
+          label: "Fallback Max Queries"
+          description: "Maximum additional retrieval queries attempted when search is weak."
+          type: "integer"
+          min: 0
+          step: 1
+          value: 2
+
+subagent:
+  title: "Subagents"
+  description: "Default provider choice, concurrency caps, and naming/tool restrictions for subagents."
+  fields:
+    provider:
+      label: "Subagent Provider"
+      description: "Optional provider override used for subagent runs."
+      type: "select"
+      nullable: true
+      options:
+        - "openai"
+        - "anthropic"
+        - "gemini"
+        - "openrouter"
+        - "lmstudio"
+      value: "openai"
+    max_active:
+      label: "Max Active Subagents"
+      description: "Maximum number of concurrent active subagents."
+      type: "integer"
+      min: 1
+      step: 1
+      value: 7
+    main_context_event_limit:
+      label: "Main Context Event Limit"
+      description: "How many main-session events get injected into child context."
+      type: "integer"
+      min: 1
+      step: 1
+      value: 8
+    codename_pool:
+      label: "Codename Pool"
+      description: "Available display names assigned to subagents."
+      type: "list"
+      value:
+        - "Friday"
+        - "Edith"
+        - "Karen"
+        - "Jocasta"
+        - "Tadashi"
+        - "Homer"
+        - "Ultron"
+    builtin_tool_blocklist:
+      label: "Builtin Tool Blocklist"
+      description: "Built-in tools that subagents should not be allowed to use."
+      type: "list"
+      value:
+        - "memory_search"
+        - "memory_get"
+        - "memory_write"
+        - "memory_admin"
+        - "send_file"
+        - "email"
+
+providers:
+  title: "Provider Profiles"
+  description: "Per-provider chat model defaults and provider-specific tuning knobs."
+  groups:
+    openai:
+      title: "OpenAI"
+      description: "Default chat model and reasoning settings for the OpenAI provider."
+      fields:
+        chat_model:
+          label: "Chat Model"
+          description: "Default OpenAI chat model name."
+          type: "text"
+          value: "gpt-5.4-2026-03-05"
+        temperature:
+          label: "Temperature"
+          description: "Sampling temperature for OpenAI responses."
+          type: "float"
+          min: 0
+          step: 0.1
+          value: 1
+        max_output_tokens:
+          label: "Max Output Tokens"
+          description: "Maximum output tokens requested from OpenAI."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 64000
+        reasoning_effort:
+          label: "Reasoning Effort"
+          description: "Reasoning effort passed to the OpenAI Responses API."
+          type: "select"
+          options:
+            - "none"
+            - "minimal"
+            - "low"
+            - "medium"
+            - "high"
+            - "xhigh"
+          value: "medium"
+        reasoning_summary:
+          label: "Reasoning Summary"
+          description: "Optional OpenAI reasoning summary mode."
+          type: "select"
+          nullable: true
+          options:
+            - "auto"
+            - "concise"
+            - "detailed"
+          value: null
+        text_verbosity:
+          label: "Text Verbosity"
+          description: "Optional OpenAI verbosity hint."
+          type: "select"
+          nullable: true
+          options:
+            - "low"
+            - "medium"
+            - "high"
+          value: null
+    anthropic:
+      title: "Anthropic"
+      description: "Default chat model and thinking settings for Anthropic."
+      fields:
+        chat_model:
+          label: "Chat Model"
+          description: "Default Anthropic chat model name."
+          type: "text"
+          value: "claude-sonnet-4-6"
+        temperature:
+          label: "Temperature"
+          description: "Sampling temperature for Anthropic requests."
+          type: "float"
+          min: 0
+          step: 0.1
+          value: 1
+        max_output_tokens:
+          label: "Max Output Tokens"
+          description: "Maximum output tokens requested from Anthropic."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 32000
+        thinking_mode:
+          label: "Thinking Mode"
+          description: "Anthropic thinking mode hint."
+          type: "select"
+          options:
+            - "adaptive"
+            - "enabled"
+            - "disabled"
+          value: "adaptive"
+        effort:
+          label: "Effort"
+          description: "Anthropic effort hint."
+          type: "select"
+          options:
+            - "minimal"
+            - "low"
+            - "medium"
+            - "high"
+          value: "medium"
+        thinking_budget_tokens:
+          label: "Thinking Budget Tokens"
+          description: "Optional explicit Anthropic thinking budget."
+          type: "integer"
+          nullable: true
+          min: 1
+          step: 100
+          value: null
+        prompt_cache_ttl:
+          label: "Prompt Cache TTL"
+          description: "Optional Anthropic prompt cache TTL."
+          type: "select"
+          nullable: true
+          options:
+            - "5m"
+            - "1h"
+          value: "5m"
+    gemini:
+      title: "Gemini"
+      description: "Default chat model and thinking settings for the Gemini provider."
+      fields:
+        chat_model:
+          label: "Chat Model"
+          description: "Default Gemini chat model name."
+          type: "text"
+          value: "gemini-3.1-pro-preview"
+        temperature:
+          label: "Temperature"
+          description: "Sampling temperature for Gemini requests."
+          type: "float"
+          min: 0
+          step: 0.1
+          value: 1
+        max_output_tokens:
+          label: "Max Output Tokens"
+          description: "Maximum output tokens requested from Gemini."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 64000
+        thinking_level:
+          label: "Thinking Level"
+          description: "Gemini thinking level hint."
+          type: "select"
+          options:
+            - "none"
+            - "low"
+            - "medium"
+            - "high"
+          value: "medium"
+        thinking_budget:
+          label: "Thinking Budget"
+          description: "Optional Gemini thinking budget."
+          type: "integer"
+          nullable: true
+          min: 1
+          step: 100
+          value: null
+    openrouter:
+      title: "OpenRouter"
+      description: "Default routing model and generation limits for OpenRouter."
+      fields:
+        chat_model:
+          label: "OpenRouter Chat Model"
+          description: "Default OpenRouter chat model name."
+          type: "text"
+          value: "moonshotai/kimi-k2.5"
+        app_name:
+          label: "OpenRouter App Name"
+          description: "App name sent in OpenRouter headers."
+          type: "text"
+          value: "Jarvis"
+        temperature:
+          label: "OpenRouter Temperature"
+          description: "Sampling temperature for OpenRouter requests."
+          type: "float"
+          min: 0
+          step: 0.1
+          value: 1
+        max_output_tokens:
+          label: "OpenRouter Max Output Tokens"
+          description: "Maximum output tokens requested from OpenRouter."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 10000
+    lmstudio:
+      title: "LM Studio"
+      description: "Base URL used to reach the local LM Studio server."
+      fields:
+        base_url:
+          label: "LM Studio Base URL"
+          description: "Base URL used for LM Studio requests."
+          type: "text"
+          value: "http://127.0.0.1:1234"

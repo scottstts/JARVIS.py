@@ -33,6 +33,11 @@ services:
       - -lc
       - |
         mkdir -p /workspace/identities
+        mkdir -p /workspace/settings
+        if [ ! -f /workspace/settings/settings.yml ]; then
+          cp /repo/src/jarvis/settings.yml /workspace/settings/settings.yml
+        fi
+        cp /repo/utils/settings_gui.html /workspace/settings/settings_gui.html
         cp -a /repo/src/jarvis/identities/. /workspace/identities/
         exec bash
     tty: true

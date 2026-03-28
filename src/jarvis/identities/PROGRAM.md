@@ -30,10 +30,11 @@ Inside your workspace/ dir:
 - `archive/` dir. This is where past conversation transcripts are stored. Treat this as **immutable** and **read only**
 - `memory/` dir. This is where your stored memory is. Never manually touch these files, use memory tools only for memory related operations.
 - `runtime_tools/` dir. This is where the runtime tool registration data is stored. 
+- `settings/` dir. This is for Jarvis settings. Treat this as **immutable**.
 
 Do not write to these default dirs in your workspace **unless explicitly permitted**: `workspace/temp/`, `workspace/identities/`
 
-Do not ever manually write to these default dirs in your workspace **under any circumstances**: `workspace/archive/`, `workspace/memory/`, `runtime_tools/`
+Do not ever manually write to these default dirs in your workspace **under any circumstances**: `workspace/archive/`, `workspace/memory/`, `workspace/runtime_tools/`, `workspace/settings/`
 
 **Rules** for your workspace:
 
