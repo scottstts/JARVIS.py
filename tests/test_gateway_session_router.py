@@ -17,7 +17,11 @@ from jarvis.core import (
     AgentTurnResult,
 )
 from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
-from jarvis.gateway.route_events import RouteAssistantMessageEvent, RouteSystemNoticeEvent
+from jarvis.gateway.route_events import (
+    RouteAssistantMessageEvent,
+    RouteErrorEvent,
+    RouteSystemNoticeEvent,
+)
 from jarvis.gateway.route_runtime import (
     RouteEventBus,
     RouteRuntime,
@@ -248,6 +252,38 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued.client_message_id, "msg_2")
             self.assertFalse(runtime._main_resume_requires_user_message)
 
+    async def test_enqueue_new_user_message_uses_user_stop_subagent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(runtime._main_loop, "request_stop", return_value=True) as request_stop:
+                with patch.object(
+                    runtime._subagent_manager,
+                    "request_stop_all_for_user_stop",
+                    return_value=(),
+                ) as stop_for_new:
+                    with patch.object(
+                        runtime._subagent_manager,
+                        "request_stop_all_for_superseded_user_message",
+                        return_value=(),
+                    ) as stop_superseded:
+                        await runtime.enqueue_user_message(
+                            "/new continue here",
+                            client_message_id="msg_new",
+                        )
+
+            request_stop.assert_called_once_with(reason="superseded_by_user_message")
+            stop_for_new.assert_called_once_with()
+            stop_superseded.assert_not_called()
+            queued = runtime._user_message_queue.get_nowait()
+            self.assertEqual(queued.user_text, "/new continue here")
+            self.assertEqual(queued.client_message_id, "msg_new")
+            self.assertTrue(queued.parse_commands)
+
     async def test_enqueue_user_message_supersedes_background_subagent_work_when_main_idle(
         self,
     ) -> None:
@@ -279,6 +315,114 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued.user_text, "redirect the task")
             self.assertEqual(queued.client_message_id, "msg_3")
             self.assertFalse(runtime._main_resume_requires_user_message)
+
+    async def test_new_command_resets_subagents_before_streaming_main_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            observed: list[object] = []
+
+            async def _reset() -> dict[str, object]:
+                observed.append("reset")
+                return {
+                    "disposed_subagent_ids": [],
+                    "cancelled_job_ids": [],
+                    "disposed_count": 0,
+                    "cancelled_job_count": 0,
+                }
+
+            async def _stream_user_input(user_text: str):
+                observed.append(("user", user_text))
+                yield AgentTurnDoneEvent(
+                    session_id="main_session",
+                    response_text="started",
+                )
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            with patch.object(
+                runtime._subagent_manager,
+                "reset_for_new_session",
+                side_effect=_reset,
+            ):
+                await runtime._user_message_queue.put(
+                    _RouteTurnRequest(
+                        user_text="/new continue here",
+                        client_message_id="msg_new",
+                        parse_commands=True,
+                        user_initiated=True,
+                    )
+                )
+                runtime._queue_wakeup.set()
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            self.assertEqual(observed, ["reset", ("user", "/new continue here")])
+
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_new_command_reset_failure_is_unbound_from_client_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            stream_called = False
+
+            async def _stream_user_input(_user_text: str):
+                nonlocal stream_called
+                stream_called = True
+                yield AgentTurnDoneEvent(
+                    session_id="main_session",
+                    response_text="should not happen",
+                )
+
+            async def _reset() -> dict[str, object]:
+                raise RuntimeError("reset failed")
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            with patch.object(
+                runtime._subagent_manager,
+                "reset_for_new_session",
+                side_effect=_reset,
+            ):
+                await runtime._user_message_queue.put(
+                    _RouteTurnRequest(
+                        user_text="/new",
+                        client_message_id="msg_new",
+                        parse_commands=True,
+                        user_initiated=True,
+                    )
+                )
+                runtime._queue_wakeup.set()
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            event = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertIsInstance(event, RouteErrorEvent)
+            if not isinstance(event, RouteErrorEvent):
+                self.fail("Expected /new reset failure to publish a route error event.")
+            self.assertEqual(event.code, "internal_error")
+            self.assertIsNone(event.turn_kind)
+            self.assertIsNone(event.client_message_id)
+            self.assertFalse(stream_called)
+
+            runtime.unsubscribe(subscriber_id)
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
 
     async def test_stop_requested_when_only_subagent_is_running_appends_main_transcript_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

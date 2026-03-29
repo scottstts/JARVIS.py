@@ -33,6 +33,9 @@ from jarvis.storage import SessionStorage
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
+    cancel_job,
+    job_status,
+    list_jobs,
     mark_job_progress_notified,
     mark_job_terminal_notice_dispatched,
 )
@@ -307,35 +310,47 @@ class SubagentManager:
             runtime.task is not None and not runtime.task.done()
         ):
             raise ValueError("Cannot dispose a running subagent. Stop it first.")
-        if runtime.status == "disposed":
-            return {
-                "subagent_id": runtime.subagent_id,
-                "codename": runtime.codename,
-                "status": runtime.status,
-                "changed": False,
-            }
-        runtime.status = "disposed"
-        runtime.pause_reason = None
-        disposed_at = _utc_now_iso()
-        self._sync_catalog(runtime, disposed_at=disposed_at)
-        self._append_notable_event(runtime, kind="disposed", summary=f"Disposed {runtime.codename}.")
-        await self._publish_event(
-            RouteSystemNoticeEvent(
-                route_id=self._route_id,
-                agent_kind="subagent",
-                agent_name=runtime.codename,
-                subagent_id=runtime.subagent_id,
-                session_id=runtime.loop.active_session_id(),
-                notice_kind="subagent_disposed",
-                text="came offline.",
-                public=True,
+        return await self._dispose_runtime(runtime, public_notice=True)
+
+    async def reset_for_new_session(self) -> dict[str, Any]:
+        self.request_stop_all_for_user_stop()
+        for runtime in tuple(self._non_disposed_runtimes()):
+            await self._wait_for_turn_settle(runtime)
+
+        disposed_subagent_ids: list[str] = []
+        cancelled_job_ids: list[str] = []
+        live_subagent_ids = set(self._subagents)
+
+        for runtime in tuple(self._subagents.values()):
+            if runtime.status == "disposed":
+                continue
+            cancelled_job_ids.extend(self._cancel_owned_bash_jobs(runtime.subagent_id))
+            runtime.pending_background_job_ids.clear()
+            self._pending_bash_job_notices.pop(runtime.subagent_id, None)
+            payload = await self._dispose_runtime(runtime, public_notice=False)
+            if payload["changed"]:
+                disposed_subagent_ids.append(runtime.subagent_id)
+
+        for entry in self._catalog.list_entries():
+            if entry.status == "disposed" or entry.subagent_id in live_subagent_ids:
+                continue
+            cancelled_job_ids.extend(self._cancel_owned_bash_jobs(entry.subagent_id))
+            self._pending_bash_job_notices.pop(entry.subagent_id, None)
+            disposed_at = _utc_now_iso()
+            self._catalog.update_entry(
+                entry.subagent_id,
+                status="disposed",
+                pause_reason=None,
+                disposed_at=disposed_at,
             )
-        )
+            disposed_subagent_ids.append(entry.subagent_id)
+
+        self._last_monitor_signatures.clear()
         return {
-            "subagent_id": runtime.subagent_id,
-            "codename": runtime.codename,
-            "status": runtime.status,
-            "changed": True,
+            "disposed_subagent_ids": disposed_subagent_ids,
+            "cancelled_job_ids": cancelled_job_ids,
+            "disposed_count": len(disposed_subagent_ids),
+            "cancelled_job_count": len(cancelled_job_ids),
         }
 
     def main_turn_runtime_messages(self) -> tuple[AgentRuntimeMessage, ...]:
@@ -1136,6 +1151,77 @@ class SubagentManager:
             except BashJobError:
                 continue
 
+    async def _dispose_runtime(
+        self,
+        runtime: SubagentRuntime,
+        *,
+        public_notice: bool,
+    ) -> dict[str, Any]:
+        if runtime.status == "disposed":
+            return {
+                "subagent_id": runtime.subagent_id,
+                "codename": runtime.codename,
+                "status": runtime.status,
+                "changed": False,
+            }
+        runtime.status = "disposed"
+        runtime.pause_reason = None
+        runtime.pending_pause_reason = None
+        runtime.pending_background_job_ids.clear()
+        disposed_at = _utc_now_iso()
+        self._sync_catalog(runtime, disposed_at=disposed_at)
+        self._pending_bash_job_notices.pop(runtime.subagent_id, None)
+        self._append_notable_event(runtime, kind="disposed", summary=f"Disposed {runtime.codename}.")
+        if public_notice:
+            await self._publish_event(
+                RouteSystemNoticeEvent(
+                    route_id=self._route_id,
+                    agent_kind="subagent",
+                    agent_name=runtime.codename,
+                    subagent_id=runtime.subagent_id,
+                    session_id=runtime.loop.active_session_id(),
+                    notice_kind="subagent_disposed",
+                    text="came offline.",
+                    public=True,
+                )
+            )
+        return {
+            "subagent_id": runtime.subagent_id,
+            "codename": runtime.codename,
+            "status": runtime.status,
+            "changed": True,
+        }
+
+    def _cancel_owned_bash_jobs(self, subagent_id: str) -> list[str]:
+        cancelled_job_ids: list[str] = []
+        for paths, record in list_jobs(self._core_settings.workspace_dir):
+            if record.owner_route_id != self._route_id:
+                continue
+            if record.owner_subagent_id != subagent_id:
+                continue
+            try:
+                status = job_status(paths, record)
+                if str(status["status"]) == "running":
+                    status = cancel_job(paths, record)
+                if str(status["status"]) == "running":
+                    raise RuntimeError(
+                        f"Detached bash job {record.job_id} is still running after cancellation."
+                    )
+                mark_job_terminal_notice_dispatched(
+                    workspace_dir=self._core_settings.workspace_dir,
+                    job_id=record.job_id,
+                    notice_kind=_terminal_notice_kind_for_status(
+                        status=str(status["status"]),
+                        exit_code=status.get("exit_code"),
+                    ),
+                )
+                cancelled_job_ids.append(record.job_id)
+            except BashJobError as exc:
+                raise RuntimeError(
+                    f"Failed to cancel or finalize detached bash job {record.job_id}: {exc}"
+                ) from exc
+        return cancelled_job_ids
+
     def _append_notable_event(self, runtime: SubagentRuntime, *, kind: str, summary: str) -> None:
         runtime.updated_at = _utc_now_iso()
         runtime.last_activity_at = runtime.updated_at
@@ -1266,6 +1352,14 @@ class SubagentManager:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _terminal_notice_kind_for_status(*, status: str, exit_code: object) -> str:
+    if status == "cancelled":
+        return "bash_job_cancelled"
+    if status == "finished":
+        return "bash_job_completed" if int(exit_code or 0) == 0 else "bash_job_failed"
+    return "bash_job_cancelled"
 
 
 def _subagent_notice_is_public(notice_kind: str) -> bool:

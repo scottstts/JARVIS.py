@@ -27,5 +27,5 @@ The agent should have below components, some of which can be straightforward, so
 Here I'll list (will be updated by me as we go) some design choices that will be built into the project. these are in no particular order or scope, I'm just writing down what comes to mind.
 
 - Using telegram as the messaging app for the agent UI here, DM only, as in I as user chat with the agent via a single DM thread (no group chats or channels or whatever, just one DM like I'm talking to one single friend)
-- Use openclaw style thread handling: one single chat thread, auto compact when near context limit, or user explicit `/new` command sent from telegram, which starts a new LLM context
+- Use openclaw style thread handling: one single chat thread, auto compact when near context limit, or user explicit `/new` command sent from telegram, which starts a new LLM context after route-level subagent cleanup
 - whenever a new session starts (including compacted sessions), always include the starter context content

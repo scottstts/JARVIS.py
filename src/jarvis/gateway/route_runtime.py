@@ -24,8 +24,10 @@ from jarvis.core import (
     ContextBudgetError,
     CoreSettings,
 )
+from jarvis.core.commands import parse_user_command
 from jarvis.core.identities import IdentityBootstrapLoader
 from jarvis.llm import LLMMessage, LLMService, ProviderTimeoutError, ToolCall, ToolDefinition
+from jarvis.logging_setup import get_application_logger
 from jarvis.subagent import (
     SUBAGENT_PRIMITIVE_NAMES,
     SubagentManager,
@@ -73,6 +75,7 @@ _MAIN_BASH_PROGRESS_RUNTIME_KIND = "main_bash_progress"
 _MAIN_BASH_PROGRESS_NOTICE_KIND = "bash_job_progress_update"
 _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND = "main_subagent_progress"
 _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND = "subagent_progress_update"
+LOGGER = get_application_logger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -172,6 +175,7 @@ class RouteRuntime:
         self._main_bash_runtime_turn_queued = False
         self._pending_main_subagent_notices: dict[str, RouteSystemNoticeEvent] = {}
         self._main_subagent_runtime_turn_queued = False
+        self._subagent_reset_in_progress = False
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
         self._bash_job_supervisor = BashJobSupervisor(
@@ -232,6 +236,11 @@ class RouteRuntime:
         self._subagent_manager.request_stop_all_for_superseded_user_message()
         self._invalidate_stale_internal_followups()
 
+    def _request_new_session_supersede(self) -> None:
+        _ = self._main_loop.request_stop(reason="superseded_by_user_message")
+        self._subagent_manager.request_stop_all_for_user_stop()
+        self._invalidate_stale_internal_followups()
+
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._approval_registry.resolve(approval_id, approved)
 
@@ -242,6 +251,7 @@ class RouteRuntime:
         client_message_id: str | None = None,
     ) -> None:
         self._bash_job_supervisor.ensure_running()
+        command = parse_user_command(user_text)
         await self._user_message_queue.put(
             _RouteTurnRequest(
                 user_text=user_text,
@@ -251,7 +261,10 @@ class RouteRuntime:
             )
         )
         self._queue_wakeup.set()
-        self._request_user_message_supersede()
+        if command.kind == "new":
+            self._request_new_session_supersede()
+        else:
+            self._request_user_message_supersede()
         self._ensure_message_worker()
 
     def subscribe(self) -> tuple[str, asyncio.Queue[RouteEvent]]:
@@ -261,6 +274,8 @@ class RouteRuntime:
         self._event_bus.unsubscribe(subscriber_id)
 
     async def publish_event(self, event: RouteEvent) -> None:
+        if self._should_suppress_event_during_subagent_reset(event):
+            return
         await self._event_bus.publish(event)
         await self._maybe_enqueue_subagent_supervisor_followup(event)
 
@@ -348,6 +363,8 @@ class RouteRuntime:
             await self._queue_wakeup.wait()
 
     async def _maybe_schedule_deferred_internal_followups(self) -> None:
+        if self._subagent_reset_in_progress:
+            return
         if self._main_resume_requires_user_message:
             return
         if not self._user_message_queue.empty():
@@ -388,6 +405,12 @@ class RouteRuntime:
         while True:
             request, source_queue = await self._dequeue_next_request()
             self._active_turn_request = request
+            parsed_command = (
+                parse_user_command(request.user_text)
+                if request.parse_commands and request.user_text is not None
+                else None
+            )
+            emitted_main_turn_event = False
             try:
                 if request.user_initiated:
                     if self._main_resume_requires_user_message:
@@ -438,6 +461,8 @@ class RouteRuntime:
                 elif request.parse_commands:
                     if request.user_text is None:
                         continue
+                    if parsed_command is not None and parsed_command.kind == "new":
+                        await self._prepare_new_session_request()
                     event_stream = self._main_loop.stream_user_input(request.user_text)
                 elif request.user_text is None:
                     event_stream = self._main_loop.stream_runtime_turn(
@@ -451,6 +476,7 @@ class RouteRuntime:
                         pre_turn_messages=request.pre_turn_messages,
                     )
                 async for event in event_stream:
+                    emitted_main_turn_event = True
                     await self._publish_main_loop_event(event, request=request)
             except ContextBudgetError as exc:
                 await self.publish_event(
@@ -481,6 +507,16 @@ class RouteRuntime:
                     )
                 )
             except Exception:
+                error_turn_kind: str | None = "user" if request.user_initiated else "runtime"
+                error_client_message_id = request.client_message_id
+                if (
+                    parsed_command is not None
+                    and parsed_command.kind == "new"
+                    and request.user_initiated
+                    and not emitted_main_turn_event
+                ):
+                    error_turn_kind = None
+                    error_client_message_id = None
                 await self.publish_event(
                     RouteErrorEvent(
                         route_id=self._route_id,
@@ -488,8 +524,8 @@ class RouteRuntime:
                         agent_name="Jarvis",
                         session_id=self._main_loop.active_session_id(),
                         turn_id=self._main_loop.active_turn_id(),
-                        turn_kind="user" if request.user_initiated else "runtime",
-                        client_message_id=request.client_message_id,
+                        turn_kind=error_turn_kind,
+                        client_message_id=error_client_message_id,
                         code="internal_error",
                         message=_INTERNAL_ERROR_MESSAGE,
                     )
@@ -500,6 +536,8 @@ class RouteRuntime:
                 await self._maybe_schedule_deferred_internal_followups()
 
     async def _maybe_enqueue_subagent_supervisor_followup(self, event: RouteEvent) -> None:
+        if self._subagent_reset_in_progress:
+            return
         if not isinstance(event, RouteSystemNoticeEvent):
             return
         if event.agent_kind != "subagent" or event.subagent_id is None:
@@ -835,6 +873,8 @@ class RouteRuntime:
         self,
         notices: tuple[BashJobNotice, ...],
     ) -> None:
+        if self._subagent_reset_in_progress:
+            return
         if self._main_resume_requires_user_message:
             return
         await self._subagent_manager.enqueue_bash_job_followup(notices)
@@ -843,6 +883,8 @@ class RouteRuntime:
         self,
         notice: RouteSystemNoticeEvent,
     ) -> None:
+        if self._subagent_reset_in_progress:
+            return
         if self._main_resume_requires_user_message:
             return
         self._merge_main_subagent_notice(notice)
@@ -867,6 +909,22 @@ class RouteRuntime:
             self._pending_main_bash_notices.pop(notice.job_id, None)
             self._pending_main_bash_notices[notice.job_id] = notice
 
+    async def _prepare_new_session_request(self) -> None:
+        self._subagent_reset_in_progress = True
+        self._invalidate_stale_internal_followups()
+        self._clear_pending_main_subagent_notices()
+        try:
+            await self._subagent_manager.reset_for_new_session()
+        except Exception:
+            LOGGER.exception(
+                "Failed to reset subagents before starting a new session for route %s.",
+                self._route_id,
+            )
+            raise
+        finally:
+            self._subagent_reset_in_progress = False
+        self._clear_pending_main_subagent_notices()
+
     def _clear_pending_main_bash_notices(self) -> None:
         self._pending_main_bash_notices.clear()
         self._main_bash_runtime_turn_queued = False
@@ -880,6 +938,11 @@ class RouteRuntime:
     def _clear_pending_main_subagent_notices(self) -> None:
         self._pending_main_subagent_notices.clear()
         self._main_subagent_runtime_turn_queued = False
+
+    def _should_suppress_event_during_subagent_reset(self, event: RouteEvent) -> bool:
+        if not self._subagent_reset_in_progress:
+            return False
+        return event.agent_kind == "subagent"
 
     def _resolve_main_bash_notice_session_id(
         self,

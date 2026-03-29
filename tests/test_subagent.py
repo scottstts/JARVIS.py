@@ -28,6 +28,7 @@ from jarvis.subagent.storage import SubagentCatalogStorage
 from jarvis.subagent.types import SubagentCatalogEntry
 from tests.helpers import build_core_settings
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolSettings
+from jarvis.tools.basic.bash.jobs import claim_job_owner, create_background_job
 
 
 def _build_response(text: str) -> LLMResponse:
@@ -474,6 +475,249 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(manager._subagents["sub_paused"].pending_pause_reason)
             self.assertIsNone(manager._subagents["sub_completed"].pending_pause_reason)
+
+    async def test_reset_for_new_session_stops_running_and_silently_disposes_route_subagents(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route_id = "route_reset_new_session"
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+            published_events: list[object] = []
+
+            async def publish_event(event: object) -> None:
+                published_events.append(event)
+
+            manager = SubagentManager(
+                route_id=route_id,
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            running_loop = _FakeSubagentLoop([], session_id="running_session")
+            completed_loop = _FakeSubagentLoop([], session_id="completed_session")
+            manager._subagents = {
+                "sub_running": SubagentRuntime(
+                    subagent_id="sub_running",
+                    codename="Friday",
+                    loop=running_loop,  # type: ignore[arg-type]
+                    storage=manager._catalog.session_storage("sub_running"),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="turn_1",
+                    status="running",
+                    created_at="2026-03-29T12:00:00+00:00",
+                    updated_at="2026-03-29T12:00:00+00:00",
+                ),
+                "sub_completed": SubagentRuntime(
+                    subagent_id="sub_completed",
+                    codename="Jocasta",
+                    loop=completed_loop,  # type: ignore[arg-type]
+                    storage=manager._catalog.session_storage("sub_completed"),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="turn_1",
+                    status="completed",
+                    created_at="2026-03-29T12:00:00+00:00",
+                    updated_at="2026-03-29T12:00:00+00:00",
+                ),
+            }
+
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id="sub_running",
+                    codename="Friday",
+                    status="running",
+                    created_at="2026-03-29T12:00:00+00:00",
+                    updated_at="2026-03-29T12:00:00+00:00",
+                    route_id=route_id,
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="turn_1",
+                    current_subagent_session_id="running_session",
+                )
+            )
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id="sub_completed",
+                    codename="Jocasta",
+                    status="completed",
+                    created_at="2026-03-29T12:00:00+00:00",
+                    updated_at="2026-03-29T12:00:00+00:00",
+                    route_id=route_id,
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="turn_1",
+                    current_subagent_session_id="completed_session",
+                )
+            )
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id="sub_stale",
+                    codename="Ultron",
+                    status="failed",
+                    created_at="2026-03-29T12:00:00+00:00",
+                    updated_at="2026-03-29T12:00:00+00:00",
+                    route_id=route_id,
+                    owner_main_session_id="older_session",
+                    owner_main_turn_id="older_turn",
+                    current_subagent_session_id="stale_session",
+                )
+            )
+
+            async def _wait_for_turn_settle(runtime: SubagentRuntime) -> None:
+                if runtime.subagent_id == "sub_running":
+                    runtime.status = "paused"
+                    runtime.pause_reason = "main_stop"
+                runtime.task = None
+
+            with patch.object(
+                manager,
+                "_wait_for_turn_settle",
+                side_effect=_wait_for_turn_settle,
+            ):
+                with patch.object(
+                    manager,
+                    "_cancel_owned_bash_jobs",
+                    return_value=[],
+                ):
+                    result = await manager.reset_for_new_session()
+
+            self.assertCountEqual(
+                result["disposed_subagent_ids"],
+                ["sub_running", "sub_completed", "sub_stale"],
+            )
+            self.assertEqual(result["disposed_count"], 3)
+            self.assertEqual(result["cancelled_job_ids"], [])
+            self.assertEqual(running_loop.stop_reasons, ["user_stop"])
+            self.assertEqual(completed_loop.stop_requests, 0)
+            self.assertEqual(manager._subagents["sub_running"].status, "disposed")
+            self.assertEqual(manager._subagents["sub_completed"].status, "disposed")
+
+            stale_entry = manager._catalog.get_entry("sub_stale")
+            self.assertIsNotNone(stale_entry)
+            if stale_entry is None:
+                self.fail("Expected stale catalog entry to be retained and disposed.")
+            self.assertEqual(stale_entry.status, "disposed")
+            self.assertIsNotNone(stale_entry.disposed_at)
+
+            dispose_notices = [
+                event
+                for event in published_events
+                if isinstance(event, RouteSystemNoticeEvent)
+                and event.notice_kind == "subagent_disposed"
+            ]
+            self.assertEqual(dispose_notices, [])
+
+    async def test_reset_for_new_session_cancels_owned_waiting_background_jobs_before_dispose(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route_id = "route_reset_background_jobs"
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+            published_events: list[object] = []
+
+            async def publish_event(event: object) -> None:
+                published_events.append(event)
+
+            manager = SubagentManager(
+                route_id=route_id,
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            runtime = SubagentRuntime(
+                subagent_id="sub_waiting",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="waiting_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage("sub_waiting"),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="turn_1",
+                status="waiting_background",
+                created_at="2026-03-29T12:00:00+00:00",
+                updated_at="2026-03-29T12:00:00+00:00",
+            )
+            runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
+            manager._subagents = {"sub_waiting": runtime}
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id="sub_waiting",
+                    codename="Friday",
+                    status="waiting_background",
+                    created_at="2026-03-29T12:00:00+00:00",
+                    updated_at="2026-03-29T12:00:00+00:00",
+                    route_id=route_id,
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="turn_1",
+                    current_subagent_session_id="waiting_session",
+                )
+            )
+
+            job = create_background_job(
+                workspace_dir=tool_settings.workspace_dir,
+                bash_executable="/bin/bash",
+                command="sleep 5",
+                cwd="/workspace",
+                log_max_bytes=tool_settings.bash_job_log_max_bytes,
+                total_storage_budget_bytes=tool_settings.bash_job_total_storage_budget_bytes,
+                retention_seconds=tool_settings.bash_job_retention_seconds,
+            )
+            claim_job_owner(
+                workspace_dir=tool_settings.workspace_dir,
+                job_id=job.job_id,
+                route_id=route_id,
+                session_id="waiting_session",
+                turn_id="turn_1",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_waiting",
+            )
+
+            with patch(
+                "jarvis.subagent.manager.job_status",
+                return_value={"status": "running", "exit_code": None},
+            ):
+                with patch(
+                    "jarvis.subagent.manager.cancel_job",
+                    return_value={"status": "cancelled", "exit_code": None},
+                ) as cancel_job_mock:
+                    with patch(
+                        "jarvis.subagent.manager.mark_job_terminal_notice_dispatched",
+                    ) as mark_terminal_notice:
+                        result = await manager.reset_for_new_session()
+
+            self.assertEqual(result["cancelled_job_ids"], [job.job_id])
+            self.assertEqual(result["cancelled_job_count"], 1)
+            self.assertEqual(manager._subagents["sub_waiting"].status, "disposed")
+            self.assertEqual(manager._subagents["sub_waiting"].pending_background_job_ids, set())
+            cancel_job_mock.assert_called_once()
+            mark_terminal_notice.assert_called_once_with(
+                workspace_dir=core_settings.workspace_dir,
+                job_id=job.job_id,
+                notice_kind="bash_job_cancelled",
+            )
+
+            catalog_entry = manager._catalog.get_entry("sub_waiting")
+            self.assertIsNotNone(catalog_entry)
+            if catalog_entry is None:
+                self.fail("Expected waiting-background subagent catalog entry to exist.")
+            self.assertEqual(catalog_entry.status, "disposed")
+            self.assertIsNotNone(catalog_entry.disposed_at)
+
+            dispose_notices = [
+                event
+                for event in published_events
+                if isinstance(event, RouteSystemNoticeEvent)
+                and event.notice_kind == "subagent_disposed"
+            ]
+            self.assertEqual(dispose_notices, [])
 
     async def test_subagent_waits_for_detached_bash_jobs_before_reporting_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

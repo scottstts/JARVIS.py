@@ -1083,6 +1083,7 @@ Add automated tests for the following.
 - `subagent_stop` pauses a running subagent
 - `subagent_step_in` stops then starts a new turn with new instructions
 - `subagent_dispose` is rejected for a running subagent
+- `/new` reuses the user-stop path for live subagents, cancels subagent-owned detached bash jobs, and disposes every remaining non-disposed route subagent before the new main session starts
 
 ### Approval Handling
 
