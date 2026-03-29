@@ -17,7 +17,7 @@ from jarvis.core import (
     ContextBudgetError,
 )
 from jarvis.gateway import GatewaySettings, create_app
-from jarvis.gateway.app import _send_json_if_open
+from jarvis.gateway.app import _build_default_router, _send_json_if_open
 from jarvis.llm import ProviderTimeoutError
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -91,6 +91,25 @@ class _FakeRouter:
 
 
 class GatewayAppTests(unittest.TestCase):
+    def test_default_router_stores_main_transcripts_under_jarvis_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+
+            with patch("jarvis.gateway.app.RouteRuntime") as runtime_cls:
+                runtime_cls.return_value.active_session_id.return_value = None
+                router = _build_default_router(
+                    core_settings=core_settings,
+                    llm_service=object(),  # type: ignore[arg-type]
+                )
+
+                self.assertIsNone(router.active_session_id("tg_123"))
+
+            runtime_core_settings = runtime_cls.call_args.kwargs["core_settings"]
+            self.assertEqual(
+                runtime_core_settings.transcript_archive_dir,
+                core_settings.transcript_archive_dir / "jarvis" / "tg_123",
+            )
+
     def test_default_app_lifespan_healthchecks_remote_tool_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch(

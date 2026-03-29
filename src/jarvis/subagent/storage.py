@@ -13,7 +13,7 @@ from .types import SubagentCatalogEntry
 
 
 class SubagentCatalogStorage:
-    """Persists the route-level subagent index and per-subagent transcript roots."""
+    """Persists the route-level catalog and per-main-session subagent transcript roots."""
 
     def __init__(self, *, archive_dir: Path, route_id: str) -> None:
         self._route_dir = archive_dir / route_id
@@ -56,15 +56,10 @@ class SubagentCatalogStorage:
         self._write_index(payload)
         return entry
 
-    def session_storage(self, subagent_id: str) -> SessionStorage:
-        subagent_dir = self._route_dir / subagent_id
-        subagent_dir.mkdir(parents=True, exist_ok=True)
-        return SessionStorage(subagent_dir)
-
-    def subagent_dir(self, subagent_id: str) -> Path:
-        path = self._route_dir / subagent_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+    def session_storage(self, *, owner_main_session_id: str, subagent_id: str) -> SessionStorage:
+        root_dir = self._route_dir / owner_main_session_id / subagent_id
+        root_dir.mkdir(parents=True, exist_ok=True)
+        return SessionStorage(root_dir)
 
     def _load_index(self) -> dict[str, Any]:
         try:

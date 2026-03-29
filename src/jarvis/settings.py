@@ -284,9 +284,6 @@ JARVIS_TRANSCRIPT_ARCHIVE_DIR: Final[str | None] = _optional_string(
 JARVIS_IDENTITIES_DIR: Final = _string("workspace.identities_dir")
 JARVIS_MEMORY_DIR: Final[str | None] = _optional_string("workspace.memory_dir")
 JARVIS_MEMORY_INDEX_DIR: Final[str | None] = _optional_string("workspace.memory_index_dir")
-JARVIS_SUBAGENT_ARCHIVE_DIR: Final[str | None] = _optional_string(
-    "workspace.subagent_archive_dir"
-)
 
 # Tool runtime defaults.
 JARVIS_TOOL_RUNTIME_BASE_URL: Final[str | None] = _optional_string("tools.runtime.base_url")

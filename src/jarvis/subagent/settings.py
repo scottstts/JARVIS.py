@@ -8,7 +8,6 @@ from pathlib import Path
 
 from jarvis import settings as app_settings
 from jarvis.llm.provider_names import LLM_PROVIDER_NAME_SET, LLM_PROVIDER_NAMES_TEXT
-from jarvis.workspace_paths import resolve_workspace_child
 
 
 def _parse_int_env(name: str, default: int) -> int:
@@ -51,13 +50,15 @@ class SubagentSettings:
     main_context_event_limit: int
 
     @classmethod
-    def from_workspace_dir(cls, workspace_dir: Path) -> "SubagentSettings":
-        archive_dir = resolve_workspace_child(
-            env_name="JARVIS_SUBAGENT_ARCHIVE_DIR",
-            configured_default=app_settings.JARVIS_SUBAGENT_ARCHIVE_DIR,
-            workspace_dir=workspace_dir,
-            child_name="archive/subagents",
-        )
+    def from_workspace_dir(
+        cls,
+        workspace_dir: Path,
+        *,
+        transcript_archive_root: Path | None = None,
+    ) -> "SubagentSettings":
+        archive_dir = (
+            transcript_archive_root or (workspace_dir / "archive" / "transcripts")
+        ) / "subagents"
         return cls(
             provider=_parse_optional_provider_env(
                 "JARVIS_SUBAGENT_PROVIDER",

@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis import settings as app_settings
+from jarvis.storage.layout import resolve_transcript_archive_root
 from jarvis.workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
 from .errors import CoreConfigurationError
@@ -118,12 +119,7 @@ class CoreSettings:
     @classmethod
     def from_env(cls) -> "CoreSettings":
         workspace_dir = resolve_workspace_dir(error_type=CoreConfigurationError)
-        transcript_archive_dir = resolve_workspace_child(
-            env_name="JARVIS_TRANSCRIPT_ARCHIVE_DIR",
-            configured_default=app_settings.JARVIS_TRANSCRIPT_ARCHIVE_DIR,
-            workspace_dir=workspace_dir,
-            child_name="archive/transcripts",
-        )
+        transcript_archive_dir = resolve_transcript_archive_root(workspace_dir)
         identities_dir = resolve_workspace_child(
             env_name="JARVIS_IDENTITIES_DIR",
             configured_default=app_settings.JARVIS_IDENTITIES_DIR,

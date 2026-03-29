@@ -30,6 +30,7 @@ from jarvis.gateway.route_events import (
 from jarvis.llm import LLMService
 from jarvis.logging_setup import get_application_logger
 from jarvis.storage import SessionStorage
+from jarvis.storage.layout import transcript_archive_root_from_runtime_path
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
@@ -81,7 +82,13 @@ class SubagentManager:
         self._route_id = route_id
         self._llm_service = llm_service
         self._core_settings = core_settings
-        self._settings = settings or SubagentSettings.from_workspace_dir(core_settings.workspace_dir)
+        self._settings = settings or SubagentSettings.from_workspace_dir(
+            core_settings.workspace_dir,
+            transcript_archive_root=transcript_archive_root_from_runtime_path(
+                transcript_archive_dir=core_settings.transcript_archive_dir,
+                route_id=route_id,
+            ),
+        )
         self._tool_registry = tool_registry
         self._tool_execution_guard = tool_execution_guard
         self._publish_event = publish_event
@@ -118,7 +125,10 @@ class SubagentManager:
             active_codenames={runtime.codename for runtime in active},
         )
         created_at = _utc_now_iso()
-        storage = self._catalog.session_storage(subagent_id)
+        storage = self._catalog.session_storage(
+            owner_main_session_id=owner_main_session_id,
+            subagent_id=subagent_id,
+        )
         bootstrap_loader = SubagentBootstrapLoader(
             assignment_message=build_assignment_message(
                 codename=codename,

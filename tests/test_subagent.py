@@ -99,6 +99,18 @@ class _FakeSubagentLoop:
 
 
 class SubagentSettingsTests(unittest.TestCase):
+    def test_archive_dir_resolves_under_shared_transcript_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            settings = SubagentSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(
+            settings.archive_dir,
+            workspace_dir / "archive" / "transcripts" / "subagents",
+        )
+
     def test_reads_provider_override_from_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -161,7 +173,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             if runtime.task is not None:
                 await asyncio.wait_for(runtime.task, timeout=1)
 
-            subagent_settings = SubagentSettings.from_workspace_dir(core_settings.workspace_dir)
+            subagent_settings = SubagentSettings.from_workspace_dir(
+                core_settings.workspace_dir,
+                transcript_archive_root=core_settings.transcript_archive_dir,
+            )
             catalog = SubagentCatalogStorage(
                 archive_dir=subagent_settings.archive_dir,
                 route_id="route_1",
@@ -175,6 +190,25 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry.owner_main_turn_id, "main_turn")
             self.assertEqual(entry.current_subagent_session_id, payload["session_id"])
             self.assertEqual(entry.status, "completed")
+            self.assertTrue(
+                (
+                    subagent_settings.archive_dir
+                    / "route_1"
+                    / "main_session"
+                    / payload["subagent_id"]
+                    / "sessions_index.json"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    subagent_settings.archive_dir
+                    / "route_1"
+                    / "main_session"
+                    / payload["subagent_id"]
+                    / "sessions"
+                    / f"{payload['session_id']}.jsonl"
+                ).exists()
+            )
 
             self.assertEqual(len(published_events), 2)
             self.assertIsInstance(published_events[0], RouteSystemNoticeEvent)
@@ -324,7 +358,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_running",
                     codename="Friday",
                     loop=running_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_running"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_running",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="running",
@@ -335,7 +372,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_paused",
                     codename="Karen",
                     loop=paused_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_paused"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_paused",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="paused",
@@ -346,7 +386,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_awaiting",
                     codename="Ultron",
                     loop=awaiting_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_awaiting"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_awaiting",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="awaiting_approval",
@@ -357,7 +400,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_completed",
                     codename="Edith",
                     loop=completed_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_completed"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_completed",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="completed",
@@ -411,7 +457,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_running",
                     codename="Friday",
                     loop=running_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_running"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_running",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="running",
@@ -422,7 +471,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_paused",
                     codename="Karen",
                     loop=paused_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_paused"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_paused",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="paused",
@@ -433,7 +485,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_awaiting",
                     codename="Ultron",
                     loop=awaiting_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_awaiting"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_awaiting",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="awaiting_approval",
@@ -444,7 +499,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_completed",
                     codename="Edith",
                     loop=completed_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_completed"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_completed",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
                     status="completed",
@@ -506,7 +564,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_running",
                     codename="Friday",
                     loop=running_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_running"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_running",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="turn_1",
                     status="running",
@@ -517,7 +578,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="sub_completed",
                     codename="Jocasta",
                     loop=completed_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage("sub_completed"),
+                    storage=manager._catalog.session_storage(
+                        owner_main_session_id="main_session",
+                        subagent_id="sub_completed",
+                    ),
                     owner_main_session_id="main_session",
                     owner_main_turn_id="turn_1",
                     status="completed",
@@ -637,7 +701,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 subagent_id="sub_waiting",
                 codename="Friday",
                 loop=_FakeSubagentLoop([], session_id="waiting_session"),  # type: ignore[arg-type]
-                storage=manager._catalog.session_storage("sub_waiting"),
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_waiting",
+                ),
                 owner_main_session_id="main_session",
                 owner_main_turn_id="turn_1",
                 status="waiting_background",
@@ -745,7 +812,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 loop=_FakeSubagentLoop(
                     [AgentTurnDoneEvent(session_id="subagent_session", response_text="done")]
                 ),  # type: ignore[arg-type]
-                storage=manager._catalog.session_storage("sub_1"),
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
                 status="running",
@@ -824,7 +894,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 subagent_id="sub_1",
                 codename="Friday",
                 loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
-                storage=manager._catalog.session_storage("sub_1"),
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
                 status="running",
@@ -906,7 +979,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 subagent_id="sub_1",
                 codename="Friday",
                 loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
-                storage=manager._catalog.session_storage("sub_1"),
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
                 status="waiting_background",
@@ -1015,7 +1091,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 subagent_id="sub_1",
                 codename="Friday",
                 loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
-                storage=manager._catalog.session_storage("sub_1"),
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
                 status="waiting_background",
@@ -1110,7 +1189,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 subagent_id="sub_1",
                 codename="Friday",
                 loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
-                storage=manager._catalog.session_storage("sub_1"),
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
                 status="waiting_background",
@@ -1136,7 +1218,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             core_settings = build_core_settings(root_dir=Path(tmp))
             tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
             registry = ToolRegistry.default(tool_settings)
-            defaults = SubagentSettings.from_workspace_dir(core_settings.workspace_dir)
+            defaults = SubagentSettings.from_workspace_dir(
+                core_settings.workspace_dir,
+                transcript_archive_root=core_settings.transcript_archive_dir,
+            )
             settings = SubagentSettings(
                 provider=defaults.provider,
                 max_active=1,
@@ -1207,7 +1292,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
             registry = ToolRegistry.default(tool_settings)
             llm_service = _FakeSubagentLLMService()
-            defaults = SubagentSettings.from_workspace_dir(core_settings.workspace_dir)
+            defaults = SubagentSettings.from_workspace_dir(
+                core_settings.workspace_dir,
+                transcript_archive_root=core_settings.transcript_archive_dir,
+            )
             settings = SubagentSettings(
                 provider="gemini",
                 max_active=defaults.max_active,

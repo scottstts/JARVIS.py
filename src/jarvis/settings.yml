@@ -47,7 +47,7 @@ workspace:
       value: "/workspace"
     transcript_archive_dir:
       label: "Transcript Archive Directory"
-      description: "Route transcript archive root."
+      description: "Shared transcript archive root for main and subagent sessions."
       type: "text"
       value: "/workspace/archive/transcripts"
     identities_dir:
@@ -65,11 +65,6 @@ workspace:
       description: "SQLite/vector index location for memory search."
       type: "text"
       value: "/workspace/memory/.index"
-    subagent_archive_dir:
-      label: "Subagent Archive Directory"
-      description: "Persistent archive path for subagent runs."
-      type: "text"
-      value: "/workspace/archive/subagents"
 
 tools:
   title: "Tool Runtime"

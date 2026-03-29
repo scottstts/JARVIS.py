@@ -591,13 +591,13 @@ Do not attempt fine-grained concurrency control in the first version. Route-glob
 
 Keep the current main transcript storage unchanged:
 
-- `/workspace/archive/transcripts/<route_id>/...`
+- `/workspace/archive/transcripts/jarvis/<route_id>/...`
 
 Add new subagent storage:
 
-- `/workspace/archive/subagents/<route_id>/index.json`
-- `/workspace/archive/subagents/<route_id>/<subagent_id>/sessions_index.json`
-- `/workspace/archive/subagents/<route_id>/<subagent_id>/sessions/<session_id>.jsonl`
+- `/workspace/archive/transcripts/subagents/<route_id>/index.json`
+- `/workspace/archive/transcripts/subagents/<route_id>/<main_session_id>/<subagent_id>/sessions_index.json`
+- `/workspace/archive/transcripts/subagents/<route_id>/<main_session_id>/<subagent_id>/sessions/<session_id>.jsonl`
 
 This means each subagent gets its own `SessionStorage` root.
 
@@ -889,7 +889,6 @@ Recommended settings:
 
 - `JARVIS_SUBAGENT_MAX_ACTIVE = 7`
 - `JARVIS_SUBAGENT_CODENAME_POOL = ("Friday", "Edith", "Karen", "Jocasta", "Tadashi", "Homer", "Ultron")`
-- `JARVIS_SUBAGENT_ARCHIVE_DIR = f"{AGENT_WORKSPACE}/archive/subagents"` when workspace is configured
 - `JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST = ("memory_search", "memory_get", "memory_write", "memory_admin", "send_file")`
 - `JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT`
   - small integer to bound how many recent noteworthy subagent events are injected into the main turn snapshot
@@ -965,7 +964,7 @@ Tasks:
 Exit criteria:
 
 - manager can spawn and track subagents internally
-- archive structure exists under `workspace/archive/subagents/`
+- archive structure exists under `workspace/archive/transcripts/subagents/`
 
 ### Phase 5: Subagent Primitives
 
@@ -1072,7 +1071,8 @@ Add automated tests for the following.
 
 ### Storage
 
-- subagent archives are written under `/workspace/archive/subagents/<route_id>/...`
+- main archives are written under `/workspace/archive/transcripts/jarvis/<route_id>/...`
+- subagent archives are written under `/workspace/archive/transcripts/subagents/<route_id>/<main_session_id>/<subagent_id>/...`
 - route-level subagent catalog contains owner main session/turn linkage
 - main transcript contains invoke/dispose cross-reference records
 
@@ -1137,7 +1137,7 @@ This feature is done when all of the following are true:
 2. Subagents use the same core loop with different bootstrap/tool/memory configuration.
 3. Functional subagent prompt files exist under `src/jarvis/subagent/prompts/` and are written as real starter context, not as implementation docs.
 4. `PROGRAM.md` contains high-level subagent usage guidance for the main agent, but not detailed primitive schemas.
-5. Subagents have their own archive storage under `workspace/archive/subagents/`.
+5. Main and subagent transcripts both live under `workspace/archive/transcripts/`, with subagents under `workspace/archive/transcripts/subagents/`.
 6. Subagents cannot access memory tools.
 7. Runtime manifest tools remain available to subagents.
 8. No nested subagent path exists.

@@ -21,6 +21,7 @@ from jarvis.core import (
 )
 from jarvis.llm import LLMService, ProviderTimeoutError
 from jarvis.logging_setup import get_application_logger
+from jarvis.storage.layout import main_agent_transcript_dir
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -258,7 +259,10 @@ def _build_default_router(
     base_transcript_archive_dir = resolved_core_settings.transcript_archive_dir
 
     def route_runtime_factory(route_id: str) -> RouteRuntime:
-        route_transcript_archive_dir = base_transcript_archive_dir / route_id
+        route_transcript_archive_dir = main_agent_transcript_dir(
+            transcript_archive_root=base_transcript_archive_dir,
+            route_id=route_id,
+        )
         route_core_settings = replace(
             resolved_core_settings,
             transcript_archive_dir=route_transcript_archive_dir,
