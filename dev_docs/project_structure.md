@@ -178,6 +178,8 @@ These files are part of the installed package, but at runtime the `jarvis_runtim
 
 Provider-agnostic LLM interfaces and provider adapters.
 
+The ethos of this part: all LLM provider quirks are dealt with right here, the agent loop only deals with normalized and unified i/o. No Provider specific quirks should be leaked beyond this part, unless absolutely necessary.
+
 Includes:
 
 - shared config
