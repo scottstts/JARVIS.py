@@ -18,11 +18,13 @@ Run Jarvis inside Docker. Bring the containers up first:
 docker compose up -d --build
 ```
 
-Docker Compose should create `~/.jarvis/workspace/` on first run; if it does not, create it manually with `mkdir -p ~/.jarvis/workspace`.
+Docker Compose should create `~/.jarvis/workspace/` on first run; if it does not, create it manually with
 
-`~/.jarvis/workspace/` will be the workspace dir for the agent. This dir on your host OS will be bind mounted in the containers as `workspace/` dir.
+```bash
+mkdir -p ~/.jarvis/workspace
+```
 
-This repo is strict container-first for Python: do not create or use a host-side `.venv`; run `uv` against the project only inside the `jarvis_runtime` container.
+`~/.jarvis/workspace/` will be the workspace dir for the agent.
 
 ### Deposit Secrets & Settings
 
@@ -36,22 +38,21 @@ stop - pause Jarvis
 compact - compact current session
 ```
 
-At container startup time, Jarvis settings YAML is copied to `workspace/settings/settings.yml` if the workspace copy does not already exist. Jarvis reads runtime settings from it. If that YAML file is missing from `workspace/settings/`, Jarvis falls back to the packaged template YAML.
+### BTWs
 
-Settings GUI is also available in `workspace/settings/settings_gui.html`. Open or drag in `settings.yml` there, edit the settings in the GUI, and save edited settings.
+- At container startup time, `jarvis_runtime` reseeds workspace starter files from the repo and overwrites the previous copies: `workspace/settings/settings.yml`, `workspace/settings/settings_gui.html`, `workspace/identities/*`, and `workspace/migrate.sh`
+- Jarvis reads runtime settings from `workspace/settings/settings.yml` when it exists, and falls back to the packaged template YAML only if that workspace file is absent.
+- Settings GUI is also available in `workspace/settings/settings_gui.html`. Open or drag in `settings.yml` there, edit the settings in the GUI, and save edited settings.
+- `workspace/migrate.sh` creates a zip archive of `archive/`, `memory/`, `runtime_tools/`, and `settings/` from the current directory. Pass `--all` to archive everything in the current directory instead.
 
 ## Run Jarvis
 
 ### Run Dev
 
-Run dev inside the `jarvis_runtime` container:
-
 ```bash
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv sync --locked --group dev"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run jarvis"
 ```
-
-After changing `~/.jarvis/workspace/settings/settings.yml`, restart the affected runtime processes so they reload the file. If you change tool-runtime settings, restart the containers with `docker compose restart`.
 
 For tests and linting, use the same container-managed environment:
 

@@ -92,6 +92,7 @@ If this document and the code ever disagree, treat the code as source of truth a
   - includes `settings_gui.html`, a Chrome-oriented metadata-driven settings renderer copied into `/workspace/settings/`
   - includes `install_build.sh`, a helper that execs into `jarvis_runtime` from the host and ensures the built wheel is installed when needed
   - includes `jarvis_shell_wrapper.sh`, the container-level `jarvis` wrapper installed into `/usr/local/bin/`
+  - includes `migrate.sh`, a workspace archival helper copied into `/workspace/migrate.sh`
 - `vendor/`
   - vendored third-party source/assets used during builds
   - currently includes `vendor/sqlite-vec/`
@@ -171,7 +172,7 @@ Source-controlled identity/bootstrap prompt files:
 - `USER.md`
 - `ARMOR.md`
 
-These files are part of the installed package, but at runtime the `jarvis_runtime` container also copies them into `/workspace/identities/` for the agent to consume from the shared workspace.
+These files are part of the installed package, but at runtime the `jarvis_runtime` container also overwrites the workspace copies in `/workspace/identities/` so the shared workspace stays aligned with the repo starter files.
 
 ### `src/jarvis/llm/`
 

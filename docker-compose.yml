@@ -34,11 +34,11 @@ services:
       - |
         mkdir -p /workspace/identities
         mkdir -p /workspace/settings
-        if [ ! -f /workspace/settings/settings.yml ]; then
-          cp /repo/src/jarvis/settings.yml /workspace/settings/settings.yml
-        fi
-        cp /repo/utils/settings_gui.html /workspace/settings/settings_gui.html
-        cp -a /repo/src/jarvis/identities/. /workspace/identities/
+        cp -f /repo/src/jarvis/settings.yml /workspace/settings/settings.yml
+        cp -f /repo/utils/settings_gui.html /workspace/settings/settings_gui.html
+        cp -af /repo/src/jarvis/identities/. /workspace/identities/
+        cp -f /repo/utils/migrate.sh /workspace/migrate.sh
+        chmod +x /workspace/migrate.sh
         exec bash
     tty: true
     stdin_open: true
