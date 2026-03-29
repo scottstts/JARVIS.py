@@ -13,6 +13,7 @@ from .route_events import (
     RouteEvent,
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
+    RouteTurnStartedEvent,
     RouteTurnDoneEvent,
 )
 
@@ -29,6 +30,7 @@ class ProtocolError(ValueError):
 @dataclass(slots=True, frozen=True)
 class ClientUserMessage:
     text: str
+    client_message_id: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -81,6 +83,13 @@ def parse_client_event(
             ),
         )
 
+    raw_client_message_id = payload.get("client_message_id")
+    if not isinstance(raw_client_message_id, str) or not raw_client_message_id.strip():
+        raise ProtocolError(
+            code="invalid_client_message_id",
+            message="'client_message_id' must be a non-empty string.",
+        )
+
     raw_text = payload.get("text")
     if not isinstance(raw_text, str):
         raise ProtocolError(
@@ -98,7 +107,10 @@ def parse_client_event(
             message=f"'text' exceeds max length of {max_message_chars} chars.",
         )
 
-    return ClientUserMessage(text=raw_text)
+    return ClientUserMessage(
+        text=raw_text,
+        client_message_id=raw_client_message_id.strip(),
+    )
 
 
 def build_ready_event(*, route_id: str, session_id: str | None) -> dict[str, Any]:
@@ -169,17 +181,25 @@ def build_turn_done_event(
     *,
     session_id: str,
     response_text: str,
+    turn_id: str | None = None,
+    turn_kind: str | None = None,
+    client_message_id: str | None = None,
     command: str | None,
     compaction_performed: bool,
     interrupted: bool,
+    interruption_reason: str | None = None,
 ) -> dict[str, Any]:
     return {
         "type": "turn_done",
         "session_id": session_id,
+        "turn_id": turn_id,
+        "turn_kind": turn_kind,
+        "client_message_id": client_message_id,
         "response_text": response_text,
         "command": command,
         "compaction_performed": compaction_performed,
         "interrupted": interrupted,
+        "interruption_reason": interruption_reason,
     }
 
 
@@ -212,10 +232,15 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
         "created_at": event.created_at,
         "route_id": event.route_id,
         "session_id": event.session_id,
+        "turn_id": event.turn_id,
+        "turn_kind": event.turn_kind,
+        "client_message_id": event.client_message_id,
         "agent_kind": event.agent_kind,
         "agent_name": event.agent_name,
         "subagent_id": event.subagent_id,
     }
+    if isinstance(event, RouteTurnStartedEvent):
+        return payload
     if isinstance(event, RouteAssistantDeltaEvent):
         payload["delta"] = event.delta
         return payload
@@ -246,6 +271,7 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
                 "compaction_performed": event.compaction_performed,
                 "interrupted": event.interrupted,
                 "approval_rejected": event.approval_rejected,
+                "interruption_reason": event.interruption_reason,
             }
         )
         return payload

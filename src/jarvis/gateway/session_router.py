@@ -22,7 +22,12 @@ class InvalidRouteIDError(ValueError):
 class RouteRuntimeLike(Protocol):
     """Minimal protocol expected by SessionRouter."""
 
-    async def enqueue_user_message(self, user_text: str) -> None:
+    async def enqueue_user_message(
+        self,
+        user_text: str,
+        *,
+        client_message_id: str | None = None,
+    ) -> None:
         """Queue one user message for the persistent route runtime."""
 
     async def run_turn(self, user_text: str) -> AgentTurnResult:
@@ -101,8 +106,17 @@ class SessionRouter:
     def unsubscribe(self, route_id: str, subscriber_id: str) -> None:
         self.get_or_create(route_id).runtime.unsubscribe(subscriber_id)
 
-    async def enqueue_message(self, route_id: str, user_text: str) -> None:
-        await self.get_or_create(route_id).runtime.enqueue_user_message(user_text)
+    async def enqueue_message(
+        self,
+        route_id: str,
+        user_text: str,
+        *,
+        client_message_id: str | None = None,
+    ) -> None:
+        await self.get_or_create(route_id).runtime.enqueue_user_message(
+            user_text,
+            client_message_id=client_message_id,
+        )
 
     async def run_turn(self, route_id: str, user_text: str) -> AgentTurnResult:
         context = self.get_or_create(route_id)

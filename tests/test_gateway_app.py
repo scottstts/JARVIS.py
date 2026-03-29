@@ -128,7 +128,13 @@ class GatewayAppTests(unittest.TestCase):
                 self.assertEqual(ready["route_id"], "dm_1")
                 self.assertIsNone(ready["session_id"])
 
-                socket.send_json({"type": "user_message", "text": "hello"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "hello",
+                        "client_message_id": "msg_1",
+                    }
+                )
                 delta = socket.receive_json()
                 self.assertEqual(delta["type"], "assistant_delta")
                 self.assertEqual(delta["session_id"], "dm_1-session")
@@ -154,7 +160,13 @@ class GatewayAppTests(unittest.TestCase):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/dm_tool") as socket:
                 _ = socket.receive_json()  # ready
-                socket.send_json({"type": "user_message", "text": "tool"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "tool",
+                        "client_message_id": "msg_1",
+                    }
+                )
 
                 tool_event = socket.receive_json()
                 self.assertEqual(tool_event["type"], "tool_call")
@@ -173,7 +185,13 @@ class GatewayAppTests(unittest.TestCase):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/dm_approval") as socket:
                 _ = socket.receive_json()  # ready
-                socket.send_json({"type": "user_message", "text": "approval"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "approval",
+                        "client_message_id": "msg_1",
+                    }
+                )
 
                 approval_event = socket.receive_json()
                 self.assertEqual(approval_event["type"], "approval_request")
@@ -251,7 +269,13 @@ class GatewayAppTests(unittest.TestCase):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/dm_3") as socket:
                 _ = socket.receive_json()  # ready
-                socket.send_json({"type": "user_message", "text": "too long"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "too long",
+                        "client_message_id": "msg_1",
+                    }
+                )
                 error = socket.receive_json()
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "message_too_large")
@@ -275,7 +299,13 @@ class GatewayAppTests(unittest.TestCase):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/dm_4") as socket:
                 _ = socket.receive_json()  # ready
-                socket.send_json({"type": "user_message", "text": "budget"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "budget",
+                        "client_message_id": "msg_1",
+                    }
+                )
                 error = socket.receive_json()
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "context_budget_exceeded")
@@ -288,7 +318,13 @@ class GatewayAppTests(unittest.TestCase):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/dm_5") as socket:
                 _ = socket.receive_json()  # ready
-                socket.send_json({"type": "user_message", "text": "boom"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "boom",
+                        "client_message_id": "msg_1",
+                    }
+                )
                 error = socket.receive_json()
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "internal_error")
@@ -301,7 +337,13 @@ class GatewayAppTests(unittest.TestCase):
         with TestClient(app) as client:
             with client.websocket_connect("/ws/dm_6") as socket:
                 _ = socket.receive_json()  # ready
-                socket.send_json({"type": "user_message", "text": "timeout"})
+                socket.send_json(
+                    {
+                        "type": "user_message",
+                        "text": "timeout",
+                        "client_message_id": "msg_1",
+                    }
+                )
                 error = socket.receive_json()
                 self.assertEqual(error["type"], "error")
                 self.assertEqual(error["code"], "provider_timeout")

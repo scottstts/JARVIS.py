@@ -10,9 +10,11 @@ from .agent_loop import (
     AgentRuntimeMessage,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
+    AgentTurnStartedEvent,
     AgentTurnDoneEvent,
     AgentTurnResult,
     AgentTurnStreamEvent,
+    InterruptionReason,
 )
 from .config import ContextPolicySettings, CoreSettings
 from .errors import ContextBudgetError, CoreConfigurationError, CoreError
@@ -27,6 +29,7 @@ __all__ = [
     "AgentRuntimeMessage",
     "AgentTextDeltaEvent",
     "AgentToolCallEvent",
+    "AgentTurnStartedEvent",
     "AgentTurnDoneEvent",
     "AgentTurnResult",
     "AgentTurnStreamEvent",
@@ -35,4 +38,5 @@ __all__ = [
     "CoreConfigurationError",
     "CoreError",
     "CoreSettings",
+    "InterruptionReason",
 ]

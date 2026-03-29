@@ -8,12 +8,14 @@ import re
 import shutil
 import time
 import unicodedata
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 from jarvis.logging_setup import get_application_logger
 from .api import (
@@ -34,6 +36,7 @@ from .gateway_client import (
     GatewayRouteSession,
     GatewaySystemNoticeEvent,
     GatewayToolCallEvent,
+    GatewayTurnStartedEvent,
     GatewayTurnDoneEvent,
     GatewayWebSocketClient,
 )
@@ -51,7 +54,7 @@ class GatewayClientLike(Protocol):
 
 
 class GatewayRouteSessionLike(Protocol):
-    async def send_user_message(self, *, text: str) -> None:
+    async def send_user_message(self, *, text: str, client_message_id: str) -> None:
         """Send one user message over the persistent route session."""
 
     async def request_stop(self) -> bool:
@@ -188,6 +191,29 @@ class _ChatRouteSession:
     event_task: asyncio.Task[None]
 
 
+@dataclass(slots=True)
+class _SubmittedTelegramTurn:
+    client_message_id: str
+    completion: asyncio.Future[None]
+    show_new_session_notice: bool = False
+
+
+@dataclass(slots=True)
+class _ActiveTelegramTurn:
+    client_message_id: str
+    turn_id: str
+    completion: asyncio.Future[None]
+    current_draft_id: int
+    show_new_session_notice: bool = False
+    accumulated_text: str = ""
+    last_draft_text: str = ""
+    last_draft_at: float = 0.0
+    segment_started_at: float = 0.0
+    delivered_any_segment: bool = False
+    pending_finalized_text_for_dedup: str | None = None
+    drafts_enabled: bool = True
+
+
 class _LegacyRouteSessionAdapter:
     """Adapts the old one-shot gateway client shape to the new route-session API."""
 
@@ -197,13 +223,31 @@ class _LegacyRouteSessionAdapter:
         self._events: asyncio.Queue[GatewayRouteEvent] = asyncio.Queue()
         self._turn_task: asyncio.Task[None] | None = None
 
-    async def send_user_message(self, *, text: str) -> None:
+    async def send_user_message(self, *, text: str, client_message_id: str) -> None:
         async def _collect() -> None:
             try:
+                await self._events.put(
+                    GatewayTurnStartedEvent(
+                        route_id=self._route_id,
+                        session_id=None,
+                        turn_id=client_message_id,
+                        turn_kind="user",
+                        client_message_id=client_message_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                    )
+                )
                 async for event in self._gateway_client.stream_turn(
                     route_id=self._route_id,
                     user_text=text,
                 ):
+                    if event.turn_id is None:
+                        event = replace(
+                            event,
+                            turn_id=client_message_id,
+                            turn_kind="user",
+                            client_message_id=client_message_id,
+                        )
                     await self._events.put(event)
             except GatewayBridgeError as exc:
                 await self._events.put(
@@ -278,6 +322,10 @@ class TelegramGatewayBridge:
         self._chat_queues: dict[int, asyncio.Queue[IncomingTelegramMessage]] = {}
         self._chat_workers: dict[int, asyncio.Task[None]] = {}
         self._route_sessions: dict[int, _ChatRouteSession] = {}
+        self._submitted_turns_by_chat: dict[int, deque[_SubmittedTelegramTurn]] = {}
+        self._submitted_turns_by_message_id: dict[tuple[int, str], _SubmittedTelegramTurn] = {}
+        self._active_turn_by_chat: dict[int, _ActiveTelegramTurn] = {}
+        self._chat_idle_events: dict[int, asyncio.Event] = {}
         self._pending_turn_events_by_chat: dict[int, asyncio.Queue[GatewayRouteEvent]] = {}
         self._approval_message_html_by_key: dict[tuple[int, int], str] = {}
 
@@ -401,40 +449,16 @@ class TelegramGatewayBridge:
         if message.file_attachment is None and _is_stop_command_text(message.text):
             await self._handle_stop_command(message)
             return
-
-        queue = self._chat_queues.get(message.chat_id)
-        if queue is None:
-            queue = asyncio.Queue()
-            self._chat_queues[message.chat_id] = queue
-        await queue.put(message)
-
-        worker = self._chat_workers.get(message.chat_id)
-        if worker is None or worker.done():
-            self._chat_workers[message.chat_id] = asyncio.create_task(
-                self._chat_worker(message.chat_id),
-                name=f"jarvis-telegram-chat-{message.chat_id}",
-            )
-
-    async def _chat_worker(self, chat_id: int) -> None:
-        queue = self._chat_queues[chat_id]
         try:
-            while True:
-                message = await queue.get()
-                try:
-                    await self.handle_message(message)
-                finally:
-                    queue.task_done()
-                if queue.empty():
-                    return
-        except asyncio.CancelledError:
-            raise
-        finally:
-            worker = self._chat_workers.get(chat_id)
-            current_task = asyncio.current_task()
-            if worker is current_task:
-                self._chat_workers.pop(chat_id, None)
-            if queue.empty():
-                self._chat_queues.pop(chat_id, None)
+            await self._submit_message(message)
+        except GatewayBridgeError:
+            LOGGER.exception(
+                "Gateway bridge failed; suppressing Telegram error text."
+            )
+        except TelegramAPIError:
+            LOGGER.exception("Telegram API send failed.")
+        except Exception:
+            LOGGER.exception("Unexpected bridge error; suppressing Telegram error text.")
 
     async def _ensure_route_session(self, chat_id: int) -> GatewayRouteSessionLike:
         existing = self._route_sessions.get(chat_id)
@@ -467,48 +491,41 @@ class TelegramGatewayBridge:
     ) -> None:
         try:
             async for event in session.events():
-                if self._route_event_belongs_to_active_main_turn(chat_id=chat_id, event=event):
-                    pending_queue = self._pending_turn_events_by_chat.get(chat_id)
-                    if pending_queue is not None:
-                        await pending_queue.put(event)
-                        continue
-                await self._handle_background_route_event(chat_id=chat_id, event=event)
+                await self._handle_route_event(chat_id=chat_id, event=event)
         except asyncio.CancelledError:
             raise
         except GatewayBridgeError as exc:
             LOGGER.exception("Persistent gateway route session failed.")
-            pending_queue = self._pending_turn_events_by_chat.get(chat_id)
-            if pending_queue is not None:
-                await pending_queue.put(
-                    GatewayErrorEvent(
-                        event_id="",
-                        created_at="",
-                        route_id=route_id_for_chat(chat_id),
-                        session_id=None,
-                        agent_kind="main",
-                        agent_name="Jarvis",
-                        subagent_id=None,
-                        code=exc.code,
-                        message=exc.message,
-                    )
+            await self._handle_route_event(
+                chat_id=chat_id,
+                event=GatewayErrorEvent(
+                    event_id="",
+                    created_at="",
+                    route_id=route_id_for_chat(chat_id),
+                    session_id=None,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    subagent_id=None,
+                    code=exc.code,
+                    message=exc.message,
                 )
+            )
         except Exception:
             LOGGER.exception("Unexpected route event worker failure.")
-            pending_queue = self._pending_turn_events_by_chat.get(chat_id)
-            if pending_queue is not None:
-                await pending_queue.put(
-                    GatewayErrorEvent(
-                        event_id="",
-                        created_at="",
-                        route_id=route_id_for_chat(chat_id),
-                        session_id=None,
-                        agent_kind="main",
-                        agent_name="Jarvis",
-                        subagent_id=None,
-                        code="gateway_unavailable",
-                        message="",
-                    )
+            await self._handle_route_event(
+                chat_id=chat_id,
+                event=GatewayErrorEvent(
+                    event_id="",
+                    created_at="",
+                    route_id=route_id_for_chat(chat_id),
+                    session_id=None,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    subagent_id=None,
+                    code="gateway_unavailable",
+                    message="",
                 )
+            )
         finally:
             tracked = self._route_sessions.get(chat_id)
             current_task = asyncio.current_task()
@@ -516,22 +533,279 @@ class TelegramGatewayBridge:
                 self._route_sessions.pop(chat_id, None)
             await session.aclose()
 
-    @staticmethod
-    def _route_event_belongs_to_active_main_turn(
+    async def _submit_message(
+        self,
+        message: IncomingTelegramMessage,
+    ) -> asyncio.Future[None] | None:
+        user_text = message.text
+        if message.file_attachment is not None:
+            try:
+                user_text = await self._build_file_turn_text(message)
+            except TelegramAPIError:
+                LOGGER.exception(
+                    "Telegram file download failed; suppressing Telegram error text."
+                )
+                return None
+
+        if not user_text:
+            return None
+
+        route_session = await self._ensure_route_session(message.chat_id)
+        client_message_id = uuid4().hex
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        submitted_turn = _SubmittedTelegramTurn(
+            client_message_id=client_message_id,
+            completion=completion,
+            show_new_session_notice=_is_new_command_text(user_text),
+        )
+        turns = self._submitted_turns_by_chat.setdefault(message.chat_id, deque())
+        turns.append(submitted_turn)
+        self._submitted_turns_by_message_id[(message.chat_id, client_message_id)] = submitted_turn
+        self._idle_event_for_chat(message.chat_id).clear()
+        try:
+            await route_session.send_user_message(
+                text=user_text,
+                client_message_id=client_message_id,
+            )
+        except Exception:
+            self._submitted_turns_by_message_id.pop((message.chat_id, client_message_id), None)
+            try:
+                turns.remove(submitted_turn)
+            except ValueError:
+                pass
+            self._update_chat_idle_state(message.chat_id)
+            raise
+        return completion
+
+    async def _handle_route_event(
+        self,
         *,
         chat_id: int,
         event: GatewayRouteEvent,
-    ) -> bool:
-        if event.agent_kind != "main":
-            return False
-        return event.type in {
-            "assistant_delta",
-            "assistant_message",
-            "tool_call",
-            "approval_request",
-            "turn_done",
-            "error",
-        }
+    ) -> None:
+        if (
+            isinstance(event, GatewayTurnStartedEvent)
+            and event.agent_kind == "main"
+            and event.turn_kind == "user"
+            and event.client_message_id is not None
+            and event.turn_id is not None
+        ):
+            submitted_turn = self._submitted_turns_by_message_id.get(
+                (chat_id, event.client_message_id)
+            )
+            if submitted_turn is not None:
+                await self._activate_submitted_turn(
+                    chat_id=chat_id,
+                    submitted_turn=submitted_turn,
+                    turn_id=event.turn_id,
+                )
+            return
+
+        active_turn = self._active_turn_by_chat.get(chat_id)
+        if (
+            active_turn is None
+            and event.agent_kind == "main"
+            and event.turn_kind == "user"
+            and event.client_message_id is not None
+        ):
+            submitted_turn = self._submitted_turns_by_message_id.get(
+                (chat_id, event.client_message_id)
+            )
+            if submitted_turn is not None:
+                active_turn = await self._activate_submitted_turn(
+                    chat_id=chat_id,
+                    submitted_turn=submitted_turn,
+                    turn_id=event.turn_id or event.client_message_id,
+                )
+        if isinstance(event, GatewayErrorEvent):
+            if active_turn is not None:
+                await self._handle_active_turn_event(
+                    chat_id=chat_id,
+                    event=event,
+                    active_turn=active_turn,
+                )
+            pending_turns = tuple(self._submitted_turns_by_chat.get(chat_id, ()))
+            for pending_turn in pending_turns:
+                self._finish_submitted_turn(
+                    chat_id=chat_id,
+                    client_message_id=pending_turn.client_message_id,
+                )
+            if active_turn is None:
+                await self._handle_background_route_event(chat_id=chat_id, event=event)
+            return
+        if (
+            active_turn is not None
+            and event.agent_kind == "main"
+            and (
+                (event.turn_id is not None and event.turn_id == active_turn.turn_id)
+                or event.client_message_id == active_turn.client_message_id
+            )
+        ):
+            await self._handle_active_turn_event(
+                chat_id=chat_id,
+                event=event,
+                active_turn=active_turn,
+            )
+            return
+
+        await self._handle_background_route_event(chat_id=chat_id, event=event)
+
+    async def _handle_active_turn_event(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayRouteEvent,
+        active_turn: _ActiveTelegramTurn,
+    ) -> None:
+        if isinstance(event, GatewayErrorEvent):
+            LOGGER.warning(
+                "Suppressing gateway error for Telegram chat %s (code=%s, message=%s).",
+                chat_id,
+                event.code or "gateway_error",
+                event.message or "",
+            )
+            self._finish_submitted_turn(
+                chat_id=chat_id,
+                client_message_id=active_turn.client_message_id,
+            )
+            return
+        if isinstance(event, GatewayDeltaEvent):
+            if not event.delta:
+                return
+            active_turn.accumulated_text += event.delta
+            if not active_turn.drafts_enabled:
+                return
+            now = time.monotonic()
+            if _should_flush_draft(
+                current_text=active_turn.accumulated_text,
+                last_sent_text=active_turn.last_draft_text,
+                last_sent_monotonic=active_turn.last_draft_at,
+                segment_started_monotonic=active_turn.segment_started_at,
+                min_chars=self._settings.stream_draft_min_chars,
+                min_interval_seconds=self._draft_min_interval_for_chat(chat_id),
+                now_monotonic=now,
+            ):
+                try:
+                    await self._send_draft(
+                        chat_id=chat_id,
+                        draft_id=active_turn.current_draft_id,
+                        text=active_turn.accumulated_text,
+                    )
+                    active_turn.last_draft_text = active_turn.accumulated_text
+                    active_turn.last_draft_at = now
+                    self._record_draft_success(chat_id=chat_id)
+                except TelegramAPIError as exc:
+                    active_turn.drafts_enabled = False
+                    self._record_draft_backoff(chat_id=chat_id, exc=exc)
+                    if exc.retry_after_seconds is not None:
+                        LOGGER.warning(
+                            "sendMessageDraft rate-limited; pausing drafts for %ss.",
+                            exc.retry_after_seconds,
+                        )
+                    else:
+                        LOGGER.exception(
+                            "sendMessageDraft failed; continuing this turn without drafts."
+                        )
+            return
+        if isinstance(event, GatewayMessageEvent):
+            final_text = _coalesce_visible_text(
+                event.text,
+                active_turn.accumulated_text,
+            )
+            if (
+                final_text is not None
+                and not (
+                    active_turn.show_new_session_notice
+                    and final_text == "Started a new session."
+                )
+                and final_text != active_turn.pending_finalized_text_for_dedup
+            ):
+                await self._send_final_text(chat_id=chat_id, text=final_text)
+                active_turn.delivered_any_segment = True
+            active_turn.pending_finalized_text_for_dedup = None
+            active_turn.accumulated_text = ""
+            active_turn.last_draft_text = ""
+            active_turn.last_draft_at = 0.0
+            active_turn.segment_started_at = time.monotonic()
+            active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+            return
+        if isinstance(event, GatewayToolCallEvent):
+            flushed_text = _coalesce_visible_text(active_turn.accumulated_text)
+            if flushed_text is not None:
+                await self._send_final_text(chat_id=chat_id, text=flushed_text)
+                active_turn.delivered_any_segment = True
+                active_turn.pending_finalized_text_for_dedup = flushed_text
+            for tool_name in event.tool_names:
+                await self._send_html_message(
+                    chat_id=chat_id,
+                    html_text=_format_tool_usage_notice(event.agent_name, tool_name),
+                )
+                active_turn.delivered_any_segment = True
+            active_turn.accumulated_text = ""
+            active_turn.last_draft_text = ""
+            active_turn.last_draft_at = 0.0
+            active_turn.segment_started_at = time.monotonic()
+            active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+            return
+        if isinstance(event, GatewayApprovalRequestEvent):
+            flushed_text = _coalesce_visible_text(active_turn.accumulated_text)
+            if flushed_text is not None:
+                await self._send_final_text(chat_id=chat_id, text=flushed_text)
+                active_turn.delivered_any_segment = True
+                active_turn.pending_finalized_text_for_dedup = flushed_text
+            await self._send_approval_request_message(chat_id=chat_id, approval=event)
+            active_turn.accumulated_text = ""
+            active_turn.last_draft_text = ""
+            active_turn.last_draft_at = 0.0
+            active_turn.segment_started_at = time.monotonic()
+            active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+            return
+        if isinstance(event, GatewayTurnDoneEvent):
+            if not event.interrupted and not active_turn.delivered_any_segment:
+                final_text = (
+                    _coalesce_visible_text(
+                        event.response_text,
+                        active_turn.accumulated_text,
+                    )
+                    or "(No response text.)"
+                )
+                if not (
+                    active_turn.show_new_session_notice
+                    and event.command == "/new"
+                    and final_text == "Started a new session."
+                ):
+                    await self._send_final_text(chat_id=chat_id, text=final_text)
+            self._finish_submitted_turn(
+                chat_id=chat_id,
+                client_message_id=active_turn.client_message_id,
+            )
+
+    async def _activate_submitted_turn(
+        self,
+        *,
+        chat_id: int,
+        submitted_turn: _SubmittedTelegramTurn,
+        turn_id: str,
+    ) -> _ActiveTelegramTurn:
+        active_turn = _ActiveTelegramTurn(
+            client_message_id=submitted_turn.client_message_id,
+            turn_id=turn_id,
+            completion=submitted_turn.completion,
+            current_draft_id=self._next_draft_id_for_chat(chat_id),
+            show_new_session_notice=submitted_turn.show_new_session_notice,
+            segment_started_at=time.monotonic(),
+            drafts_enabled=(
+                time.monotonic()
+                >= self._draft_retry_until_by_chat.get(chat_id, 0.0)
+            ),
+        )
+        self._active_turn_by_chat[chat_id] = active_turn
+        if submitted_turn.show_new_session_notice:
+            await self._send_html_message(
+                chat_id=chat_id,
+                html_text=_format_local_system_notice("Started a new session."),
+            )
+        return active_turn
 
     async def _handle_background_route_event(
         self,
@@ -539,6 +813,8 @@ class TelegramGatewayBridge:
         chat_id: int,
         event: GatewayRouteEvent,
     ) -> None:
+        if isinstance(event, GatewayTurnStartedEvent):
+            return
         if isinstance(event, GatewayToolCallEvent):
             for tool_name in event.tool_names:
                 await self._send_html_message(
@@ -560,6 +836,8 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayTurnDoneEvent):
             if event.agent_kind != "main":
+                return
+            if event.turn_kind == "user":
                 return
             final_text = _coalesce_visible_text(event.response_text)
             if final_text is None:
@@ -590,166 +868,11 @@ class TelegramGatewayBridge:
         if message.file_attachment is None and _is_stop_command_text(message.text):
             await self._handle_stop_command(message)
             return
-
-        user_text = message.text
-        if message.file_attachment is not None:
-            try:
-                user_text = await self._build_file_turn_text(message)
-            except TelegramAPIError:
-                LOGGER.exception(
-                    "Telegram file download failed; suppressing Telegram error text."
-                )
-                return
-
-        if not user_text:
-            return
-
-        route_session = await self._ensure_route_session(message.chat_id)
-        current_draft_id = self._next_draft_id_for_chat(message.chat_id)
-
-        accumulated_text = ""
-        last_draft_text = ""
-        last_draft_at = 0.0
-        segment_started_at = time.monotonic()
-        delivered_any_segment = False
-        pending_finalized_text_for_dedup: str | None = None
-        drafts_enabled = (
-            time.monotonic()
-            >= self._draft_retry_until_by_chat.get(message.chat_id, 0.0)
-        )
-        pending_queue: asyncio.Queue[GatewayRouteEvent] = asyncio.Queue()
-        self._pending_turn_events_by_chat[message.chat_id] = pending_queue
-
         try:
-            await route_session.send_user_message(text=user_text)
-            while True:
-                event = await pending_queue.get()
-                if isinstance(event, GatewayErrorEvent):
-                    LOGGER.warning(
-                        "Suppressing gateway error for Telegram chat %s (code=%s, message=%s).",
-                        message.chat_id,
-                        event.code or "gateway_error",
-                        event.message or "",
-                    )
-                    return
-                if isinstance(event, GatewayDeltaEvent):
-                    if not event.delta:
-                        continue
-                    accumulated_text += event.delta
-                    if not drafts_enabled:
-                        continue
-                    now = time.monotonic()
-                    if _should_flush_draft(
-                        current_text=accumulated_text,
-                        last_sent_text=last_draft_text,
-                        last_sent_monotonic=last_draft_at,
-                        segment_started_monotonic=segment_started_at,
-                        min_chars=self._settings.stream_draft_min_chars,
-                        min_interval_seconds=self._draft_min_interval_for_chat(
-                            message.chat_id
-                        ),
-                        now_monotonic=now,
-                    ):
-                        try:
-                            await self._send_draft(
-                                chat_id=message.chat_id,
-                                draft_id=current_draft_id,
-                                text=accumulated_text,
-                            )
-                            last_draft_text = accumulated_text
-                            last_draft_at = now
-                            self._record_draft_success(chat_id=message.chat_id)
-                        except TelegramAPIError as exc:
-                            drafts_enabled = False
-                            self._record_draft_backoff(
-                                chat_id=message.chat_id,
-                                exc=exc,
-                            )
-                            if exc.retry_after_seconds is not None:
-                                LOGGER.warning(
-                                    "sendMessageDraft rate-limited; pausing drafts for %ss.",
-                                    exc.retry_after_seconds,
-                                )
-                            else:
-                                LOGGER.exception(
-                                    "sendMessageDraft failed; continuing this turn without drafts."
-                                )
-                    continue
-
-                if isinstance(event, GatewayMessageEvent):
-                    final_text = _coalesce_visible_text(event.text, accumulated_text)
-                    if (
-                        final_text is not None
-                        and final_text != pending_finalized_text_for_dedup
-                    ):
-                        await self._send_final_text(chat_id=message.chat_id, text=final_text)
-                        delivered_any_segment = True
-                    pending_finalized_text_for_dedup = None
-                    accumulated_text = ""
-                    last_draft_text = ""
-                    last_draft_at = 0.0
-                    segment_started_at = time.monotonic()
-                    current_draft_id = self._next_draft_id_for_chat(message.chat_id)
-                    continue
-
-                if isinstance(event, GatewayToolCallEvent):
-                    flushed_text = _coalesce_visible_text(accumulated_text)
-                    if flushed_text is not None:
-                        await self._send_final_text(
-                            chat_id=message.chat_id,
-                            text=flushed_text,
-                        )
-                        delivered_any_segment = True
-                        pending_finalized_text_for_dedup = flushed_text
-                    for tool_name in event.tool_names:
-                        await self._send_html_message(
-                            chat_id=message.chat_id,
-                            html_text=_format_tool_usage_notice(event.agent_name, tool_name),
-                        )
-                        delivered_any_segment = True
-                    accumulated_text = ""
-                    last_draft_text = ""
-                    last_draft_at = 0.0
-                    segment_started_at = time.monotonic()
-                    current_draft_id = self._next_draft_id_for_chat(message.chat_id)
-                    continue
-
-                if isinstance(event, GatewayApprovalRequestEvent):
-                    flushed_text = _coalesce_visible_text(accumulated_text)
-                    if flushed_text is not None:
-                        await self._send_final_text(
-                            chat_id=message.chat_id,
-                            text=flushed_text,
-                        )
-                        delivered_any_segment = True
-                        pending_finalized_text_for_dedup = flushed_text
-                    await self._send_approval_request_message(
-                        chat_id=message.chat_id,
-                        approval=event,
-                    )
-                    accumulated_text = ""
-                    last_draft_text = ""
-                    last_draft_at = 0.0
-                    segment_started_at = time.monotonic()
-                    current_draft_id = self._next_draft_id_for_chat(message.chat_id)
-                    continue
-
-                if isinstance(event, GatewayTurnDoneEvent):
-                    if event.interrupted:
-                        return
-                    if not delivered_any_segment:
-                        final_text = (
-                            _coalesce_visible_text(
-                                event.response_text,
-                                accumulated_text,
-                            )
-                            or "(No response text.)"
-                            )
-                        await self._send_final_text(
-                            chat_id=message.chat_id,
-                            text=final_text,
-                        )
-                    return
+            completion = await self._submit_message(message)
+            if completion is None:
+                return
+            await completion
         except GatewayBridgeError:
             LOGGER.exception(
                 "Gateway bridge failed; suppressing Telegram error text."
@@ -758,8 +881,6 @@ class TelegramGatewayBridge:
             LOGGER.exception("Telegram API send failed.")
         except Exception:
             LOGGER.exception("Unexpected bridge error; suppressing Telegram error text.")
-        finally:
-            self._pending_turn_events_by_chat.pop(message.chat_id, None)
 
     async def aclose(self) -> None:
         chat_workers = tuple(self._chat_workers.values())
@@ -768,8 +889,6 @@ class TelegramGatewayBridge:
         for worker in chat_workers:
             with suppress(asyncio.CancelledError):
                 await worker
-        self._chat_workers.clear()
-        self._chat_queues.clear()
         route_sessions = tuple(self._route_sessions.values())
         for route_session in route_sessions:
             route_session.event_task.cancel()
@@ -777,16 +896,62 @@ class TelegramGatewayBridge:
             with suppress(asyncio.CancelledError):
                 await route_session.event_task
         self._route_sessions.clear()
+        self._chat_workers.clear()
+        self._chat_queues.clear()
+        self._submitted_turns_by_chat.clear()
+        self._submitted_turns_by_message_id.clear()
+        self._active_turn_by_chat.clear()
+        self._chat_idle_events.clear()
         self._pending_turn_events_by_chat.clear()
         await self._telegram.aclose()
 
     async def wait_for_chat_idle(self, chat_id: int) -> None:
-        queue = self._chat_queues.get(chat_id)
-        if queue is not None:
-            await queue.join()
-        worker = self._chat_workers.get(chat_id)
-        if worker is not None:
-            await worker
+        idle_event = self._chat_idle_events.get(chat_id)
+        if idle_event is not None:
+            await idle_event.wait()
+
+    def _idle_event_for_chat(self, chat_id: int) -> asyncio.Event:
+        idle_event = self._chat_idle_events.get(chat_id)
+        if idle_event is None:
+            idle_event = asyncio.Event()
+            idle_event.set()
+            self._chat_idle_events[chat_id] = idle_event
+        return idle_event
+
+    def _finish_submitted_turn(self, *, chat_id: int, client_message_id: str) -> None:
+        self._active_turn_by_chat.pop(chat_id, None)
+        submitted_turn = self._submitted_turns_by_message_id.pop(
+            (chat_id, client_message_id),
+            None,
+        )
+        if submitted_turn is not None and not submitted_turn.completion.done():
+            submitted_turn.completion.set_result(None)
+            turns = self._submitted_turns_by_chat.get(chat_id)
+            if turns is not None:
+                while turns and turns[0].client_message_id == client_message_id:
+                    turns.popleft()
+                    break
+                else:
+                    filtered = deque(
+                        turn
+                        for turn in turns
+                        if turn.client_message_id != client_message_id
+                    )
+                    self._submitted_turns_by_chat[chat_id] = filtered
+        self._update_chat_idle_state(chat_id)
+
+    def _update_chat_idle_state(self, chat_id: int) -> None:
+        turns = self._submitted_turns_by_chat.get(chat_id)
+        if turns is not None and not turns:
+            self._submitted_turns_by_chat.pop(chat_id, None)
+        idle_event = self._idle_event_for_chat(chat_id)
+        if chat_id in self._active_turn_by_chat:
+            idle_event.clear()
+            return
+        if self._submitted_turns_by_chat.get(chat_id):
+            idle_event.clear()
+            return
+        idle_event.set()
 
     async def _handle_stop_command(self, message: IncomingTelegramMessage) -> None:
         try:
@@ -1231,10 +1396,24 @@ def _format_system_notice(event: GatewaySystemNoticeEvent) -> str:
     return f"⚙️ <b>System:</b> <b>{actor}</b>"
 
 
+def _format_local_system_notice(message: str) -> str:
+    normalized_message = html.escape(message.strip())
+    if normalized_message:
+        return f"⚙️ <b>System:</b> {normalized_message}"
+    return "⚙️ <b>System:</b>"
+
+
 def _truncate_approval_command(command: str) -> str:
     if len(command) <= _APPROVAL_COMMAND_PREVIEW_CHARS:
         return command
     return command[: _APPROVAL_COMMAND_PREVIEW_CHARS - 15] + "\n...[truncated]..."
+
+
+def _is_new_command_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return False
+    return stripped.split(maxsplit=1)[0] == "/new"
 
 
 def _extract_file_attachment(message: dict[str, Any]) -> IncomingTelegramFile | None:

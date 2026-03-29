@@ -100,6 +100,8 @@ The project is strict container-first:
 
 - Use ruff for python lint checking at the end of each turn
 - Use pytest for testing
+- When asked to make a plan or proposal, NEVER give a "simple v1 followed by further v2". Always plan for long term, plan for ultimate form, NOT in incremental phases
+- When writing instructions for the agent (Jarvis or subagents), including things like system instruction, tool description, system message, etc., as long as it is plain text that is meant for the agent, you MUST NOT write it like a codebase documentation. Instead, write it with only information that the agent **needs to know**, and write it as concisely as possible without losing necessary details
 - Build production grade code, **BUT** avoid excessive abstraction layers
 - all source code go into src/ dir
 - the primary installable package lives under `src/jarvis/`

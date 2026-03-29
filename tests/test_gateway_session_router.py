@@ -217,6 +217,37 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enqueue_user_message_supersedes_active_main_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(runtime._main_loop, "has_active_turn", return_value=True):
+                with patch.object(
+                    runtime._main_loop,
+                    "request_stop",
+                    return_value=True,
+                ) as request_stop:
+                    with patch.object(
+                        runtime._subagent_manager,
+                        "request_stop_all_for_superseded_user_message",
+                        return_value=(),
+                    ) as stop_subagents:
+                        await runtime.enqueue_user_message(
+                            "continue",
+                            client_message_id="msg_2",
+                        )
+
+            request_stop.assert_called_once_with(reason="superseded_by_user_message")
+            stop_subagents.assert_called_once_with()
+            queued = runtime._user_message_queue.get_nowait()
+            self.assertEqual(queued.user_text, "continue")
+            self.assertEqual(queued.client_message_id, "msg_2")
+            self.assertFalse(runtime._main_resume_requires_user_message)
+
     async def test_stop_requested_when_only_subagent_is_running_appends_main_transcript_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(

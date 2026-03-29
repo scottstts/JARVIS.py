@@ -78,8 +78,19 @@ _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT = (
     "Follow-up retry aborted: compacted request still overflowed the provider context limit."
 )
 _APPROVAL_REJECTED_TEXT = "Approval request was rejected. I did not execute the action."
-_PREVIOUS_TASK_INTERRUPTED_TEXT = "The previous task was interrupted by the user."
-_TURN_INTERRUPTED_RECORD_TEXT = "This turn was interrupted by the user before it completed."
+_PREVIOUS_TASK_INTERRUPTED_TEXT = (
+    "The user interrupted the previous task. Treat any partial output from it as incomplete."
+)
+_PREVIOUS_TASK_SUPERSEDED_TEXT = (
+    "A newer user message superseded the previous task. Handle the current user message "
+    "first. Use completed results from the older task only if they are directly relevant."
+)
+_TURN_INTERRUPTED_RECORD_TEXT = (
+    "The user interrupted this turn before it completed."
+)
+_TURN_SUPERSEDED_RECORD_TEXT = (
+    "A newer user message superseded this turn before it completed."
+)
 _TURN_ORPHANED_RECOVERY_RECORD_TEXT = (
     "This turn ended unexpectedly before it completed. Treat any partial assistant output "
     "above as incomplete."
@@ -94,6 +105,7 @@ _ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT = (
 LOGGER = get_application_logger(__name__)
 
 AgentKind = Literal["main", "subagent"]
+InterruptionReason = Literal["user_stop", "superseded_by_user_message"]
 
 
 class BootstrapMessageLoader(Protocol):
@@ -131,16 +143,26 @@ RuntimeMessagesProvider = Callable[[str], Sequence[AgentRuntimeMessage]]
 class AgentTurnResult:
     session_id: str
     response_text: str
+    turn_id: str = ""
     command: str | None = None
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    interruption_reason: InterruptionReason | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AgentTurnStartedEvent:
+    session_id: str
+    turn_id: str
+    type: Literal["turn_started"] = "turn_started"
 
 
 @dataclass(slots=True, frozen=True)
 class AgentTextDeltaEvent:
     session_id: str
     delta: str
+    turn_id: str = ""
     type: Literal["text_delta"] = "text_delta"
 
 
@@ -148,6 +170,7 @@ class AgentTextDeltaEvent:
 class AgentAssistantMessageEvent:
     session_id: str
     text: str
+    turn_id: str = ""
     type: Literal["assistant_message"] = "assistant_message"
 
 
@@ -155,6 +178,7 @@ class AgentAssistantMessageEvent:
 class AgentToolCallEvent:
     session_id: str
     tool_names: tuple[str, ...]
+    turn_id: str = ""
     type: Literal["tool_call"] = "tool_call"
 
 
@@ -165,6 +189,7 @@ class AgentApprovalRequestEvent:
     kind: str
     summary: str
     details: str
+    turn_id: str = ""
     command: str | None = None
     tool_name: str | None = None
     inspection_url: str | None = None
@@ -175,30 +200,41 @@ class AgentApprovalRequestEvent:
 class AgentTurnDoneEvent:
     session_id: str
     response_text: str
+    turn_id: str = ""
     command: str | None = None
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    interruption_reason: InterruptionReason | None = None
     type: Literal["done"] = "done"
 
     def to_result(self) -> AgentTurnResult:
         return AgentTurnResult(
             session_id=self.session_id,
+            turn_id=self.turn_id,
             response_text=self.response_text,
             command=self.command,
             compaction_performed=self.compaction_performed,
             interrupted=self.interrupted,
             approval_rejected=self.approval_rejected,
+            interruption_reason=self.interruption_reason,
         )
 
 
 AgentTurnStreamEvent = (
-    AgentTextDeltaEvent
+    AgentTurnStartedEvent
+    | AgentTextDeltaEvent
     | AgentAssistantMessageEvent
     | AgentToolCallEvent
     | AgentApprovalRequestEvent
     | AgentTurnDoneEvent
 )
+
+
+@dataclass(slots=True, frozen=True)
+class _RequestedInterruption:
+    turn_id: str
+    reason: InterruptionReason
 
 
 @dataclass(slots=True, frozen=True)
@@ -286,7 +322,7 @@ class AgentLoop:
             ),
         )
         self._active_turn_id: str | None = None
-        self._stop_requested_turn_id: str | None = None
+        self._requested_interruption: _RequestedInterruption | None = None
         self._pending_approval_future: asyncio.Future[bool] | None = None
         self._pending_approval_id: str | None = None
         self._pending_approval_turn_id: str | None = None
@@ -388,6 +424,9 @@ class AgentLoop:
         active = self._storage.get_active_session()
         return active.session_id if active is not None else None
 
+    def active_turn_id(self) -> str | None:
+        return self._active_turn_id
+
     def has_active_turn(self) -> bool:
         return self._active_turn_id is not None
 
@@ -426,11 +465,18 @@ class AgentLoop:
         session = await self._start_session(start_reason=start_reason)
         return session.session_id
 
-    def request_stop(self) -> bool:
+    def request_stop(
+        self,
+        *,
+        reason: InterruptionReason = "user_stop",
+    ) -> bool:
         active_turn_id = self._active_turn_id
         if active_turn_id is None:
             return False
-        self._stop_requested_turn_id = active_turn_id
+        self._requested_interruption = _RequestedInterruption(
+            turn_id=active_turn_id,
+            reason=reason,
+        )
         return True
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
@@ -503,6 +549,7 @@ class AgentLoop:
         yield AgentTurnDoneEvent(
             session_id=session.session_id,
             response_text="Started a new session.",
+            turn_id="",
             command="/new",
             compaction_performed=False,
         )
@@ -519,6 +566,7 @@ class AgentLoop:
         yield AgentTurnDoneEvent(
             session_id=result.session_id,
             response_text=result.response_text,
+            turn_id=result.turn_id,
             command=result.command,
             compaction_performed=result.compaction_performed,
         )
@@ -570,7 +618,6 @@ class AgentLoop:
                 pending_records=pending_records,
                 record=user_record,
             )
-
         try:
             (
                 session,
@@ -671,6 +718,7 @@ class AgentLoop:
             return AgentTurnResult(
                 session_id=session.session_id,
                 response_text=final_response.text,
+                turn_id=turn_id,
                 command=command_override,
                 compaction_performed=did_compaction,
                 approval_rejected=approval_rejected,
@@ -708,6 +756,9 @@ class AgentLoop:
                     tool_record = self._build_tool_record(
                         session_id,
                         tool_result,
+                        metadata_overrides=_completed_after_interrupt_metadata(
+                            self._stop_requested_reason(turn_id)
+                        ),
                         turn_id=turn_id,
                     )
                     attachment_records = tuple(
@@ -1125,6 +1176,7 @@ class AgentLoop:
                         AgentTextDeltaEvent(
                             session_id=session_id,
                             delta=event.delta,
+                            turn_id=turn_id,
                         )
                     )
             elif event.type == "done":
@@ -1150,6 +1202,7 @@ class AgentLoop:
                 AgentAssistantMessageEvent(
                     session_id=session_id,
                     text=normalized.text,
+                    turn_id=turn_id,
                 )
             )
         return recovery_events, normalized, estimated_input_tokens
@@ -1201,6 +1254,10 @@ class AgentLoop:
                 pending_records=pending_records,
                 record=user_record,
             )
+        yield AgentTurnStartedEvent(
+            session_id=session.session_id,
+            turn_id=turn_id,
+        )
 
         try:
             overflow_compacted = False
@@ -1224,6 +1281,7 @@ class AgentLoop:
                                 yield AgentTextDeltaEvent(
                                     session_id=session.session_id,
                                     delta=event.delta,
+                                    turn_id=turn_id,
                                 )
                         elif event.type == "tool_call_delta":
                             emitted_any = True
@@ -1234,6 +1292,7 @@ class AgentLoop:
                                 yield AgentToolCallEvent(
                                     session_id=session.session_id,
                                     tool_names=(tool_name,),
+                                    turn_id=turn_id,
                                 )
                             if self._stop_requested(turn_id) and tool_name and call_id:
                                 partial_record = self._build_streamed_assistant_text_record(
@@ -1258,9 +1317,11 @@ class AgentLoop:
                                 yield AgentTurnDoneEvent(
                                     session_id=interrupted.session_id,
                                     response_text=interrupted.response_text,
+                                    turn_id=turn_id,
                                     command=interrupted.command,
                                     compaction_performed=interrupted.compaction_performed,
                                     interrupted=True,
+                                    interruption_reason=interrupted.interruption_reason,
                                 )
                                 return
                         elif event.type == "done":
@@ -1313,6 +1374,7 @@ class AgentLoop:
                 yield AgentAssistantMessageEvent(
                     session_id=session.session_id,
                     text=initial_response.text,
+                    turn_id=turn_id,
                 )
             if initial_response.tool_calls:
                 tool_names = _pending_tool_notice_names(
@@ -1323,6 +1385,7 @@ class AgentLoop:
                     yield AgentToolCallEvent(
                         session_id=session.session_id,
                         tool_names=tool_names,
+                        turn_id=turn_id,
                     )
             if self._stop_requested(turn_id):
                 interrupted = self._interrupt_turn(
@@ -1336,9 +1399,11 @@ class AgentLoop:
                 yield AgentTurnDoneEvent(
                     session_id=interrupted.session_id,
                     response_text=interrupted.response_text,
+                    turn_id=turn_id,
                     command=interrupted.command,
                     compaction_performed=interrupted.compaction_performed,
                     interrupted=True,
+                    interruption_reason=interrupted.interruption_reason,
                 )
                 return
 
@@ -1361,9 +1426,11 @@ class AgentLoop:
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
                         response_text=interrupted.response_text,
+                        turn_id=turn_id,
                         command=interrupted.command,
                         compaction_performed=interrupted.compaction_performed,
                         interrupted=True,
+                        interruption_reason=interrupted.interruption_reason,
                     )
                     return
 
@@ -1412,6 +1479,9 @@ class AgentLoop:
                                 tool_record = self._build_tool_record(
                                     session.session_id,
                                     tool_result,
+                                    metadata_overrides=_completed_after_interrupt_metadata(
+                                        self._stop_requested_reason(turn_id)
+                                    ),
                                     turn_id=turn_id,
                                 )
                                 attachment_records = tuple(
@@ -1461,6 +1531,7 @@ class AgentLoop:
                             )
                             yield self._build_approval_request_event(
                                 session_id=session.session_id,
+                                turn_id=turn_id,
                                 approval=pending_approval,
                             )
                             approved = await self._wait_for_approval(
@@ -1479,9 +1550,11 @@ class AgentLoop:
                                 yield AgentTurnDoneEvent(
                                     session_id=interrupted.session_id,
                                     response_text=interrupted.response_text,
+                                    turn_id=turn_id,
                                     command=interrupted.command,
                                     compaction_performed=interrupted.compaction_performed,
                                     interrupted=True,
+                                    interruption_reason=interrupted.interruption_reason,
                                 )
                                 return
                             self._append_turn_record(
@@ -1552,9 +1625,11 @@ class AgentLoop:
                         yield AgentTurnDoneEvent(
                             session_id=interrupted.session_id,
                             response_text=interrupted.response_text,
+                            turn_id=turn_id,
                             command=interrupted.command,
                             compaction_performed=interrupted.compaction_performed,
                             interrupted=True,
+                            interruption_reason=interrupted.interruption_reason,
                         )
                         return
                     request, final_estimated_input_tokens = self._build_followup_attempt_request(
@@ -1612,6 +1687,7 @@ class AgentLoop:
                                     yield AgentTextDeltaEvent(
                                         session_id=session.session_id,
                                         delta=event.delta,
+                                        turn_id=turn_id,
                                     )
                             elif event.type == "tool_call_delta":
                                 emitted_any = True
@@ -1622,6 +1698,7 @@ class AgentLoop:
                                     yield AgentToolCallEvent(
                                         session_id=session.session_id,
                                         tool_names=(tool_name,),
+                                        turn_id=turn_id,
                                     )
                                 if self._stop_requested(turn_id) and tool_name and call_id:
                                     partial_record = self._build_streamed_assistant_text_record(
@@ -1646,9 +1723,11 @@ class AgentLoop:
                                     yield AgentTurnDoneEvent(
                                         session_id=interrupted.session_id,
                                         response_text=interrupted.response_text,
+                                        turn_id=turn_id,
                                         command=interrupted.command,
                                         compaction_performed=interrupted.compaction_performed,
                                         interrupted=True,
+                                        interruption_reason=interrupted.interruption_reason,
                                     )
                                     return
                             elif event.type == "done":
@@ -1761,6 +1840,7 @@ class AgentLoop:
                     yield AgentAssistantMessageEvent(
                         session_id=session.session_id,
                         text=current_response.text,
+                        turn_id=turn_id,
                     )
                 if current_response.tool_calls:
                     tool_names = _pending_tool_notice_names(
@@ -1771,6 +1851,7 @@ class AgentLoop:
                         yield AgentToolCallEvent(
                             session_id=session.session_id,
                             tool_names=tool_names,
+                            turn_id=turn_id,
                         )
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
@@ -1784,9 +1865,11 @@ class AgentLoop:
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
                         response_text=interrupted.response_text,
+                        turn_id=turn_id,
                         command=interrupted.command,
                         compaction_performed=interrupted.compaction_performed,
                         interrupted=True,
+                        interruption_reason=interrupted.interruption_reason,
                     )
                     return
                 if pending_detached_job_ids:
@@ -1824,6 +1907,7 @@ class AgentLoop:
             yield AgentTurnDoneEvent(
                 session_id=session.session_id,
                 response_text=final_response.text,
+                turn_id=turn_id,
                 command=command_override,
                 compaction_performed=did_compaction,
                 approval_rejected=turn_approval_rejected,
@@ -1863,11 +1947,7 @@ class AgentLoop:
                 did_compaction = True
 
         records = self._storage.load_records(session.session_id)
-        interruption_notice_text = (
-            _PREVIOUS_TASK_INTERRUPTED_TEXT
-            if session.pending_interruption_notice
-            else None
-        )
+        interruption_notice_text = self._pending_interruption_notice_text(session)
         turn_runtime_messages = self._build_turn_runtime_messages(
             session_id=session.session_id,
             pre_turn_messages=pre_turn_messages,
@@ -1893,11 +1973,7 @@ class AgentLoop:
                 session = compacted
                 did_compaction = True
                 records = self._storage.load_records(session.session_id)
-                interruption_notice_text = (
-                    _PREVIOUS_TASK_INTERRUPTED_TEXT
-                    if session.pending_interruption_notice
-                    else None
-                )
+                interruption_notice_text = self._pending_interruption_notice_text(session)
                 request = self._build_turn_request(
                     session_id=session.session_id,
                     records=records,
@@ -1958,6 +2034,17 @@ class AgentLoop:
         response = await self._llm_service.generate(retry_request)
         return compacted, response, True, retry_estimate, rebound_pending_records
 
+    def _pending_interruption_notice_text(
+        self,
+        session: SessionMetadata,
+    ) -> str | None:
+        if not session.pending_interruption_notice:
+            return None
+        reason = (session.pending_interruption_notice_reason or "").strip()
+        if reason == "superseded_by_user_message":
+            return _PREVIOUS_TASK_SUPERSEDED_TEXT
+        return _PREVIOUS_TASK_INTERRUPTED_TEXT
+
     def _persist_successful_turn(
         self,
         *,
@@ -1975,6 +2062,7 @@ class AgentLoop:
         self._storage.update_session(
             session_id,
             pending_interruption_notice=False,
+            pending_interruption_notice_reason=None,
             last_input_tokens=usage.input_tokens if usage is not None else None,
             last_output_tokens=usage.output_tokens if usage is not None else None,
             last_total_tokens=usage.total_tokens if usage is not None else None,
@@ -2527,6 +2615,7 @@ class AgentLoop:
             next_session.session_id,
             pending_reactive_compaction=False,
             pending_interruption_notice=session.pending_interruption_notice,
+            pending_interruption_notice_reason=session.pending_interruption_notice_reason,
         )
         return self._storage.get_session(next_session.session_id) or next_session
 
@@ -2727,12 +2816,19 @@ class AgentLoop:
         text: str,
         turn_id: str | None = None,
     ) -> ConversationRecord:
+        interruption_reason: InterruptionReason = "user_stop"
+        if text == _PREVIOUS_TASK_SUPERSEDED_TEXT:
+            interruption_reason = "superseded_by_user_message"
         return self._build_message_record(
             session_id=session_id,
             role="system",
             content=text,
             metadata={
                 _INTERRUPTION_NOTICE_METADATA_KEY: True,
+                "interruption_reason": interruption_reason,
+                "prioritize_current_user_message": (
+                    interruption_reason == "superseded_by_user_message"
+                ),
             },
             turn_id=turn_id,
         )
@@ -2956,7 +3052,7 @@ class AgentLoop:
             status="in_progress",
         )
         self._active_turn_id = turn_id
-        self._stop_requested_turn_id = None
+        self._requested_interruption = None
 
     def _finish_turn(
         self,
@@ -2972,17 +3068,25 @@ class AgentLoop:
         )
         if self._active_turn_id == turn_id:
             self._active_turn_id = None
-        if self._stop_requested_turn_id == turn_id:
-            self._stop_requested_turn_id = None
+        requested = self._requested_interruption
+        if requested is not None and requested.turn_id == turn_id:
+            self._requested_interruption = None
 
     def _stop_requested(self, turn_id: str) -> bool:
-        return self._stop_requested_turn_id == turn_id
+        return self._stop_requested_reason(turn_id) is not None
+
+    def _stop_requested_reason(self, turn_id: str) -> InterruptionReason | None:
+        requested = self._requested_interruption
+        if requested is None or requested.turn_id != turn_id:
+            return None
+        return requested.reason
 
     def _clear_turn_control(self, turn_id: str) -> None:
         if self._active_turn_id == turn_id:
             self._active_turn_id = None
-        if self._stop_requested_turn_id == turn_id:
-            self._stop_requested_turn_id = None
+        requested = self._requested_interruption
+        if requested is not None and requested.turn_id == turn_id:
+            self._requested_interruption = None
         if self._pending_approval_turn_id == turn_id:
             future = self._pending_approval_future
             if future is not None and not future.done():
@@ -2995,10 +3099,12 @@ class AgentLoop:
         self,
         *,
         session_id: str,
+        turn_id: str,
         approval: dict[str, Any],
     ) -> AgentApprovalRequestEvent:
         return AgentApprovalRequestEvent(
             session_id=session_id,
+            turn_id=turn_id,
             approval_id=str(approval["approval_id"]),
             kind=str(approval.get("kind", "approval")).strip() or "approval",
             summary=str(approval.get("summary", "")).strip(),
@@ -3121,6 +3227,15 @@ class AgentLoop:
         response_text: str,
         unexecuted_tool_names: Sequence[str] = (),
     ) -> AgentTurnResult:
+        interruption_reason = self._stop_requested_reason(turn_id) or "user_stop"
+        interrupted_status: Literal["interrupted", "superseded"]
+        interrupted_record_text: str
+        if interruption_reason == "superseded_by_user_message":
+            interrupted_status = "superseded"
+            interrupted_record_text = _TURN_SUPERSEDED_RECORD_TEXT
+        else:
+            interrupted_status = "interrupted"
+            interrupted_record_text = _TURN_INTERRUPTED_RECORD_TEXT
         if unexecuted_tool_names:
             self._storage.append_record(
                 session_id,
@@ -3133,26 +3248,35 @@ class AgentLoop:
         interruption_record = self._build_message_record(
             session_id=session_id,
             role="system",
-            content=_TURN_INTERRUPTED_RECORD_TEXT,
-            metadata={"interrupted_by_user": True},
+            content=interrupted_record_text,
+            metadata={
+                "interrupted_by_user": interruption_reason == "user_stop",
+                "superseded_by_user_message": (
+                    interruption_reason == "superseded_by_user_message"
+                ),
+                "interruption_reason": interruption_reason,
+            },
             turn_id=turn_id,
         )
         self._storage.append_record(session_id, interruption_record)
         self._finish_turn(
             session_id=session_id,
             turn_id=turn_id,
-            status="interrupted",
+            status=interrupted_status,
         )
         self._storage.update_session(
             session_id,
             pending_interruption_notice=True,
+            pending_interruption_notice_reason=interruption_reason,
         )
         return AgentTurnResult(
             session_id=session_id,
+            turn_id=turn_id,
             response_text=response_text,
             command=command,
             compaction_performed=compaction_performed,
             interrupted=True,
+            interruption_reason=interruption_reason,
         )
 
     def _clone_record_for_session(
@@ -3643,6 +3767,17 @@ def _copy_record_with_content(
         kind=record.kind,
         metadata=metadata,
     )
+
+def _completed_after_interrupt_metadata(
+    reason: InterruptionReason | None,
+) -> dict[str, Any] | None:
+    if reason is None:
+        return None
+    return {
+        "completed_after_interrupt_request": True,
+        "interruption_reason": reason,
+        "superseded_turn_output": reason == "superseded_by_user_message",
+    }
 
 
 def _unexecuted_tool_call_note_text(tool_names: Sequence[str]) -> str:

@@ -238,6 +238,16 @@ class SubagentManager:
                 affected.append(runtime.snapshot())
         return tuple(affected)
 
+    def request_stop_all_for_superseded_user_message(self) -> tuple[SubagentSnapshot, ...]:
+        affected: list[SubagentSnapshot] = []
+        for runtime in self._non_disposed_runtimes():
+            if self._request_runtime_stop(
+                runtime,
+                pause_reason="superseded_by_user_message",
+            ):
+                affected.append(runtime.snapshot())
+        return tuple(affected)
+
     async def stop(self, *, agent: str, reason: str | None = None) -> dict[str, Any]:
         runtime = self._require_runtime(agent)
         if not self._request_runtime_stop(runtime, pause_reason="main_stop"):

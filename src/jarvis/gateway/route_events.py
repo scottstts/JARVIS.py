@@ -10,6 +10,7 @@ from uuid import uuid4
 from jarvis.core.agent_loop import AgentKind
 
 RouteEventType = Literal[
+    "turn_started",
     "assistant_delta",
     "assistant_message",
     "turn_done",
@@ -18,6 +19,7 @@ RouteEventType = Literal[
     "system_notice",
     "error",
 ]
+RouteTurnKind = Literal["user", "runtime"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -26,10 +28,18 @@ class RouteEventBase:
     agent_kind: AgentKind
     agent_name: str
     session_id: str | None = None
+    turn_id: str | None = None
+    turn_kind: RouteTurnKind | None = None
+    client_message_id: str | None = None
     subagent_id: str | None = None
     public: bool = True
     event_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=lambda: _utc_now_iso())
+
+
+@dataclass(slots=True, frozen=True)
+class RouteTurnStartedEvent(RouteEventBase):
+    type: Literal["turn_started"] = "turn_started"
 
 
 @dataclass(slots=True, frozen=True)
@@ -69,6 +79,7 @@ class RouteTurnDoneEvent(RouteEventBase):
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    interruption_reason: str | None = None
     type: Literal["turn_done"] = "turn_done"
 
 
@@ -87,7 +98,8 @@ class RouteErrorEvent(RouteEventBase):
 
 
 RouteEvent = (
-    RouteAssistantDeltaEvent
+    RouteTurnStartedEvent
+    | RouteAssistantDeltaEvent
     | RouteAssistantMessageEvent
     | RouteToolCallEvent
     | RouteApprovalRequestEvent

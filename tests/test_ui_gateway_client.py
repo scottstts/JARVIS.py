@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from jarvis.ui.telegram.gateway_client import (
@@ -48,13 +49,44 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         socket = _FakeSocket(
             incoming=[
                 json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
-                json.dumps({"type": "assistant_delta", "session_id": "s1", "delta": "hel"}),
-                json.dumps({"type": "tool_call", "session_id": "s1", "tool_names": ["bash"]}),
-                json.dumps({"type": "assistant_message", "session_id": "s1", "text": "hello"}),
+                json.dumps(
+                    {
+                        "type": "turn_started",
+                        "session_id": "s1",
+                        "turn_id": "turn_1",
+                        "turn_kind": "user",
+                        "client_message_id": "msg_1",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant_delta",
+                        "session_id": "s1",
+                        "turn_id": "turn_1",
+                        "delta": "hel",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_call",
+                        "session_id": "s1",
+                        "turn_id": "turn_1",
+                        "tool_names": ["bash"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant_message",
+                        "session_id": "s1",
+                        "turn_id": "turn_1",
+                        "text": "hello",
+                    }
+                ),
                 json.dumps(
                     {
                         "type": "turn_done",
                         "session_id": "s1",
+                        "turn_id": "turn_1",
                         "response_text": "hello",
                         "interrupted": True,
                     }
@@ -66,6 +98,9 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
+        ), patch(
+            "jarvis.ui.telegram.gateway_client.uuid4",
+            return_value=SimpleNamespace(hex="msg_1"),
         ):
             events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
 
@@ -79,7 +114,9 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[3].response_text, "hello")
         self.assertTrue(events[3].interrupted)
         outbound = json.loads(socket.sent[0])
-        self.assertEqual(outbound, {"type": "user_message", "text": "hi"})
+        self.assertEqual(outbound["type"], "user_message")
+        self.assertEqual(outbound["text"], "hi")
+        self.assertEqual(outbound["client_message_id"], "msg_1")
 
     async def test_request_stop_returns_acknowledged_state(self) -> None:
         socket = _FakeSocket(
@@ -106,8 +143,18 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
                 json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
                 json.dumps(
                     {
+                        "type": "turn_started",
+                        "session_id": "s1",
+                        "turn_id": "turn_1",
+                        "turn_kind": "user",
+                        "client_message_id": "msg_1",
+                    }
+                ),
+                json.dumps(
+                    {
                         "type": "approval_request",
                         "session_id": "s1",
+                        "turn_id": "turn_1",
                         "approval_id": "approval_1",
                         "kind": "bash_command",
                         "summary": "Install a CLI.",
@@ -121,6 +168,7 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "type": "turn_done",
                         "session_id": "s1",
+                        "turn_id": "turn_1",
                         "response_text": "",
                     }
                 ),
@@ -131,6 +179,9 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
             return_value=lambda *args, **kwargs: _FakeConnection(socket),
+        ), patch(
+            "jarvis.ui.telegram.gateway_client.uuid4",
+            return_value=SimpleNamespace(hex="msg_1"),
         ):
             events = [event async for event in client.stream_turn(route_id="tg_1", user_text="hi")]
 

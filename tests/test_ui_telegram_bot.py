@@ -35,6 +35,7 @@ from jarvis.ui.telegram.gateway_client import (
     GatewayMessageEvent,
     GatewaySystemNoticeEvent,
     GatewayToolCallEvent,
+    GatewayTurnStartedEvent,
     GatewayTurnDoneEvent,
 )
 
@@ -335,6 +336,45 @@ class _FakeClosableRouteSession:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _PersistentFakeRouteSession:
+    def __init__(self) -> None:
+        self.sent_messages: list[tuple[str, str]] = []
+        self.stop_requested = False
+        self.closed = False
+        self._events: asyncio.Queue[Any] = asyncio.Queue()
+
+    async def send_user_message(self, *, text: str, client_message_id: str) -> None:
+        self.sent_messages.append((text, client_message_id))
+
+    async def request_stop(self) -> bool:
+        self.stop_requested = True
+        return True
+
+    async def submit_approval(self, *, approval_id: str, approved: bool) -> bool:
+        _ = approval_id, approved
+        return True
+
+    async def events(self) -> AsyncIterator[Any]:
+        while True:
+            yield await self._events.get()
+
+    async def emit(self, event: Any) -> None:
+        await self._events.put(event)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _PersistentFakeGatewayClient:
+    def __init__(self, session: _PersistentFakeRouteSession) -> None:
+        self._session = session
+        self.connected_routes: list[str] = []
+
+    async def connect_route(self, *, route_id: str) -> _PersistentFakeRouteSession:
+        self.connected_routes.append(route_id)
+        return self._session
 
 
 def _settings(**overrides: object) -> UISettings:
@@ -1098,6 +1138,296 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             ["Stop requested. I will stop after the current step."],
+        )
+
+    async def test_dispatch_message_submits_second_message_immediately_while_first_turn_is_active(
+        self,
+    ) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        first = IncomingTextMessage(
+            update_id=1,
+            chat_id=777,
+            chat_type="private",
+            text="first",
+        )
+        second = IncomingTextMessage(
+            update_id=2,
+            chat_id=777,
+            chat_type="private",
+            text="second",
+        )
+
+        await bridge.dispatch_message(first)
+        await bridge.dispatch_message(second)
+
+        self.assertEqual(gateway.connected_routes, ["tg_777"])
+        self.assertEqual(
+            [text for text, _client_message_id in session.sent_messages],
+            ["first", "second"],
+        )
+        first_client_message_id = session.sent_messages[0][1]
+        second_client_message_id = session.sent_messages[1][1]
+
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="partial",
+                interrupted=True,
+                interruption_reason="superseded_by_user_message",
+            )
+        )
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="handled second",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="handled second",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["handled second"],
+        )
+
+    async def test_dispatch_message_submits_mid_turn_file_message_immediately(self) -> None:
+        telegram = _FakeTelegramClient(
+            remote_files={
+                "file_1": TelegramRemoteFile(
+                    file_id="file_1",
+                    file_path="documents/spec.txt",
+                    file_unique_id="uniq_1",
+                    file_size=12,
+                )
+            },
+            download_payloads={"documents/spec.txt": b"hello world\n"},
+        )
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=777,
+                chat_type="private",
+                text="first",
+            )
+        )
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=2,
+                chat_id=777,
+                chat_type="private",
+                text="please inspect",
+                file_attachment=IncomingTelegramFile(
+                    telegram_media_type="document",
+                    file_id="file_1",
+                    file_unique_id="uniq_1",
+                    original_file_name="spec.txt",
+                    mime_type="text/plain",
+                    size_bytes=12,
+                ),
+            )
+        )
+
+        self.assertEqual(gateway.connected_routes, ["tg_777"])
+        self.assertEqual(len(session.sent_messages), 2)
+        self.assertEqual(session.sent_messages[0][0], "first")
+        file_turn_text = session.sent_messages[1][0]
+        self.assertIn("User sent a Telegram file.", file_turn_text)
+        self.assertIn("filename: spec.txt", file_turn_text)
+        self.assertIn("telegram_media_type: document", file_turn_text)
+        self.assertIn("caption: please inspect", file_turn_text)
+        self.assertEqual(
+            [download.remote_file_path for download in telegram.downloaded_files],
+            ["documents/spec.txt"],
+        )
+
+    async def test_new_command_sends_telegram_only_session_notice(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=777,
+                chat_type="private",
+                text="/new",
+            )
+        )
+
+        self.assertEqual(len(session.sent_messages), 1)
+        client_message_id = session.sent_messages[0][1]
+
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id=None,
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="Started a new session.",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id=None,
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="Started a new session.",
+                command="/new",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["⚙️ <b>System:</b> Started a new session."],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.sent_messages],
+            ["HTML"],
+        )
+
+    async def test_new_command_with_body_keeps_notice_and_response_separate(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=777,
+                chat_type="private",
+                text="/new continue here",
+            )
+        )
+
+        self.assertEqual(len(session.sent_messages), 1)
+        client_message_id = session.sent_messages[0][1]
+
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="continuing in the new session",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="continuing in the new session",
+                command="/new",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "⚙️ <b>System:</b> Started a new session.",
+                "continuing in the new session",
+            ],
         )
 
     async def test_stop_command_gateway_error_is_suppressed(self) -> None:

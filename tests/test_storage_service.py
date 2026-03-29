@@ -71,7 +71,9 @@ class SessionStorageTests(unittest.TestCase):
             self.assertIsNotNone(archived)
             self.assertIsNone(archived.pending_approval)  # type: ignore[union-attr]
 
-    def test_load_records_includes_interrupted_but_hides_in_progress_and_superseded(self) -> None:
+    def test_load_records_includes_interrupted_and_superseded_but_hides_in_progress(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             storage = SessionStorage(Path(tmp) / "archive" / "transcripts")
             session = storage.create_session(start_reason="initial")
@@ -135,7 +137,10 @@ class SessionStorageTests(unittest.TestCase):
             )
 
             visible = storage.load_records(session.session_id)
-            self.assertEqual([record.content for record in visible], ["completed", "interrupted"])
+            self.assertEqual(
+                [record.content for record in visible],
+                ["completed", "interrupted", "superseded"],
+            )
 
             all_records = storage.load_records(session.session_id, include_all_turns=True)
             self.assertEqual(

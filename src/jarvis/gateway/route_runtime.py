@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from jarvis.core import (
     AgentApprovalRequestEvent,
@@ -16,6 +17,7 @@ from jarvis.core import (
     AgentRuntimeMessage,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
+    AgentTurnStartedEvent,
     AgentTurnDoneEvent,
     AgentTurnResult,
     AgentTurnStreamEvent,
@@ -47,6 +49,7 @@ from .route_events import (
     RouteEvent,
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
+    RouteTurnStartedEvent,
     RouteTurnDoneEvent,
 )
 
@@ -78,6 +81,7 @@ class _RouteTurnRequest:
     pre_turn_messages: tuple[AgentRuntimeMessage, ...] = ()
     parse_commands: bool = True
     user_initiated: bool = True
+    client_message_id: str | None = None
     internal_generation: int | None = None
     runtime_turn_kind: str | None = None
 
@@ -156,8 +160,11 @@ class RouteRuntime:
         self._tool_execution_guard = asyncio.Semaphore(1)
         self._event_bus = RouteEventBus()
         self._approval_registry = RouteApprovalRegistry()
+        self._user_message_queue: asyncio.Queue[_RouteTurnRequest] = asyncio.Queue()
         self._message_queue: asyncio.Queue[_RouteTurnRequest] = asyncio.Queue()
+        self._queue_wakeup = asyncio.Event()
         self._message_worker: asyncio.Task[None] | None = None
+        self._active_turn_request: _RouteTurnRequest | None = None
         self._main_resume_requires_user_message = False
         self._internal_followup_generation = 0
         self._pending_main_bash_notices: dict[str, BashJobNotice] = {}
@@ -202,7 +209,7 @@ class RouteRuntime:
         return self._main_loop.active_session_id()
 
     def request_stop(self) -> bool:
-        main_stop_requested = self._main_loop.request_stop()
+        main_stop_requested = self._main_loop.request_stop(reason="user_stop")
         affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
         pending_bash_jobs = self._bash_job_supervisor.pending_jobs()
         stop_requested = (
@@ -212,25 +219,39 @@ class RouteRuntime:
         )
         if stop_requested and not self._main_resume_requires_user_message:
             self._main_resume_requires_user_message = True
-            self._internal_followup_generation += 1
+            self._invalidate_stale_internal_followups()
         if affected_subagents:
             self._append_user_stop_subagent_note(affected_subagents)
         if pending_bash_jobs:
             self._append_user_stop_bash_job_note(pending_bash_jobs)
         return stop_requested
 
+    def _request_user_message_supersede(self) -> None:
+        _ = self._main_loop.request_stop(reason="superseded_by_user_message")
+        self._subagent_manager.request_stop_all_for_superseded_user_message()
+        self._invalidate_stale_internal_followups()
+
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._approval_registry.resolve(approval_id, approved)
 
-    async def enqueue_user_message(self, user_text: str) -> None:
+    async def enqueue_user_message(
+        self,
+        user_text: str,
+        *,
+        client_message_id: str | None = None,
+    ) -> None:
         self._bash_job_supervisor.ensure_running()
-        await self._message_queue.put(
+        await self._user_message_queue.put(
             _RouteTurnRequest(
                 user_text=user_text,
                 parse_commands=True,
                 user_initiated=True,
+                client_message_id=client_message_id,
             )
         )
+        self._queue_wakeup.set()
+        if self._main_loop.has_active_turn():
+            self._request_user_message_supersede()
         self._ensure_message_worker()
 
     def subscribe(self) -> tuple[str, asyncio.Queue[RouteEvent]]:
@@ -248,7 +269,12 @@ class RouteRuntime:
         user_text: str,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         subscriber_id, queue = self.subscribe()
-        await self.enqueue_user_message(user_text)
+        client_message_id = uuid4().hex
+        matched_turn_id: str | None = None
+        await self.enqueue_user_message(
+            user_text,
+            client_message_id=client_message_id,
+        )
         try:
             while True:
                 event = await queue.get()
@@ -260,6 +286,12 @@ class RouteRuntime:
                         raise ProviderTimeoutError(event.message)
                     raise RuntimeError(event.message)
                 if event.agent_kind != "main":
+                    continue
+                if isinstance(event, RouteTurnStartedEvent):
+                    if event.client_message_id == client_message_id:
+                        matched_turn_id = event.turn_id
+                    continue
+                if matched_turn_id is None or event.turn_id != matched_turn_id:
                     continue
                 mapped = _map_route_event_to_agent_event(event)
                 if mapped is None:
@@ -287,25 +319,83 @@ class RouteRuntime:
             name=f"jarvis-route-runtime-{self._route_id}",
         )
 
+    def _invalidate_stale_internal_followups(self) -> None:
+        self._internal_followup_generation += 1
+        self._main_bash_runtime_turn_queued = False
+        self._main_subagent_runtime_turn_queued = False
+
+    async def _dequeue_next_request(
+        self,
+    ) -> tuple[_RouteTurnRequest, asyncio.Queue[_RouteTurnRequest]]:
+        while True:
+            try:
+                return self._user_message_queue.get_nowait(), self._user_message_queue
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                return self._message_queue.get_nowait(), self._message_queue
+            except asyncio.QueueEmpty:
+                pass
+            self._queue_wakeup.clear()
+            try:
+                return self._user_message_queue.get_nowait(), self._user_message_queue
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                return self._message_queue.get_nowait(), self._message_queue
+            except asyncio.QueueEmpty:
+                pass
+            await self._queue_wakeup.wait()
+
+    async def _maybe_schedule_deferred_internal_followups(self) -> None:
+        if self._main_resume_requires_user_message:
+            return
+        if not self._user_message_queue.empty():
+            return
+        if self._main_bash_runtime_turn_queued or self._main_subagent_runtime_turn_queued:
+            return
+        if self._pending_main_bash_notices:
+            await self._message_queue.put(
+                _RouteTurnRequest(
+                    user_text=None,
+                    force_session_id=self._resolve_main_bash_notice_session_id(
+                        tuple(self._pending_main_bash_notices.values())
+                    ),
+                    parse_commands=False,
+                    user_initiated=False,
+                    internal_generation=self._internal_followup_generation,
+                    runtime_turn_kind=_MAIN_BASH_PROGRESS_RUNTIME_KIND,
+                )
+            )
+            self._main_bash_runtime_turn_queued = True
+            self._queue_wakeup.set()
+        if self._pending_main_subagent_notices and not self._main_bash_runtime_turn_queued:
+            first_notice = next(iter(self._pending_main_subagent_notices.values()))
+            await self._message_queue.put(
+                _RouteTurnRequest(
+                    user_text=None,
+                    force_session_id=self._resolve_main_subagent_notice_session_id(first_notice),
+                    parse_commands=False,
+                    user_initiated=False,
+                    internal_generation=self._internal_followup_generation,
+                    runtime_turn_kind=_MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND,
+                )
+            )
+            self._main_subagent_runtime_turn_queued = True
+            self._queue_wakeup.set()
+
     async def _message_worker_loop(self) -> None:
         while True:
-            request = await self._message_queue.get()
+            request, source_queue = await self._dequeue_next_request()
+            self._active_turn_request = request
             try:
                 if request.user_initiated:
                     if self._main_resume_requires_user_message:
                         self._main_resume_requires_user_message = False
                 else:
                     if self._main_resume_requires_user_message:
-                        if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
-                            self._clear_pending_main_bash_notices()
-                        if request.runtime_turn_kind == _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND:
-                            self._clear_pending_main_subagent_notices()
                         continue
                     if request.internal_generation != self._internal_followup_generation:
-                        if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
-                            self._clear_pending_main_bash_notices()
-                        if request.runtime_turn_kind == _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND:
-                            self._clear_pending_main_subagent_notices()
                         continue
                 if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
                     self._main_bash_runtime_turn_queued = False
@@ -361,7 +451,7 @@ class RouteRuntime:
                         pre_turn_messages=request.pre_turn_messages,
                     )
                 async for event in event_stream:
-                    await self._publish_main_loop_event(event)
+                    await self._publish_main_loop_event(event, request=request)
             except ContextBudgetError as exc:
                 await self.publish_event(
                     RouteErrorEvent(
@@ -369,6 +459,9 @@ class RouteRuntime:
                         agent_kind="main",
                         agent_name="Jarvis",
                         session_id=self._main_loop.active_session_id(),
+                        turn_id=self._main_loop.active_turn_id(),
+                        turn_kind="user" if request.user_initiated else "runtime",
+                        client_message_id=request.client_message_id,
                         code="context_budget_exceeded",
                         message=str(exc),
                     )
@@ -380,6 +473,9 @@ class RouteRuntime:
                         agent_kind="main",
                         agent_name="Jarvis",
                         session_id=self._main_loop.active_session_id(),
+                        turn_id=self._main_loop.active_turn_id(),
+                        turn_kind="user" if request.user_initiated else "runtime",
+                        client_message_id=request.client_message_id,
                         code="provider_timeout",
                         message=_PROVIDER_TIMEOUT_MESSAGE,
                     )
@@ -391,12 +487,17 @@ class RouteRuntime:
                         agent_kind="main",
                         agent_name="Jarvis",
                         session_id=self._main_loop.active_session_id(),
+                        turn_id=self._main_loop.active_turn_id(),
+                        turn_kind="user" if request.user_initiated else "runtime",
+                        client_message_id=request.client_message_id,
                         code="internal_error",
                         message=_INTERNAL_ERROR_MESSAGE,
                     )
                 )
             finally:
-                self._message_queue.task_done()
+                self._active_turn_request = None
+                source_queue.task_done()
+                await self._maybe_schedule_deferred_internal_followups()
 
     async def _maybe_enqueue_subagent_supervisor_followup(self, event: RouteEvent) -> None:
         if not isinstance(event, RouteSystemNoticeEvent):
@@ -409,14 +510,29 @@ class RouteRuntime:
             return
         await self._enqueue_main_subagent_followup(event)
 
-    async def _publish_main_loop_event(self, event: AgentTurnStreamEvent) -> None:
+    async def _publish_main_loop_event(
+        self,
+        event: AgentTurnStreamEvent,
+        *,
+        request: _RouteTurnRequest,
+    ) -> None:
+        turn_kind = "user" if request.user_initiated else "runtime"
+        route_event_kwargs = {
+            "route_id": self._route_id,
+            "agent_kind": "main",
+            "agent_name": "Jarvis",
+            "session_id": event.session_id,
+            "turn_id": getattr(event, "turn_id", None) or None,
+            "turn_kind": turn_kind,
+            "client_message_id": request.client_message_id,
+        }
+        if isinstance(event, AgentTurnStartedEvent):
+            await self.publish_event(RouteTurnStartedEvent(**route_event_kwargs))
+            return
         if isinstance(event, AgentTextDeltaEvent):
             await self.publish_event(
                 RouteAssistantDeltaEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=event.session_id,
+                    **route_event_kwargs,
                     delta=event.delta,
                 )
             )
@@ -424,10 +540,7 @@ class RouteRuntime:
         if isinstance(event, AgentAssistantMessageEvent):
             await self.publish_event(
                 RouteAssistantMessageEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=event.session_id,
+                    **route_event_kwargs,
                     text=event.text,
                 )
             )
@@ -435,10 +548,7 @@ class RouteRuntime:
         if isinstance(event, AgentToolCallEvent):
             await self.publish_event(
                 RouteToolCallEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=event.session_id,
+                    **route_event_kwargs,
                     tool_names=event.tool_names,
                 )
             )
@@ -447,10 +557,7 @@ class RouteRuntime:
             self._approval_registry.register(event.approval_id, self._main_loop)
             await self.publish_event(
                 RouteApprovalRequestEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=event.session_id,
+                    **route_event_kwargs,
                     approval_id=event.approval_id,
                     kind=event.kind,
                     summary=event.summary,
@@ -464,15 +571,13 @@ class RouteRuntime:
         if isinstance(event, AgentTurnDoneEvent):
             await self.publish_event(
                 RouteTurnDoneEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=event.session_id,
+                    **route_event_kwargs,
                     response_text=event.response_text,
                     command=event.command,
                     compaction_performed=event.compaction_performed,
                     interrupted=event.interrupted,
                     approval_rejected=event.approval_rejected,
+                    interruption_reason=event.interruption_reason,
                 )
             )
 
@@ -723,6 +828,7 @@ class RouteRuntime:
                 runtime_turn_kind=_MAIN_BASH_PROGRESS_RUNTIME_KIND,
             )
         )
+        self._queue_wakeup.set()
         self._ensure_message_worker()
 
     async def _enqueue_subagent_bash_job_followup(
@@ -753,6 +859,7 @@ class RouteRuntime:
                 runtime_turn_kind=_MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND,
             )
         )
+        self._queue_wakeup.set()
         self._ensure_message_worker()
 
     def _merge_main_bash_notices(self, notices: Sequence[BashJobNotice]) -> None:
@@ -1139,24 +1246,35 @@ def _format_payload_lines(payload: dict[str, Any]) -> str:
 
 
 def _map_route_event_to_agent_event(event: RouteEvent) -> AgentTurnStreamEvent | None:
+    if isinstance(event, RouteTurnStartedEvent):
+        if event.turn_id is None:
+            return None
+        return AgentTurnStartedEvent(
+            session_id=event.session_id or "",
+            turn_id=event.turn_id,
+        )
     if isinstance(event, RouteAssistantDeltaEvent):
         return AgentTextDeltaEvent(
             session_id=event.session_id or "",
             delta=event.delta,
+            turn_id=event.turn_id or "",
         )
     if isinstance(event, RouteAssistantMessageEvent):
         return AgentAssistantMessageEvent(
             session_id=event.session_id or "",
             text=event.text,
+            turn_id=event.turn_id or "",
         )
     if isinstance(event, RouteToolCallEvent):
         return AgentToolCallEvent(
             session_id=event.session_id or "",
             tool_names=event.tool_names,
+            turn_id=event.turn_id or "",
         )
     if isinstance(event, RouteApprovalRequestEvent):
         return AgentApprovalRequestEvent(
             session_id=event.session_id or "",
+            turn_id=event.turn_id or "",
             approval_id=event.approval_id,
             kind=event.kind,
             summary=event.summary,
@@ -1169,9 +1287,11 @@ def _map_route_event_to_agent_event(event: RouteEvent) -> AgentTurnStreamEvent |
         return AgentTurnDoneEvent(
             session_id=event.session_id or "",
             response_text=event.response_text,
+            turn_id=event.turn_id or "",
             command=event.command,
             compaction_performed=event.compaction_performed,
             interrupted=event.interrupted,
             approval_rejected=event.approval_rejected,
+            interruption_reason=event.interruption_reason,
         )
     return None

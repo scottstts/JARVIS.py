@@ -10,10 +10,15 @@ from jarvis.gateway.protocol import ProtocolError, parse_client_event
 class GatewayProtocolTests(unittest.TestCase):
     def test_parse_user_message_success(self) -> None:
         parsed = parse_client_event(
-            {"type": "user_message", "text": "hello"},
+            {
+                "type": "user_message",
+                "text": "hello",
+                "client_message_id": "msg_1",
+            },
             max_message_chars=100,
         )
         self.assertEqual(parsed.text, "hello")
+        self.assertEqual(parsed.client_message_id, "msg_1")
 
     def test_payload_must_be_object(self) -> None:
         with self.assertRaises(ProtocolError) as context:
@@ -58,17 +63,43 @@ class GatewayProtocolTests(unittest.TestCase):
 
     def test_text_must_be_non_empty_string(self) -> None:
         with self.assertRaises(ProtocolError) as non_string:
-            parse_client_event({"type": "user_message", "text": 123}, max_message_chars=100)
+            parse_client_event(
+                {
+                    "type": "user_message",
+                    "text": 123,
+                    "client_message_id": "msg_1",
+                },
+                max_message_chars=100,
+            )
         self.assertEqual(non_string.exception.code, "invalid_message_text")
 
         with self.assertRaises(ProtocolError) as empty:
-            parse_client_event({"type": "user_message", "text": "   "}, max_message_chars=100)
+            parse_client_event(
+                {
+                    "type": "user_message",
+                    "text": "   ",
+                    "client_message_id": "msg_1",
+                },
+                max_message_chars=100,
+            )
         self.assertEqual(empty.exception.code, "empty_message")
 
     def test_message_length_is_limited(self) -> None:
         with self.assertRaises(ProtocolError) as context:
             parse_client_event(
-                {"type": "user_message", "text": "hello"},
+                {
+                    "type": "user_message",
+                    "text": "hello",
+                    "client_message_id": "msg_1",
+                },
                 max_message_chars=4,
             )
         self.assertEqual(context.exception.code, "message_too_large")
+
+    def test_client_message_id_is_required(self) -> None:
+        with self.assertRaises(ProtocolError) as context:
+            parse_client_event(
+                {"type": "user_message", "text": "hello"},
+                max_message_chars=100,
+            )
+        self.assertEqual(context.exception.code, "invalid_client_message_id")

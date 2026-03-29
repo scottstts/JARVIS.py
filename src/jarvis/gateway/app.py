@@ -14,6 +14,7 @@ from jarvis.core import (
     AgentAssistantMessageEvent,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
+    AgentTurnStartedEvent,
     AgentTurnDoneEvent,
     ContextBudgetError,
     CoreSettings,
@@ -194,7 +195,11 @@ def create_app(
                         return
                     continue
 
-                await resolved_router.enqueue_message(route_id, event.text)
+                await resolved_router.enqueue_message(
+                    route_id,
+                    event.text,
+                    client_message_id=event.client_message_id,
+                )
 
         async def _writer() -> None:
             while True:
@@ -341,12 +346,28 @@ async def _serve_legacy_router_connection(
 
         try:
             async for turn_event in router.stream_turn(route_id, event.text):
+                if isinstance(turn_event, AgentTurnStartedEvent):
+                    if not await _send_json_if_open(
+                        websocket,
+                        {
+                            "type": "turn_started",
+                            "session_id": turn_event.session_id,
+                            "turn_id": turn_event.turn_id,
+                            "turn_kind": "user",
+                            "client_message_id": event.client_message_id,
+                        },
+                    ):
+                        return
+                    continue
                 if isinstance(turn_event, AgentTextDeltaEvent):
                     if not await _send_json_if_open(
                         websocket,
                         {
                             "type": "assistant_delta",
                             "session_id": turn_event.session_id,
+                            "turn_id": turn_event.turn_id,
+                            "turn_kind": "user",
+                            "client_message_id": event.client_message_id,
                             "delta": turn_event.delta,
                         },
                     ):
@@ -358,6 +379,9 @@ async def _serve_legacy_router_connection(
                         {
                             "type": "assistant_message",
                             "session_id": turn_event.session_id,
+                            "turn_id": turn_event.turn_id,
+                            "turn_kind": "user",
+                            "client_message_id": event.client_message_id,
                             "text": turn_event.text,
                         },
                     ):
@@ -369,6 +393,9 @@ async def _serve_legacy_router_connection(
                         {
                             "type": "tool_call",
                             "session_id": turn_event.session_id,
+                            "turn_id": turn_event.turn_id,
+                            "turn_kind": "user",
+                            "client_message_id": event.client_message_id,
                             "tool_names": list(turn_event.tool_names),
                         },
                     ):
@@ -380,6 +407,9 @@ async def _serve_legacy_router_connection(
                         {
                             "type": "approval_request",
                             "session_id": turn_event.session_id,
+                            "turn_id": turn_event.turn_id,
+                            "turn_kind": "user",
+                            "client_message_id": event.client_message_id,
                             "approval_id": turn_event.approval_id,
                             "kind": turn_event.kind,
                             "summary": turn_event.summary,
@@ -397,11 +427,15 @@ async def _serve_legacy_router_connection(
                         {
                             "type": "turn_done",
                             "session_id": turn_event.session_id,
+                            "turn_id": turn_event.turn_id,
+                            "turn_kind": "user",
+                            "client_message_id": event.client_message_id,
                             "response_text": turn_event.response_text,
                             "command": turn_event.command,
                             "compaction_performed": turn_event.compaction_performed,
                             "interrupted": turn_event.interrupted,
                             "approval_rejected": turn_event.approval_rejected,
+                            "interruption_reason": turn_event.interruption_reason,
                         },
                     ):
                         return

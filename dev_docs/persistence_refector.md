@@ -102,7 +102,26 @@ Current reconciliation behavior:
 
 This prevents persisted prompt-visible records from disappearing just because the old process died before it could finalize turn status.
 
-### 6. Tool-round-limit recovery persists explicit normalization first
+### 6. Superseded turns stay replayable and keep their explicit interruption reason
+
+Superseded turns are intentionally visible in normal replay, not hidden like `in_progress` turns.
+
+That is required so later turns can still see:
+
+- completed tool results from the superseded task
+- the persisted interrupted-or-superseded turn note
+- any other completed prompt-visible outputs that landed before the cooperative interruption checkpoint
+
+If a session compacts while an interruption notice is still pending, the pending notice flag and its explicit reason both carry forward into the compacted session.
+
+That preserves the difference between:
+
+- generic user stop
+- superseded by newer user message
+
+without inventing new prompt-visible content during replay.
+
+### 7. Tool-round-limit recovery persists explicit normalization first
 
 When the loop hits the per-turn tool-round limit while the latest assistant response still contains unexecuted tool calls:
 

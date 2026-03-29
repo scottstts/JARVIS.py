@@ -214,4 +214,4 @@ def _record_is_visible(
         return True
     if turn_id in include_turn_ids:
         return True
-    return turn_states.get(turn_id) in {"completed", "interrupted"}
+    return turn_states.get(turn_id) in {"completed", "interrupted", "superseded"}

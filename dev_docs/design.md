@@ -10,7 +10,7 @@ The agent should have below components, some of which can be straightforward, so
 
 - `src/jarvis/identities/` . this mainly contains a series of "starter context content" md files, possibly using a similar design as openclaw, which means things like REACTOR.md (persona, boundaries, tone, like SOUL.md for openclaw), USER.md (user preferences + address/how to speak), PROGRAM.md (operating rules like “how I run tasks, when I write memory, what I optimize for”, like AGENTS.md for openclaw), and ARMOR.md (security-practice overlay).
 
-- `src/jarvis/gateway/` . this is the control surface of the agent system's connection to outside. use Starlette with a minimal design (websocket), also handles session routing
+- `src/jarvis/gateway/` . this is the control surface of the agent system's connection to outside. use Starlette with a minimal design (websocket), also handles session routing. Route websocket sessions are persistent per route: normal user messages queue FIFO, newer user messages cooperatively supersede active work, and explicit `/stop` remains a distinct pause request.
 
 - `src/jarvis/memory/` . this is the agent's long term memory system. Here I will like use a more complex system than openclaw's MEMORY.md. This will likely include memory specific tools that agent can use to read/write/edit memory, separate from general tools in `src/jarvis/tools/`, but also could include non-agent-controlled memory infra like regular memory consolidation, reorganization, update, decay, etc. I might build this following the file memory and graph memory approach like in another project of mine: `~/Documents/Projects/Python/simple_agent_memory`, tho I haven't decided whether i should use sql wrapper or just use plain md files
 

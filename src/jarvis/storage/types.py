@@ -23,6 +23,7 @@ class SessionMetadata:
     status: SessionStatus = "active"
     pending_reactive_compaction: bool = False
     pending_interruption_notice: bool = False
+    pending_interruption_notice_reason: str | None = None
     pending_approval: dict[str, Any] | None = None
     compaction_count: int = 0
     last_input_tokens: int | None = None
@@ -41,6 +42,7 @@ class SessionMetadata:
             "status": self.status,
             "pending_reactive_compaction": self.pending_reactive_compaction,
             "pending_interruption_notice": self.pending_interruption_notice,
+            "pending_interruption_notice_reason": self.pending_interruption_notice_reason,
             "pending_approval": (
                 dict(self.pending_approval)
                 if isinstance(self.pending_approval, dict)
@@ -65,6 +67,9 @@ class SessionMetadata:
             status="archived" if data.get("status") == "archived" else "active",
             pending_reactive_compaction=bool(data.get("pending_reactive_compaction", False)),
             pending_interruption_notice=bool(data.get("pending_interruption_notice", False)),
+            pending_interruption_notice_reason=_optional_str(
+                data.get("pending_interruption_notice_reason")
+            ),
             pending_approval=(
                 dict(data["pending_approval"])
                 if isinstance(data.get("pending_approval"), dict)
@@ -136,6 +141,13 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _normalize_turn_states(value: Any) -> dict[str, TurnStatus]:

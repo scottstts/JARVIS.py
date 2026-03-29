@@ -80,8 +80,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in loop.stream_user_input("hello")]
             self.assertEqual(
                 [event.type for event in events],
-                ["text_delta", "text_delta", "assistant_message", "done"],
+                ["turn_started", "text_delta", "text_delta", "assistant_message", "done"],
             )
+            self.assertTrue(events[0].turn_id)
             self.assertIsInstance(events[-2], AgentAssistantMessageEvent)
             self.assertIsInstance(events[-1], AgentTurnDoneEvent)
             done = events[-1]
@@ -243,7 +244,10 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].role, "user")
             self.assertEqual(message_records[-2].role, "assistant")
             self.assertEqual(message_records[-1].role, "system")
-            self.assertEqual(message_records[-1].content, "This turn was interrupted by the user before it completed.")
+            self.assertEqual(
+                message_records[-1].content,
+                "The user interrupted this turn before it completed.",
+            )
 
             session = storage.get_session(done.session_id)
             self.assertIsNotNone(session)
@@ -294,13 +298,111 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
                 if message.role == "system"
                 for part in message.parts
                 if isinstance(part, TextPart)
-                and "The previous task was interrupted by the user." in part.text
+                and "The user interrupted the previous task." in part.text
             ]
             self.assertEqual(
                 interruption_messages,
-                ["The previous task was interrupted by the user."],
+                [
+                    "The user interrupted the previous task. Treat any partial output from it as incomplete."
+                ],
             )
 
             session = storage.get_session(result.session_id)
             self.assertIsNotNone(session)
             self.assertFalse(session.pending_interruption_notice)  # type: ignore[union-attr]
+
+    async def test_next_turn_includes_previous_task_superseded_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _InterruptibleStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("hello")]
+
+            task = asyncio.create_task(_collect_events())
+            await llm_service.stream_started.wait()
+            self.assertTrue(
+                loop.request_stop(reason="superseded_by_user_message")
+            )
+            llm_service.release_stream.set()
+            _ = await task
+
+            active_session_id = loop.active_session_id()
+            self.assertIsNotNone(active_session_id)
+            all_records = storage.load_records(active_session_id, include_all_turns=True)
+            self.assertTrue(
+                any(
+                    record.content
+                    == "A newer user message superseded this turn before it completed."
+                    for record in all_records
+                    if record.role == "system"
+                )
+            )
+
+            result = await loop.handle_user_input("continue")
+            self.assertEqual(result.response_text, "next-turn")
+            self.assertEqual(len(llm_service.generate_requests), 1)
+
+            request = llm_service.generate_requests[0]
+            superseded_messages = [
+                part.text
+                for message in request.messages
+                if message.role == "system"
+                for part in message.parts
+                if isinstance(part, TextPart)
+                and "superseded the previous task" in part.text
+            ]
+            self.assertIn(
+                (
+                    "A newer user message superseded the previous task. Handle the "
+                    "current user message first. Use completed results from the older "
+                    "task only if they are directly relevant."
+                ),
+                superseded_messages,
+            )
+
+            session = storage.get_session(result.session_id)
+            self.assertIsNotNone(session)
+            self.assertFalse(session.pending_interruption_notice)  # type: ignore[union-attr]
+            self.assertIsNone(session.pending_interruption_notice_reason)  # type: ignore[union-attr]
+
+    async def test_compaction_preserves_pending_superseded_notice_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _InterruptibleStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("hello")]
+
+            task = asyncio.create_task(_collect_events())
+            await llm_service.stream_started.wait()
+            self.assertTrue(
+                loop.request_stop(reason="superseded_by_user_message")
+            )
+            llm_service.release_stream.set()
+            _ = await task
+
+            active_session_id = loop.active_session_id()
+            self.assertIsNotNone(active_session_id)
+            active_session = storage.get_session(active_session_id)
+            self.assertIsNotNone(active_session)
+
+            compacted = await loop._compact_session(active_session, reason="manual")
+            self.assertIsNotNone(compacted)
+            self.assertTrue(compacted.pending_interruption_notice)  # type: ignore[union-attr]
+            self.assertEqual(
+                compacted.pending_interruption_notice_reason,
+                "superseded_by_user_message",
+            )

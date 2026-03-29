@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 
 class GatewayBridgeError(RuntimeError):
@@ -24,9 +25,17 @@ class GatewayRouteEventBase:
     created_at: str = ""
     route_id: str = ""
     session_id: str | None = None
+    turn_id: str | None = None
+    turn_kind: str | None = None
+    client_message_id: str | None = None
     agent_kind: str = "main"
     agent_name: str = "Jarvis"
     subagent_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class GatewayTurnStartedEvent(GatewayRouteEventBase):
+    type: str = "turn_started"
 
 
 @dataclass(slots=True, frozen=True)
@@ -66,6 +75,7 @@ class GatewayTurnDoneEvent(GatewayRouteEventBase):
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    interruption_reason: str | None = None
     type: str = "turn_done"
 
 
@@ -84,7 +94,8 @@ class GatewayErrorEvent(GatewayRouteEventBase):
 
 
 GatewayRouteEvent = (
-    GatewayDeltaEvent
+    GatewayTurnStartedEvent
+    | GatewayDeltaEvent
     | GatewayMessageEvent
     | GatewayToolCallEvent
     | GatewayApprovalRequestEvent
@@ -188,10 +199,18 @@ class GatewayRouteSession:
             except Exception:
                 pass
 
-    async def send_user_message(self, *, text: str) -> None:
+    async def send_user_message(self, *, text: str, client_message_id: str) -> None:
         await self._ensure_connected()
         async with self._send_lock:
-            await self._socket.send(json.dumps({"type": "user_message", "text": text}))
+            await self._socket.send(
+                json.dumps(
+                    {
+                        "type": "user_message",
+                        "text": text,
+                        "client_message_id": client_message_id,
+                    }
+                )
+            )
 
     async def request_stop(self) -> bool:
         await self._ensure_connected()
@@ -317,14 +336,27 @@ class GatewayWebSocketClient:
 
     async def stream_turn(self, *, route_id: str, user_text: str) -> AsyncIterator[GatewayRouteEvent]:
         session = await self.connect_route(route_id=route_id)
+        client_message_id = uuid4().hex
+        matched_turn_id: str | None = None
         try:
-            await session.send_user_message(text=user_text)
+            await session.send_user_message(
+                text=user_text,
+                client_message_id=client_message_id,
+            )
             async for event in session.events():
                 if isinstance(event, GatewayErrorEvent):
                     raise GatewayBridgeError(
                         code=event.code or "gateway_error",
                         message=event.message or "Gateway returned an error.",
                     )
+                if isinstance(event, GatewayTurnStartedEvent):
+                    if event.client_message_id == client_message_id:
+                        matched_turn_id = event.turn_id
+                    continue
+                if matched_turn_id is None:
+                    continue
+                if event.turn_id != matched_turn_id:
+                    continue
                 yield event
                 if isinstance(event, GatewayTurnDoneEvent):
                     return
@@ -405,6 +437,21 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
             if payload.get("session_id") is not None
             else None
         ),
+        "turn_id": (
+            str(payload["turn_id"])
+            if payload.get("turn_id") is not None
+            else None
+        ),
+        "turn_kind": (
+            str(payload["turn_kind"])
+            if payload.get("turn_kind") is not None
+            else None
+        ),
+        "client_message_id": (
+            str(payload["client_message_id"])
+            if payload.get("client_message_id") is not None
+            else None
+        ),
         "agent_kind": str(payload.get("agent_kind", "")),
         "agent_name": str(payload.get("agent_name", "")),
         "subagent_id": (
@@ -414,6 +461,8 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
         ),
     }
     event_type = str(payload.get("type", ""))
+    if event_type == "turn_started":
+        return GatewayTurnStartedEvent(**base_kwargs)
     if event_type == "assistant_delta":
         return GatewayDeltaEvent(**base_kwargs, delta=str(payload.get("delta", "")))
     if event_type == "assistant_message":
@@ -462,6 +511,11 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
             compaction_performed=bool(payload.get("compaction_performed", False)),
             interrupted=bool(payload.get("interrupted", False)),
             approval_rejected=bool(payload.get("approval_rejected", False)),
+            interruption_reason=(
+                str(payload["interruption_reason"])
+                if payload.get("interruption_reason") is not None
+                else None
+            ),
         )
     if event_type == "system_notice":
         return GatewaySystemNoticeEvent(

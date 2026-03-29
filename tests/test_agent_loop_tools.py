@@ -1784,6 +1784,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [event.type for event in events],
                 [
+                    "turn_started",
                     "text_delta",
                     "assistant_message",
                     "tool_call",
@@ -1792,14 +1793,14 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     "done",
                 ],
             )
-            self.assertIsInstance(events[1], AgentAssistantMessageEvent)
-            self.assertIsInstance(events[2], AgentToolCallEvent)
-            self.assertIsInstance(events[4], AgentAssistantMessageEvent)
-            first_message = events[1]
+            self.assertIsInstance(events[2], AgentAssistantMessageEvent)
+            self.assertIsInstance(events[3], AgentToolCallEvent)
+            self.assertIsInstance(events[5], AgentAssistantMessageEvent)
+            first_message = events[2]
             if not isinstance(first_message, AgentAssistantMessageEvent):
                 self.fail("Expected assistant message stream event before tool execution.")
             self.assertEqual(first_message.text, "Working on it.")
-            tool_event = events[2]
+            tool_event = events[3]
             if not isinstance(tool_event, AgentToolCallEvent):
                 self.fail("Expected tool-call stream event before tool execution.")
             self.assertEqual(tool_event.tool_names, ("bash",))
@@ -1825,6 +1826,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [event.type for event in events],
                 [
+                    "turn_started",
                     "tool_call",
                     "text_delta",
                     "assistant_message",
@@ -1833,11 +1835,11 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     "done",
                 ],
             )
-            tool_event = events[0]
+            tool_event = events[1]
             if not isinstance(tool_event, AgentToolCallEvent):
                 self.fail("Expected first stream event to be a tool-call notice.")
             self.assertEqual(tool_event.tool_names, ("bash",))
-            first_message = events[2]
+            first_message = events[3]
             if not isinstance(first_message, AgentAssistantMessageEvent):
                 self.fail("Expected the mixed response text to still be finalized.")
             self.assertEqual(first_message.text, "Working on it.")
@@ -1895,6 +1897,9 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-2].role, "tool")
             self.assertEqual(message_records[-1].role, "system")
             self.assertEqual(message_records[-2].content, "slow tool finished")
+            self.assertTrue(
+                message_records[-2].metadata.get("completed_after_interrupt_request")
+            )
 
     async def test_stream_user_input_persists_text_when_stop_interrupts_mid_tool_call_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1920,9 +1925,9 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 [event.type for event in events],
-                ["text_delta", "tool_call", "done"],
+                ["turn_started", "text_delta", "tool_call", "done"],
             )
-            tool_event = events[1]
+            tool_event = events[2]
             if not isinstance(tool_event, AgentToolCallEvent):
                 self.fail("Expected the second event to be an AgentToolCallEvent.")
             self.assertEqual(tool_event.tool_names, ("bash",))
