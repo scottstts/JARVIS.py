@@ -9,6 +9,7 @@ This document now serves as the design-and-handoff source of truth for route-lev
 Current implementation notes:
 
 - websocket `user_message` events require `client_message_id`; Telegram and compatibility helpers synthesize and forward one for every submitted turn
+- every queued user message now runs through the route-level supersede path, so background subagent work is also asked to stop even when the main loop itself is not in an active turn
 - superseded turns remain visible in normal transcript replay so completed outputs from the older task are still available to the next turn
 - pending interruption notices preserve their explicit reason across compaction, so a pending supersede notice stays supersede-specific after session rollover
 - Telegram text messages and Telegram file submissions both use the same immediate-submit, cooperative-supersede path

@@ -109,6 +109,7 @@ The project is strict container-first:
 - do NOT git commit code, I will **always** do that myself
 - throughout the implementation, you will constantly ask me design choice questions like "option ABC, which do you want". This is because I'm not sure about some design choices yet, so constantly offer me options, alternatives, and challenge me when something doesn't seem to make obvious sense.
 - thoughtout the implementation, don't be too "trigger-happy", which means that you never go directly editing code unprompted. Never presume anything. If there's any ambiguity, contradiction, or things that appear to be obvious mistakes from me, always point out or ask.
+- Telegram is for app functional logic messages only, including UX confirmations like `/new` or `/stop`; never send app/runtime warnings, errors, internal-state alerts, stale-request notices, or placeholder fallback text to Telegram, and log those instead.
 - No need to delete __pycache__/
 - agent system runtime settings live in `src/jarvis/settings.py`, and only secrets (api keys, bot tokens, etc.) need to be in `secrets/`
 - After testing, **clean up** any testing artifacts inside the ~/.jarvis/workspace/ dir. The artifacts i refer to are the folders inside workspace/ like this: `~/.jarvis/workspace/jarvis-test-_gmb1oo6/`

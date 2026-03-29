@@ -61,6 +61,7 @@ class _FakeSubagentLoop:
         self._events = tuple(events)
         self._session_id = session_id
         self.stop_requests = 0
+        self.stop_reasons: list[str] = []
         self.system_notes: list[tuple[str, str | None, dict[str, object] | None]] = []
 
     async def prepare_session(self, *, start_reason: str) -> str:
@@ -90,8 +91,9 @@ class _FakeSubagentLoop:
         self.system_notes.append((content, session_id, metadata))
         return True
 
-    def request_stop(self) -> bool:
+    def request_stop(self, *, reason: str = "user_stop") -> bool:
         self.stop_requests += 1
+        self.stop_reasons.append(reason)
         return True
 
 
@@ -370,6 +372,8 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(awaiting_loop.stop_requests, 1)
             self.assertEqual(paused_loop.stop_requests, 0)
             self.assertEqual(completed_loop.stop_requests, 0)
+            self.assertEqual(running_loop.stop_reasons, ["user_stop"])
+            self.assertEqual(awaiting_loop.stop_reasons, ["user_stop"])
             self.assertEqual(manager._subagents["sub_running"].pending_pause_reason, "main_stop")
             self.assertEqual(manager._subagents["sub_awaiting"].pending_pause_reason, "main_stop")
             self.assertIsNone(manager._subagents["sub_paused"].pending_pause_reason)
@@ -458,6 +462,8 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(awaiting_loop.stop_requests, 1)
             self.assertEqual(paused_loop.stop_requests, 0)
             self.assertEqual(completed_loop.stop_requests, 0)
+            self.assertEqual(running_loop.stop_reasons, ["superseded_by_user_message"])
+            self.assertEqual(awaiting_loop.stop_reasons, ["superseded_by_user_message"])
             self.assertEqual(
                 manager._subagents["sub_running"].pending_pause_reason,
                 "superseded_by_user_message",

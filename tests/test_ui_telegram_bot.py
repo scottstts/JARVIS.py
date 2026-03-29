@@ -577,6 +577,35 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(telegram.edited_messages), 1)
         self.assertIn("Status: Approved", telegram.edited_messages[0].text)
 
+    async def test_handle_approval_callback_stale_request_is_silent(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(approval_resolved=False)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_approval_callback(
+            IncomingTelegramApprovalCallback(
+                update_id=1,
+                callback_query_id="callback_1",
+                chat_id=777,
+                message_id=42,
+                sender_user_id=777,
+                approval_id="approval_1",
+                approved=True,
+                message_text="Approval required\nsummary: Install a CLI.",
+            )
+        )
+
+        self.assertEqual(gateway.approval_calls, [("tg_777", "approval_1", True)])
+        self.assertEqual(len(telegram.answered_callbacks), 1)
+        self.assertIsNone(telegram.answered_callbacks[0].text)
+        self.assertFalse(telegram.answered_callbacks[0].show_alert)
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.edited_messages, [])
+
     async def test_handle_message_streams_drafts_then_final_message(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
@@ -613,6 +642,26 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             [message.parse_mode for message in telegram.sent_messages],
             ["HTML"],
         )
+
+    async def test_handle_message_suppresses_blank_final_turn(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayTurnDoneEvent(session_id="session", response_text=""),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.sent_drafts, [])
 
     async def test_handle_message_preserves_multiple_assistant_segments(self) -> None:
         telegram = _FakeTelegramClient()
@@ -1137,7 +1186,11 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.stop_calls, ["tg_777"])
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["Stop requested. I will stop after the current step."],
+            ["⚙️ <b>System:</b> Stop requested. I will stop after the current step."],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.sent_messages],
+            ["HTML"],
         )
 
     async def test_dispatch_message_submits_second_message_immediately_while_first_turn_is_active(
@@ -1438,6 +1491,22 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 message="Could not communicate with the gateway websocket.",
             )
         )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="/stop"),
+        )
+
+        self.assertEqual(gateway.stop_calls, ["tg_777"])
+        self.assertEqual(telegram.sent_messages, [])
+
+    async def test_stop_command_without_active_turn_is_silent(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(stop_requested=False)
         bridge = TelegramGatewayBridge(
             settings=_settings(),
             telegram_client=telegram,
@@ -1909,8 +1978,8 @@ class TelegramBotHelpersTests(unittest.TestCase):
         chunks = split_telegram_message("abc", max_chars=2)
         self.assertEqual(chunks, ["ab", "c"])
 
-    def test_split_telegram_message_returns_placeholder_for_blank_text(self) -> None:
-        self.assertEqual(split_telegram_message(" \n\t "), ["(No response text.)"])
+    def test_split_telegram_message_returns_no_chunks_for_blank_text(self) -> None:
+        self.assertEqual(split_telegram_message(" \n\t "), [])
 
-    def test_split_telegram_message_returns_placeholder_for_invisible_unicode(self) -> None:
-        self.assertEqual(split_telegram_message("\u200b\u200d\ufeff"), ["(No response text.)"])
+    def test_split_telegram_message_returns_no_chunks_for_invisible_unicode(self) -> None:
+        self.assertEqual(split_telegram_message("\u200b\u200d\ufeff"), [])

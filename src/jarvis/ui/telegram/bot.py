@@ -408,8 +408,8 @@ class TelegramGatewayBridge:
         if not resolved:
             await self._telegram.answer_callback_query(
                 callback_query_id=callback.callback_query_id,
-                text="This approval request is no longer pending.",
-                show_alert=True,
+                text=None,
+                show_alert=False,
             )
             return
 
@@ -762,14 +762,11 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayTurnDoneEvent):
             if not event.interrupted and not active_turn.delivered_any_segment:
-                final_text = (
-                    _coalesce_visible_text(
-                        event.response_text,
-                        active_turn.accumulated_text,
-                    )
-                    or "(No response text.)"
+                final_text = _coalesce_visible_text(
+                    event.response_text,
+                    active_turn.accumulated_text,
                 )
-                if not (
+                if final_text is not None and not (
                     active_turn.show_new_session_notice
                     and event.command == "/new"
                     and final_text == "Started a new session."
@@ -966,15 +963,13 @@ class TelegramGatewayBridge:
             return
 
         if stop_requested:
-            await self._send_final_text(
+            await self._send_html_message(
                 chat_id=message.chat_id,
-                text="Stop requested. I will stop after the current step.",
+                html_text=_format_local_system_notice(
+                    "Stop requested. I will stop after the current step."
+                ),
             )
-            return
-        await self._send_final_text(
-            chat_id=message.chat_id,
-            text="Nothing is currently running.",
-        )
+        return
 
     async def send_file(
         self,
@@ -1066,7 +1061,9 @@ class TelegramGatewayBridge:
         )
 
     async def _send_final_text(self, *, chat_id: int, text: str) -> None:
-        normalized_text = _coalesce_visible_text(text) or "(No response text.)"
+        normalized_text = _coalesce_visible_text(text)
+        if normalized_text is None:
+            return
         chunks = split_telegram_message(
             normalized_text,
             max_chars=self._settings.telegram_max_message_chars,
@@ -1707,7 +1704,7 @@ def _coalesce_visible_text(*candidates: str) -> str | None:
 
 def split_telegram_message(text: str, *, max_chars: int = 4_096) -> list[str]:
     if not _has_effective_text(text):
-        return ["(No response text.)"]
+        return []
     if len(text) <= max_chars:
         return [text]
 
@@ -1724,7 +1721,7 @@ def split_telegram_message(text: str, *, max_chars: int = 4_096) -> list[str]:
         if _has_effective_text(chunk):
             chunks.append(chunk)
         start = end
-    return chunks or ["(No response text.)"]
+    return chunks
 
 
 def _has_effective_text(text: str) -> bool:

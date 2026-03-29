@@ -1229,7 +1229,12 @@ class SubagentManager:
     ) -> bool:
         if runtime.status in {"paused", "completed", "waiting_background", "failed", "disposed"}:
             return False
-        if not runtime.loop.request_stop():
+        interruption_reason: str
+        if pause_reason == "superseded_by_user_message":
+            interruption_reason = "superseded_by_user_message"
+        else:
+            interruption_reason = "user_stop"
+        if not runtime.loop.request_stop(reason=interruption_reason):
             return False
         runtime.pending_pause_reason = pause_reason
         return True

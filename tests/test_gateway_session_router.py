@@ -248,6 +248,38 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued.client_message_id, "msg_2")
             self.assertFalse(runtime._main_resume_requires_user_message)
 
+    async def test_enqueue_user_message_supersedes_background_subagent_work_when_main_idle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(
+                runtime._main_loop,
+                "request_stop",
+                return_value=False,
+            ) as request_stop:
+                with patch.object(
+                    runtime._subagent_manager,
+                    "request_stop_all_for_superseded_user_message",
+                    return_value=(),
+                ) as stop_subagents:
+                    await runtime.enqueue_user_message(
+                        "redirect the task",
+                        client_message_id="msg_3",
+                    )
+
+            request_stop.assert_called_once_with(reason="superseded_by_user_message")
+            stop_subagents.assert_called_once_with()
+            queued = runtime._user_message_queue.get_nowait()
+            self.assertEqual(queued.user_text, "redirect the task")
+            self.assertEqual(queued.client_message_id, "msg_3")
+            self.assertFalse(runtime._main_resume_requires_user_message)
+
     async def test_stop_requested_when_only_subagent_is_running_appends_main_transcript_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
@@ -305,6 +337,31 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                     session_id="sub_session",
                     notice_kind="subagent_completed",
                     text="Ultron completed.",
+                )
+            )
+
+            self.assertTrue(runtime._message_queue.empty())
+
+    async def test_stop_suppresses_paused_subagent_followup_until_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(runtime._main_loop, "request_stop", return_value=True):
+                self.assertTrue(runtime.request_stop())
+
+            await runtime.publish_event(
+                RouteSystemNoticeEvent(
+                    route_id="route_1",
+                    agent_kind="subagent",
+                    agent_name="Ultron",
+                    subagent_id="sub_1",
+                    session_id="sub_session",
+                    notice_kind="subagent_paused",
+                    text="paused (user_stop).",
                 )
             )
 
@@ -399,6 +456,50 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                             session_id="sub_session",
                             notice_kind="subagent_waiting_background",
                             text="waiting on detached bash jobs.",
+                        )
+                    )
+
+            queued = runtime._message_queue.get_nowait()
+            self.assertIsNone(queued.user_text)
+            self.assertFalse(queued.parse_commands)
+            self.assertEqual(queued.pre_turn_messages, ())
+            self.assertEqual(queued.force_session_id, session_id)
+            self.assertEqual(queued.runtime_turn_kind, "main_subagent_progress")
+
+    async def test_subagent_paused_notice_enqueues_runtime_main_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="paused",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="turn_1",
+                current_subagent_session_id="sub_session",
+                pause_reason="superseded_by_user_message",
+            )
+
+            with patch.object(runtime, "_ensure_message_worker"):
+                with patch.object(
+                    runtime._subagent_manager,
+                    "snapshot_for",
+                    return_value=snapshot,
+                ):
+                    await runtime.publish_event(
+                        RouteSystemNoticeEvent(
+                            route_id="route_1",
+                            agent_kind="subagent",
+                            agent_name="Ultron",
+                            subagent_id="sub_1",
+                            session_id="sub_session",
+                            notice_kind="subagent_paused",
+                            text="paused (superseded_by_user_message).",
                         )
                     )
 

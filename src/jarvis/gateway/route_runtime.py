@@ -60,6 +60,7 @@ _SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS = frozenset(
         "subagent_completed",
         "subagent_failed",
         "subagent_approval_rejected",
+        "subagent_paused",
         "subagent_waiting_background",
         "subagent_needs_attention",
     }
@@ -250,8 +251,7 @@ class RouteRuntime:
             )
         )
         self._queue_wakeup.set()
-        if self._main_loop.has_active_turn():
-            self._request_user_message_supersede()
+        self._request_user_message_supersede()
         self._ensure_message_worker()
 
     def subscribe(self) -> tuple[str, asyncio.Queue[RouteEvent]]:
