@@ -216,6 +216,12 @@ class _ActiveTelegramTurn:
     suppress_compaction_completion_text: bool = False
 
 
+@dataclass(slots=True)
+class _ToolNoticeState:
+    turn_id: str | None = None
+    last_tool_name: str | None = None
+
+
 class _LegacyRouteSessionAdapter:
     """Adapts the old one-shot gateway client shape to the new route-session API."""
 
@@ -330,6 +336,7 @@ class TelegramGatewayBridge:
         self._chat_idle_events: dict[int, asyncio.Event] = {}
         self._pending_turn_events_by_chat: dict[int, asyncio.Queue[GatewayRouteEvent]] = {}
         self._approval_message_html_by_key: dict[tuple[int, int], str] = {}
+        self._tool_notice_state_by_chat: dict[int, dict[tuple[str, str], _ToolNoticeState]] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -533,6 +540,7 @@ class TelegramGatewayBridge:
             current_task = asyncio.current_task()
             if tracked is not None and tracked.event_task is current_task:
                 self._route_sessions.pop(chat_id, None)
+                self._tool_notice_state_by_chat.pop(chat_id, None)
             await session.aclose()
 
     async def _submit_message(
@@ -749,11 +757,12 @@ class TelegramGatewayBridge:
                 await self._send_final_text(chat_id=chat_id, text=flushed_text)
                 active_turn.delivered_any_segment = True
                 active_turn.pending_finalized_text_for_dedup = flushed_text
-            for tool_name in event.tool_names:
-                await self._send_html_message(
-                    chat_id=chat_id,
-                    html_text=_format_tool_usage_notice(event.agent_name, tool_name),
-                )
+            notices_sent = await self._send_tool_usage_notices(
+                chat_id=chat_id,
+                event=event,
+                fallback_turn_id=active_turn.turn_id,
+            )
+            if notices_sent:
                 active_turn.delivered_any_segment = True
             active_turn.accumulated_text = ""
             active_turn.last_draft_text = ""
@@ -831,11 +840,10 @@ class TelegramGatewayBridge:
         if isinstance(event, GatewayTurnStartedEvent):
             return
         if isinstance(event, GatewayToolCallEvent):
-            for tool_name in event.tool_names:
-                await self._send_html_message(
-                    chat_id=chat_id,
-                    html_text=_format_tool_usage_notice(event.agent_name, tool_name),
-                )
+            await self._send_tool_usage_notices(
+                chat_id=chat_id,
+                event=event,
+            )
             return
         if isinstance(event, GatewayApprovalRequestEvent):
             await self._send_approval_request_message(
@@ -924,6 +932,7 @@ class TelegramGatewayBridge:
         self._active_turn_by_chat.clear()
         self._chat_idle_events.clear()
         self._pending_turn_events_by_chat.clear()
+        self._tool_notice_state_by_chat.clear()
         await self._telegram.aclose()
 
     async def wait_for_chat_idle(self, chat_id: int) -> None:
@@ -973,6 +982,83 @@ class TelegramGatewayBridge:
             idle_event.clear()
             return
         idle_event.set()
+
+    async def _send_tool_usage_notices(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayToolCallEvent,
+        fallback_turn_id: str | None = None,
+    ) -> bool:
+        delivered_notice = False
+        for tool_name in self._tool_notice_names_for_event(
+            chat_id=chat_id,
+            event=event,
+            fallback_turn_id=fallback_turn_id,
+        ):
+            await self._send_html_message(
+                chat_id=chat_id,
+                html_text=_format_tool_usage_notice(event.agent_name, tool_name),
+            )
+            delivered_notice = True
+        return delivered_notice
+
+    def _tool_notice_names_for_event(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayToolCallEvent,
+        fallback_turn_id: str | None = None,
+    ) -> tuple[str, ...]:
+        state_by_agent = self._tool_notice_state_by_chat.setdefault(chat_id, {})
+        agent_key = self._tool_notice_agent_key(event)
+        state = state_by_agent.get(agent_key)
+        if state is None:
+            state = _ToolNoticeState()
+            state_by_agent[agent_key] = state
+
+        current_turn_id = self._tool_notice_turn_id(
+            event=event,
+            fallback_turn_id=fallback_turn_id,
+        )
+        if state.turn_id != current_turn_id:
+            state.turn_id = current_turn_id
+            state.last_tool_name = None
+
+        tool_names: list[str] = []
+        for raw_tool_name in event.tool_names:
+            tool_name = raw_tool_name.strip()
+            if not tool_name:
+                continue
+            if state.last_tool_name == tool_name:
+                continue
+            tool_names.append(tool_name)
+            state.last_tool_name = tool_name
+        return tuple(tool_names)
+
+    def _tool_notice_agent_key(self, event: GatewayToolCallEvent) -> tuple[str, str]:
+        agent_kind = event.agent_kind.strip() or "main"
+        agent_id = (event.subagent_id or "").strip()
+        if not agent_id:
+            agent_id = event.agent_name.strip() or "Jarvis"
+        return (agent_kind, agent_id)
+
+    def _tool_notice_turn_id(
+        self,
+        *,
+        event: GatewayToolCallEvent,
+        fallback_turn_id: str | None,
+    ) -> str | None:
+        candidates = (
+            (event.turn_id or "").strip(),
+            (fallback_turn_id or "").strip(),
+            (event.client_message_id or "").strip(),
+            event.event_id.strip(),
+        )
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return None
 
     async def _handle_stop_command(self, message: IncomingTelegramMessage) -> None:
         try:

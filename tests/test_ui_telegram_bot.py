@@ -758,6 +758,44 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["HTML", "HTML"],
         )
 
+    async def test_handle_message_collapses_only_consecutive_duplicate_tool_notices(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayToolCallEvent(
+                    session_id="session",
+                    tool_names=(
+                        "bash",
+                        "bash",
+                        "web_fetch",
+                        "web_fetch",
+                        "bash",
+                    ),
+                ),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_draft_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "🔧 <b>Jarvis</b> used <b>web_fetch</b> tool.",
+                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "Done.",
+            ],
+        )
+
     async def test_handle_message_flushes_pending_stream_text_before_tool_notice(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
@@ -952,6 +990,176 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.draft_attempts, 0)
         self.assertEqual(telegram.sent_drafts, [])
         self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
+
+    async def test_dispatch_message_repeats_tool_notice_when_same_tool_is_used_in_next_turn(
+        self,
+    ) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="first"),
+        )
+        first_client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                tool_names=("bash", "bash"),
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                text="Done 1.",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                response_text="Done 1.",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="second"),
+        )
+        second_client_message_id = session.sent_messages[1][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                tool_names=("bash",),
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                text="Done 2.",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                response_text="Done 2.",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "Done 1.",
+                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "Done 2.",
+            ],
+        )
+
+    async def test_background_subagent_tool_notices_collapse_only_consecutive_duplicates(
+        self,
+    ) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="sub_session",
+                turn_id="sub_turn_1",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_1",
+                tool_names=("bash", "bash", "web_fetch", "bash"),
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                response_text="",
+                interrupted=True,
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 <b>Friday</b> used <b>bash</b> tool.",
+                "🔧 <b>Friday</b> used <b>web_fetch</b> tool.",
+                "🔧 <b>Friday</b> used <b>bash</b> tool.",
+            ],
+        )
 
     async def test_handle_message_skips_whitespace_only_assistant_segment(self) -> None:
         telegram = _FakeTelegramClient()

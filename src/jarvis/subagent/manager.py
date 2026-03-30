@@ -649,6 +649,7 @@ class SubagentManager:
                             agent_kind="subagent",
                             agent_name=runtime.codename,
                             session_id=event.session_id,
+                            turn_id=event.turn_id or None,
                             subagent_id=runtime.subagent_id,
                             tool_names=event.tool_names,
                         )

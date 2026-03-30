@@ -268,6 +268,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     AgentToolCallEvent(
                         session_id="subagent_session",
                         tool_names=("bash",),
+                        turn_id="sub_turn_1",
                     ),
                     AgentTurnDoneEvent(
                         session_id="subagent_session",
@@ -325,6 +326,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 any(
                     isinstance(event, RouteToolCallEvent)
                     and event.tool_names == ("bash",)
+                    and event.turn_id == "sub_turn_1"
                     for event in published_events
                 )
             )
