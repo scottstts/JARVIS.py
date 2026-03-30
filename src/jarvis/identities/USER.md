@@ -1,7 +1,7 @@
 # USER.md
 
 Name: Scott
-My Website Markdown: https://scottsun.io/llm.txt
+My Website Markdown: https://scottsun.io/llms.txt
 
 ## Context
 
