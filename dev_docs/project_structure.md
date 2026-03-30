@@ -65,6 +65,7 @@ If this document and the code ever disagree, treat the code as source of truth a
   - intended for `uv run ...` against the bind-mounted repo
 - `Dockerfile.tool_runtime`
   - isolated runtime image for the HTTP tool runtime service
+  - imports Node 22 tooling from the official `node:22-*-slim` image through a staging copy that preserves launcher symlinks and bundled targets
   - installs the `jarvis` package into `/opt/venv`
   - does not rely on `PYTHONPATH`
 

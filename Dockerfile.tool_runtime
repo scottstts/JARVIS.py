@@ -1,8 +1,21 @@
 FROM node:22-trixie-slim AS node_runtime
 
+RUN mkdir -p /node-export/usr/local/bin /node-export/usr/local/lib /node-export/usr/local/include /node-export/opt \
+  && for tool in node npm npx corepack pnpm pnpx yarn yarnpkg; do \
+       if [ -e "/usr/local/bin/${tool}" ]; then \
+         cp -a "/usr/local/bin/${tool}" /node-export/usr/local/bin/; \
+       fi; \
+     done \
+  && if [ -d /opt/yarn-v1.22.22 ]; then \
+       cp -a /opt/yarn-v1.22.22 /node-export/opt/yarn-v1.22.22; \
+     fi \
+  && cp -a /usr/local/lib/node_modules /node-export/usr/local/lib/node_modules \
+  && cp -a /usr/local/include/node /node-export/usr/local/include/node
+
 FROM python:3.12-slim
 
 ARG YQ_VERSION=v4.50.1
+ARG DEFUDDLE_VERSION=0.14.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -43,12 +56,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && yq --version \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=node_runtime /usr/local/bin/node /usr/local/bin/node
-COPY --from=node_runtime /usr/local/bin/npm /usr/local/bin/npm
-COPY --from=node_runtime /usr/local/bin/npx /usr/local/bin/npx
-COPY --from=node_runtime /usr/local/bin/corepack /usr/local/bin/corepack
-COPY --from=node_runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
-COPY --from=node_runtime /usr/local/include/node /usr/local/include/node
+COPY --from=node_runtime /node-export/usr/local/bin/ /usr/local/bin/
+COPY --from=node_runtime /node-export/usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=node_runtime /node-export/usr/local/include/node /usr/local/include/node
+COPY --from=node_runtime /node-export/opt/ /opt/
+
+RUN npm install -g --no-fund --no-update-notifier "defuddle@${DEFUDDLE_VERSION}" \
+  && npm cache clean --force
 
 RUN python -m pip install --no-cache-dir uv
 
