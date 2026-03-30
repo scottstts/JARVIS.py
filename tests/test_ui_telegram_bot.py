@@ -32,6 +32,7 @@ from jarvis.ui.telegram.gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayErrorEvent,
+    GatewayLocalNoticeEvent,
     GatewayMessageEvent,
     GatewaySystemNoticeEvent,
     GatewayToolCallEvent,
@@ -1483,6 +1484,92 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_compact_command_sends_local_notices_and_suppresses_duplicate_plain_text(
+        self,
+    ) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=777,
+                chat_type="private",
+                text="/compact",
+            )
+        )
+
+        self.assertEqual(len(session.sent_messages), 1)
+        client_message_id = session.sent_messages[0][1]
+
+        await session.emit(
+            GatewayLocalNoticeEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                notice_kind="compaction_started",
+                text="Compacting...",
+            )
+        )
+        await session.emit(
+            GatewayLocalNoticeEvent(
+                route_id="tg_777",
+                session_id="session_2",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                notice_kind="compaction_completed",
+                text="Context compacted into a new session.",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_2",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="Context compacted into a new session.",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_2",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="Context compacted into a new session.",
+                command="/compact",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "⚙️ <b>System:</b> Compacting...",
+                "⚙️ <b>System:</b> Context compacted into a new session.",
+            ],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.sent_messages],
+            ["HTML", "HTML"],
+        )
+
     async def test_stop_command_gateway_error_is_suppressed(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
@@ -1583,6 +1670,34 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             telegram.sent_messages[0].text,
             "⚙️ <b>System:</b> <b>Ultron</b> completed.",
+        )
+
+    async def test_background_local_notice_is_sent_to_chat(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+
+        await bridge._handle_background_route_event(
+            chat_id=777,
+            event=GatewayLocalNoticeEvent(
+                route_id="route_1",
+                session_id="session_1",
+                turn_kind="runtime",
+                agent_kind="main",
+                agent_name="Jarvis",
+                notice_kind="compaction_started",
+                text="Compacting...",
+            ),
+        )
+
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(telegram.sent_messages[0].parse_mode, "HTML")
+        self.assertEqual(
+            telegram.sent_messages[0].text,
+            "⚙️ <b>System:</b> Compacting...",
         )
 
     async def test_background_main_turn_done_is_sent_to_chat(self) -> None:

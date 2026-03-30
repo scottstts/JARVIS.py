@@ -1703,6 +1703,34 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(new_records[-1].role, "assistant")
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 
+    async def test_local_notice_callback_wraps_manual_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            notices: list[tuple[str, str]] = []
+
+            async def _record_notice(notice_kind: str, text: str) -> None:
+                notices.append((notice_kind, text))
+
+            loop = AgentLoop(
+                llm_service=_FakeFollowupPreflightCompactionLLMService(),
+                settings=settings,
+                storage=storage,
+                local_notice_callback=_record_notice,
+            )
+
+            await loop.handle_user_input("Seed history.")
+            compacted = await loop.handle_user_input("/compact keep constraints")
+
+            self.assertTrue(compacted.compaction_performed)
+            self.assertEqual(
+                notices,
+                [
+                    ("compaction_started", "Compacting..."),
+                    ("compaction_completed", "Context compacted into a new session."),
+                ],
+            )
+
     async def test_handle_user_input_auto_compacts_when_current_turn_itself_overflows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -2266,10 +2294,16 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
+            notices: list[tuple[str, str]] = []
+
+            async def _record_notice(notice_kind: str, text: str) -> None:
+                notices.append((notice_kind, text))
+
             loop = AgentLoop(
                 llm_service=_FakeFollowupOverflowCompactionLLMService(),
                 settings=settings,
                 storage=storage,
+                local_notice_callback=_record_notice,
             )
 
             seeded = await loop.handle_user_input("Seed history.")
@@ -2292,6 +2326,13 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
             )
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
+            self.assertEqual(
+                notices,
+                [
+                    ("compaction_started", "Compacting..."),
+                    ("compaction_completed", "Context compacted into a new session."),
+                ],
+            )
 
     async def test_stream_user_input_auto_compacts_when_followup_provider_overflows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

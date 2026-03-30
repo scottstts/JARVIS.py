@@ -16,10 +16,12 @@ from jarvis.core import (
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
+from jarvis.core.compaction import CompactionOutcome
 from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
 from jarvis.gateway.route_events import (
     RouteAssistantMessageEvent,
     RouteErrorEvent,
+    RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
 )
 from jarvis.gateway.route_runtime import (
@@ -749,6 +751,84 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 worker.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await worker
+
+    async def test_manual_compaction_publishes_local_notice_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            self.assertTrue(
+                runtime._main_loop.append_system_note(
+                    "Compact this context.",
+                    session_id=session_id,
+                )
+            )
+            subscriber_id, event_queue = runtime.subscribe()
+
+            try:
+                with patch.object(
+                    runtime._main_loop._compactor,
+                    "compact",
+                    return_value=CompactionOutcome(
+                        summary_text="Compacted summary",
+                        model="fake-model",
+                        provider="fake-provider",
+                        input_tokens=10,
+                        output_tokens=5,
+                        total_tokens=15,
+                        response_id="resp_fake",
+                    ),
+                ):
+                    await runtime.enqueue_user_message(
+                        "/compact",
+                        client_message_id="client_1",
+                    )
+                    await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+                events: list[object] = []
+                while not event_queue.empty():
+                    events.append(event_queue.get_nowait())
+            finally:
+                runtime.unsubscribe(subscriber_id)
+                worker = runtime._message_worker
+                if worker is not None:
+                    worker.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await worker
+
+            local_notices = [
+                event
+                for event in events
+                if isinstance(event, RouteLocalNoticeEvent)
+            ]
+            self.assertEqual(
+                [
+                    (
+                        event.notice_kind,
+                        event.text,
+                        event.client_message_id,
+                        event.turn_kind,
+                    )
+                    for event in local_notices
+                ],
+                [
+                    (
+                        "compaction_started",
+                        "Compacting...",
+                        "client_1",
+                        "user",
+                    ),
+                    (
+                        "compaction_completed",
+                        "Context compacted into a new session.",
+                        "client_1",
+                        "user",
+                    ),
+                ],
+            )
 
     async def test_stop_latches_when_detached_bash_jobs_are_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

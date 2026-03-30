@@ -16,6 +16,7 @@ RouteEventType = Literal[
     "turn_done",
     "tool_call",
     "approval_request",
+    "local_notice",
     "system_notice",
     "error",
 ]
@@ -84,6 +85,13 @@ class RouteTurnDoneEvent(RouteEventBase):
 
 
 @dataclass(slots=True, frozen=True)
+class RouteLocalNoticeEvent(RouteEventBase):
+    notice_kind: str = ""
+    text: str = ""
+    type: Literal["local_notice"] = "local_notice"
+
+
+@dataclass(slots=True, frozen=True)
 class RouteSystemNoticeEvent(RouteEventBase):
     notice_kind: str = ""
     text: str = ""
@@ -104,6 +112,7 @@ RouteEvent = (
     | RouteToolCallEvent
     | RouteApprovalRequestEvent
     | RouteTurnDoneEvent
+    | RouteLocalNoticeEvent
     | RouteSystemNoticeEvent
     | RouteErrorEvent
 )

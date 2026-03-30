@@ -183,6 +183,34 @@ Rules:
 - `transcript_only` records are excluded from replay
 - do not use `transcript_only` as a substitute for prompt-visible current-turn data
 
+## Telegram-local notices
+
+Some user-facing Telegram notices are intentionally not transcript records at all.
+
+Ephemeral messages are allowed in general.
+
+The actual rule is narrower:
+
+- ephemeral messages must not be persisted
+- ephemeral messages must not be replayed into later requests
+- ephemeral messages must not be used to build provider-visible context
+- ephemeral messages must not be sent to LLM providers
+
+That separation is intentional because it preserves UI flexibility while maximizing provider-side cache hit rates.
+
+Examples:
+
+- `/new` confirmation
+- `/stop` confirmation
+- compaction start and completion notices
+
+Rules:
+
+- they are emitted as transport-visible route events for the UI
+- they are not persisted in transcript storage
+- they are not replayed into later requests
+- they are not sent to LLM providers
+
 ## Subagent Notes
 
 Subagents use the same `AgentLoop`, so the persistence and replay guarantees above apply to both:

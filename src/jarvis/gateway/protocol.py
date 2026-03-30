@@ -11,6 +11,7 @@ from .route_events import (
     RouteAssistantMessageEvent,
     RouteErrorEvent,
     RouteEvent,
+    RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
     RouteTurnStartedEvent,
@@ -272,6 +273,14 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
                 "interrupted": event.interrupted,
                 "approval_rejected": event.approval_rejected,
                 "interruption_reason": event.interruption_reason,
+            }
+        )
+        return payload
+    if isinstance(event, RouteLocalNoticeEvent):
+        payload.update(
+            {
+                "notice_kind": event.notice_kind,
+                "text": event.text,
             }
         )
         return payload

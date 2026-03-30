@@ -31,6 +31,7 @@ from .gateway_client import (
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayErrorEvent,
+    GatewayLocalNoticeEvent,
     GatewayMessageEvent,
     GatewayRouteEvent,
     GatewayRouteSession,
@@ -212,6 +213,7 @@ class _ActiveTelegramTurn:
     delivered_any_segment: bool = False
     pending_finalized_text_for_dedup: str | None = None
     drafts_enabled: bool = True
+    suppress_compaction_completion_text: bool = False
 
 
 class _LegacyRouteSessionAdapter:
@@ -707,6 +709,14 @@ class TelegramGatewayBridge:
                             "sendMessageDraft failed; continuing this turn without drafts."
                         )
             return
+        if isinstance(event, GatewayLocalNoticeEvent):
+            await self._send_html_message(
+                chat_id=chat_id,
+                html_text=_format_local_system_notice(event.text),
+            )
+            if event.notice_kind == "compaction_completed":
+                active_turn.suppress_compaction_completion_text = True
+            return
         if isinstance(event, GatewayMessageEvent):
             final_text = _coalesce_visible_text(
                 event.text,
@@ -717,6 +727,10 @@ class TelegramGatewayBridge:
                 and not (
                     active_turn.show_new_session_notice
                     and final_text == "Started a new session."
+                )
+                and not (
+                    active_turn.suppress_compaction_completion_text
+                    and final_text == "Context compacted into a new session."
                 )
                 and final_text != active_turn.pending_finalized_text_for_dedup
             ):
@@ -770,6 +784,10 @@ class TelegramGatewayBridge:
                     active_turn.show_new_session_notice
                     and event.command == "/new"
                     and final_text == "Started a new session."
+                ) and not (
+                    active_turn.suppress_compaction_completion_text
+                    and event.command == "/compact"
+                    and final_text == "Context compacted into a new session."
                 ):
                     await self._send_final_text(chat_id=chat_id, text=final_text)
             self._finish_submitted_turn(
@@ -823,6 +841,12 @@ class TelegramGatewayBridge:
             await self._send_approval_request_message(
                 chat_id=chat_id,
                 approval=event,
+            )
+            return
+        if isinstance(event, GatewayLocalNoticeEvent):
+            await self._send_html_message(
+                chat_id=chat_id,
+                html_text=_format_local_system_notice(event.text),
             )
             return
         if isinstance(event, GatewaySystemNoticeEvent):

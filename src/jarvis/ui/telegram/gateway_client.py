@@ -80,6 +80,13 @@ class GatewayTurnDoneEvent(GatewayRouteEventBase):
 
 
 @dataclass(slots=True, frozen=True)
+class GatewayLocalNoticeEvent(GatewayRouteEventBase):
+    notice_kind: str = ""
+    text: str = ""
+    type: str = "local_notice"
+
+
+@dataclass(slots=True, frozen=True)
 class GatewaySystemNoticeEvent(GatewayRouteEventBase):
     notice_kind: str = ""
     text: str = ""
@@ -100,6 +107,7 @@ GatewayRouteEvent = (
     | GatewayToolCallEvent
     | GatewayApprovalRequestEvent
     | GatewayTurnDoneEvent
+    | GatewayLocalNoticeEvent
     | GatewaySystemNoticeEvent
     | GatewayErrorEvent
 )
@@ -350,13 +358,22 @@ class GatewayWebSocketClient:
                         message=event.message or "Gateway returned an error.",
                     )
                 if isinstance(event, GatewayTurnStartedEvent):
-                    if event.client_message_id == client_message_id:
-                        matched_turn_id = event.turn_id
+                    if event.client_message_id != client_message_id:
+                        continue
+                    matched_turn_id = event.turn_id
                     continue
                 if matched_turn_id is None:
-                    continue
-                if event.turn_id != matched_turn_id:
-                    continue
+                    if event.client_message_id != client_message_id:
+                        continue
+                else:
+                    if event.turn_id is not None and event.turn_id != matched_turn_id:
+                        continue
+                    if (
+                        event.turn_id is None
+                        and event.client_message_id is not None
+                        and event.client_message_id != client_message_id
+                    ):
+                        continue
                 yield event
                 if isinstance(event, GatewayTurnDoneEvent):
                     return
@@ -516,6 +533,12 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
                 if payload.get("interruption_reason") is not None
                 else None
             ),
+        )
+    if event_type == "local_notice":
+        return GatewayLocalNoticeEvent(
+            **base_kwargs,
+            notice_kind=str(payload.get("notice_kind", "")),
+            text=str(payload.get("text", "")),
         )
     if event_type == "system_notice":
         return GatewaySystemNoticeEvent(

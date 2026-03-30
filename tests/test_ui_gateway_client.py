@@ -11,6 +11,7 @@ from jarvis.ui.telegram.gateway_client import (
     GatewayApprovalRequestEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
+    GatewayLocalNoticeEvent,
     GatewayMessageEvent,
     GatewayToolCallEvent,
     GatewayTurnDoneEvent,
@@ -190,6 +191,59 @@ class GatewayWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0].approval_id, "approval_1")
         self.assertEqual(events[0].tool_name, "bash")
         self.assertEqual(events[1].response_text, "")
+
+    async def test_stream_turn_keeps_local_notice_before_turn_started(self) -> None:
+        socket = _FakeSocket(
+            incoming=[
+                json.dumps({"type": "ready", "route_id": "tg_1", "session_id": None}),
+                json.dumps(
+                    {
+                        "type": "local_notice",
+                        "session_id": "s1",
+                        "turn_kind": "user",
+                        "client_message_id": "msg_1",
+                        "notice_kind": "compaction_started",
+                        "text": "Compacting...",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant_message",
+                        "session_id": "s1",
+                        "turn_kind": "user",
+                        "client_message_id": "msg_1",
+                        "text": "Context compacted into a new session.",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn_done",
+                        "session_id": "s1",
+                        "turn_kind": "user",
+                        "client_message_id": "msg_1",
+                        "response_text": "Context compacted into a new session.",
+                        "command": "/compact",
+                    }
+                ),
+            ]
+        )
+        client = GatewayWebSocketClient(websocket_base_url="ws://localhost:8080/ws")
+
+        with patch(
+            "jarvis.ui.telegram.gateway_client._resolve_websocket_connect",
+            return_value=lambda *args, **kwargs: _FakeConnection(socket),
+        ), patch(
+            "jarvis.ui.telegram.gateway_client.uuid4",
+            return_value=SimpleNamespace(hex="msg_1"),
+        ):
+            events = [event async for event in client.stream_turn(route_id="tg_1", user_text="/compact")]
+
+        self.assertEqual(len(events), 3)
+        self.assertIsInstance(events[0], GatewayLocalNoticeEvent)
+        self.assertEqual(events[0].notice_kind, "compaction_started")
+        self.assertEqual(events[0].text, "Compacting...")
+        self.assertIsInstance(events[1], GatewayMessageEvent)
+        self.assertIsInstance(events[2], GatewayTurnDoneEvent)
 
     async def test_submit_approval_returns_acknowledged_state(self) -> None:
         socket = _FakeSocket(

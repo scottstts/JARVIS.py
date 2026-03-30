@@ -137,6 +137,7 @@ class AgentMemoryMode:
 ToolDefinitionsProvider = Callable[[Sequence[str]], tuple[ToolDefinition, ...]]
 ToolExecutorCallable = Callable[[ToolCall, ToolExecutionContext], Awaitable[ToolExecutionResult]]
 RuntimeMessagesProvider = Callable[[str], Sequence[AgentRuntimeMessage]]
+LocalNoticeCallback = Callable[[str, str], Awaitable[None]]
 
 
 @dataclass(slots=True, frozen=True)
@@ -272,6 +273,7 @@ class AgentLoop:
         tool_definitions_provider: ToolDefinitionsProvider | None = None,
         tool_executor: ToolExecutorCallable | None = None,
         runtime_messages_provider: RuntimeMessagesProvider | None = None,
+        local_notice_callback: LocalNoticeCallback | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
@@ -303,6 +305,7 @@ class AgentLoop:
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
         self._tool_definitions_provider = tool_definitions_provider or self._default_tool_definitions
         self._tool_executor = tool_executor or self._default_execute_tool_call
+        self._local_notice_callback = local_notice_callback
         self._tool_context = ToolExecutionContext(
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
@@ -2575,15 +2578,6 @@ class AgentLoop:
             session.session_id,
             include_turn_ids=include_turn_ids,
         )
-        if self._memory_mode.maintenance:
-            try:
-                await self._memory_service.flush_before_compaction(
-                    route_id=self._tool_context.route_id,
-                    session_id=session.session_id,
-                    records=tuple(records),
-                )
-            except Exception:
-                LOGGER.exception("Memory pre-compaction flush failed.")
         compactable_records = [
             record
             for record in records
@@ -2596,6 +2590,20 @@ class AgentLoop:
         if not compactable_records:
             self._storage.update_session(session.session_id, pending_reactive_compaction=False)
             return None
+
+        await self._emit_local_notice(
+            notice_kind="compaction_started",
+            text="Compacting...",
+        )
+        if self._memory_mode.maintenance:
+            try:
+                await self._memory_service.flush_before_compaction(
+                    route_id=self._tool_context.route_id,
+                    session_id=session.session_id,
+                    records=tuple(records),
+                )
+            except Exception:
+                LOGGER.exception("Memory pre-compaction flush failed.")
 
         outcome = await self._compactor.compact(
             compactable_records,
@@ -2617,7 +2625,23 @@ class AgentLoop:
             pending_interruption_notice=session.pending_interruption_notice,
             pending_interruption_notice_reason=session.pending_interruption_notice_reason,
         )
+        await self._emit_local_notice(
+            notice_kind="compaction_completed",
+            text="Context compacted into a new session.",
+        )
         return self._storage.get_session(next_session.session_id) or next_session
+
+    async def _emit_local_notice(self, *, notice_kind: str, text: str) -> None:
+        if self._identity.kind != "main":
+            return
+        callback = self._local_notice_callback
+        if callback is None:
+            return
+        normalized_notice_kind = notice_kind.strip()
+        normalized_text = text.strip()
+        if not normalized_notice_kind or not normalized_text:
+            return
+        await callback(normalized_notice_kind, normalized_text)
 
     async def _ensure_memory_runtime_ready(self) -> None:
         if not self._memory_mode.maintenance:

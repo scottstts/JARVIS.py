@@ -49,6 +49,7 @@ from .route_events import (
     RouteAssistantMessageEvent,
     RouteErrorEvent,
     RouteEvent,
+    RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
     RouteTurnStartedEvent,
@@ -208,6 +209,7 @@ class RouteRuntime:
             tool_definitions_provider=self._build_main_tool_definitions,
             tool_executor=self._execute_main_tool_call,
             runtime_messages_provider=lambda _session_id: self._subagent_manager.main_turn_runtime_messages(),
+            local_notice_callback=self._publish_main_local_notice,
         )
 
     def active_session_id(self) -> str | None:
@@ -278,6 +280,27 @@ class RouteRuntime:
             return
         await self._event_bus.publish(event)
         await self._maybe_enqueue_subagent_supervisor_followup(event)
+
+    async def _publish_main_local_notice(self, notice_kind: str, text: str) -> None:
+        request = self._active_turn_request
+        turn_kind: str | None = None
+        client_message_id: str | None = None
+        if request is not None:
+            turn_kind = "user" if request.user_initiated else "runtime"
+            client_message_id = request.client_message_id
+        await self.publish_event(
+            RouteLocalNoticeEvent(
+                route_id=self._route_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                session_id=self._main_loop.active_session_id(),
+                turn_id=self._main_loop.active_turn_id(),
+                turn_kind=turn_kind,
+                client_message_id=client_message_id,
+                notice_kind=notice_kind,
+                text=text,
+            )
+        )
 
     async def stream_turn(
         self,
