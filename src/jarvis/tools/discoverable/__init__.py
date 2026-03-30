@@ -16,11 +16,6 @@ from .transcribe import (
     build_transcribe_discoverable,
     build_transcribe_tool,
 )
-from .youtube import (
-    YouTubePolicy,
-    build_youtube_discoverable,
-    build_youtube_tool,
-)
 
 __all__ = [
     "EmailPolicy",
@@ -29,11 +24,8 @@ __all__ = [
     "build_ffmpeg_discoverable",
     "GenerateEditImagePolicy",
     "TranscribePolicy",
-    "YouTubePolicy",
     "build_generate_edit_image_discoverable",
     "build_generate_edit_image_tool",
     "build_transcribe_discoverable",
     "build_transcribe_tool",
-    "build_youtube_discoverable",
-    "build_youtube_tool",
 ]

@@ -316,12 +316,6 @@ JARVIS_TOOL_MAX_ROUNDS_PER_TURN: Final = _integer("tools.limits.max_rounds_per_t
 JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT: Final = _integer("tools.web_search.result_count")
 JARVIS_TOOL_WEB_SEARCH_TIMEOUT_SECONDS: Final = _float("tools.web_search.timeout_seconds")
 JARVIS_TOOL_WEB_FETCH_TIMEOUT_SECONDS: Final = _float("tools.web_fetch.timeout_seconds")
-JARVIS_TOOL_WEB_FETCH_PLAYWRIGHT_TIMEOUT_SECONDS: Final = _float(
-    "tools.web_fetch.playwright_timeout_seconds"
-)
-JARVIS_TOOL_WEB_FETCH_MAX_RESPONSE_BYTES: Final = _integer(
-    "tools.web_fetch.max_response_bytes"
-)
 JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS: Final = _integer(
     "tools.web_fetch.max_markdown_chars"
 )

@@ -18,7 +18,6 @@ from .discoverable.email import EmailPolicy
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .discoverable.memory_admin import MemoryAdminPolicy
 from .discoverable.transcribe import TranscribePolicy
-from .discoverable.youtube import YouTubePolicy
 from .types import ToolExecutionContext, ToolPolicyDecision
 
 
@@ -124,12 +123,6 @@ class ToolPolicy:
                 context=context,
             )
 
-        if tool_name == "youtube":
-            return YouTubePolicy().authorize(
-                arguments=arguments,
-                context=context,
-            )
-
         if tool_name not in {
             "bash",
             "file_patch",
@@ -146,7 +139,6 @@ class ToolPolicy:
             "generate_edit_image",
             "memory_admin",
             "transcribe",
-            "youtube",
         }:
             return ToolPolicyDecision(
                 allowed=False,

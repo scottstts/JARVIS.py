@@ -46,7 +46,6 @@ from jarvis.tools import (
     ToolRuntime,
     ToolSettings,
 )
-from jarvis.tools.basic.web_fetch.tool import HTTPFetchResult
 
 _EXPECTED_BASIC_TOOL_NAMES = [
     "bash",
@@ -108,20 +107,34 @@ def _has_summary_seed_message(request: LLMRequest) -> bool:
     )
 
 
-def _build_http_fetch_result(
+def _build_web_fetch_tool_result(
     *,
+    call_id: str = "unused",
     requested_url: str,
-    content_type: str,
-    body_text: str,
-) -> HTTPFetchResult:
-    return HTTPFetchResult(
-        requested_url=requested_url,
-        final_url=requested_url,
-        status_code=200,
-        headers={"Content-Type": content_type},
-        content_type=content_type,
-        body_text=body_text,
-        redirect_chain=(),
+    markdown: str,
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        call_id=call_id,
+        name="web_fetch",
+        ok=True,
+        content="\n".join(
+            [
+                "Web fetch result",
+                f"url: {requested_url}",
+                "provider: defuddle",
+                "markdown:",
+                markdown,
+            ]
+        ),
+        metadata={
+            "requested_url": requested_url,
+            "provider": "defuddle",
+            "markdown_chars": len(markdown),
+            "markdown_truncated": False,
+            "target_runtime": "tool_runtime",
+            "runtime_location": "tool_runtime_container",
+            "runtime_transport": "http",
+        },
     )
 
 
@@ -823,8 +836,8 @@ class _FakeWebFetchLLMService:
             raise AssertionError("Expected one tool result part before follow-up model call.")
         if "Web fetch result" not in tool_result_parts[0].content:
             raise AssertionError("Expected web_fetch tool result content.")
-        if "strategy: tier1_markdown_accept" not in tool_result_parts[0].content:
-            raise AssertionError("Expected web_fetch result to record the tier 1 strategy.")
+        if "provider: defuddle" not in tool_result_parts[0].content:
+            raise AssertionError("Expected web_fetch result to record the Defuddle provider.")
 
         return _build_response("Fetched page.")
 
@@ -2541,15 +2554,15 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 storage=storage,
             )
 
-            tier1_result = _build_http_fetch_result(
+            web_fetch_result = _build_web_fetch_tool_result(
+                call_id="web_fetch_1",
                 requested_url="https://example.com/docs",
-                content_type="text/markdown",
-                body_text="# Example Docs\n\nHello from the fetched page.",
+                markdown="# Example Docs\n\nHello from the fetched page.",
             )
 
             with patch(
-                "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
-                return_value=tier1_result,
+                "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+                return_value=web_fetch_result,
             ):
                 result = await loop.handle_user_input("Fetch https://example.com/docs for me.")
 
@@ -2563,7 +2576,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-1].role, "assistant")
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "web_fetch")
             self.assertIn("Web fetch result", message_records[-2].content)
-            self.assertEqual(message_records[-2].metadata["strategy"], "tier1_markdown_accept")
+            self.assertEqual(message_records[-2].metadata["provider"], "defuddle")
 
     async def test_handle_user_input_surfaces_discoverable_tools_after_high_verbosity_tool_search(
         self,

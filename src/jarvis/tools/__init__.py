@@ -15,11 +15,11 @@ from .basic.tool_register import ToolRegisterPolicy
 from .basic.tool_search import ToolSearchPolicy
 from .basic.web_fetch import WebFetchPolicy
 from .basic.web_search import WebSearchPolicy
+from .basic.view_image import ViewImagePolicy
 from .discoverable.email import EmailPolicy
 from .discoverable.generate_edit_image import GenerateEditImagePolicy
 from .discoverable.memory_admin import MemoryAdminPolicy
 from .discoverable.transcribe import TranscribePolicy
-from .discoverable.youtube import YouTubePolicy
 from .types import (
     ToolExecutionContext,
     ToolExecutionResult,
@@ -27,7 +27,6 @@ from .types import (
     ToolPolicyDecision,
     RegisteredTool,
 )
-from .basic.view_image import ViewImagePolicy
 
 __all__ = [
     "BashCommandPolicy",
@@ -43,7 +42,6 @@ __all__ = [
     "SendFilePolicy",
     "ToolRegisterPolicy",
     "TranscribePolicy",
-    "YouTubePolicy",
     "ToolExecutionContext",
     "ToolExecutionResult",
     "ToolExposure",

@@ -33,10 +33,6 @@ from .discoverable.transcribe import (
     build_transcribe_discoverable,
     build_transcribe_tool,
 )
-from .discoverable.youtube import (
-    build_youtube_discoverable,
-    build_youtube_tool,
-)
 from .types import AgentToolAccess, DiscoverableTool, RegisteredTool
 
 
@@ -232,7 +228,6 @@ class ToolRegistry:
         registry.register(build_generate_edit_image_tool(settings))
         registry.register(build_memory_admin_tool())
         registry.register(build_transcribe_tool(settings))
-        registry.register(build_youtube_tool(settings))
         registry.register(build_tool_search_tool(registry))
         registry.register(build_tool_register_tool(registry))
         registry.register_discoverable(build_email_discoverable())
@@ -240,7 +235,6 @@ class ToolRegistry:
         registry.register_discoverable(build_generate_edit_image_discoverable())
         registry.register_discoverable(build_memory_admin_discoverable())
         registry.register_discoverable(build_transcribe_discoverable())
-        registry.register_discoverable(build_youtube_discoverable())
         return registry
 
     def register(self, tool: RegisteredTool) -> None:

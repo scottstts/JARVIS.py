@@ -1,4 +1,4 @@
-"""ASGI app for isolated bash execution."""
+"""ASGI app for isolated tool execution."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from jarvis.tools.config import ToolSettings
+from jarvis.tools.basic.web_fetch.tool import build_service_web_fetch_executor
 from jarvis.tools.types import ToolExecutionContext
 
 from .bash_executor import build_service_bash_executor
@@ -25,6 +26,7 @@ from .models import (
 def create_app(settings: ToolSettings | None = None) -> Starlette:
     resolved_settings = settings or ToolSettings.from_env()
     bash_executor = build_service_bash_executor(resolved_settings)
+    web_fetch_executor = build_service_web_fetch_executor(resolved_settings)
 
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse(
@@ -35,13 +37,25 @@ def create_app(settings: ToolSettings | None = None) -> Starlette:
         )
 
     async def execute_bash(request: Request) -> JSONResponse:
-        return await _execute_request(request, executor=bash_executor, workspace_dir=resolved_settings.workspace_dir)
+        return await _execute_request(
+            request,
+            executor=bash_executor,
+            workspace_dir=resolved_settings.workspace_dir,
+        )
+
+    async def execute_web_fetch(request: Request) -> JSONResponse:
+        return await _execute_request(
+            request,
+            executor=web_fetch_executor,
+            workspace_dir=resolved_settings.workspace_dir,
+        )
 
     return Starlette(
         debug=False,
         routes=[
             Route("/health", healthcheck, methods=["GET"]),
             Route("/tools/bash/execute", execute_bash, methods=["POST"]),
+            Route("/tools/web_fetch/execute", execute_web_fetch, methods=["POST"]),
         ],
     )
 

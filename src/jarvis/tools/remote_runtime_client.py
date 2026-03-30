@@ -184,14 +184,16 @@ def _resolve_request_timeout_seconds(
     base_timeout_seconds: float,
 ) -> float:
     requested_timeout = arguments.get("timeout_seconds")
-    if tool_name != "bash":
-        return base_timeout_seconds
-    effective_timeout = _resolve_effective_timeout(
-        requested_timeout,
-        default_timeout=settings.bash_default_timeout_seconds,
-        max_timeout=settings.bash_max_timeout_seconds,
-    )
-    return max(base_timeout_seconds, effective_timeout + 15.0)
+    if tool_name == "bash":
+        effective_timeout = _resolve_effective_timeout(
+            requested_timeout,
+            default_timeout=settings.bash_default_timeout_seconds,
+            max_timeout=settings.bash_max_timeout_seconds,
+        )
+        return max(base_timeout_seconds, effective_timeout + 15.0)
+    if tool_name == "web_fetch":
+        return max(base_timeout_seconds, settings.web_fetch_timeout_seconds + 15.0)
+    return base_timeout_seconds
 
 
 async def ensure_remote_tool_runtime_healthy(settings: ToolSettings) -> None:

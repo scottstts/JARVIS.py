@@ -21,6 +21,7 @@ from jarvis.memory import MemoryService, MemorySettings
 from jarvis.tools import (
     DiscoverableTool,
     RegisteredTool,
+    ToolExecutionResult,
     ToolExecutionContext,
     ToolPolicy,
     ToolRegistry,
@@ -44,12 +45,7 @@ from jarvis.tools.basic.bash.local_executor import (
 )
 from jarvis.tools.basic.bash.jobs import load_job, sweep_job_artifacts
 from jarvis.tools.basic.web_fetch.tool import (
-    BrowserRenderResult,
-    HTTPFetchResult,
-    MarkdownConversionResult,
-    WebFetchRequestError,
-    _render_page_html,
-    _validate_browser_request_url,
+    DirectWebFetchToolExecutor,
 )
 
 _REMOTE_TOOL_RUNTIME_CONFIGURED = bool(os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"))
@@ -94,6 +90,37 @@ _SAMPLE_JPEG_BASE64 = (
 def _bash_python_heredoc(code: str) -> str:
     normalized = code.rstrip("\n")
     return f"python - <<'PY'\n{normalized}\nPY"
+
+
+def _build_web_fetch_tool_result(
+    *,
+    requested_url: str,
+    markdown: str,
+    markdown_truncated: bool = False,
+) -> ToolExecutionResult:
+    lines = [
+        "Web fetch result",
+        f"url: {requested_url}",
+        "provider: defuddle",
+    ]
+    if markdown_truncated:
+        lines.append("markdown_truncated: true")
+    lines.extend(["markdown:", markdown])
+    return ToolExecutionResult(
+        call_id="unused",
+        name="web_fetch",
+        ok=True,
+        content="\n".join(lines),
+        metadata={
+            "requested_url": requested_url,
+            "provider": "defuddle",
+            "markdown_chars": len(markdown),
+            "markdown_truncated": markdown_truncated,
+            "target_runtime": "tool_runtime",
+            "runtime_location": "tool_runtime_container",
+            "runtime_transport": "http",
+        },
+    )
 
 
 class _FakeWebSearchResponse:
@@ -231,30 +258,6 @@ class _FakeAsyncHTTPResponse:
         if self._payload is None:
             raise ValueError("No JSON payload configured.")
         return self._payload
-
-
-def _build_http_fetch_result(
-    *,
-    requested_url: str = "https://example.com/page",
-    final_url: str | None = None,
-    status_code: int = 200,
-    headers: dict[str, str] | None = None,
-    content_type: str | None = "text/html",
-    body_text: str = "",
-    redirect_chain: tuple[str, ...] = (),
-) -> HTTPFetchResult:
-    resolved_headers = dict(headers or {})
-    if content_type is not None and "Content-Type" not in resolved_headers:
-        resolved_headers["Content-Type"] = content_type
-    return HTTPFetchResult(
-        requested_url=requested_url,
-        final_url=final_url or requested_url,
-        status_code=status_code,
-        headers=resolved_headers,
-        content_type=content_type,
-        body_text=body_text,
-        redirect_chain=redirect_chain,
-    )
 
 
 def _write_runtime_manifest(workspace_dir: Path, payload: dict[str, object]) -> Path:
@@ -435,9 +438,7 @@ class ToolSettingsTests(unittest.TestCase):
             settings = ToolSettings.from_workspace_dir(workspace_dir)
 
         self.assertEqual(settings.web_fetch_timeout_seconds, 20.0)
-        self.assertEqual(settings.web_fetch_playwright_timeout_seconds, 20.0)
-        self.assertEqual(settings.web_fetch_max_response_bytes, 2_097_152)
-        self.assertEqual(settings.web_fetch_max_markdown_chars, 20_000)
+        self.assertEqual(settings.web_fetch_max_markdown_chars, 250_000)
 
     def test_uses_default_central_python_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1260,7 +1261,6 @@ class ToolRegistryTests(unittest.TestCase):
                     "generate_edit_image",
                     "memory_admin",
                     "transcribe",
-                    "youtube",
                 ],
             )
             self.assertEqual(
@@ -1284,10 +1284,6 @@ class ToolRegistryTests(unittest.TestCase):
                 ["ffmpeg"],
             )
             self.assertEqual(
-                [tool.name for tool in registry.search_discoverable("youtube")],
-                ["youtube"],
-            )
-            self.assertEqual(
                 [
                     tool.name
                     for tool in registry.resolve_discoverable_tool_definitions(["ffmpeg"])
@@ -1307,7 +1303,6 @@ class ToolRegistryTests(unittest.TestCase):
                 "generate_edit_image",
                 "memory_admin",
                 "transcribe",
-                "youtube",
             ):
                 registered = registry.require(tool_name)
                 discoverable = registry.get_discoverable(tool_name)
@@ -2160,48 +2155,6 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("inside", decision.reason or "")
-
-    def test_youtube_allows_valid_youtube_urls(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="youtube",
-            arguments={
-                "video_urls": [
-                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                    "https://youtu.be/3JZ_D3ELwOQ?t=43",
-                ]
-            },
-            context=self.context,
-        )
-        self.assertTrue(decision.allowed)
-
-    def test_youtube_denies_invalid_video_urls(self) -> None:
-        decision = self.policy.authorize(
-            tool_name="youtube",
-            arguments={
-                "video_urls": [
-                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                    "https://example.com/not-youtube",
-                    "https://youtu.be/not-a-real-id",
-                ]
-            },
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn("[2] https://example.com/not-youtube", decision.reason or "")
-        self.assertIn("[3] https://youtu.be/not-a-real-id", decision.reason or "")
-
-    def test_youtube_denies_more_than_ten_urls(self) -> None:
-        video_urls = [
-            f"https://www.youtube.com/watch?v=vid{i:08d}"
-            for i in range(11)
-        ]
-        decision = self.policy.authorize(
-            tool_name="youtube",
-            arguments={"video_urls": video_urls},
-            context=self.context,
-        )
-        self.assertFalse(decision.allowed)
-        self.assertIn("at most 10", decision.reason or "")
 
     def test_web_search_allows_non_empty_query(self) -> None:
         decision = self.policy.authorize(
@@ -3967,343 +3920,6 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("25 MB limit", result.content)
 
-    async def test_youtube_executes_with_default_objectives(self) -> None:
-        captured: dict[str, object] = {}
-
-        class _FakeUsageMetadata:
-            def model_dump(self, *, exclude_none: bool = False) -> dict[str, int]:
-                _ = exclude_none
-                return {"total_token_count": 55}
-
-        class _FakeGeminiModels:
-            def generate_content(self, *, model, contents, config):
-                captured["model"] = model
-                captured["contents"] = contents
-                captured["config"] = config
-                return type(
-                    "_FakeGeminiResponse",
-                    (),
-                    {
-                        "model_version": "gemini-3-flash-preview",
-                        "response_id": "resp_youtube_123",
-                        "usage_metadata": _FakeUsageMetadata(),
-                        "candidates": [
-                            type(
-                                "_FakeCandidate",
-                                (),
-                                {
-                                    "content": type(
-                                        "_FakeContent",
-                                        (),
-                                        {
-                                            "parts": [
-                                                type(
-                                                    "_FakeTextPart",
-                                                    (),
-                                                    {
-                                                        "text": "Video one explains the launch plan.",
-                                                    },
-                                                )(),
-                                                type(
-                                                    "_FakeTextPart",
-                                                    (),
-                                                    {
-                                                        "text": " Video two adds implementation details.",
-                                                    },
-                                                )(),
-                                            ],
-                                        },
-                                    )(),
-                                },
-                            )()
-                        ],
-                    },
-                )()
-
-        class _FakeGeminiClient:
-            def __init__(self, *, api_key: str) -> None:
-                captured["api_key"] = api_key
-                self.models = _FakeGeminiModels()
-
-            def close(self) -> None:
-                captured["closed"] = True
-
-        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
-            with patch(
-                "jarvis.tools.discoverable.youtube.tool.genai.Client",
-                _FakeGeminiClient,
-            ):
-                result = await self.runtime.execute(
-                    tool_call=ToolCall(
-                        call_id="call_youtube_default",
-                        name="youtube",
-                        arguments={
-                            "video_urls": [
-                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                                "https://youtu.be/3JZ_D3ELwOQ",
-                            ]
-                        },
-                        raw_arguments=(
-                            '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ",'
-                            '"https://youtu.be/3JZ_D3ELwOQ"]}'
-                        ),
-                    ),
-                    context=self.context,
-                )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(result.metadata["provider"], "gemini")
-        self.assertEqual(result.metadata["model"], "gemini-3-flash-preview")
-        self.assertEqual(result.metadata["video_count"], 2)
-        self.assertEqual(result.metadata["objectives_source"], "default")
-        self.assertEqual(captured["api_key"], "test-google-key")
-        self.assertEqual(captured["model"], "gemini-3-flash-preview")
-        self.assertTrue(captured["closed"])
-        config = captured["config"]
-        self.assertIn("You are helping another agent", config.system_instruction)
-        self.assertIn("Summarize each provided video", config.system_instruction)
-        contents = captured["contents"]
-        self.assertEqual(len(contents), 3)
-        self.assertEqual(
-            [contents[0].file_data.file_uri, contents[1].file_data.file_uri],
-            [
-                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                "https://youtu.be/3JZ_D3ELwOQ",
-            ],
-        )
-        self.assertEqual(
-            contents[2],
-            "Analyze the provided YouTube videos using the active system instruction.",
-        )
-        self.assertEqual(
-            result.metadata["usage"],
-            {"total_token_count": 55},
-        )
-        self.assertIn("YouTube analysis completed", result.content)
-        self.assertIn("Video one explains the launch plan.", result.content)
-
-    async def test_youtube_executes_with_custom_objectives(self) -> None:
-        captured: dict[str, object] = {}
-
-        class _FakeGeminiModels:
-            def generate_content(self, *, model, contents, config):
-                captured["model"] = model
-                captured["contents"] = contents
-                captured["config"] = config
-                return type(
-                    "_FakeGeminiResponse",
-                    (),
-                    {
-                        "model_version": "gemini-3-flash-preview",
-                        "candidates": [
-                            type(
-                                "_FakeCandidate",
-                                (),
-                                {
-                                    "content": type(
-                                        "_FakeContent",
-                                        (),
-                                        {
-                                            "parts": [
-                                                type(
-                                                    "_FakeTextPart",
-                                                    (),
-                                                    {
-                                                        "text": "The release date claim appears at the start of the video.",
-                                                    },
-                                                )(),
-                                            ],
-                                        },
-                                    )(),
-                                },
-                            )()
-                        ],
-                    },
-                )()
-
-        class _FakeGeminiClient:
-            def __init__(self, *, api_key: str) -> None:
-                _ = api_key
-                self.models = _FakeGeminiModels()
-
-        custom_objectives = (
-            "Context: I do not need a general summary. I only need release-date evidence "
-            "from this video for downstream planning. Task: extract only concrete claims "
-            "about release timing, attribute each claim clearly, and separate direct "
-            "statements from speculation."
-        )
-
-        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-google-key"}, clear=False):
-            with patch(
-                "jarvis.tools.discoverable.youtube.tool.genai.Client",
-                _FakeGeminiClient,
-            ):
-                result = await self.runtime.execute(
-                    tool_call=ToolCall(
-                        call_id="call_youtube_custom_objectives",
-                        name="youtube",
-                        arguments={
-                            "video_urls": [
-                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                            ],
-                            "objectives": custom_objectives,
-                        },
-                        raw_arguments=(
-                            '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],'
-                            '"objectives":"Context: I do not need a general summary. I only need release-date evidence from this video for downstream planning. Task: extract only concrete claims about release timing, attribute each claim clearly, and separate direct statements from speculation."}'
-                        ),
-                    ),
-                    context=self.context,
-                )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(result.metadata["objectives_source"], "provided")
-        self.assertEqual(result.metadata["objectives"], custom_objectives)
-        self.assertEqual(captured["model"], "gemini-3-flash-preview")
-        self.assertIn("You are helping another agent", captured["config"].system_instruction)
-        self.assertIn(custom_objectives, captured["config"].system_instruction)
-        self.assertIn("release date", result.content)
-
-    async def test_youtube_executes_transcript_mode_with_defuddle(self) -> None:
-        captured_commands: list[list[str]] = []
-
-        def _fake_curl_run(*args, **kwargs):
-            command = args[0]
-            captured_commands.append(command)
-            self.assertEqual(
-                command[:5],
-                ["curl", "--fail", "--silent", "--show-error", "--location"],
-            )
-            self.assertTrue(command[5].startswith("https://defuddle.md/"))
-            self.assertTrue(kwargs["capture_output"])
-            self.assertTrue(kwargs["text"])
-            self.assertEqual(kwargs["encoding"], "utf-8")
-            self.assertFalse(kwargs["check"])
-            return subprocess.CompletedProcess(
-                args=command,
-                returncode=0,
-                stdout="# Transcript\n\nThe speaker confirms the launch date.\n",
-                stderr="",
-            )
-
-        class _FailIfCalledGeminiClient:
-            def __init__(self, *, api_key: str) -> None:
-                _ = api_key
-                raise AssertionError(
-                    "Gemini client should not be created in transcript mode."
-                )
-
-        with patch(
-            "jarvis.tools.discoverable.youtube.tool.subprocess.run",
-            side_effect=_fake_curl_run,
-        ):
-            with patch(
-                "jarvis.tools.discoverable.youtube.tool.genai.Client",
-                _FailIfCalledGeminiClient,
-            ):
-                result = await self.runtime.execute(
-                    tool_call=ToolCall(
-                        call_id="call_youtube_transcript",
-                        name="youtube",
-                        arguments={
-                            "video_urls": [
-                                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                                "https://youtu.be/3JZ_D3ELwOQ?t=43",
-                            ],
-                            "objectives": "Only summarize release timing.",
-                            "transcript": True,
-                        },
-                        raw_arguments=(
-                            '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ",'
-                            '"https://youtu.be/3JZ_D3ELwOQ?t=43"],'
-                            '"objectives":"Only summarize release timing.",'
-                            '"transcript":true}'
-                        ),
-                    ),
-                    context=self.context,
-                )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(result.metadata["provider"], "defuddle")
-        self.assertEqual(result.metadata["mode"], "transcript")
-        self.assertTrue(result.metadata["transcript_requested"])
-        self.assertTrue(result.metadata["objectives_ignored"])
-        self.assertEqual(result.metadata["video_count"], 2)
-        self.assertEqual(len(captured_commands), 2)
-        self.assertEqual(
-            captured_commands[0][5],
-            "https://defuddle.md/https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ",
-        )
-        self.assertEqual(
-            captured_commands[1][5],
-            "https://defuddle.md/https%3A%2F%2Fyoutu.be%2F3JZ_D3ELwOQ%3Ft%3D43",
-        )
-        self.assertIn("YouTube transcript retrieval completed", result.content)
-        self.assertIn("objectives_ignored: yes", result.content)
-        self.assertIn("# Transcript", result.content)
-
-    async def test_youtube_transcript_mode_reports_curl_failure(self) -> None:
-        def _fake_curl_run(*args, **kwargs):
-            _ = kwargs
-            return subprocess.CompletedProcess(
-                args=args[0],
-                returncode=22,
-                stdout="",
-                stderr="HTTP 502 from defuddle",
-            )
-
-        with patch(
-            "jarvis.tools.discoverable.youtube.tool.subprocess.run",
-            side_effect=_fake_curl_run,
-        ):
-            result = await self.runtime.execute(
-                tool_call=ToolCall(
-                    call_id="call_youtube_transcript_failure",
-                    name="youtube",
-                    arguments={
-                        "video_urls": [
-                            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                        ],
-                        "transcript": True,
-                    },
-                    raw_arguments=(
-                        '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],'
-                        '"transcript":true}'
-                    ),
-                ),
-                context=self.context,
-            )
-
-        self.assertFalse(result.ok)
-        self.assertEqual(result.metadata["provider"], "defuddle")
-        self.assertEqual(result.metadata["mode"], "transcript")
-        self.assertTrue(result.metadata["transcript_requested"])
-        self.assertIn("YouTube transcript retrieval failed", result.content)
-        self.assertIn("HTTP 502 from defuddle", result.content)
-
-    async def test_youtube_invalid_urls_fail_before_execution(self) -> None:
-        result = await self.runtime.execute(
-            tool_call=ToolCall(
-                call_id="call_youtube_invalid",
-                name="youtube",
-                arguments={
-                    "video_urls": [
-                        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                        "https://example.com/not-youtube",
-                    ]
-                },
-                raw_arguments=(
-                    '{"video_urls":["https://www.youtube.com/watch?v=dQw4w9WgXcQ",'
-                    '"https://example.com/not-youtube"]}'
-                ),
-            ),
-            context=self.context,
-        )
-
-        self.assertFalse(result.ok)
-        self.assertTrue(result.metadata["policy_denied"])
-        self.assertIn("[2] https://example.com/not-youtube", result.content)
-
     async def test_web_search_executes_and_normalizes_results(self) -> None:
         def _fake_requests_get(url, *, params, headers, timeout):
             self.assertEqual(url, "https://api.search.brave.com/res/v1/web/search")
@@ -4573,47 +4189,27 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ["email"],
         )
 
-    async def test_tool_search_high_verbosity_youtube_activates_tool(self) -> None:
-        result = await self.runtime.execute(
-            tool_call=ToolCall(
-                call_id="call_tool_search_youtube",
-                name="tool_search",
-                arguments={"query": "youtube", "verbosity": "high"},
-                raw_arguments='{"query":"youtube","verbosity":"high"}',
-            ),
-            context=self.context,
-        )
-
-        self.assertTrue(result.ok)
-        self.assertIn("youtube", result.content)
-        self.assertIn("transcript=true", result.content)
-        self.assertIn("objectives", result.content)
-        self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["youtube"])
-        self.assertEqual(
-            [match["name"] for match in result.metadata["matches"]],
-            ["youtube"],
-        )
-
-    async def test_web_fetch_uses_tier1_markdown_when_available(self) -> None:
+    async def test_web_fetch_routes_to_remote_tool_runtime(self) -> None:
         requested_url = "https://example.com/page"
-        tier1_result = _build_http_fetch_result(
+        expected_result = _build_web_fetch_tool_result(
             requested_url=requested_url,
-            content_type="text/markdown",
-            headers={
-                "Content-Type": "text/markdown",
-                "X-Markdown-Tokens": "41",
-                "Content-Signal": "search=yes",
-            },
-            body_text="# Example\n\nHello from Tier 1.",
+            markdown="# Example\n\nHello from Defuddle.",
+        )
+        expected_result = ToolExecutionResult(
+            call_id="call_web_fetch_remote",
+            name="web_fetch",
+            ok=expected_result.ok,
+            content=expected_result.content,
+            metadata=expected_result.metadata,
         )
 
         with patch(
-            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
-            return_value=tier1_result,
-        ) as fetch_mock:
+            "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+            new=AsyncMock(return_value=expected_result),
+        ) as execute_mock:
             result = await self.runtime.execute(
                 tool_call=ToolCall(
-                    call_id="call_web_fetch_tier1",
+                    call_id="call_web_fetch_remote",
                     name="web_fetch",
                     arguments={"url": requested_url},
                     raw_arguments='{"url":"https://example.com/page"}',
@@ -4622,219 +4218,109 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result.ok)
-        self.assertEqual(fetch_mock.call_count, 1)
-        self.assertEqual(result.metadata["strategy"], "tier1_markdown_accept")
-        self.assertEqual(result.metadata["markdown_tokens"], 41)
-        self.assertIn("strategy: tier1_markdown_accept", result.content)
+        execute_mock.assert_awaited_once()
+        self.assertEqual(execute_mock.await_args.kwargs["tool_name"], "web_fetch")
+        self.assertEqual(
+            execute_mock.await_args.kwargs["arguments"],
+            {"url": requested_url},
+        )
+        self.assertIn("provider: defuddle", result.content)
 
-    async def test_web_fetch_converts_html_when_markdown_fast_path_fails(self) -> None:
+    async def test_direct_web_fetch_executor_runs_defuddle(self) -> None:
         requested_url = "https://example.com/article"
-        tier1_result = _build_http_fetch_result(
-            requested_url=requested_url,
-            content_type="text/html",
-            body_text="<html><body><div>Not markdown</div></body></html>",
-        )
-        tier2_result = _build_http_fetch_result(
-            requested_url=requested_url,
-            content_type="text/html",
-            body_text=(
-                "<html><body><article><h1>Example</h1><p>Hello from HTML.</p>"
-                "</article></body></html>"
-            ),
-        )
-        converted_result = MarkdownConversionResult(
-            markdown="# Example\n\nHello from HTML.",
-            markdown_tokens=88,
-        )
+        captured_call: dict[str, object] = {}
+        executor = DirectWebFetchToolExecutor(self.settings)
+
+        def _fake_run(command: list[str], **kwargs):
+            captured_call["command"] = command
+            captured_call["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="# Example\n\nHello from Defuddle.\n",
+                stderr="",
+            )
 
         with patch(
-            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
-            side_effect=[tier1_result, tier2_result],
-        ) as fetch_mock:
-            with patch(
-                "jarvis.tools.basic.web_fetch.tool._convert_html_to_markdown",
-                return_value=converted_result,
-            ) as convert_mock:
-                result = await self.runtime.execute(
-                    tool_call=ToolCall(
-                        call_id="call_web_fetch_tier2",
-                        name="web_fetch",
-                        arguments={"url": requested_url},
-                        raw_arguments='{"url":"https://example.com/article"}',
-                    ),
-                    context=self.context,
-                )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(fetch_mock.call_count, 2)
-        convert_mock.assert_called_once()
-        self.assertEqual(result.metadata["strategy"], "tier2_html_to_markdown")
-        self.assertIn("Hello from HTML.", result.content)
-
-    async def test_web_fetch_falls_back_to_playwright_for_js_heavy_page(self) -> None:
-        requested_url = "https://example.com/app"
-        app_shell_html = (
-            "<html><body><div id=\"__next\"></div><script>window.__APP__ = {};</script>"
-            "</body></html>"
-        )
-        tier1_result = _build_http_fetch_result(
-            requested_url=requested_url,
-            content_type="text/html",
-            body_text=app_shell_html,
-        )
-        tier2_result = _build_http_fetch_result(
-            requested_url=requested_url,
-            content_type="text/html",
-            body_text=app_shell_html,
-        )
-        low_signal_markdown = MarkdownConversionResult(
-            markdown="Loading...",
-            markdown_tokens=3,
-        )
-        rendered_result = BrowserRenderResult(
-            requested_url=requested_url,
-            final_url=requested_url,
-            html=(
-                "<html><body><main><h1>Rendered App</h1><p>The client content loaded."
-                "</p></main></body></html>"
-            ),
-        )
-        rendered_markdown = MarkdownConversionResult(
-            markdown="# Rendered App\n\nThe client content loaded.",
-            markdown_tokens=55,
-        )
-
-        with patch(
-            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
-            side_effect=[tier1_result, tier2_result],
-        ) as fetch_mock:
-            with patch(
-                "jarvis.tools.basic.web_fetch.tool._convert_html_to_markdown",
-                side_effect=[low_signal_markdown, rendered_markdown],
-            ) as convert_mock:
-                with patch(
-                    "jarvis.tools.basic.web_fetch.tool._render_page_html",
-                    new=AsyncMock(return_value=rendered_result),
-                ) as render_mock:
-                    result = await self.runtime.execute(
-                        tool_call=ToolCall(
-                            call_id="call_web_fetch_tier3",
-                            name="web_fetch",
-                            arguments={"url": requested_url},
-                            raw_arguments='{"url":"https://example.com/app"}',
-                        ),
-                        context=self.context,
-                    )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(fetch_mock.call_count, 2)
-        self.assertEqual(convert_mock.call_count, 2)
-        render_mock.assert_awaited_once()
-        self.assertEqual(result.metadata["strategy"], "tier3_playwright_html_to_markdown")
-        self.assertTrue(result.metadata["browser_rendered"])
-
-    def test_validate_browser_request_url_allows_data_scheme(self) -> None:
-        _validate_browser_request_url("data:text/plain,hello")
-
-    def test_validate_browser_request_url_denies_non_http_scheme(self) -> None:
-        with self.assertRaises(WebFetchRequestError):
-            _validate_browser_request_url("javascript:alert(1)")
-
-    async def test_render_page_html_blocks_non_public_browser_subrequests(self) -> None:
-        requested_url = "https://example.com/app"
-        page = _FakeBrowserPage(
-            final_url=requested_url,
-            html="<html><body><main>Rendered</main></body></html>",
-            request_urls=(
-                requested_url,
-                "http://127.0.0.1:8080/debug",
-            ),
-        )
-        manager = _FakePlaywrightManager(page)
-
-        def validate_public_url(url: str) -> None:
-            if "127.0.0.1" in url:
-                raise WebFetchRequestError(
-                    "web_fetch does not allow private, loopback, or reserved IP targets."
-                )
-
-        with patch("jarvis.tools.basic.web_fetch.tool.async_playwright", return_value=manager):
-            with patch(
-                "jarvis.tools.basic.web_fetch.tool._validate_public_url",
-                side_effect=validate_public_url,
-            ):
-                result = await _render_page_html(
-                    url=requested_url,
-                    settings=self.settings,
-                )
-
-        self.assertEqual(result.final_url, requested_url)
-        self.assertEqual(manager.browser.context_kwargs, [{"service_workers": "block"}])
-        self.assertEqual(len(page.handled_routes), 2)
-        self.assertTrue(page.handled_routes[0].continued)
-        self.assertTrue(page.handled_routes[1].aborted)
-        self.assertEqual(page.handled_routes[1].abort_error_code, "blockedbyclient")
-
-    async def test_render_page_html_rejects_private_final_url(self) -> None:
-        requested_url = "https://example.com/app"
-        page = _FakeBrowserPage(
-            final_url="http://127.0.0.1:8080/debug",
-            html="<html><body><main>Blocked</main></body></html>",
-            request_urls=(requested_url,),
-        )
-        manager = _FakePlaywrightManager(page)
-
-        def validate_public_url(url: str) -> None:
-            if "127.0.0.1" in url:
-                raise WebFetchRequestError(
-                    "web_fetch does not allow private, loopback, or reserved IP targets."
-                )
-
-        with patch("jarvis.tools.basic.web_fetch.tool.async_playwright", return_value=manager):
-            with patch(
-                "jarvis.tools.basic.web_fetch.tool._validate_public_url",
-                side_effect=validate_public_url,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "blocked final URL"):
-                    await _render_page_html(
-                        url=requested_url,
-                        settings=self.settings,
-                    )
-
-    async def test_web_fetch_returns_configuration_error_when_account_id_missing(self) -> None:
-        requested_url = "https://example.com/docs"
-        tier1_result = _build_http_fetch_result(
-            requested_url=requested_url,
-            content_type="text/html",
-            body_text="<html><body><div>fallback</div></body></html>",
-        )
-        tier2_result = _build_http_fetch_result(
-            requested_url=requested_url,
-            content_type="text/html",
-            body_text="<html><body><article><h1>Docs</h1></article></body></html>",
-        )
-
-        with patch(
-            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
-            side_effect=[tier1_result, tier2_result],
+            "jarvis.tools.basic.web_fetch.tool.subprocess.run",
+            side_effect=_fake_run,
         ):
-            with patch.dict(
-                os.environ,
-                {"CLOUDFLARE_AI_WORKERS_REST_API_KEY": "test-key"},
-                clear=True,
-            ):
-                result = await self.runtime.execute(
-                    tool_call=ToolCall(
-                        call_id="call_web_fetch_missing_account",
-                        name="web_fetch",
-                        arguments={"url": requested_url},
-                        raw_arguments='{"url":"https://example.com/docs"}',
-                    ),
-                    context=self.context,
-                )
+            result = await executor(
+                call_id="call_defuddle_success",
+                arguments={"url": requested_url},
+                context=self.context,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            captured_call["command"],
+            ["npx", "defuddle", "parse", requested_url, "--markdown"],
+        )
+        kwargs = captured_call["kwargs"]
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        self.assertEqual(kwargs["encoding"], "utf-8")
+        self.assertFalse(kwargs["check"])
+        self.assertEqual(kwargs["cwd"], str(self.workspace_dir))
+        self.assertEqual(kwargs["timeout"], self.settings.web_fetch_timeout_seconds)
+        self.assertEqual(
+            kwargs["env"]["NODE_EXTRA_CA_CERTS"],
+            "/etc/ssl/certs/ca-certificates.crt",
+        )
+        self.assertIn("provider: defuddle", result.content)
+        self.assertIn("Hello from Defuddle.", result.content)
+
+    async def test_direct_web_fetch_executor_truncates_markdown(self) -> None:
+        requested_url = "https://example.com/long"
+        markdown = "x" * (self.settings.web_fetch_max_markdown_chars + 25)
+        executor = DirectWebFetchToolExecutor(self.settings)
+
+        with patch(
+            "jarvis.tools.basic.web_fetch.tool.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["npx", "defuddle"],
+                returncode=0,
+                stdout=markdown,
+                stderr="",
+            ),
+        ):
+            result = await executor(
+                call_id="call_defuddle_truncated",
+                arguments={"url": requested_url},
+                context=self.context,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.metadata["markdown_truncated"])
+        rendered_markdown = result.content.split("markdown:\n", 1)[1]
+        self.assertLessEqual(
+            len(rendered_markdown),
+            self.settings.web_fetch_max_markdown_chars,
+        )
+
+    async def test_direct_web_fetch_executor_returns_tool_error_on_defuddle_failure(self) -> None:
+        requested_url = "https://example.com/failure"
+        executor = DirectWebFetchToolExecutor(self.settings)
+
+        with patch(
+            "jarvis.tools.basic.web_fetch.tool.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["npx", "defuddle"],
+                returncode=1,
+                stdout="",
+                stderr="Error: fetch failed",
+            ),
+        ):
+            result = await executor(
+                call_id="call_defuddle_failure",
+                arguments={"url": requested_url},
+                context=self.context,
+            )
 
         self.assertFalse(result.ok)
-        self.assertIn("CLOUDFLARE_ACCOUNT_ID", result.content)
+        self.assertEqual(result.metadata["provider"], "defuddle")
+        self.assertIn("Web fetch failed", result.content)
+        self.assertIn("Error: fetch failed", result.content)
 
     async def test_view_image_rejects_non_universal_format(self) -> None:
         image_path = self.workspace_dir / "temp" / "sample.gif"

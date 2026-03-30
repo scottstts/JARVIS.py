@@ -67,8 +67,6 @@ class ToolSettings:
     web_search_result_count: int
     web_search_timeout_seconds: float
     web_fetch_timeout_seconds: float
-    web_fetch_playwright_timeout_seconds: float
-    web_fetch_max_response_bytes: int
     web_fetch_max_markdown_chars: int
     email_smtp_host: str
     email_smtp_port: int
@@ -121,10 +119,6 @@ class ToolSettings:
             raise ValueError("web_search_timeout_seconds must be > 0.")
         if self.web_fetch_timeout_seconds <= 0:
             raise ValueError("web_fetch_timeout_seconds must be > 0.")
-        if self.web_fetch_playwright_timeout_seconds <= 0:
-            raise ValueError("web_fetch_playwright_timeout_seconds must be > 0.")
-        if self.web_fetch_max_response_bytes <= 0:
-            raise ValueError("web_fetch_max_response_bytes must be > 0.")
         if self.web_fetch_max_markdown_chars <= 0:
             raise ValueError("web_fetch_max_markdown_chars must be > 0.")
         if not self.email_smtp_host.strip():
@@ -231,14 +225,6 @@ class ToolSettings:
             web_fetch_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_WEB_FETCH_TIMEOUT_SECONDS",
                 app_settings.JARVIS_TOOL_WEB_FETCH_TIMEOUT_SECONDS,
-            ),
-            web_fetch_playwright_timeout_seconds=_parse_float_env(
-                "JARVIS_TOOL_WEB_FETCH_PLAYWRIGHT_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_WEB_FETCH_PLAYWRIGHT_TIMEOUT_SECONDS,
-            ),
-            web_fetch_max_response_bytes=_parse_int_env(
-                "JARVIS_TOOL_WEB_FETCH_MAX_RESPONSE_BYTES",
-                app_settings.JARVIS_TOOL_WEB_FETCH_MAX_RESPONSE_BYTES,
             ),
             web_fetch_max_markdown_chars=_parse_int_env(
                 "JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS",

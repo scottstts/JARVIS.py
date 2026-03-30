@@ -66,6 +66,7 @@ If this document and the code ever disagree, treat the code as source of truth a
 - `Dockerfile.tool_runtime`
   - isolated runtime image for the HTTP tool runtime service
   - imports Node 22 tooling from the official `node:22-*-slim` image through a staging copy that preserves launcher symlinks and bundled targets
+  - installs pinned global `defuddle` and the CA env needed for Node-based HTTPS fetches in `tool_runtime`
   - installs the `jarvis` package into `/opt/venv`
   - does not rely on `PYTHONPATH`
 
@@ -219,6 +220,8 @@ Packaged prompt resources live under `subagent/prompts/`.
 HTTP service used by the isolated `tool_runtime` container.
 
 This package is launched inside the runtime container via `python -m jarvis.tool_runtime_service`.
+
+Current built-in remote endpoints execute `bash` and `web_fetch`.
 
 ### `src/jarvis/tools/`
 

@@ -569,7 +569,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - Status: implemented
 - Exposure: `basic`
 - Package: `src/jarvis/tools/basic/web_fetch/`
-- Purpose: fetch a specific web page and return clean markdown through a markdown-first three-tier strategy
+- Purpose: fetch one specific public URL and return Defuddle markdown through the isolated `tool_runtime` container
 
 #### Input Schema
 
@@ -577,13 +577,12 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Executor Behavior
 
-- reads `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_AI_WORKERS_REST_API_KEY` from runtime environment for HTML-to-markdown conversion
-- Tier 1 requests the target URL with `Accept: text/markdown` and returns the response directly when usable markdown is available
-- Tier 2 re-fetches the URL as normal HTML/text content and converts fetched HTML through Cloudflare `toMarkdown`
-- Tier 3 uses local Playwright only as a fallback for JavaScript-heavy or render-dependent pages, then sends the rendered HTML through the same Cloudflare `toMarkdown` path
-- manually validates redirect targets and rejects private / localhost / reserved destinations before following them
-- caps fetched response bodies at `JARVIS_TOOL_WEB_FETCH_MAX_RESPONSE_BYTES` and truncates oversized markdown output at `JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS`
-- stores strategy, redirect chain, content type, markdown token count, and attempt summaries in normalized tool-result metadata
+- app-side executor routes `web_fetch` into `tool_runtime` over the same internal HTTP boundary used by remote-capable tools
+- service-side executor runs `npx defuddle parse '<url>' --markdown`
+- sets `NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt` for the Defuddle process so generic HTTPS fetches stay reliable inside `tool_runtime`
+- truncates oversized markdown output at `JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS`
+- returns normalized metadata centered on requested URL, provider, truncation, and remote runtime location
+- keeps the agent-facing surface URL-only even though Defuddle itself can parse more than plain webpages, such as YouTube links and X posts
 
 #### Policy
 
@@ -594,9 +593,9 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Current Limitations
 
-- HTML conversion and browser-render fallback both depend on Cloudflare `toMarkdown`; if `CLOUDFLARE_ACCOUNT_ID` is missing, only the Tier 1 markdown-native path can succeed
-- v1 intentionally excludes image conversion and general binary/document conversion paths
-- browser rendering is fallback-only and does not expose multi-step browser automation
+- remote-only; there is no local in-process fallback when `tool_runtime` is unavailable
+- depends on Defuddle's extraction quality for the target URL type
+- does not expose browser automation, structured metadata extraction, or local file input; it is still a fetch-one-URL-to-markdown tool
 
 ### `tool_search`
 
@@ -857,45 +856,6 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - files larger than `25 MB` must be trimmed, split, or converted first, typically via `ffmpeg`
 - the tool relies on `OPENAI_API_KEY` at runtime and does not currently support alternate transcription providers
 
-### `youtube`
-
-- Status: implemented
-- Exposure: `discoverable`
-- Package: `src/jarvis/tools/discoverable/youtube/`
-- Purpose: understand one or more public YouTube videos by URL through Gemini after discovery through `tool_search`
-
-#### Input Schema
-
-- `video_urls: string[]` required; list of one or more valid YouTube video URLs
-- `objectives: string` optional; replaces the default summary task while preserving the tool's shared system instruction when provided
-- `transcript: boolean` optional; defaults to `false`; when `true`, ignores `objectives` and returns transcript text for each video via Defuddle instead of running Gemini
-
-#### Executor Behavior
-
-- stays hidden by default and only becomes callable after `tool_search` high-verbosity activation
-- when `transcript=false`, uses Gemini model `gemini-3-flash-preview`
-- when `transcript=false`, sends each public YouTube URL to Gemini as a video input part and appends a short text prompt after the video parts, following the current Gemini video-understanding guidance
-- when `transcript=false`, always keeps a built-in shared system instruction with universal context and guidelines
-- when `transcript=false`, uses a built-in summary-oriented task objective by default
-- when `transcript=false`, replaces only that default task objective when `objectives` is provided
-- when `transcript=true`, ignores `objectives` and internally runs `curl` against `https://defuddle.md/<encoded-youtube-url>` for each provided URL, returning the transcript text as the tool result
-- use `transcript=true` when exact dialogue or narration wording matters
-- use `transcript=false` when the agent wants overview, focused question answering, or analysis that depends on visual content or broader audio cues beyond the transcript
-- validates all `video_urls` before execution and returns an indexed invalid-URL error instead of making the Gemini call when any URL is malformed
-- returns normalized metadata including provider, mode, video count, and response size; Gemini mode additionally records model, objectives source, and usage metadata when available
-
-#### Policy
-
-- `video_urls` must be a non-empty list
-- every entry in `video_urls` must be a valid YouTube video URL
-- the current implementation allows at most `10` video URLs per call
-
-#### Current Limitations
-
-- v1 only does simple regex validation; it does not verify that a valid-looking YouTube URL is actually reachable, public, or still available
-- the tool is text-output only; transcript mode returns raw Defuddle text and Gemini mode does not expose structured extraction or timestamp-specific controls beyond what the caller writes into `objectives`
-- Gemini analysis mode relies on `GOOGLE_API_KEY`; transcript mode instead depends on local `curl` plus Defuddle service availability
-
 ### `email`
 
 - Status: implemented
@@ -977,6 +937,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`
 - Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
-- Implemented discoverable tools: `email`, `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`, `youtube`
+- Implemented discoverable tools: `email`, `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`
