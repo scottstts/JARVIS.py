@@ -8,9 +8,13 @@ from dataclasses import replace
 
 import uvicorn
 
+from jarvis.core import CoreSettings
 from jarvis.gateway import GatewaySettings, create_app
+from jarvis.llm import LLMSettings
 from jarvis.logging_setup import configure_application_logging, get_application_logger
+from jarvis.memory import MemorySettings
 from jarvis.runtime_env import load_docker_secrets_if_present
+from jarvis.subagent.settings import SubagentSettings
 from jarvis.ui.telegram import UISettings, run_telegram_ui
 
 LOGGER = get_application_logger(__name__)
@@ -22,12 +26,17 @@ async def run_system(
     ui_settings: UISettings | None = None,
 ) -> None:
     resolved_gateway_settings = gateway_settings or GatewaySettings.from_env()
+    resolved_core_settings = CoreSettings.from_env()
     resolved_ui_settings = _bind_ui_to_gateway(
         ui_settings or UISettings.from_env(),
         resolved_gateway_settings,
     )
+    _log_runtime_provider_configuration(core_settings=resolved_core_settings)
 
-    app = create_app(gateway_settings=resolved_gateway_settings)
+    app = create_app(
+        gateway_settings=resolved_gateway_settings,
+        core_settings=resolved_core_settings,
+    )
     server = uvicorn.Server(
         uvicorn.Config(
             app=app,
@@ -131,6 +140,50 @@ def _gateway_ws_base_url(gateway_settings: GatewaySettings) -> str:
         host = "127.0.0.1"
     websocket_path = gateway_settings.websocket_path
     return f"ws://{host}:{gateway_settings.port}{websocket_path}"
+
+
+def _log_runtime_provider_configuration(*, core_settings: CoreSettings) -> None:
+    provider_configuration = _load_runtime_provider_configuration(
+        core_settings=core_settings,
+    )
+    LOGGER.info("=====================================")
+    LOGGER.info("Main Agent LLM Provider: %s", provider_configuration["main_llm"])
+    LOGGER.info("Subagent LLM Provider: %s", provider_configuration["subagent_llm"])
+    LOGGER.info(
+        "Memory Maintenance LLM Provider: %s",
+        provider_configuration["memory_maintenance_llm"],
+    )
+    LOGGER.info("Embedding Model Provider: %s", provider_configuration["embedding"])
+    LOGGER.info("=====================================")
+
+
+def _load_runtime_provider_configuration(*, core_settings: CoreSettings) -> dict[str, str]:
+    llm_settings = LLMSettings.from_env()
+    memory_settings = MemorySettings.from_workspace_dir(core_settings.workspace_dir)
+    subagent_settings = SubagentSettings.from_workspace_dir(
+        core_settings.workspace_dir,
+        transcript_archive_root=core_settings.transcript_archive_dir,
+    )
+    return _resolve_runtime_provider_configuration(
+        llm_settings=llm_settings,
+        memory_settings=memory_settings,
+        subagent_settings=subagent_settings,
+    )
+
+
+def _resolve_runtime_provider_configuration(
+    *,
+    llm_settings: LLMSettings,
+    memory_settings: MemorySettings,
+    subagent_settings: SubagentSettings,
+) -> dict[str, str]:
+    main_provider = llm_settings.default_provider
+    return {
+        "main_llm": main_provider,
+        "subagent_llm": subagent_settings.provider or main_provider,
+        "memory_maintenance_llm": memory_settings.maintenance_provider,
+        "embedding": llm_settings.embedding.provider,
+    }
 
 
 if __name__ == "__main__":

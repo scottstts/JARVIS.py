@@ -10,7 +10,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import jarvis.main as jarvis_main
+from jarvis.core import ContextPolicySettings, CoreSettings
 from jarvis.gateway import GatewaySettings
+from jarvis.llm import EmbeddingSettings, LLMSettings
+from jarvis.memory import MemorySettings
+from jarvis.subagent.settings import SubagentSettings
 from jarvis.ui.telegram import UISettings
 
 from jarvis.runtime_env import load_docker_secrets_if_present
@@ -118,6 +122,102 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fake_server.config["access_log"])
         self.assertEqual(fake_server.config["host"], "0.0.0.0")
         self.assertEqual(fake_server.config["port"], 8181)
+
+    def test_resolve_runtime_provider_configuration_falls_back_to_main_for_subagent(self) -> None:
+        provider_configuration = jarvis_main._resolve_runtime_provider_configuration(
+            llm_settings=LLMSettings(
+                default_provider="openai",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-3-small"),
+            ),
+            memory_settings=MemorySettings(
+                workspace_dir=Path("/tmp/workspace"),
+                memory_dir=Path("/tmp/workspace/memory"),
+                index_dir=Path("/tmp/workspace/memory/.index"),
+                default_timezone="Europe/Dublin",
+                maintenance_provider="anthropic",
+                maintenance_model="claude-maintenance",
+                maintenance_max_output_tokens=1024,
+                bootstrap_max_tokens=8000,
+                core_bootstrap_max_tokens=3000,
+                ongoing_bootstrap_max_tokens=3000,
+                search_default_top_k=8,
+                daily_lookback_days=7,
+                enable_reflection=True,
+                enable_auto_apply_core=True,
+                enable_auto_apply_ongoing=True,
+                graph_default_expand=1,
+            ),
+            subagent_settings=SubagentSettings(
+                provider=None,
+                max_active=4,
+                codename_pool=("Friday",),
+                archive_dir=Path("/tmp/workspace/archive/transcripts/subagents"),
+                builtin_tool_blocklist=(),
+                main_context_event_limit=20,
+            ),
+        )
+
+        self.assertEqual(
+            provider_configuration,
+            {
+                "main_llm": "openai",
+                "subagent_llm": "openai",
+                "memory_maintenance_llm": "anthropic",
+                "embedding": "openai",
+            },
+        )
+
+    def test_log_runtime_provider_configuration_logs_effective_providers(self) -> None:
+        core_settings = CoreSettings(
+            context_policy=ContextPolicySettings(
+                context_window_tokens=100_000,
+                compact_threshold_tokens=60_000,
+                compact_reserve_output_tokens=8_000,
+                compact_reserve_overhead_tokens=2_000,
+            ),
+            workspace_dir=Path("/tmp/workspace"),
+            transcript_archive_dir=Path("/tmp/workspace/archive/transcripts"),
+            identities_dir=Path("/tmp/workspace/identities"),
+            turn_timezone="Europe/Dublin",
+        )
+
+        with patch.object(
+            jarvis_main,
+            "_load_runtime_provider_configuration",
+            return_value={
+                "main_llm": "openai",
+                "subagent_llm": "gemini",
+                "memory_maintenance_llm": "anthropic",
+                "embedding": "openai",
+            },
+        ):
+            with self.assertLogs(jarvis_main.LOGGER.name, level="INFO") as captured_logs:
+                jarvis_main._log_runtime_provider_configuration(core_settings=core_settings)
+
+        self.assertIn(
+            "=====================================",
+            captured_logs.output[0],
+        )
+        self.assertIn(
+            "Main Agent LLM Provider: openai",
+            captured_logs.output[1],
+        )
+        self.assertIn(
+            "Subagent LLM Provider: gemini",
+            captured_logs.output[2],
+        )
+        self.assertIn(
+            "Memory Maintenance LLM Provider: anthropic",
+            captured_logs.output[3],
+        )
+        self.assertIn(
+            "Embedding Model Provider: openai",
+            captured_logs.output[4],
+        )
+        self.assertIn(
+            "=====================================",
+            captured_logs.output[5],
+        )
 
     async def test_run_system_propagates_gateway_startup_failure(self) -> None:
         startup_error = RuntimeError("gateway boom")

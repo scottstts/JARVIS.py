@@ -135,3 +135,4 @@
 - `/new` now performs a route-wide subagent reset before the fresh main session starts: it reuses the user-stop path for live children, cancels subagent-owned detached bash jobs, silently disposes every remaining non-disposed subagent, and leaves `/new` startup failures unbound from Telegram so they stay log-only.
 - Telegram-local UX notices now have a dedicated ephemeral route event path; `/new`, `/stop`, and compaction start/completion messages are shown in Telegram but never persisted or sent to providers.
 - After Telegram shows the `/stop` confirmation, the bridge now mutes all later route events for that chat until the next user turn starts, while the runtime still finishes and persists in-flight work normally.
+- Combined `jarvis` startup now logs effective provider routing for main LLM, subagent LLM, memory maintenance LLM, and embeddings; subagents log the inherited main provider when no override is configured.
