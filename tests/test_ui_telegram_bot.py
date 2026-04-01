@@ -1506,6 +1506,283 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["handled second"],
         )
 
+    async def test_stop_command_suppresses_in_flight_route_events_until_next_user_turn(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="first"),
+        )
+        first_client_message_id = session.sent_messages[0][1]
+
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="/stop"),
+        )
+
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="suppressed reply",
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                tool_names=("bash",),
+            )
+        )
+        await session.emit(
+            GatewaySystemNoticeEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                agent_kind="subagent",
+                agent_name="Ultron",
+                subagent_id="sub_1",
+                notice_kind="subagent_completed",
+                text="completed.",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="suppressed reply",
+                interrupted=True,
+                interruption_reason="user_stop",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertTrue(session.stop_requested)
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["⚙️ <b>System:</b> Stop requested. I will stop after the current step."],
+        )
+
+    async def test_stop_command_resumes_output_only_after_next_user_turn_event(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="first"),
+        )
+        first_client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="/stop"),
+        )
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=3, chat_id=777, chat_type="private", text="resume"),
+        )
+        second_client_message_id = session.sent_messages[1][1]
+
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="stale after stop",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="stale after stop",
+                interrupted=True,
+                interruption_reason="user_stop",
+            )
+        )
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="handled second",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_2",
+                turn_kind="user",
+                client_message_id=second_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="handled second",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "⚙️ <b>System:</b> Stop requested. I will stop after the current step.",
+                "handled second",
+            ],
+        )
+
+    async def test_stop_command_resumes_new_command_without_turn_started_event(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="first"),
+        )
+        first_client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="/stop"),
+        )
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=3, chat_id=777, chat_type="private", text="/new"),
+        )
+        new_client_message_id = session.sent_messages[1][1]
+
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=first_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="",
+                interrupted=True,
+                interruption_reason="user_stop",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session_2",
+                turn_kind="user",
+                client_message_id=new_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                text="Started a new session.",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session_2",
+                turn_kind="user",
+                client_message_id=new_client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                response_text="Started a new session.",
+                command="/new",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "⚙️ <b>System:</b> Stop requested. I will stop after the current step.",
+                "⚙️ <b>System:</b> Started a new session.",
+            ],
+        )
+
     async def test_dispatch_message_submits_mid_turn_file_message_immediately(self) -> None:
         telegram = _FakeTelegramClient(
             remote_files={

@@ -210,6 +210,7 @@ Rules:
 - they are not persisted in transcript storage
 - they are not replayed into later requests
 - they are not sent to LLM providers
+- after Telegram shows the `/stop` confirmation, the Telegram bridge suppresses all later route output for that paused route until the next user turn starts emitting its own user-turn events
 
 ## Subagent Notes
 

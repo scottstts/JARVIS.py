@@ -222,6 +222,12 @@ class _ToolNoticeState:
     last_tool_name: str | None = None
 
 
+@dataclass(slots=True)
+class _ChatOutputPauseState:
+    paused: bool = False
+    resume_client_message_id: str | None = None
+
+
 class _LegacyRouteSessionAdapter:
     """Adapts the old one-shot gateway client shape to the new route-session API."""
 
@@ -337,6 +343,7 @@ class TelegramGatewayBridge:
         self._pending_turn_events_by_chat: dict[int, asyncio.Queue[GatewayRouteEvent]] = {}
         self._approval_message_html_by_key: dict[tuple[int, int], str] = {}
         self._tool_notice_state_by_chat: dict[int, dict[tuple[str, str], _ToolNoticeState]] = {}
+        self._output_pause_state_by_chat: dict[int, _ChatOutputPauseState] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -572,12 +579,20 @@ class TelegramGatewayBridge:
         turns.append(submitted_turn)
         self._submitted_turns_by_message_id[(message.chat_id, client_message_id)] = submitted_turn
         self._idle_event_for_chat(message.chat_id).clear()
+        self._maybe_arm_chat_output_resume(
+            chat_id=message.chat_id,
+            client_message_id=client_message_id,
+        )
         try:
             await route_session.send_user_message(
                 text=user_text,
                 client_message_id=client_message_id,
             )
         except Exception:
+            self._clear_chat_output_resume_candidate_if_matches(
+                chat_id=message.chat_id,
+                client_message_id=client_message_id,
+            )
             self._submitted_turns_by_message_id.pop((message.chat_id, client_message_id), None)
             try:
                 turns.remove(submitted_turn)
@@ -593,6 +608,7 @@ class TelegramGatewayBridge:
         chat_id: int,
         event: GatewayRouteEvent,
     ) -> None:
+        self._maybe_resume_chat_output_from_event(chat_id=chat_id, event=event)
         if (
             isinstance(event, GatewayTurnStartedEvent)
             and event.agent_kind == "main"
@@ -667,6 +683,7 @@ class TelegramGatewayBridge:
         event: GatewayRouteEvent,
         active_turn: _ActiveTelegramTurn,
     ) -> None:
+        output_paused = self._chat_output_paused(chat_id)
         if isinstance(event, GatewayErrorEvent):
             LOGGER.warning(
                 "Suppressing gateway error for Telegram chat %s (code=%s, message=%s).",
@@ -683,7 +700,7 @@ class TelegramGatewayBridge:
             if not event.delta:
                 return
             active_turn.accumulated_text += event.delta
-            if not active_turn.drafts_enabled:
+            if output_paused or not active_turn.drafts_enabled:
                 return
             now = time.monotonic()
             if _should_flush_draft(
@@ -718,12 +735,13 @@ class TelegramGatewayBridge:
                         )
             return
         if isinstance(event, GatewayLocalNoticeEvent):
-            await self._send_html_message(
-                chat_id=chat_id,
-                html_text=_format_local_system_notice(event.text),
-            )
-            if event.notice_kind == "compaction_completed":
-                active_turn.suppress_compaction_completion_text = True
+            if not output_paused:
+                await self._send_html_message(
+                    chat_id=chat_id,
+                    html_text=_format_local_system_notice(event.text),
+                )
+                if event.notice_kind == "compaction_completed":
+                    active_turn.suppress_compaction_completion_text = True
             return
         if isinstance(event, GatewayMessageEvent):
             final_text = _coalesce_visible_text(
@@ -731,7 +749,8 @@ class TelegramGatewayBridge:
                 active_turn.accumulated_text,
             )
             if (
-                final_text is not None
+                not output_paused
+                and final_text is not None
                 and not (
                     active_turn.show_new_session_notice
                     and final_text == "Started a new session."
@@ -753,15 +772,17 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayToolCallEvent):
             flushed_text = _coalesce_visible_text(active_turn.accumulated_text)
-            if flushed_text is not None:
+            if not output_paused and flushed_text is not None:
                 await self._send_final_text(chat_id=chat_id, text=flushed_text)
                 active_turn.delivered_any_segment = True
                 active_turn.pending_finalized_text_for_dedup = flushed_text
-            notices_sent = await self._send_tool_usage_notices(
-                chat_id=chat_id,
-                event=event,
-                fallback_turn_id=active_turn.turn_id,
-            )
+            notices_sent = False
+            if not output_paused:
+                notices_sent = await self._send_tool_usage_notices(
+                    chat_id=chat_id,
+                    event=event,
+                    fallback_turn_id=active_turn.turn_id,
+                )
             if notices_sent:
                 active_turn.delivered_any_segment = True
             active_turn.accumulated_text = ""
@@ -772,11 +793,12 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayApprovalRequestEvent):
             flushed_text = _coalesce_visible_text(active_turn.accumulated_text)
-            if flushed_text is not None:
+            if not output_paused and flushed_text is not None:
                 await self._send_final_text(chat_id=chat_id, text=flushed_text)
                 active_turn.delivered_any_segment = True
                 active_turn.pending_finalized_text_for_dedup = flushed_text
-            await self._send_approval_request_message(chat_id=chat_id, approval=event)
+            if not output_paused:
+                await self._send_approval_request_message(chat_id=chat_id, approval=event)
             active_turn.accumulated_text = ""
             active_turn.last_draft_text = ""
             active_turn.last_draft_at = 0.0
@@ -784,7 +806,11 @@ class TelegramGatewayBridge:
             active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
             return
         if isinstance(event, GatewayTurnDoneEvent):
-            if not event.interrupted and not active_turn.delivered_any_segment:
+            if (
+                not output_paused
+                and not event.interrupted
+                and not active_turn.delivered_any_segment
+            ):
                 final_text = _coalesce_visible_text(
                     event.response_text,
                     active_turn.accumulated_text,
@@ -837,6 +863,15 @@ class TelegramGatewayBridge:
         chat_id: int,
         event: GatewayRouteEvent,
     ) -> None:
+        if self._chat_output_paused(chat_id):
+            if isinstance(event, GatewayErrorEvent):
+                LOGGER.warning(
+                    "Suppressing background gateway error for Telegram chat %s (code=%s, message=%s).",
+                    chat_id,
+                    event.code or "gateway_error",
+                    event.message or "",
+                )
+            return
         if isinstance(event, GatewayTurnStartedEvent):
             return
         if isinstance(event, GatewayToolCallEvent):
@@ -933,6 +968,7 @@ class TelegramGatewayBridge:
         self._chat_idle_events.clear()
         self._pending_turn_events_by_chat.clear()
         self._tool_notice_state_by_chat.clear()
+        self._output_pause_state_by_chat.clear()
         await self._telegram.aclose()
 
     async def wait_for_chat_idle(self, chat_id: int) -> None:
@@ -950,6 +986,10 @@ class TelegramGatewayBridge:
 
     def _finish_submitted_turn(self, *, chat_id: int, client_message_id: str) -> None:
         self._active_turn_by_chat.pop(chat_id, None)
+        self._clear_chat_output_resume_candidate_if_matches(
+            chat_id=chat_id,
+            client_message_id=client_message_id,
+        )
         submitted_turn = self._submitted_turns_by_message_id.pop(
             (chat_id, client_message_id),
             None,
@@ -1079,7 +1119,82 @@ class TelegramGatewayBridge:
                     "Stop requested. I will stop after the current step."
                 ),
             )
+            self._pause_chat_output(message.chat_id)
         return
+
+    def _pause_chat_output(self, chat_id: int) -> None:
+        state = self._output_pause_state_by_chat.get(chat_id)
+        if state is None:
+            state = _ChatOutputPauseState()
+            self._output_pause_state_by_chat[chat_id] = state
+        state.paused = True
+        state.resume_client_message_id = None
+
+    def _chat_output_paused(self, chat_id: int) -> bool:
+        state = self._output_pause_state_by_chat.get(chat_id)
+        return bool(state is not None and state.paused)
+
+    def _maybe_arm_chat_output_resume(
+        self,
+        *,
+        chat_id: int,
+        client_message_id: str,
+    ) -> None:
+        state = self._output_pause_state_by_chat.get(chat_id)
+        if state is None or not state.paused:
+            return
+        if state.resume_client_message_id is not None:
+            return
+        normalized_client_message_id = client_message_id.strip()
+        if not normalized_client_message_id:
+            return
+        state.resume_client_message_id = normalized_client_message_id
+
+    def _maybe_resume_chat_output_from_event(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayRouteEvent,
+    ) -> None:
+        state = self._output_pause_state_by_chat.get(chat_id)
+        if state is None or not state.paused:
+            return
+        resume_client_message_id = (state.resume_client_message_id or "").strip()
+        if not resume_client_message_id:
+            return
+        if event.agent_kind != "main" or event.turn_kind != "user":
+            return
+        event_client_message_id = (event.client_message_id or "").strip()
+        if event_client_message_id != resume_client_message_id:
+            return
+        state.paused = False
+        state.resume_client_message_id = None
+        self._maybe_prune_chat_output_pause_state(chat_id)
+
+    def _clear_chat_output_resume_candidate_if_matches(
+        self,
+        *,
+        chat_id: int,
+        client_message_id: str,
+    ) -> None:
+        state = self._output_pause_state_by_chat.get(chat_id)
+        if state is None or not state.paused:
+            return
+        normalized_client_message_id = client_message_id.strip()
+        if not normalized_client_message_id:
+            return
+        if state.resume_client_message_id != normalized_client_message_id:
+            return
+        state.resume_client_message_id = None
+        self._maybe_prune_chat_output_pause_state(chat_id)
+
+    def _maybe_prune_chat_output_pause_state(self, chat_id: int) -> None:
+        state = self._output_pause_state_by_chat.get(chat_id)
+        if state is None:
+            return
+        if state.paused or state.resume_client_message_id is not None:
+            return
+        self._output_pause_state_by_chat.pop(chat_id, None)
 
     async def send_file(
         self,
