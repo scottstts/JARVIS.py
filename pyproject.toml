@@ -14,6 +14,7 @@ dependencies = [
     "httpx>=0.28.1",
     "jsonschema>=4.25.1",
     "openai>=2.24.0",
+    "playwright>=1.58.0",
     "pyyaml>=6.0.3",
     "rapidfuzz>=3.14.3",
     "requests>=2.32.5",

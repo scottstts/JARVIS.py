@@ -569,7 +569,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - Status: implemented
 - Exposure: `basic`
 - Package: `src/jarvis/tools/basic/web_fetch/`
-- Purpose: fetch one specific public URL and return Defuddle markdown through the isolated `tool_runtime` container
+- Purpose: fetch one specific public URL and return clean markdown through a split jarvis-runtime / tool-runtime fallback flow
 
 #### Input Schema
 
@@ -577,12 +577,21 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Executor Behavior
 
-- app-side executor routes `web_fetch` into `tool_runtime` over the same internal HTTP boundary used by remote-capable tools
-- service-side executor runs `npx defuddle parse '<url>' --markdown`
-- sets `NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt` for the Defuddle process so generic HTTPS fetches stay reliable inside `tool_runtime`
+- app-side executor runs inside `jarvis_runtime` and orchestrates the fallback order
+- generic URL order is:
+  1. request the target with `Accept: text/markdown` and return it directly when usable markdown is available
+  2. if that does not yield usable markdown, call the remote `tool_runtime` executor for Defuddle
+  3. if Defuddle fails, fetch the page as HTML/text in `jarvis_runtime` and send HTML through Cloudflare `toMarkdown`
+- if the normal HTML fetch path still fails or returns unusable content, `jarvis_runtime` falls back to local Playwright rendering, writes the rendered HTML to a temporary shared-workspace file, asks `tool_runtime` Defuddle to parse that local HTML file first, and only then falls back to Cloudflare `toMarkdown` on the rendered HTML
+- YouTube video URLs, X/Twitter post or article URLs, and Reddit URLs are forced onto the Defuddle-only path and skip the local Cloudflare paths
+- the remote `tool_runtime` executor is Defuddle-only and runs `npx defuddle parse '<url>' --markdown`
+- the remote executor also accepts internal rendered-HTML workspace paths from `jarvis_runtime` so local browser renders can still be parsed by Defuddle without installing Node/Defuddle in `jarvis_runtime`
+- the Defuddle subprocess sets `NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt` so Node-based HTTPS fetches stay reliable inside `tool_runtime`
+- the Cloudflare HTML conversion path runs only in `jarvis_runtime`, reading `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_AI_WORKERS_REST_API_KEY` from the app runtime environment
+- local Playwright rendering also runs only in `jarvis_runtime`; rendered HTML temp files are deleted immediately after the internal Defuddle attempt
+- before the Cloudflare conversion path, local HTTP fetches reject binary/document responses and keep the fetch-size budget tied to `JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS`
 - truncates oversized markdown output at `JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS`
-- returns normalized metadata centered on requested URL, provider, truncation, and remote runtime location
-- keeps the agent-facing surface URL-only even though Defuddle itself can parse more than plain webpages, such as YouTube links and X posts
+- keeps the agent-facing surface URL-only and does not expose extraction-strategy metadata to the model
 
 #### Policy
 
@@ -593,9 +602,10 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Current Limitations
 
-- remote-only; there is no local in-process fallback when `tool_runtime` is unavailable
-- depends on Defuddle's extraction quality for the target URL type
-- does not expose browser automation, structured metadata extraction, or local file input; it is still a fetch-one-URL-to-markdown tool
+- forced-Defuddle URL classes currently include YouTube video URLs, X/Twitter post/article URLs, and Reddit URLs only
+- the Cloudflare HTML conversion fallback depends on app-runtime Cloudflare credentials being present; the isolated `tool_runtime` intentionally does not receive those secrets
+- browser rendering is fallback-only, stays local to `jarvis_runtime`, and still may fail on some anti-bot sites
+- does not expose structured extraction, browser automation, or local file input; it remains a fetch-one-URL-to-markdown tool
 
 ### `tool_search`
 

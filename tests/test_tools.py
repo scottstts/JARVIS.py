@@ -45,7 +45,14 @@ from jarvis.tools.basic.bash.local_executor import (
 )
 from jarvis.tools.basic.bash.jobs import load_job, sweep_job_artifacts
 from jarvis.tools.basic.web_fetch.tool import (
+    BrowserRenderResult,
     DirectWebFetchToolExecutor,
+    HTTPFetchResult,
+    MarkdownConversionResult,
+    WebFetchRequestError,
+    _markdown_is_usable,
+    _render_page_html,
+    _validate_browser_request_url,
 )
 
 _REMOTE_TOOL_RUNTIME_CONFIGURED = bool(os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"))
@@ -98,28 +105,43 @@ def _build_web_fetch_tool_result(
     markdown: str,
     markdown_truncated: bool = False,
 ) -> ToolExecutionResult:
-    lines = [
-        "Web fetch result",
-        f"url: {requested_url}",
-        "provider: defuddle",
-    ]
-    if markdown_truncated:
-        lines.append("markdown_truncated: true")
-    lines.extend(["markdown:", markdown])
     return ToolExecutionResult(
         call_id="unused",
         name="web_fetch",
         ok=True,
-        content="\n".join(lines),
+        content="\n".join(
+            [
+                "Web fetch result",
+                f"url: {requested_url}",
+                "markdown:",
+                markdown,
+            ]
+        ),
         metadata={
             "requested_url": requested_url,
-            "provider": "defuddle",
             "markdown_chars": len(markdown),
             "markdown_truncated": markdown_truncated,
-            "target_runtime": "tool_runtime",
-            "runtime_location": "tool_runtime_container",
-            "runtime_transport": "http",
         },
+    )
+
+
+def _build_http_fetch_result(
+    *,
+    requested_url: str,
+    body_text: str,
+    content_type: str,
+    status_code: int = 200,
+    final_url: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> HTTPFetchResult:
+    return HTTPFetchResult(
+        requested_url=requested_url,
+        final_url=final_url or requested_url,
+        status_code=status_code,
+        headers=headers or {},
+        content_type=content_type,
+        body_text=body_text,
+        redirect_chain=(),
     )
 
 
@@ -4189,14 +4211,167 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ["email"],
         )
 
-    async def test_web_fetch_routes_to_remote_tool_runtime(self) -> None:
+    async def test_web_fetch_returns_source_markdown_without_defuddle_fallback(self) -> None:
         requested_url = "https://example.com/page"
+        tier1_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/markdown",
+            headers={
+                "Content-Type": "text/markdown",
+                "X-Markdown-Tokens": "41",
+                "Content-Signal": "search=yes",
+            },
+            body_text="# Example\n\nHello from Tier 1.",
+        )
+
+        with patch(
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
+            return_value=tier1_result,
+        ) as fetch_mock:
+            with patch(
+                "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+                new=AsyncMock(side_effect=AssertionError("Defuddle should not be used.")),
+            ):
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_web_fetch_tier1",
+                        name="web_fetch",
+                        arguments={"url": requested_url},
+                        raw_arguments='{"url":"https://example.com/page"}',
+                    ),
+                    context=self.context,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(fetch_mock.call_count, 1)
+        self.assertEqual(result.metadata["final_url"], requested_url)
+        self.assertEqual(result.metadata["status_code"], 200)
+        self.assertEqual(result.metadata["markdown_tokens"], 41)
+        self.assertEqual(result.metadata["content_signal"], "search=yes")
+        self.assertIn("Hello from Tier 1.", result.content)
+
+    async def test_web_fetch_routes_youtube_x_and_reddit_urls_to_remote_defuddle_only(self) -> None:
+        forced_urls = (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://x.com/openai/status/1234567890",
+            "https://www.reddit.com/r/python/comments/abc123/example_post/",
+        )
+
+        for index, requested_url in enumerate(forced_urls, start=1):
+            with self.subTest(url=requested_url):
+                expected_result = _build_web_fetch_tool_result(
+                    requested_url=requested_url,
+                    markdown="# Example\n\nHello from Defuddle.",
+                )
+                expected_result = ToolExecutionResult(
+                    call_id=f"call_web_fetch_remote_{index}",
+                    name="web_fetch",
+                    ok=expected_result.ok,
+                    content=expected_result.content,
+                    metadata=expected_result.metadata,
+                )
+
+                with patch(
+                    "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+                    new=AsyncMock(return_value=expected_result),
+                ) as execute_mock:
+                    with patch(
+                        "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
+                        side_effect=AssertionError("HTTP fallback should not run."),
+                    ):
+                        result = await self.runtime.execute(
+                            tool_call=ToolCall(
+                                call_id=f"call_web_fetch_remote_{index}",
+                                name="web_fetch",
+                                arguments={"url": requested_url},
+                                raw_arguments=f'{{"url":"{requested_url}"}}',
+                            ),
+                            context=self.context,
+                        )
+
+                self.assertTrue(result.ok)
+                execute_mock.assert_awaited_once()
+                self.assertEqual(execute_mock.await_args.kwargs["tool_name"], "web_fetch")
+                self.assertEqual(
+                    execute_mock.await_args.kwargs["arguments"],
+                    {"url": requested_url},
+                )
+
+    async def test_web_fetch_falls_back_from_defuddle_to_cloudflare_conversion(self) -> None:
+        requested_url = "https://example.com/article"
+        tier1_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text="<html><body><div>Not markdown</div></body></html>",
+        )
+        tier2_result = _build_http_fetch_result(
+            requested_url=requested_url,
+            content_type="text/html",
+            body_text=(
+                "<html><body><article><h1>Example</h1><p>Hello from HTML.</p>"
+                "</article></body></html>"
+            ),
+        )
+        defuddle_failure = ToolExecutionResult(
+            call_id="web_fetch_defuddle_step",
+            name="web_fetch",
+            ok=False,
+            content="\n".join(
+                [
+                    "Web fetch failed",
+                    f"url: {requested_url}",
+                    "reason: Defuddle fetch failed.",
+                ]
+            ),
+            metadata={
+                "requested_url": requested_url,
+                "error": "Defuddle fetch failed.",
+            },
+        )
+        converted_result = MarkdownConversionResult(
+            markdown="# Example\n\nHello from HTML.",
+            markdown_tokens=88,
+        )
+
+        with patch(
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
+            side_effect=[tier1_result, tier2_result],
+        ) as fetch_mock:
+            with patch(
+                "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+                new=AsyncMock(return_value=defuddle_failure),
+            ) as execute_mock:
+                with patch(
+                    "jarvis.tools.basic.web_fetch.tool._convert_html_to_markdown",
+                    return_value=converted_result,
+                ) as convert_mock:
+                    result = await self.runtime.execute(
+                        tool_call=ToolCall(
+                            call_id="call_web_fetch_cloudflare_fallback",
+                            name="web_fetch",
+                            arguments={"url": requested_url},
+                            raw_arguments='{"url":"https://example.com/article"}',
+                        ),
+                        context=self.context,
+                    )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(fetch_mock.call_count, 2)
+        execute_mock.assert_awaited_once()
+        convert_mock.assert_called_once()
+        self.assertEqual(result.metadata["final_url"], requested_url)
+        self.assertEqual(result.metadata["status_code"], 200)
+        self.assertEqual(result.metadata["markdown_tokens"], 88)
+        self.assertIn("Hello from HTML.", result.content)
+
+    async def test_web_fetch_continues_after_tier1_http_error(self) -> None:
+        requested_url = "https://example.com/protected"
         expected_result = _build_web_fetch_tool_result(
             requested_url=requested_url,
             markdown="# Example\n\nHello from Defuddle.",
         )
         expected_result = ToolExecutionResult(
-            call_id="call_web_fetch_remote",
+            call_id="call_web_fetch_tier1_403",
             name="web_fetch",
             ok=expected_result.ok,
             content=expected_result.content,
@@ -4204,27 +4379,196 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
-            new=AsyncMock(return_value=expected_result),
-        ) as execute_mock:
-            result = await self.runtime.execute(
-                tool_call=ToolCall(
-                    call_id="call_web_fetch_remote",
-                    name="web_fetch",
-                    arguments={"url": requested_url},
-                    raw_arguments='{"url":"https://example.com/page"}',
-                ),
-                context=self.context,
-            )
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
+            side_effect=WebFetchRequestError(
+                "request returned HTTP 403.",
+                status_code=403,
+            ),
+        ):
+            with patch(
+                "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+                new=AsyncMock(return_value=expected_result),
+            ) as execute_mock:
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_web_fetch_tier1_403",
+                        name="web_fetch",
+                        arguments={"url": requested_url},
+                        raw_arguments='{"url":"https://example.com/protected"}',
+                    ),
+                    context=self.context,
+                )
 
         self.assertTrue(result.ok)
         execute_mock.assert_awaited_once()
-        self.assertEqual(execute_mock.await_args.kwargs["tool_name"], "web_fetch")
-        self.assertEqual(
-            execute_mock.await_args.kwargs["arguments"],
-            {"url": requested_url},
+        self.assertIn("Hello from Defuddle.", result.content)
+
+    async def test_web_fetch_falls_back_to_playwright_and_remote_defuddle_html(self) -> None:
+        requested_url = "https://example.com/protected"
+        initial_defuddle_failure = ToolExecutionResult(
+            call_id="call_web_fetch_browser_fallback",
+            name="web_fetch",
+            ok=False,
+            content="\n".join(
+                [
+                    "Web fetch failed",
+                    f"url: {requested_url}",
+                    "reason: Defuddle fetch failed.",
+                ]
+            ),
+            metadata={
+                "requested_url": requested_url,
+                "error": "Defuddle fetch failed.",
+            },
         )
-        self.assertIn("provider: defuddle", result.content)
+        rendered_defuddle_success = ToolExecutionResult(
+            call_id="call_web_fetch_browser_fallback",
+            name="web_fetch",
+            ok=True,
+            content="\n".join(
+                [
+                    "Web fetch result",
+                    f"url: {requested_url}",
+                    "markdown:",
+                    "# Rendered Example\n\nHello from browser HTML.",
+                ]
+            ),
+            metadata={
+                "requested_url": requested_url,
+                "markdown_chars": 37,
+                "markdown_truncated": False,
+            },
+        )
+        rendered_result = BrowserRenderResult(
+            requested_url=requested_url,
+            final_url=requested_url,
+            html=(
+                "<html><body><main><h1>Rendered Example</h1>"
+                "<p>Hello from browser HTML.</p></main></body></html>"
+            ),
+        )
+
+        with patch(
+            "jarvis.tools.basic.web_fetch.tool._fetch_http_text",
+            side_effect=[
+                WebFetchRequestError("request returned HTTP 403.", status_code=403),
+                WebFetchRequestError("request returned HTTP 403.", status_code=403),
+            ],
+        ):
+            with patch(
+                "jarvis.tools.basic.web_fetch.tool.RemoteToolRuntimeClient.execute",
+                new=AsyncMock(
+                    side_effect=[
+                        initial_defuddle_failure,
+                        rendered_defuddle_success,
+                    ]
+                ),
+            ) as execute_mock:
+                with patch(
+                    "jarvis.tools.basic.web_fetch.tool._render_page_html",
+                    new=AsyncMock(return_value=rendered_result),
+                ) as render_mock:
+                    result = await self.runtime.execute(
+                        tool_call=ToolCall(
+                            call_id="call_web_fetch_browser_fallback",
+                            name="web_fetch",
+                            arguments={"url": requested_url},
+                            raw_arguments='{"url":"https://example.com/protected"}',
+                        ),
+                        context=self.context,
+                    )
+
+        self.assertTrue(result.ok)
+        render_mock.assert_awaited_once()
+        self.assertEqual(execute_mock.await_count, 2)
+        first_call = execute_mock.await_args_list[0].kwargs
+        second_call = execute_mock.await_args_list[1].kwargs
+        self.assertEqual(first_call["arguments"], {"url": requested_url})
+        self.assertEqual(second_call["arguments"]["url"], requested_url)
+        self.assertIn("input_path", second_call["arguments"])
+        self.assertEqual(
+            list(self.workspace_dir.glob("web-fetch-render-*.html")),
+            [],
+        )
+        self.assertIn("Hello from browser HTML.", result.content)
+
+    def test_validate_browser_request_url_allows_data_scheme(self) -> None:
+        _validate_browser_request_url("data:text/plain,hello")
+
+    def test_validate_browser_request_url_denies_non_http_scheme(self) -> None:
+        with self.assertRaises(WebFetchRequestError):
+            _validate_browser_request_url("javascript:alert(1)")
+
+    def test_markdown_is_usable_rejects_access_challenge_pages(self) -> None:
+        markdown = (
+            "## www.axios.com\n\n"
+            "## Performing security verification\n\n"
+            "This website uses a security service to protect against malicious bots. "
+            "This page is displayed while the website verifies you are not a bot.\n\n"
+            "Just a moment...\n"
+        )
+        self.assertFalse(_markdown_is_usable(markdown))
+
+    async def test_render_page_html_blocks_non_public_browser_subrequests(self) -> None:
+        requested_url = "https://example.com/app"
+        page = _FakeBrowserPage(
+            final_url=requested_url,
+            html="<html><body><main>Rendered</main></body></html>",
+            request_urls=(
+                requested_url,
+                "http://127.0.0.1:8080/debug",
+            ),
+        )
+        manager = _FakePlaywrightManager(page)
+
+        def validate_public_url(url: str) -> None:
+            if "127.0.0.1" in url:
+                raise WebFetchRequestError(
+                    "web_fetch does not allow private, loopback, or reserved IP targets."
+                )
+
+        with patch("jarvis.tools.basic.web_fetch.tool.async_playwright", return_value=manager):
+            with patch(
+                "jarvis.tools.basic.web_fetch.tool._validate_public_url",
+                side_effect=validate_public_url,
+            ):
+                result = await _render_page_html(
+                    url=requested_url,
+                    settings=self.settings,
+                )
+
+        self.assertEqual(result.final_url, requested_url)
+        self.assertEqual(manager.browser.context_kwargs, [{"service_workers": "block"}])
+        self.assertEqual(len(page.handled_routes), 2)
+        self.assertTrue(page.handled_routes[0].continued)
+        self.assertTrue(page.handled_routes[1].aborted)
+        self.assertEqual(page.handled_routes[1].abort_error_code, "blockedbyclient")
+
+    async def test_render_page_html_rejects_private_final_url(self) -> None:
+        requested_url = "https://example.com/app"
+        page = _FakeBrowserPage(
+            final_url="http://127.0.0.1:8080/debug",
+            html="<html><body><main>Blocked</main></body></html>",
+            request_urls=(requested_url,),
+        )
+        manager = _FakePlaywrightManager(page)
+
+        def validate_public_url(url: str) -> None:
+            if "127.0.0.1" in url:
+                raise WebFetchRequestError(
+                    "web_fetch does not allow private, loopback, or reserved IP targets."
+                )
+
+        with patch("jarvis.tools.basic.web_fetch.tool.async_playwright", return_value=manager):
+            with patch(
+                "jarvis.tools.basic.web_fetch.tool._validate_public_url",
+                side_effect=validate_public_url,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "blocked final URL"):
+                    await _render_page_html(
+                        url=requested_url,
+                        settings=self.settings,
+                    )
 
     async def test_direct_web_fetch_executor_runs_defuddle(self) -> None:
         requested_url = "https://example.com/article"
@@ -4267,7 +4611,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             kwargs["env"]["NODE_EXTRA_CA_CERTS"],
             "/etc/ssl/certs/ca-certificates.crt",
         )
-        self.assertIn("provider: defuddle", result.content)
+        self.assertNotIn("provider: defuddle", result.content)
         self.assertIn("Hello from Defuddle.", result.content)
 
     async def test_direct_web_fetch_executor_truncates_markdown(self) -> None:
@@ -4318,7 +4662,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.metadata["provider"], "defuddle")
+        self.assertEqual(result.metadata["error"], "Error: fetch failed")
         self.assertIn("Web fetch failed", result.content)
         self.assertIn("Error: fetch failed", result.content)
 

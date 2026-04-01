@@ -229,11 +229,11 @@ tools:
           value: 15
     web_fetch:
       title: "Web Fetch"
-      description: "Timeout and markdown-size cap for Defuddle-backed web fetches."
+      description: "Timeout and markdown-size cap for split-runtime web fetches."
       fields:
         timeout_seconds:
           label: "Web Fetch Timeout Seconds"
-          description: "Timeout for the Defuddle fetch command."
+          description: "Timeout for each web-fetch network step."
           type: "float"
           min: 0.1
           step: 0.5

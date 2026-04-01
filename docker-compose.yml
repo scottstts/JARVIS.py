@@ -25,6 +25,8 @@ services:
       - TELEGRAM_TOKEN
       - JARVIS_UI_TELEGRAM_ALLOWED_USER_ID
       - BRAVE_SEARCH_API_KEY
+      - CLOUDFLARE_ACCOUNT_ID
+      - CLOUDFLARE_AI_WORKERS_REST_API_KEY
     working_dir: /repo
     command:
       - bash
@@ -98,3 +100,7 @@ secrets:
     file: ./secrets/JARVIS_UI_TELEGRAM_ALLOWED_USER_ID
   BRAVE_SEARCH_API_KEY:
     file: ./secrets/BRAVE_SEARCH_API_KEY
+  CLOUDFLARE_ACCOUNT_ID:
+    file: ./secrets/CLOUDFLARE_ACCOUNT_ID
+  CLOUDFLARE_AI_WORKERS_REST_API_KEY:
+    file: ./secrets/CLOUDFLARE_AI_WORKERS_REST_API_KEY

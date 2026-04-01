@@ -20,6 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     SQLITE_VEC_VENDOR_VERSION=v0.1.7-alpha.10 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PATH="/usr/local/bin:/root/.local/bin:/opt/venv/bin:${PATH}"
 
 WORKDIR /repo
@@ -39,7 +40,8 @@ RUN mkdir -p /opt/sqlite-vec \
        -o /opt/sqlite-vec/vec0.so \
        -lm \
   && python -c "import os, sqlite3; conn = sqlite3.connect(':memory:'); conn.enable_load_extension(True); conn.load_extension('/opt/sqlite-vec/vec0'); conn.enable_load_extension(False); version = conn.execute('select vec_version()').fetchone()[0]; expected = os.environ['SQLITE_VEC_VENDOR_VERSION']; assert version == expected, (version, expected)" \
-  && uv sync --locked --group dev
+  && uv sync --locked --group dev \
+  && "${UV_PROJECT_ENVIRONMENT}/bin/python" -m playwright install --with-deps chromium
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]

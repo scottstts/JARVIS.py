@@ -61,6 +61,7 @@ If this document and the code ever disagree, treat the code as source of truth a
   - Linux development environment
   - installs `uv`
   - prepares `/opt/venv`
+  - installs Playwright Chromium for app-runtime-only browser rendering fallbacks such as `web_fetch`
   - installs a `/usr/local/bin/jarvis` shell wrapper that prefers the tool-installed artifact when present
   - intended for `uv run ...` against the bind-mounted repo
 - `Dockerfile.tool_runtime`

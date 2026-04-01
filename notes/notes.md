@@ -40,7 +40,9 @@
 - `view_image` is the single workspace-image path for multimodal turns: it prepares a transient local-file attachment that all four provider adapters consume without persisting image bytes into transcript storage.
 - `send_file` is now a basic tool: it only allows explicit non-`.env` files inside `/workspace`, and it routes Telegram delivery through the existing UI file-send path using the active `tg_<chat_id>` route when available.
 - `web_search` is now a basic Brave-backed tool with a query-only schema, web-only normalized results, and a settings-controlled result count (`JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT`, default `10`).
-- `web_fetch` now routes into `tool_runtime` and runs `npx defuddle parse '<url>' --markdown`; it stays URL-only, returns normalized markdown, and has no local fallback.
+- `web_fetch` keeps a URL-only surface, but now splits execution: `jarvis_runtime` handles native-markdown and Cloudflare HTML conversion while `tool_runtime` stays Defuddle-only.
+- `web_fetch` is now split-runtime: `jarvis_runtime` handles native-markdown plus Cloudflare HTML conversion, while `tool_runtime` remains Defuddle-only and only forced-Defuddle URL classes (YouTube videos, X/Twitter posts/articles, Reddit) bypass the local fallback order.
+- `web_fetch` browser fallback renders in `jarvis_runtime` with local Playwright, writes rendered HTML only to a temporary shared-workspace file, asks `tool_runtime` Defuddle to parse that HTML first, and deletes the temp file immediately after that attempt.
 - Telegram `sendMessageDraft` rejects effectively empty text, so draft sends should skip whitespace-only payloads and fall back to plain text when rendered HTML has no visible content.
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
