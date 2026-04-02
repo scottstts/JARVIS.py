@@ -11,6 +11,7 @@ from .config import LLMSettings
 from .errors import (
     LLMConfigurationError,
     ProviderNotFoundError,
+    ProviderTimeoutError,
     UnsupportedCapabilityError,
     is_retryable_error,
 )
@@ -184,7 +185,10 @@ class LLMService:
     ) -> T:
         if timeout_seconds is None:
             return await awaitable
-        return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise ProviderTimeoutError("Request timed out.") from exc
 
     async def _iter_with_per_event_timeout(
         self,
@@ -202,6 +206,11 @@ class LLMService:
                 event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_seconds)
             except StopAsyncIteration:
                 return
+            except asyncio.TimeoutError as exc:
+                aclose = getattr(iterator, "aclose", None)
+                if callable(aclose):
+                    await aclose()
+                raise ProviderTimeoutError("Request timed out.") from exc
             yield event
 
     def _resolve_generate_request(self, request: LLMRequest) -> LLMRequest:

@@ -464,6 +464,11 @@ async def _serve_legacy_router_connection(
                 return
             continue
         except Exception:
+            LOGGER.exception(
+                "Gateway websocket turn failed for route %s while processing client_message_id=%s.",
+                route_id,
+                event.client_message_id,
+            )
             if not await _send_json_if_open(
                 websocket,
                 build_error_event(

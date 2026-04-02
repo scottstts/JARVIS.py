@@ -530,6 +530,11 @@ class RouteRuntime:
                     )
                 )
             except Exception:
+                LOGGER.exception(
+                    "Route %s main turn failed while processing client_message_id=%s.",
+                    self._route_id,
+                    request.client_message_id,
+                )
                 error_turn_kind: str | None = "user" if request.user_initiated else "runtime"
                 error_client_message_id = request.client_message_id
                 if (

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from jarvis.llm.config import EmbeddingSettings, LLMSettings
+from jarvis.llm.errors import ProviderTimeoutError
 from jarvis.llm.protocols import ProviderCapabilities
 from jarvis.llm.service import LLMService
+from jarvis.llm.types import LLMMessage, LLMRequest
 
 
 class _FakeProvider:
@@ -34,6 +37,16 @@ class _FakeProvider:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _SlowProvider(_FakeProvider):
+    async def generate(self, request):
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    async def stream_generate(self, request):
+        await asyncio.sleep(3600)
+        yield None
 
 
 class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -65,3 +78,38 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service.registry.get("lmstudio").name, "lmstudio")
         finally:
             await service.aclose()
+
+    async def test_generate_maps_service_timeout_to_provider_timeout(self) -> None:
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openai",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            ),
+            providers=(_SlowProvider("openai"),),
+        )
+
+        with self.assertRaises(ProviderTimeoutError):
+            await service.generate(
+                LLMRequest(
+                    messages=(LLMMessage.text("user", "hello"),),
+                    timeout_seconds=0.01,
+                )
+            )
+
+    async def test_stream_generate_maps_per_event_timeout_to_provider_timeout(self) -> None:
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openai",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            ),
+            providers=(_SlowProvider("openai"),),
+        )
+
+        with self.assertRaises(ProviderTimeoutError):
+            async for _event in service.stream_generate(
+                LLMRequest(
+                    messages=(LLMMessage.text("user", "hello"),),
+                    timeout_seconds=0.01,
+                )
+            ):
+                pass

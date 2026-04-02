@@ -119,6 +119,7 @@
 - LM Studio is chat-only in Jarvis: the provider auto-discovers exactly one matching loaded local LLM from LM Studio on each request, rewrites loopback LM Studio URLs to `host.docker.internal` when running inside Docker, uses no provider-side model/inference defaults or API token, and is intentionally excluded from embedding-provider support.
 - LM Studio statefulness now stays provider-local: the provider uses `/v1/responses`, caches prior response ids against canonicalized full history, and reuses `previous_response_id` only for exact append-only continuations, including tool-result follow-up turns, without any core agent-loop changes.
 - LM Studio stateful lineage should now transparently recover from stale `previous_response_id` cache entries (for example after an LM Studio reset) by dropping that cached id and retrying the request once with full history.
+- Service-layer `asyncio.wait_for` expirations must be normalized to `ProviderTimeoutError`; otherwise slow or stalled streaming requests surface as gateway `internal_error` instead of `provider_timeout`.
 - Auto-injected Jarvis context now uses `system` only across main loop, subagent loop, runtime notices, and memory reflection.
 - Jarvis is now packaged as a real `uv` project under `src/jarvis/`; `pyproject.toml` keeps only the real user-facing `jarvis` script, while internal processes use module invocation instead of extra project scripts.
 - The repo is now strict container-first for Python: no host `.venv`, `uv` commands run in `jarvis_runtime`, and the isolated `tool_runtime` image installs the package instead of relying on `PYTHONPATH`.
@@ -138,3 +139,5 @@
 - Telegram-local UX notices now have a dedicated ephemeral route event path; `/new`, `/stop`, and compaction start/completion messages are shown in Telegram but never persisted or sent to providers.
 - After Telegram shows the `/stop` confirmation, the bridge now mutes all later route events for that chat until the next user turn starts, while the runtime still finishes and persists in-flight work normally.
 - Combined `jarvis` startup now logs effective provider routing for main LLM, subagent LLM, memory maintenance LLM, and embeddings; subagents log the inherited main provider when no override is configured.
+- LM Studio tool-capability gating happens before `/v1/responses`: Jarvis sends tools on normal user turns, so if the only loaded LM Studio LLM reports `capabilities.trained_for_tool_use = false`, the turn fails during `/api/v1/models` inspection and never reaches generation.
+- Gateway broad `internal_error` fallbacks should always log the underlying exception stack, or provider/configuration failures become opaque from Telegram warnings alone.
