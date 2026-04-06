@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 from jarvis import settings as app_settings
 
-from jarvis.llm.config import EmbeddingSettings, LLMSettings, LMStudioProviderSettings
+from jarvis.llm.config import (
+    EmbeddingSettings,
+    LLMSettings,
+    LMStudioProviderSettings,
+    OpenRouterProviderSettings,
+)
 from jarvis.llm.errors import LLMConfigurationError
 
 
@@ -35,3 +40,25 @@ class LMStudioConfigTests(unittest.TestCase):
             settings = LMStudioProviderSettings.from_env()
 
         self.assertEqual(settings.base_url, "http://127.0.0.1:4321")
+
+
+class OpenRouterConfigTests(unittest.TestCase):
+    def test_openrouter_settings_read_yaml_site_url_default(self) -> None:
+        settings = OpenRouterProviderSettings.from_env()
+
+        self.assertEqual(settings.site_url, app_settings.OPENROUTER_SITE_URL)
+        self.assertEqual(settings.app_name, app_settings.OPENROUTER_APP_NAME)
+
+    def test_openrouter_settings_reads_site_url_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "OPENROUTER_SITE_URL": "https://jarvis.example",
+                "OPENROUTER_APP_NAME": "Jarvis Dev",
+            },
+            clear=True,
+        ):
+            settings = OpenRouterProviderSettings.from_env()
+
+        self.assertEqual(settings.site_url, "https://jarvis.example")
+        self.assertEqual(settings.app_name, "Jarvis Dev")

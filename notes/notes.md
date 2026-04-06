@@ -141,3 +141,4 @@
 - Combined `jarvis` startup now logs effective provider-and-model routing for main LLM, subagent LLM, memory maintenance LLM, and embeddings; subagents log the inherited main provider/model when no override is configured.
 - LM Studio tool-capability gating happens before `/v1/responses`: Jarvis sends tools on normal user turns, so if the only loaded LM Studio LLM reports `capabilities.trained_for_tool_use = false`, the turn fails during `/api/v1/models` inspection and never reaches generation.
 - Gateway broad `internal_error` fallbacks should always log the underlying exception stack, or provider/configuration failures become opaque from Telegram warnings alone.
+- OpenRouter app attribution depends on `HTTP-Referer` plus title headers, so `providers.openrouter.site_url` must be set in workspace settings if you want requests to show up as a named app instead of `unknown`.

@@ -440,6 +440,7 @@ class OpenRouterProvider:
         if self._settings.site_url:
             headers["HTTP-Referer"] = self._settings.site_url
         if self._settings.app_name:
+            headers["X-OpenRouter-Title"] = self._settings.app_name
             headers["X-Title"] = self._settings.app_name
         return url, headers, timeout
 

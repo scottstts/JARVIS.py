@@ -139,6 +139,7 @@ src/jarvis/
 - `settings.yml`
   - shipped non-secret runtime settings template plus UI metadata
   - grouped, user-facing YAML source for both the `settings.py` compatibility layer and `settings_gui.html`
+  - provider-specific HTTP attribution defaults such as OpenRouter `site_url` and `app_name` live here, and workspace overrides take precedence at runtime
 - `runtime_env.py`
   - Docker secret loading and runtime environment bootstrap
 - `logging_setup.py`

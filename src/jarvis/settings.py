@@ -479,6 +479,7 @@ JARVIS_GEMINI_THINKING_BUDGET: Final[int | None] = _optional_integer(
 
 # OpenRouter provider defaults.
 JARVIS_OPENROUTER_CHAT_MODEL: Final = _string("providers.openrouter.chat_model")
+OPENROUTER_SITE_URL: Final[str | None] = _optional_string("providers.openrouter.site_url")
 OPENROUTER_APP_NAME: Final = _string("providers.openrouter.app_name")
 JARVIS_OPENROUTER_TEMPERATURE: Final = _float("providers.openrouter.temperature")
 JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS: Final = _integer(

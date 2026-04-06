@@ -318,7 +318,7 @@ class OpenRouterProviderSettings:
                 "JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS",
                 app_settings.JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS,
             ),
-            site_url=_optional_env("OPENROUTER_SITE_URL"),
+            site_url=_optional_setting("OPENROUTER_SITE_URL", app_settings.OPENROUTER_SITE_URL),
             app_name=_optional_setting("OPENROUTER_APP_NAME", app_settings.OPENROUTER_APP_NAME),
         )
 

@@ -873,6 +873,12 @@ providers:
           description: "Default OpenRouter chat model name."
           type: "text"
           value: "moonshotai/kimi-k2.5"
+        site_url:
+          label: "OpenRouter Site URL"
+          description: "Optional app URL sent in OpenRouter attribution headers."
+          type: "text"
+          nullable: true
+          value: "https://github.com/scottstts/JARVIS.py"
         app_name:
           label: "OpenRouter App Name"
           description: "App name sent in OpenRouter headers."

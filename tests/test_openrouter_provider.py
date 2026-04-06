@@ -43,6 +43,27 @@ class _FakeStreamingResponse:
 
 
 class OpenRouterProviderStreamingTests(unittest.TestCase):
+    def test_request_context_includes_openrouter_attribution_headers(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(
+                api_key="test-key",
+                site_url="https://jarvis.example",
+                app_name="Jarvis",
+            ),
+            default_timeout_seconds=60.0,
+        )
+
+        _url, headers, timeout = provider._build_request_context(
+            endpoint="/chat/completions",
+            timeout_seconds=None,
+        )
+
+        self.assertEqual(headers["Authorization"], "Bearer test-key")
+        self.assertEqual(headers["HTTP-Referer"], "https://jarvis.example")
+        self.assertEqual(headers["X-OpenRouter-Title"], "Jarvis")
+        self.assertEqual(headers["X-Title"], "Jarvis")
+        self.assertEqual(timeout, 60.0)
+
     def test_stream_generate_emits_text_usage_and_done_events(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
