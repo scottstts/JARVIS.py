@@ -147,13 +147,13 @@ def _log_runtime_provider_configuration(*, core_settings: CoreSettings) -> None:
         core_settings=core_settings,
     )
     LOGGER.info("=====================================")
-    LOGGER.info("Main Agent LLM Provider: %s", provider_configuration["main_llm"])
-    LOGGER.info("Subagent LLM Provider: %s", provider_configuration["subagent_llm"])
+    LOGGER.info("  Main Agent LLM Provider: %s", provider_configuration["main_llm"])
+    LOGGER.info("  Subagent LLM Provider: %s", provider_configuration["subagent_llm"])
     LOGGER.info(
-        "Memory Maintenance LLM Provider: %s",
+        "  Memory Maintenance LLM Provider: %s",
         provider_configuration["memory_maintenance_llm"],
     )
-    LOGGER.info("Embedding Model Provider: %s", provider_configuration["embedding"])
+    LOGGER.info("  Embedding Model Provider: %s", provider_configuration["embedding"])
     LOGGER.info("=====================================")
 
 
@@ -178,12 +178,43 @@ def _resolve_runtime_provider_configuration(
     subagent_settings: SubagentSettings,
 ) -> dict[str, str]:
     main_provider = llm_settings.default_provider
+    subagent_provider = subagent_settings.provider or main_provider
     return {
-        "main_llm": main_provider,
-        "subagent_llm": subagent_settings.provider or main_provider,
-        "memory_maintenance_llm": memory_settings.maintenance_provider,
-        "embedding": llm_settings.embedding.provider,
+        "main_llm": _format_provider_target(
+            provider=main_provider,
+            model=_chat_model_for_provider(llm_settings=llm_settings, provider=main_provider),
+        ),
+        "subagent_llm": _format_provider_target(
+            provider=subagent_provider,
+            model=_chat_model_for_provider(llm_settings=llm_settings, provider=subagent_provider),
+        ),
+        "memory_maintenance_llm": _format_provider_target(
+            provider=memory_settings.maintenance_provider,
+            model=memory_settings.maintenance_model,
+        ),
+        "embedding": _format_provider_target(
+            provider=llm_settings.embedding.provider,
+            model=llm_settings.embedding.model,
+        ),
     }
+
+
+def _chat_model_for_provider(*, llm_settings: LLMSettings, provider: str) -> str:
+    if provider == "openai":
+        return llm_settings.openai.chat_model or "(unconfigured)"
+    if provider == "anthropic":
+        return llm_settings.anthropic.chat_model or "(unconfigured)"
+    if provider == "gemini":
+        return llm_settings.gemini.chat_model or "(unconfigured)"
+    if provider == "openrouter":
+        return llm_settings.openrouter.chat_model or "(unconfigured)"
+    if provider == "lmstudio":
+        return "(provider-selected)"
+    return "(unknown)"
+
+
+def _format_provider_target(*, provider: str, model: str) -> str:
+    return f"{provider} | {model}"
 
 
 if __name__ == "__main__":

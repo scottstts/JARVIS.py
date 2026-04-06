@@ -12,7 +12,12 @@ from unittest.mock import patch
 import jarvis.main as jarvis_main
 from jarvis.core import ContextPolicySettings, CoreSettings
 from jarvis.gateway import GatewaySettings
-from jarvis.llm import EmbeddingSettings, LLMSettings
+from jarvis.llm import (
+    EmbeddingSettings,
+    GeminiProviderSettings,
+    LLMSettings,
+    OpenAIProviderSettings,
+)
 from jarvis.memory import MemorySettings
 from jarvis.subagent.settings import SubagentSettings
 from jarvis.ui.telegram import UISettings
@@ -128,6 +133,8 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             llm_settings=LLMSettings(
                 default_provider="openai",
                 embedding=EmbeddingSettings(provider="openai", model="text-embedding-3-small"),
+                openai=OpenAIProviderSettings(chat_model="gpt-5.4"),
+                gemini=GeminiProviderSettings(chat_model="gemini-3.1-pro"),
             ),
             memory_settings=MemorySettings(
                 workspace_dir=Path("/tmp/workspace"),
@@ -160,10 +167,10 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             provider_configuration,
             {
-                "main_llm": "openai",
-                "subagent_llm": "openai",
-                "memory_maintenance_llm": "anthropic",
-                "embedding": "openai",
+                "main_llm": "openai | gpt-5.4",
+                "subagent_llm": "openai | gpt-5.4",
+                "memory_maintenance_llm": "anthropic | claude-maintenance",
+                "embedding": "openai | text-embedding-3-small",
             },
         )
 
@@ -185,10 +192,10 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             jarvis_main,
             "_load_runtime_provider_configuration",
             return_value={
-                "main_llm": "openai",
-                "subagent_llm": "gemini",
-                "memory_maintenance_llm": "anthropic",
-                "embedding": "openai",
+                "main_llm": "openai | gpt-5.4",
+                "subagent_llm": "gemini | gemini-3.1-pro",
+                "memory_maintenance_llm": "anthropic | claude-maintenance",
+                "embedding": "openai | text-embedding-3-small",
             },
         ):
             with self.assertLogs(jarvis_main.LOGGER.name, level="INFO") as captured_logs:
@@ -199,19 +206,19 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             captured_logs.output[0],
         )
         self.assertIn(
-            "Main Agent LLM Provider: openai",
+            "Main Agent LLM Provider: openai | gpt-5.4",
             captured_logs.output[1],
         )
         self.assertIn(
-            "Subagent LLM Provider: gemini",
+            "Subagent LLM Provider: gemini | gemini-3.1-pro",
             captured_logs.output[2],
         )
         self.assertIn(
-            "Memory Maintenance LLM Provider: anthropic",
+            "Memory Maintenance LLM Provider: anthropic | claude-maintenance",
             captured_logs.output[3],
         )
         self.assertIn(
-            "Embedding Model Provider: openai",
+            "Embedding Model Provider: openai | text-embedding-3-small",
             captured_logs.output[4],
         )
         self.assertIn(
