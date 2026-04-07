@@ -447,6 +447,7 @@ llm:
         - "openai"
         - "anthropic"
         - "gemini"
+        - "grok"
         - "openrouter"
         - "lmstudio"
       value: "openai"
@@ -507,6 +508,7 @@ memory:
             - "openai"
             - "anthropic"
             - "gemini"
+            - "grok"
             - "openrouter"
             - "lmstudio"
           value: "openai"
@@ -665,6 +667,7 @@ subagent:
         - "openai"
         - "anthropic"
         - "gemini"
+        - "grok"
         - "openrouter"
         - "lmstudio"
       value: "openai"
@@ -865,6 +868,29 @@ providers:
           min: 1
           step: 100
           value: null
+    grok:
+      title: "Grok"
+      description: "Default chat model and generation limits for the xAI Grok provider."
+      fields:
+        chat_model:
+          label: "Grok Chat Model"
+          description: "Default Grok chat model name."
+          type: "text"
+          value: "grok-4.20-0309-non-reasoning"
+        temperature:
+          label: "Grok Temperature"
+          description: "Sampling temperature for Grok requests."
+          type: "float"
+          min: 0
+          step: 0.1
+          value: 1
+        max_output_tokens:
+          label: "Grok Max Output Tokens"
+          description: "Maximum output tokens requested from Grok."
+          type: "integer"
+          min: 1
+          step: 100
+          value: 32000
     openrouter:
       title: "OpenRouter"
       description: "Default routing model and generation limits for OpenRouter."

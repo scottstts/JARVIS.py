@@ -65,6 +65,7 @@ class LLMService:
         if providers is None:
             from .providers.anthropic_provider import AnthropicProvider
             from .providers.gemini_provider import GeminiProvider
+            from .providers.grok_provider import GrokProvider
             from .providers.lmstudio_provider import LMStudioProvider
             from .providers.openai_provider import OpenAIProvider
             from .providers.openrouter_provider import OpenRouterProvider
@@ -80,6 +81,10 @@ class LLMService:
                 ),
                 GeminiProvider(
                     settings=self.settings.gemini,
+                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                ),
+                GrokProvider(
+                    settings=self.settings.grok,
                     default_timeout_seconds=self.settings.request_timeout_seconds,
                 ),
                 OpenRouterProvider(
@@ -254,6 +259,18 @@ class LLMService:
                 max_output_tokens
                 if max_output_tokens is not None
                 else self.settings.gemini.max_output_tokens
+            )
+        elif provider == "grok":
+            model = model or self.settings.grok.chat_model
+            temperature = (
+                temperature
+                if temperature is not None
+                else self.settings.grok.temperature
+            )
+            max_output_tokens = (
+                max_output_tokens
+                if max_output_tokens is not None
+                else self.settings.grok.max_output_tokens
             )
         elif provider == "openrouter":
             model = model or self.settings.openrouter.chat_model

@@ -30,6 +30,8 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
             raise unittest.SkipTest("ANTHROPIC_API_KEY is not configured.")
         if provider == "gemini" and not os.getenv("GOOGLE_API_KEY"):
             raise unittest.SkipTest("GOOGLE_API_KEY is not configured.")
+        if provider == "grok" and not os.getenv("XAI_API_KEY"):
+            raise unittest.SkipTest("XAI_API_KEY is not configured.")
         if provider == "openrouter" and not os.getenv("OPENROUTER_API_KEY"):
             raise unittest.SkipTest("OPENROUTER_API_KEY is not configured.")
 

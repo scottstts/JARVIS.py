@@ -366,7 +366,7 @@ JARVIS_CORE_TIMEZONE: Final = _string("core.timezone")
 
 # Core LLM routing/runtime.
 # The provider chosen here will determine which provider settings/token are needed below.
-# 'openai', 'gemini', 'anthropic', 'openrouter', 'lmstudio'
+# 'openai', 'gemini', 'anthropic', 'grok', 'openrouter', 'lmstudio'
 JARVIS_LLM_DEFAULT_PROVIDER: Final = _string("llm.default_provider")
 JARVIS_LLM_TIMEOUT_SECONDS: Final = _float("llm.timeout_seconds")
 JARVIS_LLM_RETRY_ATTEMPTS: Final = _integer("llm.retry_attempts")
@@ -476,6 +476,11 @@ JARVIS_GEMINI_THINKING_LEVEL: Final = _string("providers.gemini.thinking_level")
 JARVIS_GEMINI_THINKING_BUDGET: Final[int | None] = _optional_integer(
     "providers.gemini.thinking_budget"
 )
+
+# Grok provider defaults.
+JARVIS_GROK_CHAT_MODEL: Final = _string("providers.grok.chat_model")
+JARVIS_GROK_TEMPERATURE: Final = _float("providers.grok.temperature")
+JARVIS_GROK_MAX_OUTPUT_TOKENS: Final = _integer("providers.grok.max_output_tokens")
 
 # OpenRouter provider defaults.
 JARVIS_OPENROUTER_CHAT_MODEL: Final = _string("providers.openrouter.chat_model")

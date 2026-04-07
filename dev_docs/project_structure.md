@@ -191,6 +191,7 @@ Includes:
 - validation
 - service lifecycle
 - provider implementations under `llm/providers/`
+- provider-local translation for cache/state quirks such as LM Studio `previous_response_id` reuse and Grok `x-grok-conv-id` routing plus system-message collapsing
 
 ### `src/jarvis/memory/`
 

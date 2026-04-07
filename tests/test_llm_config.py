@@ -10,6 +10,7 @@ from jarvis import settings as app_settings
 
 from jarvis.llm.config import (
     EmbeddingSettings,
+    GrokProviderSettings,
     LLMSettings,
     LMStudioProviderSettings,
     OpenRouterProviderSettings,
@@ -62,3 +63,30 @@ class OpenRouterConfigTests(unittest.TestCase):
 
         self.assertEqual(settings.site_url, "https://jarvis.example")
         self.assertEqual(settings.app_name, "Jarvis Dev")
+
+
+class GrokConfigTests(unittest.TestCase):
+    def test_grok_can_be_the_default_provider(self) -> None:
+        settings = LLMSettings(
+            default_provider="grok",
+            embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+        )
+
+        self.assertEqual(settings.default_provider, "grok")
+        self.assertEqual(settings.grok.chat_model, app_settings.JARVIS_GROK_CHAT_MODEL)
+
+    def test_grok_settings_reads_model_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "JARVIS_GROK_CHAT_MODEL": "grok-test-model",
+                "JARVIS_GROK_TEMPERATURE": "0.2",
+                "JARVIS_GROK_MAX_OUTPUT_TOKENS": "2048",
+            },
+            clear=True,
+        ):
+            settings = GrokProviderSettings.from_env()
+
+        self.assertEqual(settings.chat_model, "grok-test-model")
+        self.assertEqual(settings.temperature, 0.2)
+        self.assertEqual(settings.max_output_tokens, 2048)

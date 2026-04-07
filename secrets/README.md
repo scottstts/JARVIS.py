@@ -8,6 +8,7 @@ Expected file names:
 - `OPENAI_API_KEY`: https://platform.openai.com/api-keys
 - `ANTHROPIC_API_KEY`: https://platform.claude.com/settings/keys
 - `GOOGLE_API_KEY`: https://aistudio.google.com/api-keys
+- `XAI_API_KEY`: https://console.x.ai/
 - `OPENROUTER_API_KEY`: https://openrouter.ai/workspaces/default/keys
 - `TELEGRAM_TOKEN`: https://core.telegram.org/bots/api
 - `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`: https://core.telegram.org/bots/api

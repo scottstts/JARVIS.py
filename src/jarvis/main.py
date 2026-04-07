@@ -206,6 +206,8 @@ def _chat_model_for_provider(*, llm_settings: LLMSettings, provider: str) -> str
         return llm_settings.anthropic.chat_model or "(unconfigured)"
     if provider == "gemini":
         return llm_settings.gemini.chat_model or "(unconfigured)"
+    if provider == "grok":
+        return llm_settings.grok.chat_model or "(unconfigured)"
     if provider == "openrouter":
         return llm_settings.openrouter.chat_model or "(unconfigured)"
     if provider == "lmstudio":

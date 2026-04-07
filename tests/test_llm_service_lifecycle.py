@@ -66,7 +66,7 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(provider_one.closed)
         self.assertTrue(provider_two.closed)
 
-    async def test_default_registry_includes_lmstudio_provider(self) -> None:
+    async def test_default_registry_includes_lmstudio_and_grok_providers(self) -> None:
         service = LLMService(
             settings=LLMSettings(
                 default_provider="lmstudio",
@@ -76,6 +76,7 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         try:
             self.assertEqual(service.registry.get("lmstudio").name, "lmstudio")
+            self.assertEqual(service.registry.get("grok").name, "grok")
         finally:
             await service.aclose()
 

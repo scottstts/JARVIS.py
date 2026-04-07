@@ -6,6 +6,7 @@ LLM_PROVIDER_NAMES: tuple[str, ...] = (
     "openai",
     "anthropic",
     "gemini",
+    "grok",
     "openrouter",
     "lmstudio",
 )

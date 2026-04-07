@@ -19,6 +19,7 @@ services:
       - OPENAI_API_KEY
       - ANTHROPIC_API_KEY
       - GOOGLE_API_KEY
+      - XAI_API_KEY
       - OPENROUTER_API_KEY
       - SENDER_EMAIL_ADDRESS
       - SMTP_PASSWORD
@@ -88,6 +89,8 @@ secrets:
     file: ./secrets/ANTHROPIC_API_KEY
   GOOGLE_API_KEY:
     file: ./secrets/GOOGLE_API_KEY
+  XAI_API_KEY:
+    file: ./secrets/XAI_API_KEY
   OPENROUTER_API_KEY:
     file: ./secrets/OPENROUTER_API_KEY
   SENDER_EMAIL_ADDRESS:

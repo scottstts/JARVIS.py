@@ -324,6 +324,38 @@ class OpenRouterProviderSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class GrokProviderSettings:
+    api_key: str | None = None
+    base_url: str = "https://api.x.ai/v1"
+    chat_model: str | None = None
+    temperature: float | None = None
+    max_output_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
+            raise LLMConfigurationError("JARVIS_GROK_MAX_OUTPUT_TOKENS must be > 0.")
+
+    @classmethod
+    def from_env(cls) -> "GrokProviderSettings":
+        return cls(
+            api_key=_optional_env("XAI_API_KEY"),
+            base_url=_optional_env("XAI_BASE_URL") or "https://api.x.ai/v1",
+            chat_model=_optional_setting(
+                "JARVIS_GROK_CHAT_MODEL",
+                app_settings.JARVIS_GROK_CHAT_MODEL,
+            ),
+            temperature=_parse_optional_float_env(
+                "JARVIS_GROK_TEMPERATURE",
+                app_settings.JARVIS_GROK_TEMPERATURE,
+            ),
+            max_output_tokens=_parse_optional_int_env(
+                "JARVIS_GROK_MAX_OUTPUT_TOKENS",
+                app_settings.JARVIS_GROK_MAX_OUTPUT_TOKENS,
+            ),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class LMStudioProviderSettings:
     base_url: str = "http://localhost:1234"
 
@@ -351,6 +383,7 @@ class LLMSettings:
     openai: OpenAIProviderSettings = field(default_factory=OpenAIProviderSettings.from_env)
     anthropic: AnthropicProviderSettings = field(default_factory=AnthropicProviderSettings.from_env)
     gemini: GeminiProviderSettings = field(default_factory=GeminiProviderSettings.from_env)
+    grok: GrokProviderSettings = field(default_factory=GrokProviderSettings.from_env)
     openrouter: OpenRouterProviderSettings = field(default_factory=OpenRouterProviderSettings.from_env)
     lmstudio: LMStudioProviderSettings = field(default_factory=LMStudioProviderSettings.from_env)
 
@@ -389,6 +422,7 @@ class LLMSettings:
             openai=OpenAIProviderSettings.from_env(),
             anthropic=AnthropicProviderSettings.from_env(),
             gemini=GeminiProviderSettings.from_env(),
+            grok=GrokProviderSettings.from_env(),
             openrouter=OpenRouterProviderSettings.from_env(),
             lmstudio=LMStudioProviderSettings.from_env(),
         )
