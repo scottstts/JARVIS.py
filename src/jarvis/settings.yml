@@ -188,6 +188,7 @@ tools:
             - "pyyaml"
             - "pymupdf"
             - "pandas"
+            - "matplotlib"
             - "pillow"
             - "pydantic"
             - "jinja2"
