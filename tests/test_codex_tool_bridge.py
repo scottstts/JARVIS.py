@@ -86,4 +86,4 @@ class CodexToolBridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(response["contentItems"][0]["text"], "Subagent invoked.")
-        self.assertIn("Do not call `subagent_monitor` again in this same turn", response["contentItems"][1]["text"])
+        self.assertIn("yielding control back to the route orchestrator", response["contentItems"][1]["text"])

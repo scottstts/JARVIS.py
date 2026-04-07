@@ -245,11 +245,16 @@ Jarvis tools are exposed to Codex through dynamic tools built from the same `Too
 Flow:
 
 1. `thread/start` or `thread/resume`
-2. the current implementation sends `dynamicTools` on `thread/start`, `thread/resume`, and `turn/start`
-3. Codex sends `item/tool/call`
-4. Jarvis executes the tool through the existing tool runtime
-5. if approval is required, Jarvis keeps its own approval flow authoritative
-6. Jarvis replies to Codex with model-visible tool output content items
+2. the backend computes the current Jarvis dynamic-tool set and a signature for it
+3. `dynamicTools` are always sent on `thread/start`
+4. `thread/resume` sends `dynamicTools` only when Jarvis needs to change the stored tool set or when older session metadata has no recorded signature yet
+5. `turn/start` sends `dynamicTools` only when the tool signature has changed since the last applied thread/tool state
+6. Codex sends `item/tool/call`
+7. Jarvis executes the tool through the existing tool runtime
+8. if approval is required, Jarvis keeps its own approval flow authoritative
+9. Jarvis replies to Codex with model-visible tool output content items
+
+The last applied dynamic-tool signature is persisted in session `backend_state` so resumed Codex sessions can avoid resending unchanged tool definitions.
 
 Supported tool result content sent back to Codex:
 
@@ -264,6 +269,38 @@ Current Codex turn inputs are text-only.
 - user text is sent as Codex `text` input items
 - runtime/pre-turn messages are sent as Codex `text` input items
 - user/runtime image inputs are not yet translated into Codex `localImage`
+- route-appended external system notes are not merely persisted: before each Codex turn, the backend also syncs any unsent external orchestrator system notes from transcript into Codex input so runtime follow-up turns see the same state that normal provider turns get from transcript replay
+
+## Async Orchestrator Yield
+
+Codex-backed actors do not keep one provider turn alive once work has moved into an orchestrator-managed async state.
+
+If a Jarvis tool result starts async work that the route orchestrator is meant to supervise, the backend yields the turn back to `RouteRuntime`.
+
+Current yield-producing tool results are:
+
+- `bash` results where the job is still `running` in background mode or was promoted to background
+- `subagent_invoke` / `subagent_step_in` results whose status is `running`, `waiting_background`, or `awaiting_approval`
+
+Behavior:
+
+1. Jarvis sends the normal tool response back to Codex
+2. the backend immediately requests `turn/interrupt` for that provider turn
+3. any later Codex deltas or assistant items from that yielded provider turn are ignored locally
+4. if Codex races and sends another `item/tool/call` before the interrupt lands, Jarvis returns a backend-local rejection response instead of executing more work
+5. when Codex reports the interrupted/completed turn, Jarvis emits a normal `done` event, not `codex_backend_error`
+
+This is how Codex-backed actors rejoin the same orchestration model used by normal providers:
+
+- the current turn ends cleanly
+- `RouteRuntime` regains control
+- later bash/subagent notices can enqueue new runtime follow-up turns
+
+For main-agent subagent completion/finalize notices, the orchestrator progress message now includes the latest persisted subagent assistant report when available.
+That lets Codex finalize against the child’s actual reported result instead of reopening the child with `subagent_monitor` or `subagent_step_in` just to recover the already-persisted output.
+
+The backend does not currently force a synthetic assistant progress message before yielding.
+If no assistant text was already produced, the user-visible output for that turn comes from the normal tool/system notice path rather than a final assistant message.
 
 ## Native Codex Execution Boundary
 
@@ -293,7 +330,7 @@ Once native-capability recovery is pending, further message deltas and completed
 
 The developer instruction sent to Codex explicitly tells it to use only client-provided dynamic tools.
 That soft suppression is advisory only; the interrupt-and-retry path is the enforcement layer.
-Codex tool responses for subagent-control actions also include Codex-only advisory text that tells the model to stop polling and wait for orchestrator-managed follow-up turns when appropriate.
+Codex tool responses for orchestrator-managed async work also include Codex-only advisory text that tells the model the turn is yielding back to Jarvis, so it should not keep polling or calling more tools in that turn.
 
 ## Path Mapping
 

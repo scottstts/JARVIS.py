@@ -21,6 +21,7 @@ from jarvis.gateway.route_events import (
     RouteToolCallEvent,
 )
 from jarvis.llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent
+from jarvis.storage import ConversationRecord
 from jarvis.subagent.manager import SubagentManager
 from jarvis.subagent.runtime import SubagentRuntime
 from jarvis.subagent.settings import SubagentSettings
@@ -145,6 +146,73 @@ class SubagentSettingsTests(unittest.TestCase):
 
 
 class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_main_progress_message_includes_latest_subagent_report_for_finalize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            storage = manager._catalog.session_storage(
+                owner_main_session_id="main_session",
+                subagent_id="sub_1",
+            )
+            session = storage.create_session(start_reason="subagent_initial")
+            storage.append_record(
+                session.session_id,
+                ConversationRecord(
+                    record_id="assistant_record",
+                    session_id=session.session_id,
+                    created_at="2026-04-07T00:00:00+00:00",
+                    role="assistant",
+                    content="one\ntwo\nUsed bash.",
+                    metadata={"turn_id": "turn_1"},
+                ),
+            )
+            storage.set_turn_status(session.session_id, turn_id="turn_1", status="completed")
+            fake_loop = _FakeSubagentLoop([], session_id=session.session_id)
+            manager._subagents["sub_1"] = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=fake_loop,  # type: ignore[arg-type]
+                storage=storage,
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="completed",
+                created_at="2026-04-07T00:00:00+00:00",
+                updated_at="2026-04-07T00:00:00+00:00",
+            )
+
+            payload = manager.build_main_progress_message(
+                agent="sub_1",
+                notice_kind="subagent_completed",
+                notice_text="completed.",
+            )
+
+            self.assertIsNotNone(payload)
+            if payload is None:
+                self.fail("Expected a progress payload.")
+            _session_id, message = payload
+            self.assertIn("Latest subagent report:", message.content)
+            self.assertIn("one\ntwo\nUsed bash.", message.content)
+            self.assertIn(
+                "instead of calling `subagent_monitor` or `subagent_step_in`",
+                message.content,
+            )
+            self.assertEqual(message.metadata["latest_subagent_report_included"], True)
+
     async def test_invoke_returns_session_id_and_catalog_owner_linkage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))

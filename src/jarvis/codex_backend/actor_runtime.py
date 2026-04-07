@@ -89,9 +89,11 @@ class _TurnState:
     usage: LLMUsage | None = None
     approval_rejected: bool = False
     terminated: bool = False
+    pending_orchestrator_yield: bool = False
+    orchestrator_yield_reason: str | None = None
     native_recovery_attempts: int = 0
     pending_native_recovery_item_type: str | None = None
-    native_recovery_interrupt_task: asyncio.Task[object] | None = None
+    provider_interrupt_task: asyncio.Task[object] | None = None
     queue: asyncio.Queue[object] = field(default_factory=asyncio.Queue)
 
     def full_text(self) -> str:
@@ -177,6 +179,7 @@ class CodexActorRuntime:
         self._current_turn: _TurnState | None = None
         self._loaded_thread_id: str | None = None
         self._loaded_session_id: str | None = None
+        self._loaded_dynamic_tools_signature: str | None = None
         self._publish_route_event = publish_route_event
 
     @property
@@ -268,6 +271,7 @@ class CodexActorRuntime:
         self._current_turn = None
         self._loaded_thread_id = None
         self._loaded_session_id = None
+        self._loaded_dynamic_tools_signature = None
 
     def append_system_note(
         self,
@@ -307,6 +311,7 @@ class CodexActorRuntime:
         await self._persist_session_bootstrap(session.session_id)
         self._loaded_session_id = None
         self._loaded_thread_id = None
+        self._loaded_dynamic_tools_signature = None
         return session.session_id
 
     def request_stop(
@@ -324,7 +329,7 @@ class CodexActorRuntime:
             pending_approval.cancel()
         provider_turn_id = turn.provider_turn_id
         if provider_turn_id is not None:
-            turn.native_recovery_interrupt_task = self._request_provider_turn_interrupt(
+            turn.provider_interrupt_task = self._request_provider_turn_interrupt(
                 provider_turn_id=provider_turn_id,
                 reason=reason,
             )
@@ -355,7 +360,10 @@ class CodexActorRuntime:
             return
 
         if method == "item/agentMessage/delta":
-            if turn.pending_native_recovery_item_type is not None:
+            if (
+                turn.pending_native_recovery_item_type is not None
+                or turn.pending_orchestrator_yield
+            ):
                 return
             item_id = _optional_string(params.get("itemId"))
             if item_id is not None:
@@ -382,6 +390,8 @@ class CodexActorRuntime:
                 await self._handle_unsupported_native_capability(turn, item_type)
                 return
             if item_type == "agentMessage":
+                if turn.pending_orchestrator_yield:
+                    return
                 await self._complete_assistant_item(turn, item=item)
                 return
             return
@@ -421,11 +431,27 @@ class CodexActorRuntime:
                     CodexProtocolError("Codex completed a turn without an id."),
                 )
                 return
+            error = raw_turn.get("error")
             if (
                 turn.pending_native_recovery_item_type is not None
                 and self._requested_interruption is None
             ):
                 await self._recover_from_native_tool_attempt(turn)
+                return
+            if (
+                turn.pending_orchestrator_yield
+                and self._requested_interruption is None
+            ):
+                if status == "failed" and not _is_expected_interrupt_error(error):
+                    message = "Codex turn failed."
+                    if isinstance(error, dict):
+                        message = str(error.get("message") or message)
+                        additional = _optional_string(error.get("additionalDetails"))
+                        if additional is not None:
+                            message = f"{message} {additional}"
+                    await self._terminate_turn_with_error(turn, CodexBackendError(message))
+                    return
+                await self._complete_orchestrator_yield(turn)
                 return
             response_text = turn.full_text()
             if response_text.strip() and not turn.completed_messages:
@@ -436,7 +462,6 @@ class CodexActorRuntime:
                 )
                 await turn.queue.put(assistant_event)
             interrupted = status == "interrupted"
-            error = raw_turn.get("error")
             self._persist_turn_completion(
                 turn,
                 response_text=response_text,
@@ -472,6 +497,11 @@ class CodexActorRuntime:
         turn = self._current_turn
         if turn is None:
             raise CodexProtocolError("Codex requested a tool call without an active turn.")
+        if turn.pending_orchestrator_yield and method == "item/tool/call":
+            return self._tool_bridge.build_tool_rejection_response(
+                "Jarvis has yielded control of this task back to the route orchestrator. "
+                "Do not call more tools in this turn."
+            )
         if method != "item/tool/call":
             await self._handle_unsupported_native_capability(turn, method)
             raise CodexNativeCapabilityError(
@@ -503,6 +533,7 @@ class CodexActorRuntime:
         )
         result = await self._execute_tool_with_approval(tool_call, context, turn=turn)
         self._persist_tool_result(turn, result=result)
+        self._maybe_begin_orchestrator_yield(turn, result=result)
         return self._tool_bridge.build_tool_response(result)
 
     async def _stream_new_command(
@@ -559,12 +590,21 @@ class CodexActorRuntime:
         else:
             session_id = await self.prepare_session()
             session = self._require_session(session_id)
+        external_runtime_messages, last_external_record_id = self._pending_external_runtime_messages(
+            session.session_id
+        )
         runtime_messages = (
             tuple(self._runtime_messages_provider(session.session_id))
             if self._runtime_messages_provider is not None
             else ()
         )
-        all_pre_turn_messages = (*runtime_messages, *pre_turn_messages)
+        if external_runtime_messages and user_text is None:
+            runtime_messages = ()
+        all_pre_turn_messages = (
+            *external_runtime_messages,
+            *runtime_messages,
+            *pre_turn_messages,
+        )
         await self._maybe_run_due_maintenance()
         thread_id = await self._ensure_thread_loaded(session)
         turn = _TurnState(
@@ -580,26 +620,23 @@ class CodexActorRuntime:
             )
             if not input_items:
                 raise CodexProtocolError("Codex turn input cannot be empty.")
-            activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
-                self._storage.load_records(session.session_id)
+            dynamic_tools, dynamic_tools_signature = self._build_dynamic_tools_bundle(
+                session.session_id
             )
-            turn_response = await self._coordinator.request(
-                "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": input_items,
-                    "cwd": str(self._path_mapper.host_repo_root),
-                    "approvalPolicy": self._settings.approval_policy,
-                    "sandboxPolicy": self._settings.sandbox_policy(),
-                    "model": self._settings.model,
-                    "effort": self._settings.reasoning_effort,
-                    "summary": self._settings.reasoning_summary,
-                    "personality": self._settings.personality,
-                    "dynamicTools": self._tool_bridge.build_dynamic_tools(
-                        activated_discoverable_tool_names=activated_discoverable_tool_names,
-                    ),
-                },
-            )
+            turn_start_params: dict[str, Any] = {
+                "threadId": thread_id,
+                "input": input_items,
+                "cwd": str(self._path_mapper.host_repo_root),
+                "approvalPolicy": self._settings.approval_policy,
+                "sandboxPolicy": self._settings.sandbox_policy(),
+                "model": self._settings.model,
+                "effort": self._settings.reasoning_effort,
+                "summary": self._settings.reasoning_summary,
+                "personality": self._settings.personality,
+            }
+            if dynamic_tools_signature != self._loaded_dynamic_tools_signature:
+                turn_start_params["dynamicTools"] = dynamic_tools
+            turn_response = await self._coordinator.request("turn/start", turn_start_params)
             provider_turn_id = _extract_turn_id(turn_response)
             turn.provider_turn_id = provider_turn_id
             if turn.logical_turn_id is None:
@@ -618,8 +655,15 @@ class CodexActorRuntime:
                     "backend_kind": "codex",
                     "thread_id": thread_id,
                     "last_turn_id": provider_turn_id,
+                    "dynamic_tools_signature": dynamic_tools_signature,
+                    **(
+                        {"last_synced_external_record_id": last_external_record_id}
+                        if last_external_record_id is not None
+                        else {}
+                    ),
                 },
             )
+            self._loaded_dynamic_tools_signature = dynamic_tools_signature
             yield AgentTurnStartedEvent(
                 session_id=session.session_id,
                 turn_id=turn.logical_turn_id,
@@ -649,7 +693,7 @@ class CodexActorRuntime:
                 self._active_turn_id = None
             self._pending_approval_future = None
             self._pending_approval_id = None
-            interrupt_task = turn.native_recovery_interrupt_task
+            interrupt_task = turn.provider_interrupt_task
             if interrupt_task is not None and interrupt_task.done():
                 with contextlib.suppress(Exception):
                     interrupt_task.result()
@@ -735,11 +779,25 @@ class CodexActorRuntime:
             on_challenge=self._publish_auth_challenge,
         )
         developer_instructions = await self._build_developer_instructions()
-        dynamic_tools = self._tool_bridge.build_dynamic_tools(
-            activated_discoverable_tool_names=_collect_activated_discoverable_tool_names(
-                self._storage.load_records(session.session_id)
-            ),
+        dynamic_tools, dynamic_tools_signature = self._build_dynamic_tools_bundle(
+            session.session_id
         )
+        stored_dynamic_tools_signature = _optional_string(
+            backend_state.get("dynamic_tools_signature")
+        )
+        stored_external_record_id = _optional_string(
+            backend_state.get("last_synced_external_record_id")
+        )
+        if thread_id is not None and stored_external_record_id is None:
+            latest_external_record_id = self._latest_external_runtime_record_id(
+                session.session_id
+            )
+            if latest_external_record_id is not None:
+                backend_state = {
+                    **backend_state,
+                    "last_synced_external_record_id": latest_external_record_id,
+                }
+                stored_external_record_id = latest_external_record_id
         if thread_id is None:
             response = await self._coordinator.request(
                 "thread/start",
@@ -769,7 +827,12 @@ class CodexActorRuntime:
                     "developerInstructions": developer_instructions,
                     "personality": self._settings.personality,
                     "persistExtendedHistory": False,
-                    "dynamicTools": dynamic_tools,
+                    **(
+                        {"dynamicTools": dynamic_tools}
+                        if stored_dynamic_tools_signature is None
+                        or stored_dynamic_tools_signature != dynamic_tools_signature
+                        else {}
+                    ),
                 },
             )
         if self._loaded_thread_id is not None and self._loaded_thread_id != thread_id:
@@ -779,6 +842,7 @@ class CodexActorRuntime:
             )
         self._loaded_thread_id = thread_id
         self._loaded_session_id = session.session_id
+        self._loaded_dynamic_tools_signature = dynamic_tools_signature
         self._coordinator.register_actor(thread_id=thread_id, actor=self)
         self._storage.update_session(
             session.session_id,
@@ -786,6 +850,12 @@ class CodexActorRuntime:
                 **backend_state,
                 "backend_kind": "codex",
                 "thread_id": thread_id,
+                "dynamic_tools_signature": dynamic_tools_signature,
+                **(
+                    {"last_synced_external_record_id": stored_external_record_id}
+                    if stored_external_record_id is not None
+                    else {}
+                ),
             },
         )
         return thread_id
@@ -814,6 +884,10 @@ class CodexActorRuntime:
             "Tooling boundary:\n"
             "- The only allowed external capabilities are the Jarvis dynamic tools in this thread.\n"
             "- If a capability is not exposed as a Jarvis dynamic tool, do not use a native Codex fallback.\n"
+            "- If the task, assignment, or orchestrator update already names the exact Jarvis tool "
+            "to use, treat tool discovery as already satisfied and do not call `tool_search` again.\n"
+            "- Use `tool_search` when tool choice is genuinely unclear or when you need a "
+            "discoverable tool that has not already been named.\n"
             "- For shell or terminal work, use Jarvis tool `bash`.\n"
             "- For text file edits, use Jarvis tool `file_patch` or `bash`.\n"
             "- For delegation or subagent work, use Jarvis tools "
@@ -896,10 +970,10 @@ class CodexActorRuntime:
         if turn.terminated:
             return
         turn.terminated = True
-        interrupt_task = turn.native_recovery_interrupt_task
+        interrupt_task = turn.provider_interrupt_task
         if interrupt_task is not None:
             interrupt_task.cancel()
-            turn.native_recovery_interrupt_task = None
+            turn.provider_interrupt_task = None
         if turn.logical_turn_id is not None:
             self._storage.set_turn_status(
                 turn.session_id,
@@ -926,6 +1000,7 @@ class CodexActorRuntime:
         await self._persist_session_bootstrap(session.session_id)
         self._loaded_thread_id = None
         self._loaded_session_id = None
+        self._loaded_dynamic_tools_signature = None
         return session
 
     def _require_session(self, session_id: str) -> SessionMetadata:
@@ -1137,7 +1212,7 @@ class CodexActorRuntime:
         if turn.native_recovery_attempts >= _NATIVE_TOOL_RECOVERY_MAX_ATTEMPTS:
             provider_turn_id = turn.provider_turn_id
             if provider_turn_id is not None:
-                turn.native_recovery_interrupt_task = self._request_provider_turn_interrupt(
+                turn.provider_interrupt_task = self._request_provider_turn_interrupt(
                     provider_turn_id=provider_turn_id,
                     reason="native_capability_blocked",
                 )
@@ -1158,7 +1233,7 @@ class CodexActorRuntime:
             )
             return
         turn.pending_native_recovery_item_type = capability_name
-        turn.native_recovery_interrupt_task = self._request_provider_turn_interrupt(
+        turn.provider_interrupt_task = self._request_provider_turn_interrupt(
             provider_turn_id=provider_turn_id,
             reason="native_capability_blocked",
         )
@@ -1188,8 +1263,8 @@ class CodexActorRuntime:
         if item_type is None:
             return
         turn.pending_native_recovery_item_type = None
-        interrupt_task = turn.native_recovery_interrupt_task
-        turn.native_recovery_interrupt_task = None
+        interrupt_task = turn.provider_interrupt_task
+        turn.provider_interrupt_task = None
         if interrupt_task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await interrupt_task
@@ -1291,8 +1366,134 @@ class CodexActorRuntime:
                 "backend_kind": "codex",
                 "thread_id": thread_id,
                 "last_turn_id": provider_turn_id,
+                "dynamic_tools_signature": self._loaded_dynamic_tools_signature,
             },
         )
+
+    def _build_dynamic_tools_bundle(
+        self,
+        session_id: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        dynamic_tools = self._tool_bridge.build_dynamic_tools(
+            activated_discoverable_tool_names=_collect_activated_discoverable_tool_names(
+                self._storage.load_records(session_id)
+            ),
+        )
+        return dynamic_tools, _dynamic_tools_signature(dynamic_tools)
+
+    def _pending_external_runtime_messages(
+        self,
+        session_id: str,
+    ) -> tuple[tuple[AgentRuntimeMessage, ...], str | None]:
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return (), None
+        records = self._storage.load_records(session_id, include_all_turns=True)
+        last_synced_record_id = _optional_string(
+            session.backend_state.get("last_synced_external_record_id")
+        )
+        eligible_records = [
+            record for record in records if _is_external_runtime_record(record)
+        ]
+        if not eligible_records:
+            return (), None
+        pending_records: list[ConversationRecord]
+        if last_synced_record_id is None:
+            pending_records = eligible_records
+        else:
+            pending_records = []
+            found_last_synced = False
+            for record in eligible_records:
+                if not found_last_synced:
+                    if record.record_id == last_synced_record_id:
+                        found_last_synced = True
+                    continue
+                pending_records.append(record)
+            if not found_last_synced:
+                pending_records = eligible_records
+        if not pending_records:
+            return (), None
+        return (
+            tuple(
+                AgentRuntimeMessage(
+                    role=record.role,
+                    content=record.content,
+                    metadata=dict(record.metadata),
+                )
+                for record in pending_records
+            ),
+            pending_records[-1].record_id,
+        )
+
+    def _latest_external_runtime_record_id(
+        self,
+        session_id: str,
+    ) -> str | None:
+        records = self._storage.load_records(session_id, include_all_turns=True)
+        for record in reversed(records):
+            if _is_external_runtime_record(record):
+                return record.record_id
+        return None
+
+    def _maybe_begin_orchestrator_yield(
+        self,
+        turn: _TurnState,
+        *,
+        result: ToolExecutionResult,
+    ) -> None:
+        if turn.pending_orchestrator_yield or turn.pending_native_recovery_item_type is not None:
+            return
+        reason = _orchestrator_wait_reason(result)
+        if reason is None:
+            return
+        provider_turn_id = turn.provider_turn_id
+        if provider_turn_id is None:
+            return
+        turn.pending_orchestrator_yield = True
+        turn.orchestrator_yield_reason = reason
+        turn.provider_interrupt_task = self._request_provider_turn_interrupt(
+            provider_turn_id=provider_turn_id,
+            reason=reason,
+        )
+
+    async def _complete_orchestrator_yield(self, turn: _TurnState) -> None:
+        interrupt_task = turn.provider_interrupt_task
+        turn.provider_interrupt_task = None
+        if interrupt_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await interrupt_task
+        response_text = turn.full_text()
+        if response_text.strip() and not turn.completed_messages:
+            await turn.queue.put(
+                AgentAssistantMessageEvent(
+                    session_id=turn.session_id,
+                    turn_id=self._visible_turn_id(turn),
+                    text=response_text,
+                )
+            )
+        self._persist_turn_completion(
+            turn,
+            response_text=response_text,
+            status="completed",
+        )
+        await turn.queue.put(
+            AgentTurnDoneEvent(
+                session_id=turn.session_id,
+                turn_id=self._visible_turn_id(turn),
+                response_text=response_text,
+                command=turn.command,
+                compaction_performed=turn.compaction_performed,
+                interrupted=False,
+                approval_rejected=False,
+                interruption_reason=None,
+            )
+        )
+        turn.terminated = True
+        turn.pending_orchestrator_yield = False
+        turn.orchestrator_yield_reason = None
+        self._active_turn_id = None
+        self._requested_interruption = None
+        self._current_turn = None
 
     def _native_tool_recovery_note(self, turn: _TurnState, *, item_type: str) -> str:
         lines = [_NATIVE_TOOL_RECOVERY_NOTE_TEMPLATE.format(item_type=item_type)]
@@ -1402,6 +1603,17 @@ def _optional_int(value: object) -> int | None:
         return None
 
 
+def _is_expected_interrupt_error(error: object) -> bool:
+    if not isinstance(error, dict):
+        return False
+    message = str(error.get("message", "")).strip().lower()
+    additional = str(error.get("additionalDetails", "")).strip().lower()
+    combined = " ".join(part for part in (message, additional) if part)
+    if not combined:
+        return False
+    return "interrupt" in combined
+
+
 def _utc_now_iso() -> str:
     import datetime as _datetime
 
@@ -1446,3 +1658,38 @@ def _collect_activated_discoverable_tool_names(
             seen.add(name)
             names.append(name)
     return tuple(names)
+
+
+def _orchestrator_wait_reason(result: ToolExecutionResult) -> str | None:
+    if result.name == "bash":
+        status = str(result.metadata.get("status") or result.metadata.get("state") or "").strip()
+        mode = str(result.metadata.get("mode", "")).strip()
+        if status == "running" and (
+            mode == "background" or bool(result.metadata.get("promoted_to_background"))
+        ):
+            return "orchestrator_wait_bash"
+        return None
+    if not result.metadata.get("subagent_control"):
+        return None
+    action = str(result.metadata.get("subagent_action", "")).strip()
+    status = str(result.metadata.get("status", "")).strip()
+    if action in {"invoke", "step_in"} and status in {
+        "running",
+        "waiting_background",
+        "awaiting_approval",
+    }:
+        return "orchestrator_wait_subagent"
+    return None
+
+
+def _dynamic_tools_signature(dynamic_tools: Sequence[dict[str, Any]]) -> str:
+    return json.dumps(dynamic_tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _is_external_runtime_record(record: ConversationRecord) -> bool:
+    if record.role != "system":
+        return False
+    metadata = record.metadata
+    if metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY):
+        return False
+    return _optional_string(metadata.get(_TURN_ID_METADATA_KEY)) is None

@@ -445,7 +445,8 @@ class SubagentManager:
         notice_kind: str,
         notice_text: str,
     ) -> tuple[str | None, AgentRuntimeMessage] | None:
-        snapshot = self.snapshot_for(agent)
+        runtime = self._subagents.get(agent)
+        snapshot = runtime.snapshot() if runtime is not None else self.snapshot_for(agent)
         if snapshot is None:
             return None
         if snapshot.status == "disposed":
@@ -467,18 +468,13 @@ class SubagentManager:
             )
         if notice_text.strip():
             parts.append(f'note="{self._truncate_for_notice(notice_text, max_length=140)}"')
+        latest_report = self._latest_assistant_report(runtime) if runtime is not None else None
         content = "\n".join(
-            [
-                "Subagent update.",
-                "- " + " ".join(parts),
-                f"recommendation={recommendation}",
-                (
-                    "This is a system update from the orchestrator, not a new user message. "
-                    "Subagent progress is orchestrator-monitored; react to this update and "
-                    "update the user accordingly instead of polling unless immediate detail is "
-                    "required."
-                ),
-            ]
+            self._build_main_progress_lines(
+                parts=parts,
+                recommendation=recommendation,
+                latest_report=latest_report,
+            )
         )
         return (
             snapshot.owner_main_session_id,
@@ -490,6 +486,7 @@ class SubagentManager:
                     "subagent_id": snapshot.subagent_id,
                     "subagent_notice_kind": notice_kind,
                     "recommended_action": recommendation,
+                    "latest_subagent_report_included": bool(latest_report),
                     "pending_subagent_ids": (
                         [snapshot.subagent_id]
                         if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
@@ -499,6 +496,46 @@ class SubagentManager:
                 content=content,
             ),
         )
+
+    def _build_main_progress_lines(
+        self,
+        *,
+        parts: list[str],
+        recommendation: str,
+        latest_report: str | None,
+    ) -> list[str]:
+        lines = [
+            "Subagent update.",
+            "- " + " ".join(parts),
+            f"recommendation={recommendation}",
+        ]
+        if recommendation in {"finalize", "inspect"} and latest_report is not None:
+            lines.extend(
+                [
+                    "Latest subagent report:",
+                    self._truncate_subagent_report_for_main(latest_report),
+                    (
+                        "The latest subagent report is already included above. Use it directly "
+                        "instead of calling `subagent_monitor` or `subagent_step_in` unless the "
+                        "report is clearly incomplete or contradictory."
+                    ),
+                ]
+            )
+        else:
+            lines.append(
+                "This is a system update from the orchestrator, not a new user message. "
+                "Subagent progress is orchestrator-monitored; react to this update and "
+                "update the user accordingly instead of polling unless immediate detail is "
+                "required."
+            )
+            return lines
+        lines.append(
+            "This is a system update from the orchestrator, not a new user message. "
+            "Subagent progress is orchestrator-monitored; react to this update and "
+            "update the user accordingly instead of polling unless immediate detail is "
+            "required."
+        )
+        return lines
 
     def is_turn_active(self, subagent_id: str) -> bool:
         runtime = self._subagents.get(subagent_id)
@@ -1172,6 +1209,17 @@ class SubagentManager:
         if len(normalized) <= max_length:
             return normalized
         return normalized[: max_length - 3] + "..."
+
+    def _truncate_subagent_report_for_main(
+        self,
+        value: str,
+        *,
+        max_length: int = 1600,
+    ) -> str:
+        normalized = value.strip()
+        if len(normalized) <= max_length:
+            return normalized
+        return normalized[: max_length - 15].rstrip() + "\n...[truncated]"
 
     def _last_non_empty_line(self, text: str) -> str | None:
         for line in reversed(text.splitlines()):

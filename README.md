@@ -38,6 +38,39 @@ stop - pause Jarvis
 compact - compact current session
 ```
 
+### Use Codex Backend
+
+Jarvis can use OpenAI Codex through a host-run `codex app-server`. In Jarvis settings, set `llm.default_provider: codex` and, if desired, `subagent.provider: codex`.
+
+Jarvis does not hold your OpenAI OAuth session itself. The host Codex app-server does. Jarvis only needs the same websocket bearer token that the host app-server expects.
+
+Create one shared websocket token and put it in both places:
+
+```bash
+mkdir -p ~/.codex
+openssl rand -hex 32 | tee ~/.codex/jarvis-ws-token > secrets/JARVIS_CODEX_WS_BEARER_TOKEN
+chmod 600 ~/.codex/jarvis-ws-token secrets/JARVIS_CODEX_WS_BEARER_TOKEN
+```
+
+Start Codex app-server on the host:
+
+```bash
+codex app-server \
+  --listen ws://0.0.0.0:4500 \
+  --ws-auth capability-token \
+  --ws-token-file ~/.codex/jarvis-ws-token
+```
+
+Then recreate `jarvis_runtime` so the secret is mounted:
+
+```bash
+docker compose up -d --build jarvis_runtime
+```
+
+Default Docker settings expect Codex at `ws://host.docker.internal:4500`. If you use a different listener, update `providers.codex.ws_url` in `settings.yml`.
+
+On the first Codex-backed message, Jarvis will send you a browser login URL. Open it and complete the OpenAI login flow. After that, the host Codex app-server keeps the OAuth session and later Jarvis turns should connect without another login unless the host session expires.
+
 ### BTWs
 
 - At container startup time, `jarvis_runtime` reseeds workspace starter files from the repo and overwrites the previous copies: `workspace/settings/settings.yml`, `workspace/settings/settings_gui.html`, `workspace/identities/*`, and `workspace/migrate.sh`

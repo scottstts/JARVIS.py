@@ -58,6 +58,12 @@ class CodexToolBridge:
             "contentItems": self._content_items_for_result(result),
         }
 
+    def build_tool_rejection_response(self, message: str) -> dict[str, Any]:
+        return {
+            "success": False,
+            "contentItems": [{"type": "inputText", "text": message}],
+        }
+
     def _dynamic_tool_spec(self, definition: ToolDefinition) -> dict[str, Any]:
         return {
             "name": definition.name,
@@ -83,15 +89,28 @@ class CodexToolBridge:
         return items
 
     def _advisory_text_for_result(self, result: ToolExecutionResult) -> str | None:
+        if result.name == "bash":
+            status = str(result.metadata.get("status") or result.metadata.get("state") or "").strip()
+            mode = str(result.metadata.get("mode", "")).strip()
+            if status == "running" and (
+                mode == "background" or bool(result.metadata.get("promoted_to_background"))
+            ):
+                return (
+                    "Codex runtime note: this detached bash job is now being monitored by the "
+                    "Jarvis orchestrator. Do not continue this turn or call more tools here."
+                )
         if result.metadata.get("subagent_control") is not True:
             return None
         action = str(result.metadata.get("subagent_action", "")).strip()
-        if action == "invoke" and str(result.metadata.get("status", "")).strip() == "running":
+        if action in {"invoke", "step_in"} and str(result.metadata.get("status", "")).strip() in {
+            "running",
+            "waiting_background",
+            "awaiting_approval",
+        }:
             return (
-                "Codex runtime note: the subagent is now running independently. Do not call "
-                "`subagent_monitor` again in this same turn unless immediate detail is strictly "
-                "required. End this turn after a brief status update and wait for a later "
-                "orchestrator system update."
+                "Codex runtime note: the subagent is now running independently and Jarvis is "
+                "yielding control back to the route orchestrator. Do not call "
+                "`subagent_monitor` or any other tool again in this turn."
             )
         if action == "monitor" and result.metadata.get("changed") is False:
             return (

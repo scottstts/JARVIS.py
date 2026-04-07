@@ -7,12 +7,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from jarvis.codex_backend.actor_runtime import _dynamic_tools_signature
 from jarvis.codex_backend.actor_runtime import CodexActorRuntime
 from jarvis.codex_backend.config import CodexBackendSettings
 from jarvis.codex_backend.types import CodexNativeCapabilityError
-from jarvis.core import AgentIdentity, AgentMemoryMode
+from jarvis.core import AgentIdentity, AgentMemoryMode, AgentRuntimeMessage
 from jarvis.llm import LLMMessage, ToolDefinition
-from jarvis.storage import SessionStorage
+from jarvis.storage import ConversationRecord, SessionStorage
 from jarvis.tools import ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 from tests.helpers import build_core_settings
 
@@ -75,6 +76,7 @@ def _build_runtime(
     coordinator: _FakeCoordinator | None = None,
     tool_definitions_provider=None,
     tool_executor=None,
+    runtime_messages_provider=None,
 ) -> tuple[CodexActorRuntime, SessionStorage, _FakeCoordinator]:
     core_settings = build_core_settings(root_dir=root_dir)
     workspace_dir = root_dir / "workspace"
@@ -114,6 +116,7 @@ def _build_runtime(
         tool_executor=tool_executor
         or (lambda tool_call, context: asyncio.sleep(0)),  # pragma: no cover
         publish_route_event=lambda _event: asyncio.sleep(0),
+        runtime_messages_provider=runtime_messages_provider,
     )
     return runtime, storage, coordinator
 
@@ -194,6 +197,7 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected an active session.")
             self.assertEqual(active.backend_state["thread_id"], "thread_1")
             self.assertEqual(active.backend_state["last_turn_id"], "turn_1")
+            self.assertIn("dynamic_tools_signature", active.backend_state)
             assistant_record = storage.load_records(active.session_id)[-1]
             self.assertEqual(assistant_record.content, "Hello")
             self.assertEqual(assistant_record.metadata["provider"], "codex")
@@ -292,6 +296,196 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual([record.content for record in assistant_records], ["First message", "Second message"])
             self.assertTrue(all(record.metadata["provider"] == "codex" for record in assistant_records))
+
+    async def test_turn_start_omits_unchanged_dynamic_tools_after_thread_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, storage, coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                tool_definitions_provider=lambda _activated: (
+                    ToolDefinition(
+                        name="bash",
+                        description="Run shell commands.",
+                        input_schema={"type": "object"},
+                    ),
+                ),
+            )
+
+            events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="hello"))
+            )
+            await asyncio.sleep(0)
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            await events_task
+
+            thread_start_request = next(
+                params
+                for method, params in coordinator.requests
+                if method == "thread/start"
+            )
+            self.assertIn("dynamicTools", thread_start_request)
+            self.assertEqual(thread_start_request["dynamicTools"][0]["name"], "bash")
+            self.assertNotIn("dynamicTools", coordinator.turn_start_requests[0])
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            self.assertEqual(
+                active.backend_state["dynamic_tools_signature"],
+                _dynamic_tools_signature(thread_start_request["dynamicTools"]),
+            )
+
+    async def test_turn_start_sends_dynamic_tools_when_discoverable_tools_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            def tool_definitions_provider(activated):
+                if "web_fetch" not in activated:
+                    return ()
+                return (
+                    ToolDefinition(
+                        name="web_fetch",
+                        description="Fetch web pages.",
+                        input_schema={"type": "object"},
+                    ),
+                )
+
+            runtime, storage, coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                coordinator=_FakeCoordinator(turn_start_ids=["turn_1", "turn_2"]),
+                tool_definitions_provider=tool_definitions_provider,
+            )
+
+            first_events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="hello"))
+            )
+            await asyncio.sleep(0)
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            await first_events_task
+
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            storage.append_record(
+                active.session_id,
+                ConversationRecord(
+                    record_id="tool_activation",
+                    session_id=active.session_id,
+                    created_at="2026-04-07T00:00:00+00:00",
+                    role="tool",
+                    content="Activated discoverable tool.",
+                    metadata={"activated_discoverable_tool_names": ["web_fetch"]},
+                ),
+            )
+
+            second_events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="again"))
+            )
+            await asyncio.sleep(0)
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_2",
+                        "items": [],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            await second_events_task
+
+            self.assertEqual(len(coordinator.turn_start_requests), 2)
+            self.assertNotIn("dynamicTools", coordinator.turn_start_requests[0])
+            self.assertIn("dynamicTools", coordinator.turn_start_requests[1])
+            self.assertEqual(
+                coordinator.turn_start_requests[1]["dynamicTools"][0]["name"],
+                "web_fetch",
+            )
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            self.assertEqual(
+                active.backend_state["dynamic_tools_signature"],
+                _dynamic_tools_signature(coordinator.turn_start_requests[1]["dynamicTools"]),
+            )
+
+    async def test_runtime_turn_syncs_external_system_notes_into_codex_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, storage, coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                coordinator=_FakeCoordinator(turn_start_ids=["turn_1"]),
+                runtime_messages_provider=lambda _session_id: (
+                    AgentRuntimeMessage(
+                        role="system",
+                        content="Subagent status snapshot:\n- should be suppressed here.",
+                    ),
+                ),
+            )
+
+            session_id = await runtime.prepare_session()
+            self.assertTrue(
+                runtime.append_system_note(
+                    "Subagent update.\n- status=completed\nLatest subagent report:\none\ntwo\nUsed bash.",
+                    session_id=session_id,
+                    metadata={"subagent_progress_update": True},
+                )
+            )
+            synced_record_id = storage.load_records(session_id, include_all_turns=True)[-1].record_id
+
+            events_task = asyncio.create_task(
+                _collect_events(runtime.stream_runtime_turn(force_session_id=session_id))
+            )
+            await asyncio.sleep(0)
+            first_input = coordinator.turn_start_requests[0]["input"]
+            self.assertEqual(len(first_input), 1)
+            self.assertIn("Subagent update.", first_input[0]["text"])
+            self.assertNotIn("should be suppressed here", first_input[0]["text"])
+
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            await events_task
+
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            self.assertEqual(
+                active.backend_state["last_synced_external_record_id"],
+                synced_record_id,
+            )
 
     async def test_handle_server_request_waits_for_jarvis_approval_and_retries_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -547,6 +741,184 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 if record.metadata.get("codex_native_tool_recovery") is True
             ]
             self.assertEqual(recovery_records[0].metadata["item_type"], "commandExecution")
+
+    async def test_subagent_invoke_yields_turn_back_to_route_when_async_work_begins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = _FakeCoordinator()
+            executor_calls: list[str] = []
+
+            async def tool_executor(tool_call, context):
+                _ = context
+                executor_calls.append(tool_call.name)
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    ok=True,
+                    content="Subagent invoked\nstatus: running",
+                    metadata={
+                        "subagent_control": True,
+                        "subagent_action": "invoke",
+                        "subagent_id": "sub_1",
+                        "status": "running",
+                    },
+                )
+
+            runtime, storage, _storage_coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                coordinator=coordinator,
+                tool_definitions_provider=lambda _activated: (
+                    ToolDefinition(
+                        name="subagent_invoke",
+                        description="Run a subagent.",
+                        input_schema={"type": "object"},
+                    ),
+                ),
+                tool_executor=tool_executor,
+            )
+
+            events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="delegate this"))
+            )
+            await asyncio.sleep(0)
+            response = await runtime.handle_server_request(
+                "item/tool/call",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "callId": "call_1",
+                    "tool": "subagent_invoke",
+                    "arguments": {"instructions": "do it"},
+                },
+            )
+            extra_response = await runtime.handle_server_request(
+                "item/tool/call",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "callId": "call_2",
+                    "tool": "subagent_monitor",
+                    "arguments": {"agent": "sub_1"},
+                },
+            )
+            await runtime.handle_notification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "itemId": "msg_1",
+                    "delta": "This should be suppressed",
+                },
+            )
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                },
+            )
+            events = await events_task
+
+            self.assertEqual(
+                [event.type for event in events],
+                ["turn_started", "tool_call", "done"],
+            )
+            self.assertEqual(response["success"], True)
+            self.assertIn("yielding control back to the route orchestrator", response["contentItems"][1]["text"])
+            self.assertEqual(extra_response["success"], False)
+            self.assertEqual(executor_calls, ["subagent_invoke"])
+            self.assertEqual(events[-1].response_text, "")
+            self.assertFalse(events[-1].interrupted)
+            self.assertEqual(
+                [method for method, _params in coordinator.requests if method == "turn/interrupt"],
+                ["turn/interrupt"],
+            )
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            self.assertEqual(active.turn_states["turn_1"], "completed")
+
+    async def test_background_bash_yields_turn_back_to_route_when_job_is_detached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = _FakeCoordinator()
+            executor_calls: list[str] = []
+
+            async def tool_executor(tool_call, context):
+                _ = context
+                executor_calls.append(tool_call.name)
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name="bash",
+                    ok=True,
+                    content="Bash background job started",
+                    metadata={
+                        "mode": "background",
+                        "job_id": "job_1",
+                        "status": "running",
+                        "state": "running",
+                    },
+                )
+
+            runtime, storage, _storage_coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                coordinator=coordinator,
+                tool_definitions_provider=lambda _activated: (
+                    ToolDefinition(
+                        name="bash",
+                        description="Run shell commands.",
+                        input_schema={"type": "object"},
+                    ),
+                ),
+                tool_executor=tool_executor,
+            )
+
+            events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="run this in background"))
+            )
+            await asyncio.sleep(0)
+            response = await runtime.handle_server_request(
+                "item/tool/call",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "callId": "call_1",
+                    "tool": "bash",
+                    "arguments": {"cmd": "sleep 10", "mode": "background"},
+                },
+            )
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "failed",
+                        "error": {"message": "Interrupted"},
+                    },
+                },
+            )
+            events = await events_task
+
+            self.assertEqual(
+                [event.type for event in events],
+                ["turn_started", "tool_call", "done"],
+            )
+            self.assertEqual(executor_calls, ["bash"])
+            self.assertEqual(response["success"], True)
+            self.assertIn("detached bash job is now being monitored", response["contentItems"][1]["text"])
+            self.assertFalse(events[-1].interrupted)
+            self.assertEqual(events[-1].response_text, "")
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            self.assertEqual(active.turn_states["turn_1"], "completed")
 
     async def test_aclose_unregisters_loaded_thread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
