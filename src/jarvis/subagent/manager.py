@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
+from jarvis.actor_backends import ActorRuntime, backend_kind_for_provider
+from jarvis.codex_backend import CodexActorRuntime, CodexBackendSettings, CodexRouteCoordinator
 from jarvis.core import (
     AgentApprovalRequestEvent,
     AgentAssistantMessageEvent,
@@ -74,10 +76,12 @@ class SubagentManager:
         tool_registry: ToolRegistry,
         tool_execution_guard: asyncio.Semaphore,
         publish_event: Callable[[object], Awaitable[None]],
-        register_approval_target: Callable[[str, AgentLoop], None],
+        register_approval_target: Callable[[str, ActorRuntime], None],
         tool_result_observer: Callable[[ToolExecutionResult, ToolExecutionContext], Awaitable[None]]
         | None = None,
         settings: SubagentSettings | None = None,
+        codex_settings: CodexBackendSettings | None = None,
+        codex_coordinator: CodexRouteCoordinator | None = None,
     ) -> None:
         self._route_id = route_id
         self._llm_service = llm_service
@@ -94,6 +98,8 @@ class SubagentManager:
         self._publish_event = publish_event
         self._register_approval_target = register_approval_target
         self._tool_result_observer = tool_result_observer
+        self._codex_settings = codex_settings or CodexBackendSettings.from_env()
+        self._codex_coordinator = codex_coordinator
         self._catalog = SubagentCatalogStorage(
             archive_dir=self._settings.archive_dir,
             route_id=route_id,
@@ -771,7 +777,7 @@ class SubagentManager:
         codename: str,
         storage: SessionStorage,
         bootstrap_loader: SubagentBootstrapLoader,
-    ) -> AgentLoop:
+    ) -> ActorRuntime:
         filtered_registry = self._tool_registry.filtered_view(
             agent_kind="subagent",
             hidden_tool_names=self._settings.builtin_tool_blocklist,
@@ -790,6 +796,37 @@ class SubagentManager:
                 context=context,
             )
             return result
+        resolved_provider = self._resolved_provider()
+        if backend_kind_for_provider(resolved_provider) == "codex":
+            if self._codex_coordinator is None:
+                raise RuntimeError("Codex coordinator is required for Codex-backed subagents.")
+            return CodexActorRuntime(
+                coordinator=self._codex_coordinator,
+                settings=self._codex_settings,
+                llm_service=self._llm_service,
+                storage=storage,
+                core_settings=self._core_settings,
+                route_id=self._route_id,
+                identity=AgentIdentity(kind="subagent", name=codename, subagent_id=subagent_id),
+                bootstrap_loader=bootstrap_loader,
+                memory_mode=AgentMemoryMode(
+                    bootstrap=False,
+                    maintenance=False,
+                    reflection=False,
+                ),
+                tool_registry=filtered_registry,
+                tool_runtime=tool_runtime,
+                tool_definitions_provider=lambda activated_names: tuple(
+                    list(filtered_registry.basic_definitions())
+                    + list(
+                        filtered_registry.resolve_discoverable_tool_definitions(
+                            activated_names
+                        )
+                    )
+                ),
+                tool_executor=_execute,
+                publish_route_event=self._publish_event,
+            )
 
         return AgentLoop(
             llm_service=self._llm_service,
@@ -805,9 +842,19 @@ class SubagentManager:
                 maintenance=False,
                 reflection=False,
             ),
-            llm_provider=self._settings.provider,
+            llm_provider=resolved_provider,
             tool_executor=_execute,
         )
+
+    def _resolved_provider(self) -> str:
+        if self._settings.provider is not None:
+            return self._settings.provider
+        service_settings = getattr(self._llm_service, "settings", None)
+        if service_settings is not None:
+            default_provider = getattr(service_settings, "default_provider", None)
+            if isinstance(default_provider, str) and default_provider.strip():
+                return default_provider.strip().lower()
+        return "openai"
 
     async def _observe_tool_result(
         self,
@@ -1180,6 +1227,17 @@ class SubagentManager:
         runtime.pending_pause_reason = None
         runtime.pending_background_job_ids.clear()
         disposed_at = _utc_now_iso()
+        active_session_id = runtime.loop.active_session_id()
+        if active_session_id is not None:
+            try:
+                runtime.storage.archive_session(active_session_id)
+            except ValueError:
+                LOGGER.debug(
+                    "Subagent %s session %s was already absent during dispose.",
+                    runtime.subagent_id,
+                    active_session_id,
+                )
+        await runtime.loop.aclose()
         self._sync_catalog(runtime, disposed_at=disposed_at)
         self._pending_bash_job_notices.pop(runtime.subagent_id, None)
         self._append_notable_event(runtime, kind="disposed", summary=f"Disposed {runtime.codename}.")

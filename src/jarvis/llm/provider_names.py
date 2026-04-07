@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 LLM_PROVIDER_NAMES: tuple[str, ...] = (
+    "codex",
     "openai",
     "anthropic",
     "gemini",

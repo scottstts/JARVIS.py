@@ -366,7 +366,7 @@ JARVIS_CORE_TIMEZONE: Final = _string("core.timezone")
 
 # Core LLM routing/runtime.
 # The provider chosen here will determine which provider settings/token are needed below.
-# 'openai', 'gemini', 'anthropic', 'grok', 'openrouter', 'lmstudio'
+# 'codex', 'openai', 'gemini', 'anthropic', 'grok', 'openrouter', 'lmstudio'
 JARVIS_LLM_DEFAULT_PROVIDER: Final = _string("llm.default_provider")
 JARVIS_LLM_TIMEOUT_SECONDS: Final = _float("llm.timeout_seconds")
 JARVIS_LLM_RETRY_ATTEMPTS: Final = _integer("llm.retry_attempts")
@@ -475,6 +475,28 @@ JARVIS_GEMINI_MAX_OUTPUT_TOKENS: Final = _integer("providers.gemini.max_output_t
 JARVIS_GEMINI_THINKING_LEVEL: Final = _string("providers.gemini.thinking_level")
 JARVIS_GEMINI_THINKING_BUDGET: Final[int | None] = _optional_integer(
     "providers.gemini.thinking_budget"
+)
+
+# Codex backend defaults.
+JARVIS_CODEX_WS_URL: Final = _string("providers.codex.ws_url")
+JARVIS_CODEX_MODEL: Final[str | None] = _optional_string("providers.codex.model")
+JARVIS_CODEX_REASONING_EFFORT: Final[str | None] = _optional_string(
+    "providers.codex.reasoning_effort"
+)
+JARVIS_CODEX_REASONING_SUMMARY: Final[str | None] = _optional_string(
+    "providers.codex.reasoning_summary"
+)
+JARVIS_CODEX_PERSONALITY: Final[str | None] = _optional_string("providers.codex.personality")
+JARVIS_CODEX_SERVICE_NAME: Final = _string("providers.codex.service_name")
+JARVIS_CODEX_HOST_REPO_ROOT: Final[str | None] = _optional_string(
+    "providers.codex.host_repo_root"
+)
+JARVIS_CODEX_HOST_WORKSPACE_ROOT: Final[str | None] = _optional_string(
+    "providers.codex.host_workspace_root"
+)
+JARVIS_CODEX_APPROVAL_POLICY: Final = _string("providers.codex.approval_policy")
+JARVIS_CODEX_SANDBOX_NETWORK_ACCESS: Final = _boolean(
+    "providers.codex.sandbox_network_access"
 )
 
 # Grok provider defaults.

@@ -9,11 +9,19 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from jarvis.actor_backends import ActorRuntime, backend_kind_for_provider
+from jarvis.codex_backend import (
+    CodexActorRuntime,
+    CodexBackendError,
+    CodexBackendSettings,
+    CodexRouteCoordinator,
+)
 from jarvis.core import (
     AgentApprovalRequestEvent,
     AgentAssistantMessageEvent,
     AgentIdentity,
     AgentLoop,
+    AgentMemoryMode,
     AgentRuntimeMessage,
     AgentTextDeltaEvent,
     AgentToolCallEvent,
@@ -28,6 +36,7 @@ from jarvis.core.commands import parse_user_command
 from jarvis.core.identities import IdentityBootstrapLoader
 from jarvis.llm import LLMMessage, LLMService, ProviderTimeoutError, ToolCall, ToolDefinition
 from jarvis.logging_setup import get_application_logger
+from jarvis.storage import SessionStorage
 from jarvis.subagent import (
     SUBAGENT_PRIMITIVE_NAMES,
     SubagentManager,
@@ -117,9 +126,9 @@ class RouteApprovalRegistry:
     """Maps approval ids to the loop instance currently waiting on them."""
 
     def __init__(self) -> None:
-        self._targets: dict[str, AgentLoop] = {}
+        self._targets: dict[str, ActorRuntime] = {}
 
-    def register(self, approval_id: str, loop: AgentLoop) -> None:
+    def register(self, approval_id: str, loop: ActorRuntime) -> None:
         self._targets[approval_id] = loop
 
     def resolve(self, approval_id: str, approved: bool) -> bool:
@@ -179,6 +188,8 @@ class RouteRuntime:
         self._subagent_reset_in_progress = False
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
+        self._codex_settings = CodexBackendSettings.from_env()
+        self._codex_coordinator = CodexRouteCoordinator(settings=self._codex_settings)
         self._bash_job_supervisor = BashJobSupervisor(
             route_id=route_id,
             settings=tool_settings,
@@ -197,20 +208,53 @@ class RouteRuntime:
             publish_event=self.publish_event,
             register_approval_target=self._approval_registry.register,
             tool_result_observer=self._bash_job_supervisor.observe_tool_result,
+            codex_settings=self._codex_settings,
+            codex_coordinator=self._codex_coordinator,
         )
-        self._main_loop = AgentLoop(
-            llm_service=llm_service,
-            settings=core_settings,
-            route_id=route_id,
+        self._main_loop: ActorRuntime = self._build_main_loop()
+
+    def _build_main_loop(self) -> ActorRuntime:
+        provider = self._resolved_main_provider()
+        if backend_kind_for_provider(provider) == "codex":
+            return CodexActorRuntime(
+                coordinator=self._codex_coordinator,
+                settings=self._codex_settings,
+                llm_service=self._llm_service,
+                storage=SessionStorage(self._core_settings.transcript_archive_dir),
+                core_settings=self._core_settings,
+                route_id=self._route_id,
+                identity=AgentIdentity(kind="main", name="Jarvis"),
+                bootstrap_loader=CompositeMainBootstrapLoader(self._core_settings),
+                memory_mode=AgentMemoryMode(),
+                tool_registry=self._main_registry,
+                tool_runtime=self._main_tool_runtime,
+                tool_definitions_provider=self._build_main_tool_definitions,
+                tool_executor=self._execute_main_tool_call,
+                publish_route_event=self.publish_event,
+                runtime_messages_provider=lambda _session_id: self._subagent_manager.main_turn_runtime_messages(),
+            )
+        return AgentLoop(
+            llm_service=self._llm_service,
+            settings=self._core_settings,
+            route_id=self._route_id,
             tool_registry=self._main_registry,
             tool_runtime=self._main_tool_runtime,
-            bootstrap_loader=CompositeMainBootstrapLoader(core_settings),
+            bootstrap_loader=CompositeMainBootstrapLoader(self._core_settings),
             identity=AgentIdentity(kind="main", name="Jarvis"),
+            llm_provider=provider,
             tool_definitions_provider=self._build_main_tool_definitions,
             tool_executor=self._execute_main_tool_call,
             runtime_messages_provider=lambda _session_id: self._subagent_manager.main_turn_runtime_messages(),
             local_notice_callback=self._publish_main_local_notice,
         )
+
+    def _resolved_main_provider(self) -> str:
+        service_settings = getattr(self._llm_service, "settings", None)
+        if service_settings is not None:
+            default_provider = getattr(service_settings, "default_provider", None)
+            if isinstance(default_provider, str) and default_provider.strip():
+                return default_provider.strip().lower()
+        return "openai"
 
     def active_session_id(self) -> str | None:
         return self._main_loop.active_session_id()
@@ -527,6 +571,27 @@ class RouteRuntime:
                         client_message_id=request.client_message_id,
                         code="provider_timeout",
                         message=_PROVIDER_TIMEOUT_MESSAGE,
+                    )
+                )
+            except CodexBackendError as exc:
+                LOGGER.warning(
+                    "Route %s main turn hit a Codex backend error while processing "
+                    "client_message_id=%s: %s",
+                    self._route_id,
+                    request.client_message_id,
+                    exc,
+                )
+                await self.publish_event(
+                    RouteErrorEvent(
+                        route_id=self._route_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        session_id=self._main_loop.active_session_id(),
+                        turn_id=self._main_loop.active_turn_id(),
+                        turn_kind="user" if request.user_initiated else "runtime",
+                        client_message_id=request.client_message_id,
+                        code="codex_backend_error",
+                        message=str(exc),
                     )
                 )
             except Exception:

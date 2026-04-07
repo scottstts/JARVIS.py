@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from jarvis.codex_backend.types import CodexConnectionError
 from jarvis.core import (
     AgentAssistantMessageEvent,
     AgentTextDeltaEvent,
@@ -418,6 +419,49 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(event.turn_kind)
             self.assertIsNone(event.client_message_id)
             self.assertFalse(stream_called)
+
+            runtime.unsubscribe(subscriber_id)
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_codex_backend_error_is_published_without_falling_back_to_internal_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+
+            async def _stream_user_input(_user_text: str):
+                raise CodexConnectionError("Codex app-server unavailable")
+                yield  # pragma: no cover
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            await runtime._user_message_queue.put(
+                _RouteTurnRequest(
+                    user_text="hello",
+                    client_message_id="msg_1",
+                    parse_commands=True,
+                    user_initiated=True,
+                )
+            )
+            runtime._queue_wakeup.set()
+            runtime._ensure_message_worker()
+            await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            event = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertIsInstance(event, RouteErrorEvent)
+            if not isinstance(event, RouteErrorEvent):
+                self.fail("Expected Codex backend failure to publish a route error event.")
+            self.assertEqual(event.code, "codex_backend_error")
+            self.assertEqual(event.client_message_id, "msg_1")
+            self.assertEqual(event.turn_kind, "user")
+            self.assertIn("Codex app-server unavailable", event.message)
 
             runtime.unsubscribe(subscriber_id)
             worker = runtime._message_worker

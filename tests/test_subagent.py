@@ -61,6 +61,7 @@ class _FakeSubagentLoop:
     def __init__(self, events: list[object], *, session_id: str = "subagent_session") -> None:
         self._events = tuple(events)
         self._session_id = session_id
+        self.closed = False
         self.stop_requests = 0
         self.stop_reasons: list[str] = []
         self.system_notes: list[tuple[str, str | None, dict[str, object] | None]] = []
@@ -96,6 +97,9 @@ class _FakeSubagentLoop:
         self.stop_requests += 1
         self.stop_reasons.append(reason)
         return True
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class SubagentSettingsTests(unittest.TestCase):

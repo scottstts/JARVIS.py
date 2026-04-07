@@ -1,298 +1,105 @@
-# Codex Backend Plan
+# Codex Backend
 
 ## Status
 
-This document is the implementation and maintenance source of truth for integrating OpenAI Codex app-server into Jarvis.
+Implemented on April 7, 2026.
 
-As of April 7, 2026, this backend is planned but not yet implemented.
-
-After implementation lands, keep this file updated so it reflects the code exactly. Do not leave stale future-tense design notes here.
+This document is the maintenance source of truth for Jarvis support for OpenAI Codex app-server.
+It describes the code as it exists now, not a future plan.
 
 ## Purpose
 
-Jarvis already supports normal LLM providers through `src/jarvis/llm/`.
+Jarvis exposes `codex` as a user-facing provider choice in `settings.yml`, but `codex` is not implemented as an `LLMProvider`.
 
-Codex app-server is different:
+Codex app-server owns:
 
-- it owns authentication
-- it owns thread and turn state
-- it streams rich item events
-- it can request approvals
-- it can invoke experimental client-executed dynamic tools
+- auth
+- thread and turn state
+- streamed item events
+- dynamic tool callbacks
 
-Because of that, Codex must not be forced into the existing `LLMProvider` adapter contract.
+That does not fit the normal `src/jarvis/llm/` contract, where Jarvis sends normalized history and receives normalized text/tool-call output.
 
-The design here is:
+Jarvis therefore routes `codex` actors onto a separate backend under `src/jarvis/codex_backend/`.
 
-- `codex` remains a selectable provider in user-facing settings
-- internally, selecting `codex` routes that actor onto a separate backend
-- the same Codex backend implementation can power the main agent and subagents
-- all Codex-specific state, auth, transport, path translation, and protocol handling stay isolated in that backend
-- the existing `src/jarvis/llm/` stack remains the implementation for normal providers only
-
-## Scope
-
-This plan covers:
+## What Is Implemented
 
 - main-agent support for provider `codex`
 - subagent support for provider `codex`
-- mixed runtime configurations where some actors use Codex and others use normal providers
-- host-side Codex app-server connectivity over WebSocket
-- first-run ChatGPT OAuth browser login through Codex app-server
-- route/session persistence needed to resume Codex threads for main and subagent sessions
-- mapping Jarvis tools into Codex `dynamicTools`
-- path translation between container paths and host paths
-- gateway/UI changes required to surface browser login and Codex approval state
-- tests
-- follow-up docs and notes updates
+- mixed routes where some actors use Codex and others use the normal LLM backend
+- host-side Codex app-server connectivity over WebSocket JSON-RPC
+- optional websocket bearer-token auth for host-side Codex app-server listeners
+- ChatGPT OAuth browser login through Codex app-server
+- route/session persistence for Codex thread ids
+- dynamic-tool bridging from Jarvis tools to Codex `item/tool/call`
+- Codex auth-required route events and Telegram UI handling
+- host/container path mapping for Codex-facing host paths
 
-This plan does not cover:
+## What Is Intentionally Not Implemented
 
+- Codex as an `LLMProvider`
 - embeddings through Codex
 - memory maintenance/reflection through Codex
-- Codex native shell/file-change/computer-use execution as a first-class Jarvis path
+- current-turn user/runtime image inputs for Codex turns
+- Codex-native shell execution, file changes, MCP tools, or collaboration tools as Jarvis-owned execution paths
 - running Codex app-server inside `jarvis_runtime`
 
-## Resolved Design Decisions
+Those are deliberate boundaries in the current implementation.
 
-These are the settled decisions for this backend.
+## Architecture
 
-1. `codex` is a settings-level provider name, but not an `LLMProvider`.
-2. Codex integration lives outside `src/jarvis/llm/`.
-3. Codex app-server runs on the host machine, not in `jarvis_runtime`.
-4. Jarvis connects to Codex app-server over WebSocket JSON-RPC.
-5. Jarvis uses ChatGPT browser login through `account/login/start { "type": "chatgpt" }` by default.
-6. Jarvis does not own or persist ChatGPT OAuth tokens; the host app-server owns auth lifecycle.
-7. Browser login is user-driven: Jarvis surfaces the returned `authUrl`, and the user opens it in a browser.
-8. Codex `dynamicTools` are the integration point for Jarvis tools.
-9. Codex experimental API must be enabled because `dynamicTools` require it.
-10. Codex-specific quirks must not leak into `src/jarvis/llm/`, the main agent loop logic, or the subagent manager logic except through explicit backend interfaces.
-11. Host/container path translation is mandatory and must stay fully inside the Codex backend.
-12. Jarvis transcript remains the durable app-visible history, but Codex thread continuity depends on persisted backend state, not transcript replay.
-13. `/new` and compaction intentionally start fresh Codex threads instead of trying to mirror old thread state forward.
-14. Memory embeddings and maintenance continue to use the existing non-Codex provider stack.
-15. Subagents may use `codex` as their provider.
-16. The Codex backend core should be actor-scoped and reusable across main and subagent actors, with the differences injected as actor identity, bootstrap, tool filtering, and memory mode.
-17. One route-scoped Codex client connection may multiplex the main actor and any Codex-backed subagents by thread id.
-18. Codex native command/file-change approvals are not the primary Jarvis tool path; Jarvis tool approvals remain authoritative for Jarvis tools.
+Normal providers still use:
 
-## Why This Is A Separate Backend
+- `RouteRuntime`
+- `AgentLoop`
+- `LLMService`
 
-The current `LLMProvider` contract in `src/jarvis/llm/protocols.py` assumes:
-
-- Jarvis sends normalized message history
-- the provider returns normalized text/tool calls
-- Jarvis owns the tool round loop
-
-Codex app-server does not fit that model. It is a richer agent protocol:
-
-- `thread/start`, `thread/resume`, `turn/start`, `turn/steer`, `turn/interrupt`
-- item streaming instead of plain text/tool-call streaming
-- server-initiated approval requests
-- server-initiated `item/tool/call` requests for `dynamicTools`
-
-That is backend behavior, not provider-adapter behavior.
-
-Trying to stuff this into `src/jarvis/llm/providers/` would either:
-
-- leak Codex thread/auth/tool semantics into the core loop, or
-- cripple Codex into a text-only path and lose the point of using Codex
-
-## Architecture Summary
-
-Keep the existing normal-provider path:
-
-- `RouteRuntime` + `AgentLoop` + `LLMService`
-
-Add a Codex backend path built around a shared route-scoped connection plus reusable actor runtimes:
+Codex-backed actors use:
 
 - `CodexRouteCoordinator`
 - `CodexClient`
 - `CodexActorRuntime`
 
-Recommended package:
+Shared selection lives in `src/jarvis/actor_backends.py`.
 
-- `src/jarvis/codex_backend/`
+- `codex` -> Codex backend
+- everything else -> normal LLM backend
 
-Recommended files:
+This selection is applied independently to:
 
-- `src/jarvis/codex_backend/__init__.py`
+- the main actor
+- each subagent
+
+## Key Files
+
+- `src/jarvis/actor_backends.py`
 - `src/jarvis/codex_backend/config.py`
-- `src/jarvis/codex_backend/types.py`
 - `src/jarvis/codex_backend/path_mapping.py`
 - `src/jarvis/codex_backend/client.py`
 - `src/jarvis/codex_backend/auth.py`
 - `src/jarvis/codex_backend/tool_bridge.py`
-- `src/jarvis/codex_backend/actor_runtime.py`
 - `src/jarvis/codex_backend/runtime.py`
-
-Recommended responsibilities:
-
-- `CodexClient`
-  - one route-scoped WebSocket JSON-RPC connection
-  - `initialize` and `initialized`
-  - request id tracking
-  - incoming event dispatch
-  - reconnect and overload retry handling
-- `CodexRouteCoordinator`
-  - owns the shared `CodexClient`
-  - owns auth gating for the route
-  - dispatches incoming events and server requests to actor runtimes by `threadId` and `turnId`
-  - surfaces route-level auth events
-- `CodexActorRuntime`
-  - powers one actor: main or subagent
-  - owns thread start/resume, turn orchestration, transcript persistence, and actor-specific event mapping
-  - injects actor-specific bootstrap, tool set, and memory mode
-
-This design supports all of these:
-
-- main = Codex, subagents = normal providers
-- main = normal provider, subagents = Codex
-- main = Codex, some subagents = Codex, some subagents = normal providers
-
-## Main And Subagent Reuse
-
-The main agent and subagents are close enough that the Codex backend should be built once and parameterized per actor.
-
-Actor-specific inputs:
-
-- actor kind: `main` or `subagent`
-- actor name: `Jarvis` or subagent codename
-- actor session storage
-- bootstrap loader
-- tool registry view
-- tool executor
-- memory mode
-- route-event labels
-
-For the main actor:
-
-- use the main identity/bootstrap path
-- allow the full main-agent tool set
-- keep current main-agent route event semantics
-
-For a subagent actor:
-
-- use the subagent bootstrap loader
-- apply current subagent built-in tool blocklist
-- keep memory bootstrap, maintenance, and reflection disabled
-- keep current subagent route event semantics and lifecycle notices
-
-The goal is not a large generic abstraction hierarchy. The goal is one Codex actor runtime implementation with a small number of explicit injected collaborators.
-
-## Backend Selection
-
-Provider selection remains user-facing.
-
-Internally, add a small actor-level routing helper that maps provider names to backend kinds:
-
-- `openai`, `anthropic`, `gemini`, `grok`, `openrouter`, `lmstudio` -> existing LLM backend
-- `codex` -> Codex backend
-
-This selection applies independently to:
-
-- the main agent provider
-- each subagent provider resolution
-
-Do not create a large generic abstraction tree.
-
-Keep the routing minimal:
-
-- one selector
-- one actor runtime factory
-- two actor runtime implementations
-
-Implication for current code:
-
-- the main route runtime must choose between normal `AgentLoop` and `CodexActorRuntime`
-- `SubagentManager._build_subagent_loop()` must become a backend-aware actor builder instead of always constructing `AgentLoop`
-
-## Host-Side Codex App-Server
-
-Jarvis should connect to a host-run Codex app-server over WebSocket.
-
-Relevant current OpenAI docs checked on April 7, 2026:
-
-- app-server supports `stdio` and experimental `websocket` transports
-- WebSocket transport is started with `codex app-server --listen ws://127.0.0.1:4500`
-- clients must send `initialize`, then `initialized`
-- `dynamicTools` require `capabilities.experimentalApi = true`
-
-Recommended runtime assumption:
-
-- the operator starts app-server manually on the host
-- Jarvis connects to a configured WebSocket URL such as `ws://host.docker.internal:4500`
-
-Jarvis should not try to spawn the host process from inside the container.
-
-## Shared Route Connection
-
-Use one Codex app-server connection per Jarvis route, not one connection per actor.
-
-Reasons:
-
-- auth state is shared anyway
-- one connection can host multiple threads
-- app-server server requests and notifications already include `threadId` and `turnId`
-- route-level approval and event routing are already central concepts in Jarvis
-
-Route-level responsibilities:
-
-- initialize once
-- authenticate once
-- multiplex main and subagent Codex threads
-- serialize auth-sensitive startup
-- dispatch incoming messages to the correct actor runtime
-
-If a route has no Codex-backed actors, it should not create a Codex client.
-
-## Critical Constraint: Host vs Container Paths
-
-This is the most important non-obvious constraint.
-
-Jarvis runs inside `jarvis_runtime`.
-Codex app-server runs on the host.
-
-That means:
-
-- Jarvis sees repo paths like `/repo/...`
-- Jarvis sees shared workspace paths like `/workspace/...`
-- Codex app-server needs host-visible absolute paths like `/Users/.../Jarvis/...` and `/Users/.../.jarvis/workspace/...`
-
-This affects:
-
-- Codex `cwd`
-- `localImage` input items
-- skill paths if used later
-- any approval/file path UI copied from Codex
-- main and subagent actors equally
-
-Add a dedicated path translation layer under `src/jarvis/codex_backend/path_mapping.py`.
-
-Required mappings:
-
-- container repo root `<->` host repo root
-- container workspace root `<->` host workspace root
-
-Required behavior:
-
-- fail fast on unmappable paths
-- never leak path-mapping logic into core loop, tools, subagent manager, or gateway
-- keep user-facing paths normalized to Jarvis conventions where practical
+- `src/jarvis/codex_backend/actor_runtime.py`
+- `src/jarvis/gateway/route_runtime.py`
+- `src/jarvis/subagent/manager.py`
+- `src/jarvis/gateway/route_events.py`
+- `src/jarvis/gateway/protocol.py`
+- `src/jarvis/ui/telegram/gateway_client.py`
+- `src/jarvis/ui/telegram/bot.py`
 
 ## Settings Surface
 
-User-facing settings should still present `codex` as a provider choice for:
+`settings.yml` keeps `codex` as a selectable provider for:
 
-- the main chat provider
-- the subagent provider override
+- `llm.default_provider`
+- `subagent.provider`
 
-Recommended `settings.yml` additions under `providers.codex`:
+Codex backend-specific settings live under `providers.codex`:
 
 - `ws_url`
 - `model`
-- `effort`
-- `summary`
+- `reasoning_effort`
+- `reasoning_summary`
 - `personality`
 - `service_name`
 - `host_repo_root`
@@ -300,414 +107,277 @@ Recommended `settings.yml` additions under `providers.codex`:
 - `approval_policy`
 - `sandbox_network_access`
 
-Recommended semantics:
+The websocket bearer token is intentionally not stored in `settings.yml`.
+If needed, Jarvis reads it only from the secret/env var `JARVIS_CODEX_WS_BEARER_TOKEN`.
 
-- `llm.default_provider` may be `codex`
-- `subagent.provider` may be `codex`
-- `providers.codex.model` is the default model for Codex-backed actors
-- `host_repo_root` is the host absolute path matching container `/repo`
-- `host_workspace_root` is the host absolute path matching container `/workspace`
+Embeddings and memory-maintenance provider settings intentionally do not accept `codex`.
 
-Recommended constraints:
+## LLMService Boundary
 
-- do not include `codex` in embedding provider settings
-- do not include `codex` in memory maintenance provider settings
+`LLMService` still owns only normal provider adapters.
+
+To keep the architectural boundary explicit, `LLMService.generate()`, `stream_generate()`, and `embed()` now fail fast with `LLMConfigurationError` if they are asked to use provider `codex`.
+
+That avoids leaking the backend split as a confusing `ProviderNotFoundError`.
+
+## Host App-Server Model
+
+Jarvis expects Codex app-server to run on the host.
+
+Default assumption:
+
+- Codex app-server listens at `ws://host.docker.internal:4500`
+- Jarvis connects from inside `jarvis_runtime`
+- when the host listener is non-loopback, Jarvis can send `Authorization: Bearer <token>` from `JARVIS_CODEX_WS_BEARER_TOKEN`
+
+Jarvis does not try to spawn the host process itself.
+
+The implementation was built against the official Codex app-server protocol as of April 7, 2026:
+
+- `initialize` then `initialized`
+- `account/read`
+- `account/login/start`
+- `account/login/completed`
+- `thread/start`
+- `thread/resume`
+- `turn/start`
+- `turn/interrupt`
+- server-driven `item/tool/call`
+
+## Route-Scoped Connection
+
+Each Jarvis route owns at most one Codex connection through `CodexRouteCoordinator`.
+
+That coordinator:
+
+- lazily creates the WebSocket client
+- initializes the protocol
+- owns route-level auth state
+- dispatches notifications and server requests by `threadId`
+- multiplexes the main actor and any Codex-backed subagents over one connection
 
 ## Authentication Flow
 
-Use the official app-server ChatGPT browser flow.
+Auth is route-scoped and serialized.
 
-Route-level flow:
+Flow:
 
-1. A Codex-backed actor requests work.
-2. The route coordinator connects and initializes the app-server connection if needed.
-3. The route coordinator calls `account/read`.
-4. If authenticated, continue immediately.
-5. If `requiresOpenaiAuth` is true and there is no active account, call `account/login/start` with `{ "type": "chatgpt" }`.
-6. Receive `{ loginId, authUrl }`.
-7. Emit a structured route event so the UI can display the browser login URL.
-8. Wait for `account/login/completed`.
-9. On success, release the waiting actor start requests.
-10. On failure or cancellation, surface a clear route error and leave no half-started actor-turn state behind.
+1. a Codex-backed actor needs a thread
+2. the coordinator ensures the client is connected
+3. the authenticator calls `account/read`
+4. if auth is missing, it calls `account/login/start { "type": "chatgpt" }`
+5. Jarvis emits a structured `auth_required` route event with the returned `authUrl`
+6. the UI shows the URL to the user
+7. Jarvis waits for `account/login/completed`
+8. after success, waiting actors continue
 
-Recommended behavior:
+Only one login flow is allowed in flight per route connection.
 
-- only one login flow may be in flight per route connection
-- if several actors are waiting on auth, queue them behind the same auth flow
-- do not try to open the browser automatically from the container
+Jarvis does not own the OAuth tokens. The host Codex app-server does.
 
-Recommended UI addition:
+## Session And Thread Model
 
-- a new route event for external auth, not just raw text
+Jarvis transcript state stays authoritative for Jarvis.
+Codex thread state stays authoritative for Codex continuity.
 
-Recommended event shape:
+At session creation, Codex-backed sessions persist starter context as transcript-only snapshots, not as replayable prompt-history records:
 
-- `auth_kind`
-- `provider`
-- `login_id`
-- `auth_url`
-- `message`
-- optional `waiting_agents`
+- one transcript-only snapshot of the full Codex `developerInstructions`
+- one transcript-only snapshot of the initial Codex `dynamicTools`
 
-## Codex Session Model
+Codex still consumes its bootstrap through `developerInstructions` on `thread/start` or `thread/resume`.
+Jarvis does not reconstruct that thread state by replaying transcript back into Codex.
 
-Jarvis session and Codex thread are related but not identical.
+`SessionMetadata` now includes `backend_state`.
 
-Persist Codex backend state in session metadata.
-
-Recommended `SessionMetadata` addition:
-
-- `backend_state: dict[str, Any] = {}`
-
-For Codex-backed sessions, `backend_state` should contain at least:
+For Codex-backed sessions, `backend_state` stores:
 
 - `backend_kind = "codex"`
 - `thread_id`
-- `last_turn_id` if useful
-- `auth_mode` snapshot if useful
+- `last_turn_id`
 
-This applies to:
+Behavior:
 
-- main sessions in the main transcript store
-- subagent sessions in subagent transcript storage
+- new Jarvis session -> new Codex thread
+- resumed Jarvis session -> `thread/resume` with stored `thread_id`
+- `/new` -> archive current session and start a fresh Codex thread
+- `/compact` -> start a fresh Codex thread for the post-compaction session
 
-Session behavior:
+Jarvis does not try to replay old transcript history back into a new Codex thread.
 
-- new Jarvis main session -> new Codex thread
-- resumed Jarvis main session -> `thread/resume` with stored `thread_id`
-- new subagent session -> new Codex thread
-- resumed subagent session -> `thread/resume` with stored `thread_id`
-- subagent `step in` continues on the same thread after the active turn settles
-- subagent dispose archives its session and stops tracking the thread
-- `/new` archives the old main session, disposes active subagents, and starts a fresh main Codex thread
-- compaction boundary -> start a fresh Codex thread for the post-compaction session
+## Main And Subagent Reuse
 
-Do not try to reconstruct Codex thread state by replaying the Jarvis transcript.
+`CodexActorRuntime` is shared by:
 
-This is a deliberate exception to the transcript-replay rules because Codex is a backend, not an `LLMProvider`.
+- the main actor
+- subagents
 
-## Turn Construction
+Injected actor-specific differences are:
 
-Each Codex-backed actor turn should be built from:
+- identity
+- bootstrap loader
+- storage
+- tool registry view
+- tool executor
+- memory mode
+- route-event labels
 
-- the current actor input
-- any current-turn image inputs translated to Codex `localImage`
-- actor bootstrap guidance translated into Codex `settings.developer_instructions`
-- actor-filtered dynamic tools derived from the current Jarvis tool registry
+Main actor behavior:
 
-Recommended mapping:
+- full main tool surface
+- normal main bootstrap
+- normal main memory mode
 
-- bootstrap instructions -> Codex `turn/start.settings.developer_instructions`
-- user or actor text -> Codex `input: [{ "type": "text", ... }]`
-- current-turn image attachments -> Codex `input: [{ "type": "localImage", "path": ... }]`
-- provider config -> `model`, `effort`, `summary`, `personality`
-- host repo root mapping -> `cwd`
+Subagent behavior:
 
-For the main actor:
+- subagent bootstrap
+- current subagent built-in tool blocklist
+- no memory bootstrap
+- no memory maintenance
+- no memory reflection
 
-- use the main identity/bootstrap loader
-- include the main-agent current-turn runtime messages as needed
-
-For a subagent actor:
-
-- use the subagent bootstrap loader
-- keep memory disabled exactly like the current subagent `AgentLoop` path
-- reuse current subagent task assignment and runtime-note behavior
-
-Do not translate archived Jarvis transcript history into per-turn Codex text input for either main or subagent actors.
-
-Codex thread state is the continuity mechanism.
+Subagent disposal now calls `loop.aclose()` so Codex-backed subagents unregister their thread from the route coordinator instead of leaving stale thread mappings behind.
 
 ## Tool Bridge
 
-Use Codex `dynamicTools` as the bridge for Jarvis tools.
-
-Recommended behavior:
-
-- build dynamic tool definitions from the same `ToolRegistry` and `ToolDefinition` source used by the current actor
-- keep existing Jarvis tool descriptions, schemas, and policy checks authoritative
-- execute tool calls inside Jarvis, not inside Codex
-- preserve actor-specific tool filtering
+Jarvis tools are exposed to Codex through dynamic tools built from the same `ToolDefinition` source used by the normal agent loop.
 
 Flow:
 
 1. `thread/start` or `thread/resume`
-2. `turn/start` with actor-specific `dynamicTools`
-3. Codex emits `item/tool/call`
-4. Jarvis executes the corresponding tool through the existing tool runtime path
-5. Jarvis responds to the server request with tool output content items
-6. Codex continues the same turn
+2. the current implementation sends `dynamicTools` on `thread/start`, `thread/resume`, and `turn/start`
+3. Codex sends `item/tool/call`
+4. Jarvis executes the tool through the existing tool runtime
+5. if approval is required, Jarvis keeps its own approval flow authoritative
+6. Jarvis replies to Codex with model-visible tool output content items
 
-This keeps:
+Supported tool result content sent back to Codex:
 
-- Jarvis tool policies
-- Jarvis remote runtime split
-- Jarvis approval prompts for Jarvis tools
-- Jarvis workspace restrictions
-- subagent built-in tool blocklists
+- text
+- error text
+- image attachments from Jarvis tools, encoded as `data:` URLs in `inputImage`
 
-inside Jarvis.
+Jarvis does not hand off tool approvals to Codex.
 
-### Tool approvals
+Current Codex turn inputs are text-only.
 
-When a Jarvis tool execution returns `approval_required`, the Codex backend must:
+- user text is sent as Codex `text` input items
+- runtime/pre-turn messages are sent as Codex `text` input items
+- user/runtime image inputs are not yet translated into Codex `localImage`
 
-1. create the normal Jarvis route approval event for the correct actor
-2. wait for the user response
-3. if approved, re-run the tool with the approved action context
-4. respond to Codex with the final tool result
-5. if rejected, return a structured tool error result to Codex
+## Native Codex Execution Boundary
 
-Do not bypass Jarvis approval rules by delegating those approvals to Codex.
+Jarvis does not allow Codex-native execution items to become first-class Jarvis execution paths.
 
-### Tool result content
-
-Support at least:
-
-- plain text tool output
-- tool error text
-- image attachments from `view_image` translated into Codex `localImage`
-
-If a Jarvis tool returns metadata that has no Codex equivalent, keep that metadata local to Jarvis and only send the model-visible content items to Codex.
-
-## Event Mapping
-
-Codex actor runtimes must translate Codex item and turn events into the same route event family the gateway/UI already uses where possible.
-
-Core mappings:
-
-- `item/agentMessage/delta` -> `RouteAssistantDeltaEvent`
-- final agent message item -> `RouteAssistantMessageEvent`
-- turn start -> `RouteTurnStartedEvent`
-- turn completion -> `RouteTurnDoneEvent`
-- Jarvis-tool invocation via dynamic tool -> `RouteToolCallEvent`
-- Jarvis-tool approval -> existing route approval event
-- browser login required -> new auth route event
-
-These route events must remain actor-aware:
-
-- main actor uses `agent_kind="main"` and `agent_name="Jarvis"`
-- subagent actor uses `agent_kind="subagent"` and its codename
-
-Unexpected Codex-native items:
+If Codex emits unsupported native item types such as:
 
 - `commandExecution`
 - `fileChange`
 - `mcpToolCall`
-- `collabToolCall`
+- `collabAgentToolCall`
 
-should not silently pass through as if Jarvis owned them.
+or unsupported native server-request methods other than `item/tool/call`, the Codex actor runtime does not allow the native path to continue.
 
-If they appear unexpectedly:
+Behavior:
 
-- surface a clear error
-- record it in logs
-- keep the failure isolated to the Codex backend
+1. request `turn/interrupt` for the active Codex provider turn
+2. append a corrective system note to the Jarvis transcript on the same logical turn
+3. start one corrected retry turn on the same Codex thread
+4. keep the outward Jarvis turn id stable across the retry
 
-## Subagent-Specific Behavior
+The corrective note explicitly tells Codex to continue with Jarvis dynamic tools only, and it includes the original user request when available.
 
-Codex-backed subagents must preserve the current subagent product behavior.
+If the corrected retry still attempts a native Codex capability, or if the retry cannot be started, the runtime then fails closed with `codex_backend_error`.
 
-Required behavior:
+Once native-capability recovery is pending, further message deltas and completed agent-message items from that offending provider turn are ignored locally.
 
-- subagent invocation still comes only from the main agent
-- nested subagents remain forbidden
-- route-level `/stop` must interrupt active Codex-backed subagent turns too
-- `step in` must interrupt the active Codex subagent turn, wait for it to settle, then start a new turn on the same Codex thread with the updated tasking
-- subagent lifecycle notices remain route events, not special Codex-only UI messages
-- subagent archive linkage to the owning main session and subagent id remains unchanged
+The developer instruction sent to Codex explicitly tells it to use only client-provided dynamic tools.
+That soft suppression is advisory only; the interrupt-and-retry path is the enforcement layer.
 
-Do not add a second subagent product with different semantics just because the backend is Codex.
+## Path Mapping
 
-## Persistence Rules
+Codex runs on the host while Jarvis runs in `jarvis_runtime`, so host/container path translation is isolated in `CodexPathMapper`.
 
-Persist normalized Jarvis-side records, not raw JSON-RPC traffic.
+Supported roots:
 
-Persist:
+- container `/repo` <-> configured host repo root
+- container workspace root <-> configured host workspace root
 
-- user messages
-- assistant messages
-- Jarvis tool call records
-- Jarvis tool results
-- Codex thread ids and other opaque backend data only in session `backend_state`
+Current active use:
 
-This applies to both:
+- host `cwd` for Codex thread and turn requests
 
-- main sessions
-- subagent sessions
+The reverse mapping is implemented and kept backend-local for future host-originating path surfaces, but current unsupported native Codex items mean it is not yet exercised in normal runtime behavior.
 
-Do not persist:
+## Event Mapping
 
-- browser auth URLs as transcript-visible records
-- raw protocol envelopes
-- transport-only notifications
+Codex backend events are normalized back into the existing route event family.
 
-If the Codex backend needs extra opaque state, keep it in `backend_state`.
+Key mappings:
 
-## Codex Native Features
+- `item/agentMessage/delta` -> `RouteAssistantDeltaEvent`
+- final text -> `RouteAssistantMessageEvent`
+- turn start -> `RouteTurnStartedEvent`
+- turn completion -> `RouteTurnDoneEvent`
+- `item/tool/call` -> `RouteToolCallEvent`
+- Jarvis approval request -> existing route approval event
+- browser login challenge -> `RouteAuthRequiredEvent`
 
-Codex has native concepts that overlap with Jarvis features:
+Telegram now renders `auth_required` as a dedicated HTML message with the login URL.
 
-- approvals
-- command execution
-- file changes
-- skills
-- apps/connectors
-- collaboration tools
+Persisted Codex assistant transcript records also include provider metadata in the same basic shape used by normal LLM-provider transcripts:
 
-For this backend, do not adopt them by default unless the integration explicitly owns them.
+- `provider = "codex"`
+- `model = <configured Codex model>`
+- `response_id = <Codex provider turn id>`
+- `finish_reason`
 
-Initial rule set:
+## Memory Behavior
 
-- use Codex for reasoning, turn management, auth, and dynamic tool orchestration
-- use Jarvis for tools, tool approvals, workspace policy, actor lifecycle, and UI event shaping
+Main Codex actors still use the existing Jarvis memory stack.
 
-That keeps one primary tool system instead of two overlapping ones.
+That means:
 
-## Recommended File-Level Changes
+- bootstrap memory rendering still comes from `MemoryService`
+- due maintenance still uses the configured maintenance provider
+- reflection still uses the configured maintenance provider
 
-### New backend package
+Codex is not used for those maintenance/reflection model calls.
 
-- `src/jarvis/codex_backend/config.py`
-  - settings model for Codex backend
-- `src/jarvis/codex_backend/path_mapping.py`
-  - container-to-host path translation
-- `src/jarvis/codex_backend/client.py`
-  - route-scoped WebSocket JSON-RPC client
-  - request id tracking
-  - initialize and initialized handshake
-  - reconnect and overload retry handling
-- `src/jarvis/codex_backend/auth.py`
-  - `account/read`
-  - login start/completion/cancel orchestration
-- `src/jarvis/codex_backend/tool_bridge.py`
-  - actor-specific dynamic tool definitions
-  - request/response handling for `item/tool/call`
-- `src/jarvis/codex_backend/actor_runtime.py`
-  - reusable main/subagent actor runtime
-  - actor session orchestration
-  - event translation
-  - backend-state persistence
-- `src/jarvis/codex_backend/runtime.py`
-  - route-scoped coordinator around the shared client
-  - auth gating
-  - actor registration and dispatch
+Subagents keep memory disabled exactly like the non-Codex subagent path.
 
-### Existing files to change
+## Operational Notes
 
-- `src/jarvis/settings.yml`
-  - add `codex` provider settings
-  - add `codex` to main provider choices
-  - ensure subagent provider choices allow `codex`
-- `src/jarvis/settings.py`
-  - export new Codex settings
-- `src/jarvis/main.py`
-  - log Codex backend targets correctly for main and subagent provider resolution
-- `src/jarvis/gateway/app.py`
-  - route runtime factory must be backend-aware
-- `src/jarvis/gateway/session_router.py`
-  - if needed for runtime factory wiring
-- `src/jarvis/gateway/route_runtime.py`
-  - integrate the Codex route coordinator and main-actor backend selection
-- `src/jarvis/gateway/route_events.py`
-  - add external-auth event
-- `src/jarvis/storage/types.py`
-  - add `backend_state`
-- `src/jarvis/storage/service.py`
-  - persist and update `backend_state`
-- `src/jarvis/subagent/settings.py`
-  - keep `codex` valid as a subagent provider
-- `src/jarvis/subagent/manager.py`
-  - build subagent actor runtime from backend selection instead of always using `AgentLoop`
-- `dev_docs/project_structure.md`
-- `notes/notes.md`
+- Codex app-server must already be running on the host before Jarvis can use provider `codex`.
+- For the default Docker setup, a host app-server bound only to `127.0.0.1` is not reachable from `jarvis_runtime`; the listener must be exposed on a host-reachable interface or proxied accordingly.
+- For non-loopback listeners using `codex app-server --ws-auth capability-token`, Jarvis expects the same bearer token in the secret/env var `JARVIS_CODEX_WS_BEARER_TOKEN`.
+- `providers.codex.host_repo_root` and `providers.codex.host_workspace_root` are required when an actor actually uses Codex.
+- `dynamicTools` are still an experimental Codex app-server surface.
+- Tool-result images are sent back as data URLs because that is the current model-visible image form used by the backend bridge.
+- `CodexPathMapper` currently has active runtime use only for host `cwd`; reverse path mapping and `localImage` host-path translation are present but not exercised by the current turn-input path.
+- `CodexRouteCoordinator.aclose()` exists, but route runtime/session-router teardown does not currently call it because routes do not yet have an explicit disposal lifecycle. In practice, the Codex route connection lives as long as the route runtime object.
+- Expected Codex transport and handshake failures are surfaced to the route layer as `codex_backend_error` rather than falling through to the generic `internal_error` path.
 
-## Testing Plan
+## Tests
 
-Add a fake Codex app-server test harness.
-
-Do not rely on live OpenAI/Codex connectivity in automated tests.
-
-Required test coverage:
-
-1. settings parsing for Codex backend fields
-2. provider-to-backend routing for main and subagent providers
-3. path translation for repo and workspace paths
-4. shared route-client initialization handshake
-5. auth required -> login URL event -> login completed -> waiting actors resume
-6. auth failure and cancel handling
-7. new main session creates a new Codex thread
-8. resumed main session uses `thread/resume`
-9. new subagent session creates a new Codex thread
-10. resumed subagent session uses `thread/resume`
-11. subagent `step in` resumes on the same Codex thread after interruption
-12. `/new` or disposal starts fresh threads and archives old backend state appropriately
-13. dynamic tool registration shape for main and filtered subagent tool sets
-14. dynamic tool invocation success path
-15. dynamic tool invocation approval-required path
-16. dynamic tool invocation rejection path
-17. `view_image` tool result -> `localImage` mapping
-18. mixed runtime configurations where only some actors use Codex
-19. unexpected native Codex item types fail loudly
-20. WebSocket overload / retryable error handling
-21. backend-state persistence survives process restart for main and subagent sessions
-
-Recommended new test files:
+Codex backend coverage lives primarily in:
 
 - `tests/test_codex_backend_config.py`
-- `tests/test_codex_path_mapping.py`
 - `tests/test_codex_client.py`
 - `tests/test_codex_auth.py`
 - `tests/test_codex_tool_bridge.py`
 - `tests/test_codex_actor_runtime.py`
-- `tests/test_codex_route_runtime.py`
+- `tests/test_gateway_protocol.py`
 
-Also update:
+Broader regression coverage comes from the existing route, subagent, gateway, main-runtime, and full-suite tests.
 
-- `tests/test_llm_config.py`
-- `tests/test_llm_service_lifecycle.py` only if provider lists or config assumptions change
-- `tests/test_agent_loop.py` only where provider lists or skip logic need adjustment
-- subagent manager tests and any gateway route-event tests impacted by the new auth event
+## Future Work
 
-## Implementation Sequence
+These are not implemented today, but they are the natural expansion points if Codex ownership grows later:
 
-Implement in this order:
-
-1. Add settings and config parsing for Codex backend plus host-path mapping inputs.
-2. Extend session metadata with `backend_state`.
-3. Build the path translation layer.
-4. Build the shared JSON-RPC WebSocket client and handshake logic.
-5. Build the route-scoped coordinator and auth gating.
-6. Build the reusable `CodexActorRuntime`.
-7. Integrate the main actor with backend-aware selection.
-8. Add the dynamic tool bridge.
-9. Add tool approval bridging.
-10. Add image-path translation for `localImage`.
-11. Refactor `SubagentManager` to build subagent runtimes from backend selection and wire Codex-backed subagents.
-12. Add mixed-backend route tests.
-13. Update `dev_docs/project_structure.md` and append concise notes to `notes/notes.md`.
-
-## Maintenance Notes
-
-- If OpenAI stabilizes `dynamicTools` outside experimental API, remove the experimental opt-in requirement here and update the docs.
-- If later work chooses to adopt Codex native command/file-change items, that must be a separate design update; do not silently mix them into this backend.
-- If host-side path conventions change, update the path-mapping rules here first.
-- If app-server transport semantics change, regenerate schemas from the installed Codex CLI and keep test fixtures aligned to that version.
-- If subagent product semantics change, update the actor-runtime injection rules here rather than forking separate Codex logic paths for main and subagents.
-
-## Sources
-
-Official OpenAI docs checked on April 7, 2026:
-
-- https://developers.openai.com/codex/app-server
-- https://developers.openai.com/codex/auth
-
-Key behaviors taken from those docs:
-
-- app-server uses JSON-RPC over `stdio` or WebSocket
-- WebSocket mode is started with `codex app-server --listen ws://IP:PORT`
-- clients must send `initialize` then `initialized`
-- `account/read`, `account/login/start`, `account/login/completed`, and `account/logout` drive auth state
-- ChatGPT browser login returns an `authUrl` whose callback is hosted by app-server
-- `dynamicTools` and related `item/tool/call` flow are experimental and require `experimentalApi`
-- Codex turn inputs support `text`, remote `image`, and `localImage`
+- Codex-driven embeddings
+- Codex as a maintenance/reflection provider
+- Codex `localImage` support for user/runtime turn inputs
+- Codex-native command/file/computer-use as explicit Jarvis execution paths
+- explicit route-runtime teardown that closes the per-route Codex coordinator connection
+- running app-server inside `jarvis_runtime`

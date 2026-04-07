@@ -28,6 +28,7 @@ from .config import UIConfigurationError, UISettings
 from .formatting import render_markdown_to_telegram_html
 from .gateway_client import (
     GatewayApprovalRequestEvent,
+    GatewayAuthRequiredEvent,
     GatewayBridgeError,
     GatewayDeltaEvent,
     GatewayErrorEvent,
@@ -805,6 +806,14 @@ class TelegramGatewayBridge:
             active_turn.segment_started_at = time.monotonic()
             active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
             return
+        if isinstance(event, GatewayAuthRequiredEvent):
+            if not output_paused:
+                await self._send_html_message(
+                    chat_id=chat_id,
+                    html_text=_format_auth_required_message(event),
+                )
+                active_turn.delivered_any_segment = True
+            return
         if isinstance(event, GatewayTurnDoneEvent):
             if (
                 not output_paused
@@ -884,6 +893,12 @@ class TelegramGatewayBridge:
             await self._send_approval_request_message(
                 chat_id=chat_id,
                 approval=event,
+            )
+            return
+        if isinstance(event, GatewayAuthRequiredEvent):
+            await self._send_html_message(
+                chat_id=chat_id,
+                html_text=_format_auth_required_message(event),
             )
             return
         if isinstance(event, GatewayLocalNoticeEvent):
@@ -1623,6 +1638,22 @@ def _format_local_system_notice(message: str) -> str:
     if normalized_message:
         return f"⚙️ <b>System:</b> {normalized_message}"
     return "⚙️ <b>System:</b>"
+
+
+def _format_auth_required_message(event: GatewayAuthRequiredEvent) -> str:
+    actor = html.escape(event.agent_name.strip() or "Jarvis")
+    auth_url = html.escape(event.auth_url.strip())
+    message = html.escape(
+        event.message.strip()
+        or "Open the login URL in a browser to continue."
+    )
+    lines = [
+        f"⚙️ <b>Authentication:</b> <b>{actor}</b> needs OpenAI login.",
+        message,
+    ]
+    if auth_url:
+        lines.append(f'<a href="{auth_url}">Open login URL</a>')
+    return "\n".join(lines)
 
 
 def _truncate_approval_command(command: str) -> str:

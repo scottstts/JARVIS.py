@@ -16,6 +16,7 @@ RouteEventType = Literal[
     "turn_done",
     "tool_call",
     "approval_request",
+    "auth_required",
     "local_notice",
     "system_notice",
     "error",
@@ -74,6 +75,16 @@ class RouteApprovalRequestEvent(RouteEventBase):
 
 
 @dataclass(slots=True, frozen=True)
+class RouteAuthRequiredEvent(RouteEventBase):
+    provider: str = ""
+    auth_kind: str = ""
+    login_id: str = ""
+    auth_url: str = ""
+    message: str = ""
+    type: Literal["auth_required"] = "auth_required"
+
+
+@dataclass(slots=True, frozen=True)
 class RouteTurnDoneEvent(RouteEventBase):
     response_text: str = ""
     command: str | None = None
@@ -111,6 +122,7 @@ RouteEvent = (
     | RouteAssistantMessageEvent
     | RouteToolCallEvent
     | RouteApprovalRequestEvent
+    | RouteAuthRequiredEvent
     | RouteTurnDoneEvent
     | RouteLocalNoticeEvent
     | RouteSystemNoticeEvent

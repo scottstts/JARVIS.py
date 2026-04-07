@@ -6,7 +6,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 
-from jarvis.core import AgentLoop
+from jarvis.actor_backends import ActorRuntime
 from jarvis.storage import SessionStorage
 
 from .types import (
@@ -21,7 +21,7 @@ from .types import (
 class SubagentRuntime:
     subagent_id: str
     codename: str
-    loop: AgentLoop
+    loop: ActorRuntime
     storage: SessionStorage
     owner_main_session_id: str
     owner_main_turn_id: str

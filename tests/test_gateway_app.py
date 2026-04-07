@@ -90,6 +90,34 @@ class _FakeRouter:
         )
 
 
+class _FailingRouteInitRouter:
+    def active_session_id(self, route_id: str) -> str | None:
+        raise RuntimeError(f"route init failed for {route_id}")
+
+    def request_stop(self, route_id: str) -> bool:
+        _ = route_id
+        return False
+
+    def resolve_approval(self, route_id: str, approval_id: str, approved: bool) -> bool:
+        _ = (route_id, approval_id, approved)
+        return False
+
+    def subscribe(self, route_id: str):
+        raise RuntimeError(f"route init failed for {route_id}")
+
+    def unsubscribe(self, route_id: str, subscriber_id: str) -> None:
+        _ = (route_id, subscriber_id)
+
+    async def enqueue_message(
+        self,
+        route_id: str,
+        user_text: str,
+        *,
+        client_message_id: str | None = None,
+    ) -> None:
+        _ = (route_id, user_text, client_message_id)
+
+
 class GatewayAppTests(unittest.TestCase):
     def test_default_router_stores_main_transcripts_under_jarvis_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +197,19 @@ class GatewayAppTests(unittest.TestCase):
                 self.assertEqual(done["session_id"], "dm_1-session")
                 self.assertEqual(done["response_text"], "echo:hello")
                 self.assertEqual(router.calls, [("dm_1", "hello")])
+
+    def test_route_init_failure_returns_error_payload_instead_of_crashing_socket(self) -> None:
+        app = create_app(
+            gateway_settings=GatewaySettings(websocket_path="/ws", max_message_chars=50),
+            router=_FailingRouteInitRouter(),
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/dm_broken") as socket:
+                error = socket.receive_json()
+                self.assertEqual(error["type"], "error")
+                self.assertEqual(error["code"], "route_init_failed")
+                self.assertIn("route init failed for dm_broken", error["message"])
 
     def test_tool_call_event_is_forwarded(self) -> None:
         app = create_app(

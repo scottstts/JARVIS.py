@@ -433,6 +433,9 @@ class AgentLoop:
     def has_active_turn(self) -> bool:
         return self._active_turn_id is not None
 
+    async def aclose(self) -> None:
+        return None
+
     def append_system_note(
         self,
         content: str,

@@ -127,14 +127,29 @@ def create_app(
             )
             return
 
-        subscriber_id, event_queue = resolved_router.subscribe(route_id)
+        try:
+            subscriber_id, event_queue = resolved_router.subscribe(route_id)
+            ready_payload = build_ready_event(
+                route_id=route_id,
+                session_id=resolved_router.active_session_id(route_id),
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "Failed to initialize route runtime for route %s.",
+                route_id,
+            )
+            message = str(exc).strip() or "Route runtime initialization failed."
+            if not await _send_json_if_open(
+                websocket,
+                build_error_event(code="route_init_failed", message=message),
+            ):
+                return
+            await websocket.close(code=1011)
+            return
 
         if not await _send_json_if_open(
             websocket,
-            build_ready_event(
-                route_id=route_id,
-                session_id=resolved_router.active_session_id(route_id),
-            ),
+            ready_payload,
         ):
             resolved_router.unsubscribe(route_id, subscriber_id)
             return

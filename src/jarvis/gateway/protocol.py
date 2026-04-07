@@ -7,6 +7,7 @@ from typing import Any
 
 from .route_events import (
     RouteApprovalRequestEvent,
+    RouteAuthRequiredEvent,
     RouteAssistantDeltaEvent,
     RouteAssistantMessageEvent,
     RouteErrorEvent,
@@ -261,6 +262,17 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
                 "command": event.command,
                 "tool_name": event.tool_name,
                 "inspection_url": event.inspection_url,
+            }
+        )
+        return payload
+    if isinstance(event, RouteAuthRequiredEvent):
+        payload.update(
+            {
+                "provider": event.provider,
+                "auth_kind": event.auth_kind,
+                "login_id": event.login_id,
+                "auth_url": event.auth_url,
+                "message": event.message,
             }
         )
         return payload

@@ -10,6 +10,7 @@ Expected file names:
 - `GOOGLE_API_KEY`: https://aistudio.google.com/api-keys
 - `XAI_API_KEY`: https://console.x.ai/
 - `OPENROUTER_API_KEY`: https://openrouter.ai/workspaces/default/keys
+- `JARVIS_CODEX_WS_BEARER_TOKEN`: optional shared bearer token for a host Codex app-server started with `codex app-server --ws-auth capability-token`; set the same token in the host `--ws-token-file`
 - `TELEGRAM_TOKEN`: https://core.telegram.org/bots/api
 - `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`: https://core.telegram.org/bots/api
 - `BRAVE_SEARCH_API_KEY`: https://api-dashboard.search.brave.com/app/documentation/web-search/get-started

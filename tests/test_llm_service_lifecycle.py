@@ -6,7 +6,7 @@ import asyncio
 import unittest
 
 from jarvis.llm.config import EmbeddingSettings, LLMSettings
-from jarvis.llm.errors import ProviderTimeoutError
+from jarvis.llm.errors import LLMConfigurationError, ProviderTimeoutError
 from jarvis.llm.protocols import ProviderCapabilities
 from jarvis.llm.service import LLMService
 from jarvis.llm.types import LLMMessage, LLMRequest
@@ -114,3 +114,19 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 )
             ):
                 pass
+
+    async def test_generate_rejects_codex_backend_provider_with_clear_error(self) -> None:
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="codex",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            ),
+            providers=(_FakeProvider("openai"),),
+        )
+
+        with self.assertRaisesRegex(LLMConfigurationError, "Codex backend"):
+            await service.generate(
+                LLMRequest(
+                    messages=(LLMMessage.text("user", "hello"),),
+                )
+            )

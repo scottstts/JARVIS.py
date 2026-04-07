@@ -444,6 +444,7 @@ llm:
       description: "Default provider used by Jarvis for chat completions."
       type: "select"
       options:
+        - "codex"
         - "openai"
         - "anthropic"
         - "gemini"
@@ -664,6 +665,7 @@ subagent:
       type: "select"
       nullable: true
       options:
+        - "codex"
         - "openai"
         - "anthropic"
         - "gemini"
@@ -868,6 +870,87 @@ providers:
           min: 1
           step: 100
           value: null
+    codex:
+      title: "Codex"
+      description: "Host app-server connectivity and default turn settings for the Codex backend."
+      fields:
+        ws_url:
+          label: "Codex App-Server WebSocket URL"
+          description: "WebSocket URL for the host-run Codex app-server."
+          type: "text"
+          value: "ws://host.docker.internal:4500"
+        model:
+          label: "Codex Model"
+          description: "Optional default model override for Codex-backed actors. Leave blank to use the app-server default."
+          type: "text"
+          nullable: true
+          value: "gpt-5.4"
+        reasoning_effort:
+          label: "Codex Reasoning Effort"
+          description: "Reasoning effort passed to Codex turns."
+          type: "select"
+          nullable: true
+          options:
+            - "none"
+            - "minimal"
+            - "low"
+            - "medium"
+            - "high"
+            - "xhigh"
+          value: "medium"
+        reasoning_summary:
+          label: "Codex Reasoning Summary"
+          description: "Optional reasoning summary mode for Codex turns."
+          type: "select"
+          nullable: true
+          options:
+            - "none"
+            - "auto"
+            - "concise"
+            - "detailed"
+          value: "none"
+        personality:
+          label: "Codex Personality"
+          description: "Optional Codex personality hint."
+          type: "select"
+          nullable: true
+          options:
+            - "none"
+            - "friendly"
+            - "pragmatic"
+          value: "pragmatic"
+        service_name:
+          label: "Codex Service Name"
+          description: "Service name surfaced to the Codex app-server for this client."
+          type: "text"
+          value: "Jarvis"
+        host_repo_root:
+          label: "Codex Host Repo Root"
+          description: "Absolute host path corresponding to container /repo."
+          type: "text"
+          nullable: true
+          value: null
+        host_workspace_root:
+          label: "Codex Host Workspace Root"
+          description: "Absolute host path corresponding to container /workspace."
+          type: "text"
+          nullable: true
+          value: null
+        approval_policy:
+          label: "Codex Approval Policy"
+          description: "Approval policy applied to Codex turns and threads."
+          type: "select"
+          options:
+            - "untrusted"
+            - "on-failure"
+            - "on-request"
+            - "never"
+          value: "untrusted"
+        sandbox_network_access:
+          label: "Codex Sandbox Network Access"
+          description: "Allow outbound network access inside the Codex sandbox policy."
+          type: "boolean"
+          value: false
     grok:
       title: "Grok"
       description: "Default chat model and generation limits for the xAI Grok provider."

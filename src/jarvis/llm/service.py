@@ -108,6 +108,7 @@ class LLMService:
         resolved = self._resolve_generate_request(request)
         if resolved.provider is None:
             raise LLMConfigurationError("Provider resolution failed.")
+        self._reject_backend_routed_provider(resolved.provider)
         provider = self.registry.get(resolved.provider)
         self._assert_generation_capabilities(provider, resolved)
 
@@ -123,6 +124,7 @@ class LLMService:
         resolved = self._resolve_generate_request(request)
         if resolved.provider is None:
             raise LLMConfigurationError("Provider resolution failed.")
+        self._reject_backend_routed_provider(resolved.provider)
         provider = self.registry.get(resolved.provider)
         self._assert_generation_capabilities(provider, resolved, require_streaming=True)
 
@@ -154,6 +156,7 @@ class LLMService:
         resolved = self._resolve_embedding_request(request)
         if resolved.provider is None:
             raise LLMConfigurationError("Provider resolution failed.")
+        self._reject_backend_routed_provider(resolved.provider)
         provider = self.registry.get(resolved.provider)
         if not provider.capabilities.embeddings:
             raise UnsupportedCapabilityError(
@@ -182,6 +185,13 @@ class LLMService:
                 await asyncio.sleep(self._retry_delay_seconds(attempt_index))
 
         raise RuntimeError("Retry loop exited unexpectedly.")
+
+    def _reject_backend_routed_provider(self, provider: str) -> None:
+        if provider != "codex":
+            return
+        raise LLMConfigurationError(
+            "Provider 'codex' is handled by the Codex backend, not by LLMService."
+        )
 
     async def _run_with_optional_timeout(
         self,
@@ -284,10 +294,12 @@ class LLMService:
                 if max_output_tokens is not None
                 else self.settings.openrouter.max_output_tokens
             )
+        elif provider == "codex":
+            pass
         elif provider == "lmstudio":
             pass
 
-        if model is None and provider != "lmstudio":
+        if model is None and provider not in {"codex", "lmstudio"}:
             raise LLMConfigurationError(
                 f"No chat model configured for provider '{provider}'."
             )

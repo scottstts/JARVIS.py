@@ -488,6 +488,7 @@ class ToolSettingsTests(unittest.TestCase):
                 "pyyaml",
                 "pymupdf",
                 "pandas",
+                "matplotlib",
                 "pillow",
                 "pydantic",
                 "jinja2",

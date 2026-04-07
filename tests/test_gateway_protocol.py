@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from jarvis.gateway.protocol import ProtocolError, parse_client_event
+from jarvis.gateway.protocol import ProtocolError, build_route_event_payload, parse_client_event
+from jarvis.gateway.route_events import RouteAuthRequiredEvent
+from jarvis.ui.telegram.gateway_client import GatewayAuthRequiredEvent, _parse_route_event
 
 
 class GatewayProtocolTests(unittest.TestCase):
@@ -103,3 +105,27 @@ class GatewayProtocolTests(unittest.TestCase):
                 max_message_chars=100,
             )
         self.assertEqual(context.exception.code, "invalid_client_message_id")
+
+    def test_auth_required_event_round_trips_through_gateway_payload(self) -> None:
+        payload = build_route_event_payload(
+            RouteAuthRequiredEvent(
+                route_id="route_1",
+                agent_kind="main",
+                agent_name="Jarvis",
+                session_id="session_1",
+                provider="codex",
+                auth_kind="openai_oauth",
+                login_id="login_1",
+                auth_url="https://auth.example/login",
+                message="Open the browser login URL.",
+            )
+        )
+
+        parsed = _parse_route_event(payload)
+
+        self.assertIsInstance(parsed, GatewayAuthRequiredEvent)
+        self.assertEqual(parsed.provider, "codex")
+        self.assertEqual(parsed.auth_kind, "openai_oauth")
+        self.assertEqual(parsed.login_id, "login_1")
+        self.assertEqual(parsed.auth_url, "https://auth.example/login")
+        self.assertEqual(parsed.message, "Open the browser login URL.")

@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import uvicorn
 
+from jarvis.codex_backend import CodexBackendSettings
 from jarvis.core import CoreSettings
 from jarvis.gateway import GatewaySettings, create_app
 from jarvis.llm import LLMSettings
@@ -200,6 +201,9 @@ def _resolve_runtime_provider_configuration(
 
 
 def _chat_model_for_provider(*, llm_settings: LLMSettings, provider: str) -> str:
+    if provider == "codex":
+        codex_settings = CodexBackendSettings.from_env()
+        return codex_settings.model or "(server default)"
     if provider == "openai":
         return llm_settings.openai.chat_model or "(unconfigured)"
     if provider == "anthropic":

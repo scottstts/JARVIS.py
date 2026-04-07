@@ -69,6 +69,16 @@ class GatewayApprovalRequestEvent(GatewayRouteEventBase):
 
 
 @dataclass(slots=True, frozen=True)
+class GatewayAuthRequiredEvent(GatewayRouteEventBase):
+    provider: str = ""
+    auth_kind: str = ""
+    login_id: str = ""
+    auth_url: str = ""
+    message: str = ""
+    type: str = "auth_required"
+
+
+@dataclass(slots=True, frozen=True)
 class GatewayTurnDoneEvent(GatewayRouteEventBase):
     response_text: str = ""
     command: str | None = None
@@ -106,6 +116,7 @@ GatewayRouteEvent = (
     | GatewayMessageEvent
     | GatewayToolCallEvent
     | GatewayApprovalRequestEvent
+    | GatewayAuthRequiredEvent
     | GatewayTurnDoneEvent
     | GatewayLocalNoticeEvent
     | GatewaySystemNoticeEvent
@@ -515,6 +526,15 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
                 if payload.get("inspection_url") is not None
                 else None
             ),
+        )
+    if event_type == "auth_required":
+        return GatewayAuthRequiredEvent(
+            **base_kwargs,
+            provider=str(payload.get("provider", "")),
+            auth_kind=str(payload.get("auth_kind", "")),
+            login_id=str(payload.get("login_id", "")),
+            auth_url=str(payload.get("auth_url", "")),
+            message=str(payload.get("message", "")),
         )
     if event_type == "turn_done":
         return GatewayTurnDoneEvent(
