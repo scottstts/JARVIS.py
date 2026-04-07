@@ -203,6 +203,96 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(assistant_record.metadata["tool_calls"], [])
             self.assertIn("thread_1", coordinator.registered_threads)
 
+    async def test_stream_turn_preserves_multiple_codex_assistant_items_as_separate_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, storage, _coordinator = _build_runtime(root_dir=Path(tmp))
+
+            events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="hello"))
+            )
+            await asyncio.sleep(0)
+            await runtime.handle_notification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "itemId": "msg_1",
+                    "delta": "First message",
+                },
+            )
+            await runtime.handle_notification(
+                "item/completed",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "id": "msg_1",
+                        "type": "agentMessage",
+                        "text": "First message",
+                    },
+                },
+            )
+            await runtime.handle_notification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "itemId": "msg_2",
+                    "delta": "Second message",
+                },
+            )
+            await runtime.handle_notification(
+                "item/completed",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "id": "msg_2",
+                        "type": "agentMessage",
+                        "text": "Second message",
+                    },
+                },
+            )
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            events = await events_task
+
+            self.assertEqual(
+                [event.type for event in events],
+                [
+                    "turn_started",
+                    "text_delta",
+                    "assistant_message",
+                    "text_delta",
+                    "assistant_message",
+                    "done",
+                ],
+            )
+            self.assertEqual(events[2].text, "First message")
+            self.assertEqual(events[4].text, "Second message")
+            self.assertEqual(events[-1].response_text, "First message\n\nSecond message")
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active session.")
+            assistant_records = [
+                record
+                for record in storage.load_records(active.session_id)
+                if record.role == "assistant"
+            ]
+            self.assertEqual([record.content for record in assistant_records], ["First message", "Second message"])
+            self.assertTrue(all(record.metadata["provider"] == "codex" for record in assistant_records))
+
     async def test_handle_server_request_waits_for_jarvis_approval_and_retries_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = _FakeCoordinator()

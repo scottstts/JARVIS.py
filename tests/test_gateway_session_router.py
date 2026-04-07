@@ -796,6 +796,63 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await worker
 
+    async def test_stale_disposed_subagent_followup_is_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="disposed",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="turn_1",
+                current_subagent_session_id="sub_session",
+            )
+            notice = RouteSystemNoticeEvent(
+                route_id="route_1",
+                agent_kind="subagent",
+                agent_name="Ultron",
+                subagent_id="sub_1",
+                session_id="sub_session",
+                notice_kind="subagent_completed",
+                text="completed.",
+                public=False,
+            )
+
+            async def _publish_event(event):
+                raise AssertionError(f"Unexpected published event: {event!r}")
+
+            async def _stream_runtime_turn(*, force_session_id=None, command_override=None, pre_turn_messages=()):
+                raise AssertionError("Unexpected runtime followup turn.")
+                yield force_session_id, command_override, pre_turn_messages  # pragma: no cover
+
+            runtime.publish_event = _publish_event  # type: ignore[method-assign]
+            runtime._main_loop.stream_runtime_turn = _stream_runtime_turn  # type: ignore[method-assign]
+
+            with patch.object(runtime._subagent_manager, "snapshot_for", return_value=snapshot):
+                await runtime._enqueue_main_subagent_followup(notice)
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._message_queue.join(), timeout=1)
+
+            records = runtime._main_loop._storage.load_records(session_id)
+            self.assertFalse(
+                any(
+                    record.role == "system"
+                    and record.metadata.get("subagent_progress_update") is True
+                    for record in records
+                )
+            )
+
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
     async def test_manual_compaction_publishes_local_notice_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(

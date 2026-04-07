@@ -68,3 +68,22 @@ class CodexToolBridgeTests(unittest.TestCase):
         encoded = image_url.split(",", 1)[1]
         self.assertEqual(base64.b64decode(encoded), b"\x89PNG\r\n\x1a\nfake-png-bytes")
 
+    def test_build_tool_response_adds_codex_subagent_wait_advisory(self) -> None:
+        bridge = CodexToolBridge(tool_definitions_provider=lambda _activated: ())
+
+        response = bridge.build_tool_response(
+            ToolExecutionResult(
+                call_id="call_1",
+                name="subagent_invoke",
+                ok=True,
+                content="Subagent invoked.",
+                metadata={
+                    "subagent_control": True,
+                    "subagent_action": "invoke",
+                    "status": "running",
+                },
+            )
+        )
+
+        self.assertEqual(response["contentItems"][0]["text"], "Subagent invoked.")
+        self.assertIn("Do not call `subagent_monitor` again in this same turn", response["contentItems"][1]["text"])

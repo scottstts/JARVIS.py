@@ -448,6 +448,8 @@ class SubagentManager:
         snapshot = self.snapshot_for(agent)
         if snapshot is None:
             return None
+        if snapshot.status == "disposed":
+            return None
         recommendation = self._recommend_main_supervision_action(
             notice_kind=notice_kind,
             snapshot=snapshot,

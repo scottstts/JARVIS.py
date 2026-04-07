@@ -67,6 +67,9 @@ class CodexToolBridge:
 
     def _content_items_for_result(self, result: ToolExecutionResult) -> list[dict[str, str]]:
         items = [{"type": "inputText", "text": result.content}]
+        advisory_text = self._advisory_text_for_result(result)
+        if advisory_text is not None:
+            items.append({"type": "inputText", "text": advisory_text})
         image_attachment = result.metadata.get("image_attachment")
         if isinstance(image_attachment, dict):
             data_url = _image_attachment_to_data_url(image_attachment)
@@ -78,6 +81,24 @@ class CodexToolBridge:
                     }
                 )
         return items
+
+    def _advisory_text_for_result(self, result: ToolExecutionResult) -> str | None:
+        if result.metadata.get("subagent_control") is not True:
+            return None
+        action = str(result.metadata.get("subagent_action", "")).strip()
+        if action == "invoke" and str(result.metadata.get("status", "")).strip() == "running":
+            return (
+                "Codex runtime note: the subagent is now running independently. Do not call "
+                "`subagent_monitor` again in this same turn unless immediate detail is strictly "
+                "required. End this turn after a brief status update and wait for a later "
+                "orchestrator system update."
+            )
+        if action == "monitor" and result.metadata.get("changed") is False:
+            return (
+                "Codex runtime note: no subagent state changed. Do not poll `subagent_monitor` "
+                "again in this turn. Wait for the next orchestrator system update instead."
+            )
+        return None
 
 
 def _image_attachment_to_data_url(image_attachment: dict[str, Any]) -> str | None:
@@ -95,4 +116,3 @@ def _image_attachment_to_data_url(image_attachment: dict[str, Any]) -> str | Non
     except OSError:
         return None
     return f"data:{media_type};base64,{payload}"
-

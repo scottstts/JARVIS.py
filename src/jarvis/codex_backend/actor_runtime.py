@@ -83,7 +83,8 @@ class _TurnState:
     command: str | None = None
     user_text: str | None = None
     compaction_performed: bool = False
-    text_chunks: list[str] = field(default_factory=list)
+    active_assistant_item_id: str | None = None
+    active_assistant_chunks: list[str] = field(default_factory=list)
     completed_messages: list[str] = field(default_factory=list)
     usage: LLMUsage | None = None
     approval_rejected: bool = False
@@ -94,12 +95,12 @@ class _TurnState:
     queue: asyncio.Queue[object] = field(default_factory=asyncio.Queue)
 
     def full_text(self) -> str:
-        if self.text_chunks:
-            return "".join(self.text_chunks)
         if self.completed_messages:
             return "\n\n".join(
                 text for text in self.completed_messages if text.strip()
             )
+        if self.active_assistant_chunks:
+            return "".join(self.active_assistant_chunks)
         return ""
 
 
@@ -356,9 +357,13 @@ class CodexActorRuntime:
         if method == "item/agentMessage/delta":
             if turn.pending_native_recovery_item_type is not None:
                 return
+            item_id = _optional_string(params.get("itemId"))
+            if item_id is not None:
+                self._rollover_active_assistant_item(turn, incoming_item_id=item_id)
+                turn.active_assistant_item_id = item_id
             delta = str(params.get("delta", ""))
             if delta:
-                turn.text_chunks.append(delta)
+                turn.active_assistant_chunks.append(delta)
                 await turn.queue.put(
                     AgentTextDeltaEvent(
                         session_id=turn.session_id,
@@ -377,11 +382,7 @@ class CodexActorRuntime:
                 await self._handle_unsupported_native_capability(turn, item_type)
                 return
             if item_type == "agentMessage":
-                if turn.pending_native_recovery_item_type is not None:
-                    return
-                text = str(item.get("text", ""))
-                if text.strip():
-                    turn.completed_messages.append(text)
+                await self._complete_assistant_item(turn, item=item)
                 return
             return
 
@@ -427,7 +428,7 @@ class CodexActorRuntime:
                 await self._recover_from_native_tool_attempt(turn)
                 return
             response_text = turn.full_text()
-            if response_text.strip():
+            if response_text.strip() and not turn.completed_messages:
                 assistant_event = AgentAssistantMessageEvent(
                     session_id=turn.session_id,
                     turn_id=self._visible_turn_id(turn),
@@ -1006,7 +1007,14 @@ class CodexActorRuntime:
         visible_turn_id = self._visible_turn_id(turn)
         if visible_turn_id is None:
             return
-        if response_text.strip():
+        assistant_messages = [
+            message
+            for message in turn.completed_messages
+            if message.strip()
+        ]
+        if not assistant_messages and response_text.strip():
+            assistant_messages = [response_text]
+        for message in assistant_messages:
             self._storage.append_record(
                 turn.session_id,
                 ConversationRecord(
@@ -1014,7 +1022,7 @@ class CodexActorRuntime:
                     session_id=turn.session_id,
                     created_at=_utc_now_iso(),
                     role="assistant",
-                    content=response_text,
+                    content=message,
                     metadata={
                         _TURN_ID_METADATA_KEY: visible_turn_id,
                         "provider": "codex",
@@ -1194,7 +1202,8 @@ class CodexActorRuntime:
             )
             return
         turn.native_recovery_attempts += 1
-        turn.text_chunks.clear()
+        turn.active_assistant_item_id = None
+        turn.active_assistant_chunks.clear()
         turn.completed_messages.clear()
         turn.usage = None
         correction_text = self._native_tool_recovery_note(turn, item_type=item_type)
@@ -1299,6 +1308,57 @@ class CodexActorRuntime:
 
     def _visible_turn_id(self, turn: _TurnState) -> str | None:
         return turn.logical_turn_id or turn.provider_turn_id
+
+    def _rollover_active_assistant_item(
+        self,
+        turn: _TurnState,
+        *,
+        incoming_item_id: str,
+    ) -> None:
+        active_item_id = turn.active_assistant_item_id
+        if (
+            active_item_id is None
+            or active_item_id == incoming_item_id
+            or not turn.active_assistant_chunks
+        ):
+            return
+        turn.completed_messages.append("".join(turn.active_assistant_chunks))
+        turn.active_assistant_chunks.clear()
+        turn.active_assistant_item_id = None
+
+    async def _complete_assistant_item(
+        self,
+        turn: _TurnState,
+        *,
+        item: dict[str, Any],
+    ) -> None:
+        if turn.pending_native_recovery_item_type is not None:
+            return
+        item_id = _optional_string(item.get("id"))
+        if item_id is not None:
+            self._rollover_active_assistant_item(turn, incoming_item_id=item_id)
+        text = ""
+        if (
+            item_id is not None
+            and turn.active_assistant_item_id == item_id
+            and turn.active_assistant_chunks
+        ):
+            text = "".join(turn.active_assistant_chunks)
+            turn.active_assistant_chunks.clear()
+            turn.active_assistant_item_id = None
+        if not text.strip():
+            text = str(item.get("text", ""))
+        normalized = text.strip()
+        if not normalized:
+            return
+        turn.completed_messages.append(normalized)
+        await turn.queue.put(
+            AgentAssistantMessageEvent(
+                session_id=turn.session_id,
+                turn_id=self._visible_turn_id(turn),
+                text=normalized,
+            )
+        )
 
 
 def _extract_thread_id(response: object) -> str:

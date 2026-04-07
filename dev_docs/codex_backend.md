@@ -293,6 +293,7 @@ Once native-capability recovery is pending, further message deltas and completed
 
 The developer instruction sent to Codex explicitly tells it to use only client-provided dynamic tools.
 That soft suppression is advisory only; the interrupt-and-retry path is the enforcement layer.
+Codex tool responses for subagent-control actions also include Codex-only advisory text that tells the model to stop polling and wait for orchestrator-managed follow-up turns when appropriate.
 
 ## Path Mapping
 
@@ -331,6 +332,8 @@ Persisted Codex assistant transcript records also include provider metadata in t
 - `model = <configured Codex model>`
 - `response_id = <Codex provider turn id>`
 - `finish_reason`
+
+When one Codex turn emits multiple assistant message items, the backend persists them as separate assistant transcript records on the same Jarvis turn instead of collapsing them into one fused blob.
 
 ## Memory Behavior
 
