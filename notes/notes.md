@@ -143,3 +143,4 @@
 - Gateway broad `internal_error` fallbacks should always log the underlying exception stack, or provider/configuration failures become opaque from Telegram warnings alone.
 - OpenRouter app attribution depends on `HTTP-Referer` plus title headers, so `providers.openrouter.site_url` must be set in workspace settings if you want requests to show up as a named app instead of `unknown`.
 - Grok is now a first-class chat-only provider: the adapter collapses all Jarvis system messages into one first xAI system message, maps `prompt_cache_key` to `x-grok-conv-id`, and uses xAI chat-completions instead of leaking provider statefulness into the core loop.
+- Planned Codex support keeps `codex` as a settings-level provider name but routes main and subagent actors through a separate host-app-server backend, with host/container path translation and auth flow kept out of `src/jarvis/llm/`.
