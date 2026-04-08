@@ -345,7 +345,7 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 _dynamic_tools_signature(thread_start_request["dynamicTools"]),
             )
 
-    async def test_turn_start_sends_dynamic_tools_when_discoverable_tools_change(self) -> None:
+    async def test_turn_start_does_not_carry_discoverable_activation_across_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             def tool_definitions_provider(activated):
                 if "web_fetch" not in activated:
@@ -394,7 +394,10 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     created_at="2026-04-07T00:00:00+00:00",
                     role="tool",
                     content="Activated discoverable tool.",
-                    metadata={"activated_discoverable_tool_names": ["web_fetch"]},
+                    metadata={
+                        "turn_id": "turn_1",
+                        "activated_discoverable_tool_names": ["web_fetch"],
+                    },
                 ),
             )
 
@@ -418,18 +421,14 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(coordinator.turn_start_requests), 2)
             self.assertNotIn("dynamicTools", coordinator.turn_start_requests[0])
-            self.assertIn("dynamicTools", coordinator.turn_start_requests[1])
-            self.assertEqual(
-                coordinator.turn_start_requests[1]["dynamicTools"][0]["name"],
-                "web_fetch",
-            )
+            self.assertNotIn("dynamicTools", coordinator.turn_start_requests[1])
             active = storage.get_active_session()
             self.assertIsNotNone(active)
             if active is None:
                 self.fail("Expected an active session.")
             self.assertEqual(
                 active.backend_state["dynamic_tools_signature"],
-                _dynamic_tools_signature(coordinator.turn_start_requests[1]["dynamicTools"]),
+                _dynamic_tools_signature(()),
             )
 
     async def test_runtime_turn_syncs_external_system_notes_into_codex_input(self) -> None:

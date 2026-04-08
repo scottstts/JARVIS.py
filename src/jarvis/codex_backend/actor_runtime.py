@@ -621,7 +621,8 @@ class CodexActorRuntime:
             if not input_items:
                 raise CodexProtocolError("Codex turn input cannot be empty.")
             dynamic_tools, dynamic_tools_signature = self._build_dynamic_tools_bundle(
-                session.session_id
+                session.session_id,
+                turn_id=None,
             )
             turn_start_params: dict[str, Any] = {
                 "threadId": thread_id,
@@ -780,7 +781,8 @@ class CodexActorRuntime:
         )
         developer_instructions = await self._build_developer_instructions()
         dynamic_tools, dynamic_tools_signature = self._build_dynamic_tools_bundle(
-            session.session_id
+            session.session_id,
+            turn_id=None,
         )
         stored_dynamic_tools_signature = _optional_string(
             backend_state.get("dynamic_tools_signature")
@@ -1342,8 +1344,9 @@ class CodexActorRuntime:
                     "summary": self._settings.reasoning_summary,
                     "personality": self._settings.personality,
                     "dynamicTools": self._tool_bridge.build_dynamic_tools(
-                        activated_discoverable_tool_names=_collect_activated_discoverable_tool_names(
-                            self._storage.load_records(turn.session_id)
+                        activated_discoverable_tool_names=_collect_turn_activated_discoverable_tool_names(
+                            self._storage.load_records(turn.session_id),
+                            turn_id=self._visible_turn_id(turn),
                         ),
                     ),
                 },
@@ -1373,10 +1376,13 @@ class CodexActorRuntime:
     def _build_dynamic_tools_bundle(
         self,
         session_id: str,
+        *,
+        turn_id: str | None,
     ) -> tuple[list[dict[str, Any]], str]:
         dynamic_tools = self._tool_bridge.build_dynamic_tools(
-            activated_discoverable_tool_names=_collect_activated_discoverable_tool_names(
-                self._storage.load_records(session_id)
+            activated_discoverable_tool_names=_collect_turn_activated_discoverable_tool_names(
+                self._storage.load_records(session_id),
+                turn_id=turn_id,
             ),
         )
         return dynamic_tools, _dynamic_tools_signature(dynamic_tools)
@@ -1640,13 +1646,19 @@ def _render_runtime_input_text(message: AgentRuntimeMessage) -> str:
     return message.content
 
 
-def _collect_activated_discoverable_tool_names(
+def _collect_turn_activated_discoverable_tool_names(
     records: Sequence[ConversationRecord],
+    *,
+    turn_id: str | None,
 ) -> tuple[str, ...]:
+    if turn_id is None:
+        return ()
     names: list[str] = []
     seen: set[str] = set()
     for record in records:
         if record.role != "tool":
+            continue
+        if _optional_string(record.metadata.get(_TURN_ID_METADATA_KEY)) != turn_id:
             continue
         raw_names = record.metadata.get("activated_discoverable_tool_names")
         if not isinstance(raw_names, list):
