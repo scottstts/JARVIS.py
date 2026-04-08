@@ -359,6 +359,9 @@ class ToolSettingsTests(unittest.TestCase):
 
         self.assertIn("upsert revises an existing canonical document", tool.definition.description.lower())
         self.assertIn("do not leave wrong active memory in place", tool.definition.description.lower())
+        self.assertIn("daily corrections are section rewrites", tool.definition.description.lower())
+        self.assertIn("memory_get", tool.definition.description.lower())
+        self.assertIn("use append_daily only to add a new daily entry", tool.definition.description.lower())
         self.assertIn("rewrite the terminal summary and body_sections", tool.definition.description.lower())
         self.assertIn("facts and relations are explicit-decision fields", tool.definition.description.lower())
         self.assertIn('literal string "none"', tool.definition.description.lower())
@@ -392,8 +395,14 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("main searchable body text", body_description)
         self.assertIn("overwrite matching canonical sections", body_description)
         self.assertIn("omitted sections stay unchanged", body_description)
+        self.assertIn("include only sections you want to rewrite", body_description)
+        self.assertIn("do not send blank placeholders", body_description)
         self.assertIn("rewrite stale narrative content", body_description)
+        self.assertIn("daily corrections", body_description)
+        self.assertIn("memory_get", body_description)
+        self.assertIn("not a list of {heading, body} objects", body_description)
         self.assertIn('{"overview":"..."}', body_description)
+        self.assertIn('{"notable events":"- went for a bike ride along the coast."}', body_description)
         self.assertIn("optional close/archive reason metadata", close_reason_description)
 
     def test_memory_write_schema_exposes_nested_truth_shapes(self) -> None:
@@ -1848,6 +1857,25 @@ class ToolPolicyTests(unittest.TestCase):
             (decision.reason or "").lower(),
         )
 
+    def test_memory_write_policy_denies_daily_upsert_without_body_sections(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "upsert",
+                "target_kind": "daily",
+                "document_id": "daily_2026-04-08",
+                "summary": "Scott went to Bray for a bike ride.",
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("daily upsert", (decision.reason or "").lower())
+        self.assertIn("memory_get", decision.reason or "")
+        self.assertIn("body_sections", decision.reason or "")
+        self.assertIn("summary alone does not rewrite prior daily content", (decision.reason or "").lower())
+        self.assertIn("append_daily", decision.reason or "")
+
     def test_memory_write_policy_denies_empty_truth_arrays(self) -> None:
         decision = self.policy.authorize(
             tool_name="memory_write",
@@ -1904,6 +1932,25 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("body_sections", decision.reason or "")
         self.assertIn("Do not pass a list of section objects", decision.reason or "")
+
+    def test_memory_write_policy_denies_blank_body_section_placeholders(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="memory_write",
+            arguments={
+                "operation": "upsert",
+                "target_kind": "daily",
+                "document_id": "daily_2026-04-08",
+                "body_sections": {
+                    "Notable Events": "- Went for a bike ride along the coast.",
+                    "Decisions": "",
+                },
+            },
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn('body_sections["Decisions"]', decision.reason or "")
+        self.assertIn("omit untouched sections instead of passing empty strings", decision.reason or "")
 
     def test_memory_write_policy_reports_multiple_nested_errors_together(self) -> None:
         decision = self.policy.authorize(
@@ -3122,6 +3169,77 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "prefer real fact objects in facts whenever the user states an explicit durable fact",
             result.content.lower(),
         )
+
+    async def test_memory_write_runtime_denies_daily_upsert_without_body_sections(self) -> None:
+        memory_service = MemoryService(
+            settings=MemorySettings.from_workspace_dir(self.workspace_dir),
+            llm_service=None,
+        )
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_daily_upsert_without_sections",
+                name="memory_write",
+                arguments={
+                    "operation": "upsert",
+                    "target_kind": "daily",
+                    "document_id": "daily_2026-04-08",
+                    "summary": "Scott went to Bray for a bike ride.",
+                },
+                raw_arguments='{"operation":"upsert","target_kind":"daily","document_id":"daily_2026-04-08","summary":"Scott went to Bray for a bike ride."}',
+            ),
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                memory_service=memory_service,
+            ),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tool execution denied by policy", result.content)
+        self.assertIn("daily upsert", result.content.lower())
+        self.assertIn("memory_get", result.content)
+        self.assertIn("body_sections", result.content)
+        self.assertIn("summary alone does not rewrite prior daily content", result.content.lower())
+        self.assertIn("append_daily", result.content)
+
+    async def test_tool_runtime_returns_recoverable_error_for_invalid_model_tool_call(self) -> None:
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_memory_write_invalid_shape",
+                name="memory_write",
+                arguments={
+                    "operation": "upsert",
+                    "target_kind": "daily",
+                    "document_id": "daily_2026-04-08",
+                    "body_sections": [
+                        {
+                            "heading": "Notable Events",
+                            "body": "- Scott went to Bray for a bike ride.",
+                        }
+                    ],
+                },
+                raw_arguments=(
+                    '{"operation":"upsert","target_kind":"daily","document_id":"daily_2026-04-08",'
+                    '"body_sections":[{"heading":"Notable Events","body":"- Scott went to Bray for a bike ride."}]}'
+                ),
+                provider_metadata={
+                    "tool_call_validation_error": (
+                        "Tool 'memory_write' arguments failed schema validation: "
+                        "[{'heading': 'Notable Events', 'body': '- Scott went to Bray for a bike ride.'}] "
+                        "is not of type 'object'"
+                    )
+                },
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.name, "memory_write")
+        self.assertIn("Tool execution failed", result.content)
+        self.assertIn("ToolCallValidationError", result.content)
+        self.assertIn("raw_arguments", result.content)
+        self.assertIn("match the tool schema", result.content)
+        self.assertTrue(result.metadata["tool_call_validation_failed"])
 
     async def test_memory_write_runtime_accepts_explicit_none_truth_decision(self) -> None:
         memory_service = MemoryService(

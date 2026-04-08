@@ -1514,6 +1514,86 @@ class _AllowAllToolPolicy:
         return ToolPolicyDecision(allowed=True)
 
 
+class _FakeInvalidToolCallLLMService:
+    def __init__(self) -> None:
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generation is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.stream_calls == 1:
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="memory_write_invalid_1",
+                            name="memory_write",
+                            arguments={
+                                "operation": "upsert",
+                                "target_kind": "daily",
+                                "document_id": "daily_2026-04-08",
+                                "body_sections": [
+                                    {
+                                        "heading": "Notable Events",
+                                        "body": "- Scott went to Bray for a bike ride.",
+                                    }
+                                ],
+                            },
+                            raw_arguments=(
+                                '{"operation":"upsert","target_kind":"daily","document_id":"daily_2026-04-08",'
+                                '"body_sections":[{"heading":"Notable Events","body":"- Scott went to Bray for a bike ride."}]}'
+                            ),
+                            provider_metadata={
+                                "tool_call_validation_error": (
+                                    "Tool 'memory_write' arguments failed schema validation: "
+                                    "[{'heading': 'Notable Events', 'body': '- Scott went to Bray for a bike ride.'}] "
+                                    "is not of type 'object'"
+                                )
+                            },
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        assistant_message = request.messages[-2]
+        tool_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before follow-up model call.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before follow-up model call.")
+        if tool_result_parts[0].is_error is not True:
+            raise AssertionError("Expected invalid tool call recovery to be marked as an error.")
+        if "ToolCallValidationError" not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to include the validation error type.")
+        if "body_sections" not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to mention the bad body_sections shape.")
+        if "raw_arguments" not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to echo raw arguments.")
+
+        yield DoneEvent(
+            response=_build_response(
+                "The previous memory_write call was invalid. I need to resend it with body_sections as an object.",
+            )
+        )
+
+
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1827,21 +1907,38 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     "done",
                 ],
             )
-            self.assertIsInstance(events[2], AgentAssistantMessageEvent)
-            self.assertIsInstance(events[3], AgentToolCallEvent)
-            self.assertIsInstance(events[5], AgentAssistantMessageEvent)
-            first_message = events[2]
-            if not isinstance(first_message, AgentAssistantMessageEvent):
-                self.fail("Expected assistant message stream event before tool execution.")
-            self.assertEqual(first_message.text, "Working on it.")
-            tool_event = events[3]
-            if not isinstance(tool_event, AgentToolCallEvent):
-                self.fail("Expected tool-call stream event before tool execution.")
-            self.assertEqual(tool_event.tool_names, ("bash",))
+
+    async def test_stream_user_input_recovers_invalid_model_tool_call_as_tool_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeInvalidToolCallLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            events = [
+                event async for event in loop.stream_user_input("Correct today's daily memory.")
+            ]
+
+            self.assertEqual(events[-1].type, "done")
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
-            self.assertEqual(done.response_text, "File written.")
+            self.assertEqual(
+                done.response_text,
+                "The previous memory_write call was invalid. I need to resend it with body_sections as an object.",
+            )
+
+            records = storage.load_records(done.session_id)
+            tool_records = [record for record in records if record.role == "tool"]
+            self.assertEqual(len(tool_records), 1)
+            self.assertFalse(tool_records[0].metadata.get("ok", True))
+            self.assertTrue(tool_records[0].metadata.get("tool_call_validation_failed"))
+            self.assertIn("ToolCallValidationError", tool_records[0].content)
+            self.assertTrue(any(isinstance(event, AgentToolCallEvent) for event in events))
+            self.assertTrue(any(isinstance(event, AgentAssistantMessageEvent) for event in events))
 
     async def test_stream_user_input_preserves_tool_first_order_when_tool_delta_arrives_first(
         self,

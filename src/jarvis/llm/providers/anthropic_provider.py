@@ -53,7 +53,7 @@ from ..types import (
     ToolResultPart,
     UsageDeltaEvent,
 )
-from ..validation import build_tool_schema_map, parse_and_validate_tool_call
+from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 _ANTHROPIC_ADAPTIVE_THINKING_MODEL_MARKERS = (
     "claude-opus-4-6",
@@ -462,7 +462,7 @@ class AnthropicProvider:
                 continue
             raw_arguments = json.dumps(block.input or {})
             tool_calls.append(
-                parse_and_validate_tool_call(
+                parse_and_validate_tool_call_or_recover(
                     call_id=block.id,
                     name=block.name,
                     raw_arguments=raw_arguments,

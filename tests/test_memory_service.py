@@ -508,6 +508,80 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response.results)
             self.assertEqual(response.results[0].document_id, written.document_id)
 
+    async def test_daily_upsert_requires_body_sections_for_corrections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            written = await service.write(
+                operation="append_daily",
+                target_kind="daily",
+                date="2026-03-12",
+                timezone_name="Europe/Dublin",
+                title="Bike ride",
+                summary="Scott went to Phoenix Park for a bike ride.",
+            )
+
+            with self.assertRaises(ValueError) as exc_info:
+                await service.write(
+                    operation="upsert",
+                    target_kind="daily",
+                    document_id=written.document_id,
+                    summary="Scott went to Bray for a bike ride.",
+                )
+
+            self.assertIn("body_sections", str(exc_info.exception))
+            self.assertIn("summary alone does not rewrite prior daily content", str(exc_info.exception))
+            self.assertIn("append_daily", str(exc_info.exception))
+            daily_text = written.path.read_text(encoding="utf-8")
+            self.assertIn("Phoenix Park", daily_text)
+            self.assertNotIn("Bray", daily_text)
+
+    async def test_daily_upsert_rewrites_existing_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            service = MemoryService(
+                settings=MemorySettings.from_workspace_dir(workspace_dir),
+                llm_service=None,
+            )
+
+            created = await service.write(
+                operation="create",
+                target_kind="daily",
+                date="2026-03-12",
+                timezone_name="Europe/Dublin",
+                body_sections={
+                    "Notable Events": "- Scott went to Phoenix Park for a bike ride.",
+                    "Decisions": "- Bring the gravel bike next time.",
+                },
+            )
+
+            updated = await service.write(
+                operation="upsert",
+                target_kind="daily",
+                document_id=created.document_id,
+                body_sections={
+                    "Notable Events": "- Scott went to Bray for a bike ride.",
+                },
+            )
+
+            document = service._store.read_document(updated.path)
+            self.assertEqual(
+                document.sections["Notable Events"],
+                "- Scott went to Bray for a bike ride.",
+            )
+            self.assertEqual(
+                document.sections["Decisions"],
+                "- Bring the gravel bike next time.",
+            )
+            self.assertNotIn("Phoenix Park", document.body_markdown)
+            self.assertIn("Bray", document.body_markdown)
+
     async def test_close_archives_ongoing_memory_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"

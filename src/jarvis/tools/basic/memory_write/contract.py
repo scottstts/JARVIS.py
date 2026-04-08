@@ -9,15 +9,18 @@ CONFIDENCE_VALUES = ("low", "medium", "high")
 RELATION_CARDINALITY_VALUES = ("single", "multi")
 
 FACT_EXAMPLE = (
-    '[{"text":"Scott is building a Three.js/WebGPU/TSL shader playground.",'
+    '[{"text":"The user is building a WebGPU shader playground.",'
     '"status":"current"}]'
 )
 RELATION_EXAMPLE = (
-    '[{"subject":"Scott","predicate":"is_building","object":"Visual Pipeline Project",'
+    '[{"subject":"The user","predicate":"is_building","object":"a visual pipeline project",'
     '"status":"current","cardinality":"single"}]'
 )
 BODY_SECTIONS_EXAMPLE = (
-    '{"Overview":"Scott is building a Three.js/WebGPU/TSL shader playground."}'
+    '{"Overview":"The user is building a WebGPU shader playground."}'
+)
+DAILY_UPSERT_EXAMPLE = (
+    '{"Notable Events":"- Went for a bike ride along the coast."}'
 )
 FACTS_USAGE_GUIDANCE = (
     'Prefer real fact objects in facts whenever the user states an explicit durable fact; '
@@ -94,6 +97,8 @@ def validate_memory_write_contract(
         )
     )
     errors.extend(_validate_body_sections_argument(arguments.get("body_sections")))
+    if operation == "upsert" and target_kind == "daily":
+        errors.extend(_validate_daily_upsert_body_sections(arguments.get("body_sections")))
     return errors
 
 
@@ -104,15 +109,24 @@ def format_memory_write_contract_error(
     errors: list[str],
 ) -> str:
     prefix = "Invalid memory_write payload."
+    example = MEMORY_WRITE_EXAMPLE
     if operation in {"create", "upsert"} and target_kind in {"core", "ongoing"}:
         prefix = (
             "Invalid memory_write payload. For core/ongoing create and upsert, facts and relations "
             "are explicit-decision fields, and summary is not a substitute. "
             f"{FACTS_USAGE_GUIDANCE}"
         )
+    elif operation == "upsert" and target_kind == "daily":
+        prefix = (
+            "Invalid memory_write payload. Daily upsert is the correction path for an existing daily "
+            "document, but it must rewrite one or more canonical sections through body_sections. "
+            "Fetch the current daily doc with memory_get, then send replacement body_sections. "
+            "summary alone does not rewrite prior daily content; use append_daily only to add a new daily entry."
+        )
+        example = f"body_sections={DAILY_UPSERT_EXAMPLE}"
     return (
         f"{prefix} Fix all of these before retrying: {'; '.join(errors)}. "
-        f"Minimal valid example: {MEMORY_WRITE_EXAMPLE}"
+        f"Minimal valid example: {example}"
     )
 
 
@@ -173,9 +187,32 @@ def _validate_body_sections_argument(value: object) -> list[str]:
             continue
         if not isinstance(section_value, str) or not section_value.strip():
             errors.append(
-                f'body_sections["{section_name}"] must be a non-empty string'
+                f'body_sections["{section_name}"] must be a non-empty string; '
+                "omit untouched sections instead of passing empty strings"
             )
     return errors
+
+
+def _validate_daily_upsert_body_sections(value: object) -> list[str]:
+    if value is None:
+        return [
+            "daily upsert must provide body_sections with at least one replacement section; "
+            "summary alone does not rewrite prior daily content; use append_daily to add a new daily entry"
+        ]
+    if not isinstance(value, dict):
+        return []
+    if any(
+        isinstance(section_name, str)
+        and section_name.strip()
+        and isinstance(section_value, str)
+        and section_value.strip()
+        for section_name, section_value in value.items()
+    ):
+        return []
+    return [
+        "daily upsert must provide body_sections with at least one replacement section; "
+        "summary alone does not rewrite prior daily content; use append_daily to add a new daily entry"
+    ]
 
 
 def _validate_fact_item(path: str, item: dict[str, Any]) -> list[str]:

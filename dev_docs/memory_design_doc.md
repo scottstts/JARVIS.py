@@ -1049,6 +1049,7 @@ Behavior:
 - applies deterministic mutation
 - `upsert` revises an existing canonical document and is the normal correction path when active memory is wrong
 - `append_daily` appends a new daily entry instead of revising prior daily content
+- daily corrections are explicit section rewrites: fetch the current daily doc with `memory_get`, then send replacement `body_sections`; summary-only daily `upsert` is rejected
 - provided `body_sections` overwrite matching canonical sections; omitted sections remain unchanged
 - provided `facts` and `relations` replace that document's structured truth sets; omitted ones remain unchanged
 - writes Markdown

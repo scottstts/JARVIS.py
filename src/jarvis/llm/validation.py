@@ -12,6 +12,8 @@ from jsonschema.exceptions import ValidationError
 from .errors import LLMConfigurationError, ToolCallValidationError
 from .types import ToolCall, ToolDefinition
 
+TOOL_CALL_VALIDATION_ERROR_METADATA_KEY = "tool_call_validation_error"
+
 
 def build_tool_schema_map(tools: Sequence[ToolDefinition]) -> dict[str, Mapping[str, Any]]:
     """Builds name->schema map and rejects duplicate tool names."""
@@ -122,3 +124,70 @@ def parse_and_validate_tool_call(
         arguments=parsed,
         raw_arguments=raw_arguments,
     )
+
+
+def parse_and_validate_tool_call_or_recover(
+    *,
+    call_id: str,
+    name: str,
+    raw_arguments: str,
+    tool_schemas: Mapping[str, Mapping[str, Any]],
+    provider_metadata: Mapping[str, Any] | None = None,
+) -> ToolCall:
+    """Parses and validates a tool call, or returns a recoverable invalid call."""
+    try:
+        tool_call = parse_and_validate_tool_call(
+            call_id=call_id,
+            name=name,
+            raw_arguments=raw_arguments,
+            tool_schemas=tool_schemas,
+        )
+    except ToolCallValidationError as exc:
+        return build_recoverable_invalid_tool_call(
+            call_id=call_id,
+            name=name,
+            raw_arguments=raw_arguments,
+            error=exc,
+            provider_metadata=provider_metadata,
+        )
+    if not provider_metadata:
+        return tool_call
+    merged_metadata = dict(provider_metadata)
+    merged_metadata.update(tool_call.provider_metadata)
+    return ToolCall(
+        call_id=tool_call.call_id,
+        name=tool_call.name,
+        arguments=tool_call.arguments,
+        raw_arguments=tool_call.raw_arguments,
+        provider_metadata=merged_metadata,
+    )
+
+
+def build_recoverable_invalid_tool_call(
+    *,
+    call_id: str,
+    name: str,
+    raw_arguments: str,
+    error: ToolCallValidationError,
+    provider_metadata: Mapping[str, Any] | None = None,
+) -> ToolCall:
+    """Builds a synthetic tool call that will surface a recoverable tool error."""
+    metadata = dict(provider_metadata or {})
+    metadata[TOOL_CALL_VALIDATION_ERROR_METADATA_KEY] = str(error)
+    return ToolCall(
+        call_id=call_id,
+        name=name,
+        arguments=_best_effort_load_tool_call_arguments(raw_arguments),
+        raw_arguments=raw_arguments,
+        provider_metadata=metadata,
+    )
+
+
+def _best_effort_load_tool_call_arguments(raw_arguments: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed

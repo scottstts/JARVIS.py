@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from jarvis.llm import ToolCall
+from jarvis.llm.validation import TOOL_CALL_VALIDATION_ERROR_METADATA_KEY
 
 from .policy import ToolPolicy
 from .registry import ToolRegistry
@@ -27,6 +28,29 @@ class ToolRuntime:
         tool_call: ToolCall,
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
+        validation_error = str(
+            tool_call.provider_metadata.get(TOOL_CALL_VALIDATION_ERROR_METADATA_KEY, "")
+        ).strip()
+        if validation_error:
+            return ToolExecutionResult(
+                call_id=tool_call.call_id,
+                name=tool_call.name,
+                ok=False,
+                content=(
+                    "Tool execution failed\n"
+                    f"tool: {tool_call.name}\n"
+                    "error_type: ToolCallValidationError\n"
+                    f"error: {validation_error}\n"
+                    f"raw_arguments: {tool_call.raw_arguments}\n"
+                    "fix: emit a new tool call whose arguments match the tool schema."
+                ),
+                metadata={
+                    "tool_call_validation_failed": True,
+                    "reason": validation_error,
+                    "raw_arguments": tool_call.raw_arguments,
+                    "arguments": dict(tool_call.arguments),
+                },
+            )
         tool = self._registry.require(tool_call.name)
         decision = self._policy.authorize(
             tool_name=tool_call.name,

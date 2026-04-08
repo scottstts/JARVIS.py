@@ -57,10 +57,12 @@ from ..types import (
 )
 from ..validation import (
     build_tool_schema_map,
+    build_recoverable_invalid_tool_call,
     get_tool_schema,
     load_tool_call_arguments,
     validate_tool_call_arguments,
 )
+from ..errors import ToolCallValidationError
 
 
 class OpenAIProvider:
@@ -467,34 +469,43 @@ class OpenAIProvider:
         for item in response_output:
             if getattr(item, "type", None) != "function_call":
                 continue
-
-            schema = get_tool_schema(
-                call_id=item.call_id,
-                name=item.name,
-                tool_schemas=tool_schemas,
-            )
-            arguments = load_tool_call_arguments(
-                call_id=item.call_id,
-                name=item.name,
-                raw_arguments=item.arguments,
-            )
-            tool = tool_definitions.get(item.name)
-            if tool is not None and tool.strict:
-                arguments = _sanitize_openai_returned_arguments(arguments, schema)
-            validate_tool_call_arguments(
-                call_id=item.call_id,
-                name=item.name,
-                arguments=arguments,
-                schema=schema,
-            )
-            validated_calls.append(
-                ToolCall(
+            try:
+                schema = get_tool_schema(
+                    call_id=item.call_id,
+                    name=item.name,
+                    tool_schemas=tool_schemas,
+                )
+                arguments = load_tool_call_arguments(
+                    call_id=item.call_id,
+                    name=item.name,
+                    raw_arguments=item.arguments,
+                )
+                tool = tool_definitions.get(item.name)
+                if tool is not None and tool.strict:
+                    arguments = _sanitize_openai_returned_arguments(arguments, schema)
+                validate_tool_call_arguments(
                     call_id=item.call_id,
                     name=item.name,
                     arguments=arguments,
-                    raw_arguments=item.arguments,
+                    schema=schema,
                 )
-            )
+                validated_calls.append(
+                    ToolCall(
+                        call_id=item.call_id,
+                        name=item.name,
+                        arguments=arguments,
+                        raw_arguments=item.arguments,
+                    )
+                )
+            except ToolCallValidationError as exc:
+                validated_calls.append(
+                    build_recoverable_invalid_tool_call(
+                        call_id=item.call_id,
+                        name=item.name,
+                        raw_arguments=item.arguments,
+                        error=exc,
+                    )
+                )
         return validated_calls
 
     def _normalize_usage(

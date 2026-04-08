@@ -44,7 +44,7 @@ from ..types import (
     ToolResultPart,
     UsageDeltaEvent,
 )
-from ..validation import build_tool_schema_map, parse_and_validate_tool_call
+from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 _GEMINI_3_MODEL_PREFIX = "gemini-3"
 _GEMINI_25_MODEL_PREFIX = "gemini-2.5"
@@ -429,21 +429,14 @@ class GeminiProvider:
                     else {}
                 )
                 tool_calls.append(
-                    parse_and_validate_tool_call(
+                    parse_and_validate_tool_call_or_recover(
                         call_id=call_id,
                         name=function_call.name,
                         raw_arguments=raw_arguments,
                         tool_schemas=tool_schemas,
-                    )
-                )
-                if provider_metadata:
-                    tool_calls[-1] = ToolCall(
-                        call_id=tool_calls[-1].call_id,
-                        name=tool_calls[-1].name,
-                        arguments=tool_calls[-1].arguments,
-                        raw_arguments=tool_calls[-1].raw_arguments,
                         provider_metadata=provider_metadata,
                     )
+                )
 
         return tool_calls
 

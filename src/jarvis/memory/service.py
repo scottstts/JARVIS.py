@@ -373,6 +373,12 @@ class MemoryService:
             raise ValueError(f"Unsupported memory write operation: {operation}")
         if current is not None:
             _assert_locked_write_allowed(current=current, allow_locked=allow_locked, operation=operation)
+        if operation == "upsert" and target_kind == "daily" and not _has_nonempty_section_overrides(body_sections):
+            raise ValueError(
+                "daily upsert must rewrite one or more canonical sections through body_sections; "
+                "summary alone does not rewrite prior daily content. "
+                "Use append_daily to add a new daily entry."
+            )
 
         now = _utc_now_iso()
         base_document = current or self._build_new_document(
@@ -1459,6 +1465,18 @@ def _merge_sections(*, base_document: MemoryDocument, overrides: dict[str, str])
             continue
         sections[heading] = content.strip()
     return sections
+
+
+def _has_nonempty_section_overrides(body_sections: dict[str, str] | None) -> bool:
+    if body_sections is None:
+        return False
+    return any(
+        isinstance(section_name, str)
+        and section_name.strip()
+        and isinstance(section_value, str)
+        and section_value.strip()
+        for section_name, section_value in body_sections.items()
+    )
 
 
 def _reconcile_summary_section(

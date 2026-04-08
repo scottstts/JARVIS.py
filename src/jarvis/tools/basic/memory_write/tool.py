@@ -118,6 +118,8 @@ def build_memory_write_tool() -> RegisteredTool:
                 "upsert revises an existing canonical document and is the normal correction path when active "
                 "memory is wrong; if the corrected truth is known, do not leave wrong active memory in place "
                 "with a separate correction note. "
+                "Daily corrections are section rewrites: fetch the current daily document with memory_get, "
+                "then pass replacement body_sections; use append_daily only to add a new daily entry. "
                 'For core and ongoing create/upsert, facts and relations are explicit-decision fields: always set both as a '
                 'non-empty structured array or the literal string "None"; summary is not a substitute. '
                 "Put durable facts in facts, structured subject-predicate-object claims in relations, and important "
@@ -132,7 +134,7 @@ def build_memory_write_tool() -> RegisteredTool:
                         "type": "string",
                         "enum": ["create", "upsert", "append_daily", "close", "archive", "promote", "demote"],
                         "description": (
-                            "Structured memory mutation. upsert revises an existing canonical document, including daily corrections. "
+                            "Structured memory mutation. upsert revises an existing canonical document. "
                             "append_daily appends a new daily entry instead of revising prior daily content. "
                             "close and archive are superseding transitions: rewrite terminal summary/body_sections first, "
                             "then flip state."
@@ -197,8 +199,12 @@ def build_memory_write_tool() -> RegisteredTool:
                         **BODY_SECTIONS_SCHEMA,
                         "description": (
                             "Canonical narrative sections keyed by section name. Provided keys overwrite matching "
-                            "canonical sections; omitted sections stay unchanged. This is the main searchable body text "
-                            'and the normal way to rewrite stale narrative content. Pass an object like {"Overview":"..."}.'
+                            "canonical sections; omitted sections stay unchanged. Include only sections you want to "
+                            "rewrite; do not send blank placeholders for untouched sections. This is the main searchable "
+                            "body text and the normal way to rewrite stale narrative content, including daily corrections "
+                            "after reading the current document with memory_get. Convert those headings into an object map, "
+                            'not a list of {heading, body} objects. Pass an object like {"Overview":"..."} or '
+                            '{"Notable Events":"- Went for a bike ride along the coast."}.'
                         ),
                     },
                     "source_refs": {"type": "array", "items": {"type": "object"}},

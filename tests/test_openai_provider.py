@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from jarvis.llm.config import OpenAIProviderSettings
-from jarvis.llm.errors import ToolCallValidationError
 from jarvis.llm.providers.openai_provider import OpenAIProvider
 from jarvis.llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
 from jarvis.tools.basic.file_patch.tool import build_file_patch_tool
@@ -147,7 +146,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].arguments, {"command": "pwd"})
 
-    def test_extract_tool_calls_keeps_required_null_validation(self) -> None:
+    def test_extract_tool_calls_recovers_required_null_validation_as_invalid_tool_call(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
             default_timeout_seconds=60.0,
@@ -165,18 +164,26 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
             },
         )
 
-        with self.assertRaises(ToolCallValidationError):
-            provider._extract_tool_calls(
-                response_output=[
-                    SimpleNamespace(
-                        type="function_call",
-                        call_id="call_123",
-                        name="bash",
-                        arguments='{"command":null}',
-                    )
-                ],
-                request_tools=(tool,),
-            )
+        calls = provider._extract_tool_calls(
+            response_output=[
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_123",
+                    name="bash",
+                    arguments='{"command":null}',
+                )
+            ],
+            request_tools=(tool,),
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].call_id, "call_123")
+        self.assertEqual(calls[0].name, "bash")
+        self.assertEqual(calls[0].arguments, {"command": None})
+        self.assertIn(
+            "arguments failed schema validation",
+            calls[0].provider_metadata["tool_call_validation_error"],
+        )
 
     def test_file_patch_tool_schema_avoids_openai_unsupported_one_of(self) -> None:
         provider = OpenAIProvider(
