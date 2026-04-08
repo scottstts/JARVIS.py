@@ -31,6 +31,7 @@ from jarvis.tools import (
 from jarvis.tools.remote_runtime_client import RemoteToolRuntimeClient, RemoteToolRuntimeError
 from jarvis.tools.basic.memory_write.tool import build_memory_write_tool
 from jarvis.tools.basic.tool_search import build_tool_search_tool
+from jarvis.tools.basic.tool_register.tool import build_tool_register_tool
 from jarvis.tools.basic.memory_search.tool import _format_memory_search_result
 from jarvis.tools.discoverable.memory_admin.tool import build_memory_admin_discoverable
 from jarvis.tools.runtime_tool_manifest import (
@@ -356,6 +357,8 @@ class ToolSettingsTests(unittest.TestCase):
     def test_memory_write_tool_describes_superseding_rewrite_and_truth_contracts(self) -> None:
         tool = build_memory_write_tool()
 
+        self.assertIn("upsert revises an existing canonical document", tool.definition.description.lower())
+        self.assertIn("do not leave wrong active memory in place", tool.definition.description.lower())
         self.assertIn("rewrite the terminal summary and body_sections", tool.definition.description.lower())
         self.assertIn("facts and relations are explicit-decision fields", tool.definition.description.lower())
         self.assertIn('literal string "none"', tool.definition.description.lower())
@@ -370,15 +373,26 @@ class ToolSettingsTests(unittest.TestCase):
         close_reason_description = tool.definition.input_schema["properties"]["close_reason"]["description"].lower()
 
         self.assertIn("close and archive are superseding transitions", operation_description)
+        self.assertIn("upsert revises an existing canonical document", operation_description)
+        self.assertIn("append_daily appends a new daily entry", operation_description)
         self.assertIn("rewrite terminal summary/body_sections first", operation_description)
         self.assertIn("summary is not a substitute", summary_description)
         self.assertIn("structured truth", summary_description)
+        self.assertIn("mirror it into facts", summary_description)
         self.assertIn("durable fact objects", facts_description)
+        self.assertIn("replaces the document's fact set", facts_description)
+        self.assertIn("existing facts stay", facts_description)
         self.assertIn('{"text":"..."}', facts_description)
         self.assertIn("subject-predicate-object claims", relations_description)
         self.assertIn("preferences", relations_description)
+        self.assertIn("replaces the document's relation set", relations_description)
+        self.assertIn("existing relations stay", relations_description)
+        self.assertIn("replace the active truth", relations_description)
         self.assertIn('{"subject":"...","predicate":"...","object":"..."}', relations_description)
         self.assertIn("main searchable body text", body_description)
+        self.assertIn("overwrite matching canonical sections", body_description)
+        self.assertIn("omitted sections stay unchanged", body_description)
+        self.assertIn("rewrite stale narrative content", body_description)
         self.assertIn('{"overview":"..."}', body_description)
         self.assertIn("optional close/archive reason metadata", close_reason_description)
 
@@ -457,6 +471,23 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIsNone(discoverable.detailed_description)
         self.assertIsInstance(discoverable.usage, str)
         self.assertIn("repair_canonical_drift", discoverable.usage)
+
+    def test_tool_register_loose_json_fields_include_array_items(self) -> None:
+        tool = build_tool_register_tool(ToolRegistry())
+        manifest_schema = tool.definition.input_schema["properties"]["manifest"]["properties"]
+
+        for field_name in (
+            "usage",
+            "notes",
+            "invocation",
+            "provisioning",
+            "artifacts",
+            "rebuild",
+            "safety",
+        ):
+            field_schema = manifest_schema[field_name]
+            self.assertIn("array", field_schema["type"])
+            self.assertIn("items", field_schema)
 
     def test_uses_default_web_fetch_limits_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

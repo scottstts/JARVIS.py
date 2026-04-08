@@ -17,6 +17,7 @@ from jarvis.core import (
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
+from jarvis.llm import TextPart
 from jarvis.core.compaction import CompactionOutcome
 from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
 from jarvis.gateway.route_events import (
@@ -26,6 +27,7 @@ from jarvis.gateway.route_events import (
     RouteSystemNoticeEvent,
 )
 from jarvis.gateway.route_runtime import (
+    CompositeMainBootstrapLoader,
     RouteEventBus,
     RouteRuntime,
     _RouteTurnRequest,
@@ -203,6 +205,35 @@ class RouteEventBusTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((await second_queue.get()).text, "hello")
         self.assertEqual((await third_queue.get()).text, "hello")
+
+
+class CompositeMainBootstrapLoaderTests(unittest.TestCase):
+    def test_subagent_bootstrap_docs_stay_heuristic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loader = CompositeMainBootstrapLoader(build_core_settings(root_dir=Path(tmp)))
+            messages = loader.load_bootstrap_messages()
+
+        subagent_text = next(
+            (
+                part.text
+                for message in messages
+                if message.role == "system"
+                for part in message.parts
+                if isinstance(part, TextPart)
+                and "Subagent control primitives are available only to Jarvis." in part.text
+            ),
+            None,
+        )
+
+        self.assertIsNotNone(subagent_text)
+        if subagent_text is None:
+            self.fail("Expected subagent control bootstrap text.")
+        self.assertIn("wait for orchestrator updates before polling", subagent_text)
+        self.assertIn("not live prompt injection", subagent_text)
+        self.assertIn("detail=\"full\"", subagent_text)
+        self.assertNotIn("Arguments:", subagent_text)
+        self.assertNotIn("Subagent runtime control reference:", subagent_text)
+        self.assertLess(len(subagent_text), 900)
 
 
 class RouteRuntimeToolResultTests(unittest.TestCase):

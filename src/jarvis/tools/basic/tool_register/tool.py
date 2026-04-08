@@ -16,7 +16,9 @@ from ...runtime_tool_manifest import (
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 _LOOSE_JSON_VALUE_SCHEMA: dict[str, Any] = {
-    "type": ["object", "array", "string", "number", "boolean", "null"]
+    "type": ["object", "array", "string", "number", "boolean", "null"],
+    "additionalProperties": True,
+    "items": {},
 }
 
 _MANIFEST_INPUT_SCHEMA: dict[str, Any] = {

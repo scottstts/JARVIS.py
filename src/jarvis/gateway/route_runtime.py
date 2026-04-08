@@ -149,7 +149,7 @@ class CompositeMainBootstrapLoader:
         messages.append(
             LLMMessage.text(
                 "system",
-                "Subagent runtime control reference:\n\n" + render_subagent_primitive_docs(),
+                render_subagent_primitive_docs(),
             )
         )
         return messages

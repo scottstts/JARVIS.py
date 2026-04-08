@@ -1047,6 +1047,10 @@ Behavior:
 - validates payload
 - reads canonical Markdown
 - applies deterministic mutation
+- `upsert` revises an existing canonical document and is the normal correction path when active memory is wrong
+- `append_daily` appends a new daily entry instead of revising prior daily content
+- provided `body_sections` overwrite matching canonical sections; omitted sections remain unchanged
+- provided `facts` and `relations` replace that document's structured truth sets; omitted ones remain unchanged
 - writes Markdown
 - updates or invalidates sidecar rows
 - returns changed path and summary of mutations

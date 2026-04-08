@@ -734,7 +734,10 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - routes all normal memory mutations through the memory service, not raw file patching
 - writes canonical Markdown, reindexes affected documents, refreshes lexical/graph state, and updates embeddings when semantic indexing is available
-- supports explicit daily appends, ongoing close/archive flows, and cross-kind promote/demote migrations
+- `upsert` revises an existing canonical document, while `append_daily` appends a new daily entry instead of revising prior daily content
+- provided `body_sections` overwrite matching canonical sections and omitted sections remain unchanged
+- provided `facts` and `relations` replace that document's structured truth sets; omitted ones retain the existing values
+- supports ongoing close/archive flows and cross-kind promote/demote migrations
 - applies relation-conflict reconciliation so older `single` cardinality current relations are superseded when a newer conflicting relation is written
 
 #### Policy

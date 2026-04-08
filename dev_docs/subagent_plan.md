@@ -345,6 +345,7 @@ Recommended primitive names:
 These definitions should be created in `src/jarvis/subagent/primitives.py`.
 
 The same module should also expose human-readable docs that can be injected into the main agent bootstrap, so the runtime docs stay in sync with the actual schemas.
+Those injected docs should stay heuristic-only: include control semantics and supervision guidance that the tool schemas do not already make obvious, but do not echo per-tool argument lists or restate the full schema surface.
 
 ### Recommended Schemas
 
@@ -1122,6 +1123,7 @@ The control primitives should be synthetic core runtime definitions owned by `sr
 ### Prefer Generated Primitive Docs
 
 The main-agent bootstrap docs for subagent primitives should be generated from the same definitions that power the synthetic tool schemas to avoid drift.
+Keep that generated block compact and focused on unique supervision heuristics, not a second schema dump.
 
 ### Keep User Visibility Intentional
 

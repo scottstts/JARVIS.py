@@ -115,6 +115,9 @@ def build_memory_write_tool() -> RegisteredTool:
             name="memory_write",
             description=(
                 "Create or update canonical memory documents through validated structured operations. "
+                "upsert revises an existing canonical document and is the normal correction path when active "
+                "memory is wrong; if the corrected truth is known, do not leave wrong active memory in place "
+                "with a separate correction note. "
                 'For core and ongoing create/upsert, facts and relations are explicit-decision fields: always set both as a '
                 'non-empty structured array or the literal string "None"; summary is not a substitute. '
                 "Put durable facts in facts, structured subject-predicate-object claims in relations, and important "
@@ -129,7 +132,8 @@ def build_memory_write_tool() -> RegisteredTool:
                         "type": "string",
                         "enum": ["create", "upsert", "append_daily", "close", "archive", "promote", "demote"],
                         "description": (
-                            "Structured memory mutation. append_daily records daily log content. "
+                            "Structured memory mutation. upsert revises an existing canonical document, including daily corrections. "
+                            "append_daily appends a new daily entry instead of revising prior daily content. "
                             "close and archive are superseding transitions: rewrite terminal summary/body_sections first, "
                             "then flip state."
                         ),
@@ -144,7 +148,8 @@ def build_memory_write_tool() -> RegisteredTool:
                         "type": "string",
                         "description": (
                             "Short summary text. For append_daily without body_sections, it is recorded under Notable Events. "
-                            "For core/ongoing create and upsert, summary is not a substitute for structured truth."
+                            "For core/ongoing create and upsert, summary is not a substitute for structured truth; "
+                            "if summary states a durable fact, mirror it into facts."
                         ),
                     },
                     "priority": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -166,7 +171,8 @@ def build_memory_write_tool() -> RegisteredTool:
                             },
                         ],
                         "description": (
-                            'Structured durable fact objects from explicit user statements. Minimal item: {"text":"..."}.'
+                            "Structured durable fact objects from explicit user statements. If provided, this replaces "
+                            'the document\'s fact set; if omitted, existing facts stay. Minimal item: {"text":"..."}.'
                         ),
                     },
                     "relations": {
@@ -182,14 +188,17 @@ def build_memory_write_tool() -> RegisteredTool:
                         ],
                         "description": (
                             "Structured subject-predicate-object claims such as preferences, tool usage, ownership, or "
-                            'responsibilities. Minimal item: {"subject":"...","predicate":"...","object":"..."}.'
+                            "responsibilities. If provided, this replaces the document's relation set; if omitted, "
+                            'existing relations stay. Use current/single when one relation should replace the active '
+                            'truth for the same subject/predicate pair. Minimal item: {"subject":"...","predicate":"...","object":"..."}.'
                         ),
                     },
                     "body_sections": {
                         **BODY_SECTIONS_SCHEMA,
                         "description": (
-                            'Canonical narrative sections keyed by section name. This is the main searchable body text. '
-                            'Pass an object like {"Overview":"..."}.'
+                            "Canonical narrative sections keyed by section name. Provided keys overwrite matching "
+                            "canonical sections; omitted sections stay unchanged. This is the main searchable body text "
+                            'and the normal way to rewrite stale narrative content. Pass an object like {"Overview":"..."}.'
                         ),
                     },
                     "source_refs": {"type": "array", "items": {"type": "object"}},
