@@ -744,7 +744,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Current Limitations
 
-- the tool schema is intentionally non-strict because nested structured payloads are too broad for provider-strict JSON schema without a large nullable expansion
+- the tool remains non-strict at the top level for provider compatibility, while field schemas bias toward the canonical shapes and runtime contract errors still enforce the semantic write contract
 - automatic LLM-backed maintenance promotions and reviews are still conservative compared with the full design ambitions in `dev_docs/memory_doc.md`
 
 ### `memory_admin`
@@ -756,7 +756,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 #### Input Schema
 
-- `action: string` required enum `reindex_all | reindex_dirty | rebuild_embeddings | run_due_maintenance | integrity_check | render_bootstrap_preview`
+- `action: string` required enum `reindex_all | reindex_dirty | rebuild_embeddings | repair_canonical_drift | run_due_maintenance | integrity_check | render_bootstrap_preview`
 
 #### Executor Behavior
 
@@ -777,9 +777,9 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - Name: `memory_admin`
 - Aliases: `memory maintenance`, `memory reindex`, `memory integrity`
-- Purpose: expose manual memory maintenance capabilities without permanently inflating the default tool list
-- Detailed Description: run explicit memory maintenance or inspection actions; use only when the user asks for memory admin work
-- Usage: choose one of `reindex_all`, `reindex_dirty`, `rebuild_embeddings`, `repair_canonical_drift`, `run_due_maintenance`, `integrity_check`, or `render_bootstrap_preview`
+- Purpose: expose manual memory maintenance capabilities without permanently inflating the default tool list; use only when the user explicitly asks for memory admin work
+- Detailed Description: omitted
+- Usage: choose action `reindex_all`, `reindex_dirty`, `rebuild_embeddings`, `repair_canonical_drift`, `run_due_maintenance`, `integrity_check`, or `render_bootstrap_preview`
 - Metadata: none beyond the discoverable purpose/usage payload
 - Backing Tool: `memory_admin`
 

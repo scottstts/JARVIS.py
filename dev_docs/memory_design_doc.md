@@ -1062,6 +1062,7 @@ Actions:
 - `reindex_all`
 - `reindex_dirty`
 - `rebuild_embeddings`
+- `repair_canonical_drift`
 - `run_due_maintenance`
 - `integrity_check`
 - `render_bootstrap_preview`

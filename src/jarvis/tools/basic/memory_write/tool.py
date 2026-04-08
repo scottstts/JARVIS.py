@@ -8,11 +8,7 @@ from jarvis.llm import ToolDefinition
 
 from .contract import (
     BODY_SECTIONS_SCHEMA,
-    FACT_EXAMPLE,
     FACT_ITEM_SCHEMA,
-    FACTS_USAGE_GUIDANCE,
-    MEMORY_WRITE_EXAMPLE,
-    RELATION_EXAMPLE,
     RELATION_ITEM_SCHEMA,
     format_memory_write_contract_error,
     validate_memory_write_contract,
@@ -119,19 +115,12 @@ def build_memory_write_tool() -> RegisteredTool:
             name="memory_write",
             description=(
                 "Create or update canonical memory documents through validated structured operations. "
-                "For core and ongoing memory, keep important narrative text in body sections, not only in frontmatter summary. "
-                "For core and ongoing create/upsert operations, facts and relations are explicit-decision fields: always set both. "
-                "When the user states an explicit durable fact, pass it in facts; when they state a structured relationship, "
-                "current preference, tool usage, ownership, or other subject-predicate-object claim, pass it in relations. "
-                f"{FACTS_USAGE_GUIDANCE} "
-                'If there is genuinely no structured truth worth storing for one field, pass the literal string "None". '
-                "summary is not a substitute for facts or relations. "
-                "Minimal valid shapes: fact items use text/status, relation items use subject/predicate/object/status/cardinality, "
-                'and body_sections is an object like {"Overview":"..."}. '
-                f"Example payload pieces: {MEMORY_WRITE_EXAMPLE}. "
-                "When superseding memory through close or archive, first rewrite the memory content to the new terminal truth "
-                "using summary and body_sections, then let the operation flip status/archive state. "
-                "If you omit that rewrite, the system will apply a generic fallback terminal stamp."
+                'For core and ongoing create/upsert, facts and relations are explicit-decision fields: always set both as a '
+                'non-empty structured array or the literal string "None"; summary is not a substitute. '
+                "Put durable facts in facts, structured subject-predicate-object claims in relations, and important "
+                "narrative text in body_sections. "
+                "For close and archive superseding transitions, rewrite the terminal summary and body_sections before "
+                "flipping state or the system will apply a generic fallback."
             ),
             input_schema={
                 "type": "object",
@@ -140,10 +129,9 @@ def build_memory_write_tool() -> RegisteredTool:
                         "type": "string",
                         "enum": ["create", "upsert", "append_daily", "close", "archive", "promote", "demote"],
                         "description": (
-                            "Structured memory mutation. append_daily records daily log content; "
-                            "close ends an ongoing memory and removes it from the active set; "
-                            "close and archive are superseding transitions, so rewrite the memory's canonical content first "
-                            "with summary and body_sections before flipping status/archive state."
+                            "Structured memory mutation. append_daily records daily log content. "
+                            "close and archive are superseding transitions: rewrite terminal summary/body_sections first, "
+                            "then flip state."
                         ),
                     },
                     "target_kind": {
@@ -155,12 +143,8 @@ def build_memory_write_tool() -> RegisteredTool:
                     "summary": {
                         "type": "string",
                         "description": (
-                            "Short summary text. For append_daily, summary-only writes are recorded "
-                            "under Notable Events when body_sections are omitted. "
-                            "For core/ongoing create and upsert, summary is not a substitute for facts or relations; "
-                            "if summary states an explicit durable fact, mirror that into facts instead of defaulting to None. "
-                            'you must still explicitly provide both fields as structured arrays or the literal string "None". '
-                            "For close/archive superseding transitions, provide the rewritten terminal summary here instead of leaving the old active wording."
+                            "Short summary text. For append_daily without body_sections, it is recorded under Notable Events. "
+                            "For core/ongoing create and upsert, summary is not a substitute for structured truth."
                         ),
                     },
                     "priority": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -175,27 +159,14 @@ def build_memory_write_tool() -> RegisteredTool:
                             {
                                 "type": "array",
                                 "items": FACT_ITEM_SCHEMA,
-                            },
-                            {
-                                "type": "array",
-                                "items": {},
+                                "minItems": 1,
                             },
                             {
                                 "type": "string",
                             },
-                            {
-                                "type": "object",
-                                "additionalProperties": {},
-                            },
                         ],
                         "description": (
-                            "Explicit fact statements to track as structured memory. "
-                            "Use this when the user gives a durable fact directly instead of burying that fact only in summary/body text. "
-                            "Prefer using real fact objects here whenever the user states an explicit durable fact. "
-                            'Use the literal string "None" only when there is genuinely no worthwhile fact to store. '
-                            'Each fact object should use at least {"text":"..."} and may also include status/currentness fields. '
-                            f"Minimal example: {FACT_EXAMPLE}. "
-                            'For core/ongoing create and upsert, this field is an explicit-decision field: pass a non-empty structured array or the literal string "None".'
+                            'Structured durable fact objects from explicit user statements. Minimal item: {"text":"..."}.'
                         ),
                     },
                     "relations": {
@@ -203,48 +174,22 @@ def build_memory_write_tool() -> RegisteredTool:
                             {
                                 "type": "array",
                                 "items": RELATION_ITEM_SCHEMA,
-                            },
-                            {
-                                "type": "array",
-                                "items": {},
+                                "minItems": 1,
                             },
                             {
                                 "type": "string",
                             },
-                            {
-                                "type": "object",
-                                "additionalProperties": {},
-                            },
                         ],
                         "description": (
-                            "Structured subject-predicate-object claims. "
-                            "Use this for stated preferences, current tools or stacks, ownership, responsibilities, and other truth-tracked relationships. "
-                            'Each relation object should use subject, predicate, and object, with optional status/cardinality. '
-                            f"Minimal example: {RELATION_EXAMPLE}. "
-                            'For core/ongoing create and upsert, this field is an explicit-decision field: pass a non-empty structured array or the literal string "None".'
+                            "Structured subject-predicate-object claims such as preferences, tool usage, ownership, or "
+                            'responsibilities. Minimal item: {"subject":"...","predicate":"...","object":"..."}.'
                         ),
                     },
                     "body_sections": {
-                        "anyOf": [
-                            BODY_SECTIONS_SCHEMA,
-                            {
-                                "type": "object",
-                                "additionalProperties": {},
-                            },
-                            {
-                                "type": "array",
-                                "items": {},
-                            },
-                            {
-                                "type": "string",
-                            },
-                        ],
+                        **BODY_SECTIONS_SCHEMA,
                         "description": (
-                            "Canonical section content keyed by section name. This is the main searchable "
-                            "narrative text of the memory document. "
-                            'Pass an object like {"Overview":"..."}; do not pass a list of section objects. '
-                            "For close/archive superseding transitions, pass the rewritten terminal body here; "
-                            "do not rely on status flip alone to supersede stale content."
+                            'Canonical narrative sections keyed by section name. This is the main searchable body text. '
+                            'Pass an object like {"Overview":"..."}.'
                         ),
                     },
                     "source_refs": {"type": "array", "items": {"type": "object"}},
@@ -254,10 +199,7 @@ def build_memory_write_tool() -> RegisteredTool:
                     "timezone": {"type": "string"},
                     "close_reason": {
                         "type": "string",
-                        "description": (
-                            "Reason for closing or archiving. This is metadata and fallback material, not a substitute "
-                            "for rewriting summary/body_sections during superseding transitions."
-                        ),
+                        "description": "Optional close/archive reason metadata.",
                     },
                 },
                 "required": ["operation", "target_kind"],

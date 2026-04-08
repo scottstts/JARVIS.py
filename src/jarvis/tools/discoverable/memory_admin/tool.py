@@ -9,6 +9,16 @@ from jarvis.llm import ToolDefinition
 
 from ...types import DiscoverableTool, RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
+_MEMORY_ADMIN_ACTIONS = (
+    "reindex_all",
+    "reindex_dirty",
+    "rebuild_embeddings",
+    "repair_canonical_drift",
+    "run_due_maintenance",
+    "integrity_check",
+    "render_bootstrap_preview",
+)
+
 
 class MemoryAdminToolExecutor:
     """Runs manual memory maintenance and inspection actions."""
@@ -110,15 +120,7 @@ def build_memory_admin_tool() -> RegisteredTool:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "reindex_all",
-                            "reindex_dirty",
-                            "rebuild_embeddings",
-                            "repair_canonical_drift",
-                            "run_due_maintenance",
-                            "integrity_check",
-                            "render_bootstrap_preview",
-                        ],
+                        "enum": list(_MEMORY_ADMIN_ACTIONS),
                     }
                 },
                 "required": ["action"],
@@ -133,19 +135,8 @@ def build_memory_admin_discoverable() -> DiscoverableTool:
     return DiscoverableTool(
         name="memory_admin",
         aliases=("memory maintenance", "memory reindex", "memory integrity"),
-        purpose="Manual maintenance and inspection actions for the runtime memory system.",
-        detailed_description=_build_memory_admin_tool_description(),
-        usage={
-            "actions": [
-                "reindex_all",
-                "reindex_dirty",
-                "rebuild_embeddings",
-                "repair_canonical_drift",
-                "run_due_maintenance",
-                "integrity_check",
-                "render_bootstrap_preview",
-            ]
-        },
+        purpose="Manual runtime memory maintenance and inspection when the user explicitly asks for it.",
+        usage="Choose action: " + ", ".join(_MEMORY_ADMIN_ACTIONS) + ".",
         backing_tool_name="memory_admin",
     )
 

@@ -32,6 +32,7 @@ from jarvis.tools.remote_runtime_client import RemoteToolRuntimeClient, RemoteTo
 from jarvis.tools.basic.memory_write.tool import build_memory_write_tool
 from jarvis.tools.basic.tool_search import build_tool_search_tool
 from jarvis.tools.basic.memory_search.tool import _format_memory_search_result
+from jarvis.tools.discoverable.memory_admin.tool import build_memory_admin_discoverable
 from jarvis.tools.runtime_tool_manifest import (
     dump_runtime_tool_manifest,
     runtime_tool_manifest_path,
@@ -355,13 +356,12 @@ class ToolSettingsTests(unittest.TestCase):
     def test_memory_write_tool_describes_superseding_rewrite_and_truth_contracts(self) -> None:
         tool = build_memory_write_tool()
 
-        self.assertIn("rewrite the memory content", tool.definition.description.lower())
+        self.assertIn("rewrite the terminal summary and body_sections", tool.definition.description.lower())
         self.assertIn("facts and relations are explicit-decision fields", tool.definition.description.lower())
-        self.assertIn("explicit durable fact", tool.definition.description.lower())
-        self.assertIn("prefer real fact objects in facts whenever the user states an explicit durable fact", tool.definition.description.lower())
+        self.assertIn('literal string "none"', tool.definition.description.lower())
+        self.assertIn("structured subject-predicate-object claims", tool.definition.description.lower())
+        self.assertIn("important narrative text in body_sections", tool.definition.description.lower())
         self.assertIn("subject-predicate-object", tool.definition.description.lower())
-        self.assertIn("minimal valid shapes", tool.definition.description.lower())
-        self.assertIn("example payload pieces", tool.definition.description.lower())
         operation_description = tool.definition.input_schema["properties"]["operation"]["description"].lower()
         summary_description = tool.definition.input_schema["properties"]["summary"]["description"].lower()
         facts_description = tool.definition.input_schema["properties"]["facts"]["description"].lower()
@@ -370,35 +370,33 @@ class ToolSettingsTests(unittest.TestCase):
         close_reason_description = tool.definition.input_schema["properties"]["close_reason"]["description"].lower()
 
         self.assertIn("close and archive are superseding transitions", operation_description)
-        self.assertIn("durable fact", facts_description)
-        self.assertIn("prefer using real fact objects here whenever the user states an explicit durable fact", facts_description)
-        self.assertIn("genuinely no worthwhile fact to store", facts_description)
-        self.assertIn("summary/body text", facts_description)
-        self.assertIn('literal string "none"', facts_description)
+        self.assertIn("rewrite terminal summary/body_sections first", operation_description)
+        self.assertIn("summary is not a substitute", summary_description)
+        self.assertIn("structured truth", summary_description)
+        self.assertIn("durable fact objects", facts_description)
         self.assertIn('{"text":"..."}', facts_description)
         self.assertIn("subject-predicate-object claims", relations_description)
         self.assertIn("preferences", relations_description)
-        self.assertIn('literal string "none"', relations_description)
-        self.assertIn("subject, predicate, and object", relations_description)
-        self.assertIn("summary is not a substitute", summary_description)
-        self.assertIn("rewritten terminal summary", summary_description)
-        self.assertIn("rewritten terminal body", body_description)
-        self.assertIn("do not pass a list of section objects", body_description)
-        self.assertIn("not a substitute", close_reason_description)
+        self.assertIn('{"subject":"...","predicate":"...","object":"..."}', relations_description)
+        self.assertIn("main searchable body text", body_description)
+        self.assertIn('{"overview":"..."}', body_description)
+        self.assertIn("optional close/archive reason metadata", close_reason_description)
 
     def test_memory_write_schema_exposes_nested_truth_shapes(self) -> None:
         tool = build_memory_write_tool()
         facts_schema = tool.definition.input_schema["properties"]["facts"]["anyOf"][0]
         relations_schema = tool.definition.input_schema["properties"]["relations"]["anyOf"][0]
-        body_sections_schema = tool.definition.input_schema["properties"]["body_sections"]["anyOf"][0]
+        body_sections_schema = tool.definition.input_schema["properties"]["body_sections"]
 
         self.assertEqual(facts_schema["type"], "array")
+        self.assertEqual(facts_schema["minItems"], 1)
         self.assertEqual(facts_schema["items"]["required"], ["text"])
         self.assertEqual(
             facts_schema["items"]["properties"]["status"]["enum"],
             ["current", "past", "uncertain", "superseded"],
         )
         self.assertEqual(relations_schema["type"], "array")
+        self.assertEqual(relations_schema["minItems"], 1)
         self.assertEqual(relations_schema["items"]["required"], ["subject", "predicate", "object"])
         self.assertEqual(
             relations_schema["items"]["properties"]["cardinality"]["enum"],
@@ -407,7 +405,7 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertEqual(body_sections_schema["type"], "object")
         self.assertEqual(body_sections_schema["additionalProperties"]["type"], "string")
 
-    def test_memory_write_schema_accepts_broad_truth_arrays_for_runtime_rejection(self) -> None:
+    def test_memory_write_schema_rejects_string_items_in_truth_arrays(self) -> None:
         tool = build_memory_write_tool()
         arguments = {
             "operation": "create",
@@ -418,9 +416,9 @@ class ToolSettingsTests(unittest.TestCase):
             "relations": "None",
         }
 
-        Draft202012Validator(tool.definition.input_schema).validate(arguments)
+        self.assertFalse(Draft202012Validator(tool.definition.input_schema).is_valid(arguments))
 
-    def test_memory_write_schema_accepts_truth_objects_for_runtime_rejection(self) -> None:
+    def test_memory_write_schema_rejects_truth_objects(self) -> None:
         tool = build_memory_write_tool()
         arguments = {
             "operation": "create",
@@ -431,9 +429,9 @@ class ToolSettingsTests(unittest.TestCase):
             "relations": "None",
         }
 
-        Draft202012Validator(tool.definition.input_schema).validate(arguments)
+        self.assertFalse(Draft202012Validator(tool.definition.input_schema).is_valid(arguments))
 
-    def test_memory_write_schema_accepts_broad_body_sections_for_runtime_rejection(self) -> None:
+    def test_memory_write_schema_rejects_body_sections_lists(self) -> None:
         tool = build_memory_write_tool()
         arguments = {
             "operation": "create",
@@ -450,7 +448,15 @@ class ToolSettingsTests(unittest.TestCase):
             ],
         }
 
-        Draft202012Validator(tool.definition.input_schema).validate(arguments)
+        self.assertFalse(Draft202012Validator(tool.definition.input_schema).is_valid(arguments))
+
+    def test_memory_admin_discoverable_stays_compact_and_explicit(self) -> None:
+        discoverable = build_memory_admin_discoverable()
+
+        self.assertIn("explicitly asks", discoverable.purpose.lower())
+        self.assertIsNone(discoverable.detailed_description)
+        self.assertIsInstance(discoverable.usage, str)
+        self.assertIn("repair_canonical_drift", discoverable.usage)
 
     def test_uses_default_web_fetch_limits_from_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1321,12 +1327,7 @@ class ToolRegistryTests(unittest.TestCase):
 
             registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
 
-            for tool_name in (
-                "email",
-                "generate_edit_image",
-                "memory_admin",
-                "transcribe",
-            ):
+            for tool_name in ("email", "generate_edit_image", "transcribe"):
                 registered = registry.require(tool_name)
                 discoverable = registry.get_discoverable(tool_name)
 
@@ -1335,6 +1336,11 @@ class ToolRegistryTests(unittest.TestCase):
                     registered.definition.description,
                     discoverable.detailed_description,
                 )
+
+            memory_admin = registry.get_discoverable("memory_admin")
+            self.assertIsNotNone(memory_admin)
+            self.assertIsNone(memory_admin.detailed_description)
+            self.assertIn("explicitly asks", memory_admin.purpose.lower())
 
     def test_search_discoverable_matches_name_alias_and_description(self) -> None:
         registry = ToolRegistry()
