@@ -102,18 +102,12 @@ def build_view_image_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path to a workspace image file that should be attached to the next "
-                            "model turn. Use the local_path provided in prior user messages."
-                        ),
+                        "description": "Workspace image file to attach to the next model turn.",
                     },
                     "detail": {
                         "type": "string",
                         "enum": ["auto", "low", "high", "original"],
-                        "description": (
-                            "Optional image detail hint for providers that support image detail "
-                            "levels. Use 'auto' unless high fidelity is clearly needed."
-                        ),
+                        "description": "Optional image detail hint.",
                     },
                 },
                 "required": ["path"],

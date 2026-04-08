@@ -877,8 +877,8 @@ class _FakeToolSearchActivationLLMService:
         ]
         if len(tool_parts) != 1:
             raise AssertionError("Expected one tool result part after tool_search.")
-        if "backing_tool_name: archive" not in tool_parts[0].content:
-            raise AssertionError("Expected high-verbosity tool_search content for archive.")
+        if "detailed_description: Use this to inspect or manipulate zip and tar archives." not in tool_parts[0].content:
+            raise AssertionError("Expected compact high-verbosity tool_search content for archive.")
 
         return _build_response("Archive tool surfaced.")
 

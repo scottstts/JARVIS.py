@@ -146,10 +146,7 @@ def build_web_search_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": (
-                            "Plain web search query. Returns only normalized web results, "
-                            "not news, videos, or other Brave verticals."
-                        ),
+                        "description": "Web search query.",
                     },
                 },
                 "required": ["query"],

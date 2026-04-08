@@ -62,78 +62,49 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                         "type": "string",
                         "enum": ["foreground", "background", "status", "tail", "cancel"],
                         "description": (
-                            "Optional bash operation mode. Defaults to 'foreground'. "
-                            "Foreground runs that are still running after the soft timeout are "
-                            "automatically moved into a background job. Use 'background' to start "
-                            "one explicitly, 'status' to inspect it, 'tail' to read recent "
-                            "output, and 'cancel' to stop it. Detached jobs are monitored by the "
-                            "orchestrator; use 'status' or 'tail' only for explicit on-demand "
-                            "inspection, not proactive polling."
+                            "Optional mode. Defaults to 'foreground'. Use 'background' to start "
+                            "a detached job; use 'status', 'tail', or 'cancel' with a job id."
                         ),
                     },
                     "command": {
                         "type": "string",
                         "description": (
-                            "Bash command to run for foreground or background execution. "
-                            "Use normal shell syntax, including pipes, redirects, "
-                            "command substitution, &&, ||, and multiline scripts."
+                            "Shell command for 'foreground' or 'background'."
                         ),
                     },
                     "job_id": {
                         "type": "string",
-                        "description": (
-                            "Background job identifier used with mode='status', "
-                            "mode='tail', or mode='cancel'."
-                        ),
+                        "description": "Background job id for 'status', 'tail', or 'cancel'.",
                     },
                     "timeout_seconds": {
                         "type": "number",
                         "minimum": 1,
                         "maximum": settings.bash_max_timeout_seconds,
-                        "description": (
-                            "Optional foreground command timeout in seconds. Use only when a "
-                            "foreground command may legitimately need more than the default. "
-                            "If the requested timeout exceeds the soft-timeout window, the "
-                            "command may be auto-promoted into a background job first."
-                        ),
+                        "description": "Optional foreground timeout in seconds.",
                     },
                     "tail_lines": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 2000,
-                        "description": (
-                            "Optional number of trailing lines to return for mode='tail'."
-                        ),
+                        "description": "Optional trailing line count for 'tail'.",
                     },
                     "tail_bytes": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": settings.bash_max_output_chars,
-                        "description": (
-                            "Optional byte limit for mode='tail'. Defaults to the bash "
-                            "output limit when omitted."
-                        ),
+                        "description": "Optional byte limit for 'tail'.",
                     },
                     "approval_summary": {
                         "type": "string",
-                        "description": (
-                            "Optional short user-facing summary to show if this command "
-                            "needs approval. Say what you want to do and why."
-                        ),
+                        "description": "Optional short approval summary.",
                     },
                     "approval_details": {
                         "type": "string",
-                        "description": (
-                            "Optional longer user-facing approval explanation. Use this "
-                            "for installs, builds, or other broader changes."
-                        ),
+                        "description": "Optional longer approval rationale.",
                     },
                     "inspection_url": {
                         "type": "string",
-                        "description": (
-                            "Optional URL the user can inspect before approving the command, "
-                            "such as the tool website or install documentation."
-                        ),
+                        "description": "Optional URL to inspect before approval.",
                     },
                 },
                 "additionalProperties": False,

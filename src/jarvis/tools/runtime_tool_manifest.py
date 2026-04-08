@@ -85,28 +85,24 @@ class RuntimeToolManifest:
     def to_discoverable(self, *, manifest_path: Path) -> DiscoverableTool:
         usage = self.usage
         if usage is None:
+            usage = {"operator": self.operator}
+            if self.invocation is not None:
+                usage["invocation"] = self.invocation
+        elif isinstance(usage, dict):
+            usage = dict(usage)
+            usage.setdefault("operator", self.operator)
+            if self.invocation is not None:
+                usage.setdefault("invocation", self.invocation)
+        else:
             usage = {
                 "operator": self.operator,
-                "invocation": self.invocation,
+                "details": usage,
             }
+            if self.invocation is not None:
+                usage["invocation"] = self.invocation
 
-        metadata: dict[str, Any] = {
-            "source": "runtime_tools",
-            "operator": self.operator,
-            "manifest_path": str(manifest_path),
-        }
-        if self.notes is not None:
-            metadata["notes"] = self.notes
-        if self.invocation is not None:
-            metadata["invocation"] = self.invocation
-        if self.provisioning is not None:
-            metadata["provisioning"] = self.provisioning
-        if self.artifacts is not None:
-            metadata["artifacts"] = self.artifacts
-        if self.rebuild is not None:
-            metadata["rebuild"] = self.rebuild
-        if self.safety is not None:
-            metadata["safety"] = self.safety
+        _ = manifest_path
+        metadata: dict[str, Any] = {"source": "runtime_tools"}
 
         return DiscoverableTool(
             name=self.name,

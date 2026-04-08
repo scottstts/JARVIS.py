@@ -216,25 +216,20 @@ def build_email_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "to_email": {
                         "type": "string",
-                        "description": "Required recipient email address.",
+                        "description": "Required recipient address.",
                     },
                     "subject": {
                         "type": "string",
-                        "description": "Required email subject line.",
+                        "description": "Required subject line.",
                     },
                     "body": {
                         "type": "string",
-                        "description": (
-                            "Required email body written in markdown. The tool converts it to "
-                            "HTML and appends a 'Sent by Jarvis' footer."
-                        ),
+                        "description": "Required markdown email body.",
                     },
                     "attachment_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Optional workspace file paths to attach."
-                        ),
+                        "description": "Optional workspace attachments.",
                     },
                 },
                 "required": ["to_email", "subject", "body"],
@@ -258,30 +253,6 @@ def build_email_discoverable() -> DiscoverableTool:
         ),
         purpose="Send an email to a recipient address through the configured SMTP account.",
         detailed_description=_build_email_tool_description(),
-        usage={
-            "arguments": [
-                {
-                    "name": "to_email",
-                    "type": "string",
-                    "required": True,
-                },
-                {
-                    "name": "subject",
-                    "type": "string",
-                    "required": True,
-                },
-                {
-                    "name": "body",
-                    "type": "string",
-                    "required": True,
-                },
-                {
-                    "name": "attachment_paths",
-                    "type": "string[]",
-                    "required": False,
-                },
-            ],
-        },
         backing_tool_name="email",
         allowed_agent_kinds=("main",),
     )

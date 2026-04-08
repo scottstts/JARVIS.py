@@ -16,28 +16,7 @@ from ...runtime_tool_manifest import (
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 
 _LOOSE_JSON_VALUE_SCHEMA: dict[str, Any] = {
-    "anyOf": [
-        {
-            "type": "object",
-            "additionalProperties": {},
-        },
-        {
-            "type": "array",
-            "items": {},
-        },
-        {
-            "type": "string",
-        },
-        {
-            "type": "number",
-        },
-        {
-            "type": "boolean",
-        },
-        {
-            "type": "null",
-        },
-    ]
+    "type": ["object", "array", "string", "number", "boolean", "null"]
 }
 
 _MANIFEST_INPUT_SCHEMA: dict[str, Any] = {
@@ -45,32 +24,53 @@ _MANIFEST_INPUT_SCHEMA: dict[str, Any] = {
     "properties": {
         "name": {
             "type": "string",
-            "description": "Runtime tool name, using lowercase letters, digits, and underscores.",
+            "description": "Runtime tool name.",
         },
         "purpose": {
             "type": "string",
-            "description": "One-line purpose surfaced by tool_search.",
+            "description": "One-line search purpose.",
         },
         "aliases": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Optional alternate search terms for the tool.",
+            "description": "Optional search aliases.",
         },
         "detailed_description": {
             "type": "string",
-            "description": "Optional long-form description surfaced at high verbosity.",
+            "description": "Optional high-verbosity description.",
         },
-        "usage": _LOOSE_JSON_VALUE_SCHEMA,
-        "notes": _LOOSE_JSON_VALUE_SCHEMA,
+        "usage": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional usage guidance.",
+        },
+        "notes": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional extra notes.",
+        },
         "operator": {
             "type": "string",
-            "description": "How the tool is normally operated, usually 'bash'.",
+            "description": "Primary operator, usually 'bash'.",
         },
-        "invocation": _LOOSE_JSON_VALUE_SCHEMA,
-        "provisioning": _LOOSE_JSON_VALUE_SCHEMA,
-        "artifacts": _LOOSE_JSON_VALUE_SCHEMA,
-        "rebuild": _LOOSE_JSON_VALUE_SCHEMA,
-        "safety": _LOOSE_JSON_VALUE_SCHEMA,
+        "invocation": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional invocation hints.",
+        },
+        "provisioning": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional setup info.",
+        },
+        "artifacts": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional artifact info.",
+        },
+        "rebuild": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional rebuild info.",
+        },
+        "safety": {
+            **_LOOSE_JSON_VALUE_SCHEMA,
+            "description": "Optional safety notes.",
+        },
     },
     "required": ["name", "purpose", "operator"],
     "additionalProperties": False,
@@ -179,35 +179,23 @@ def build_tool_register_tool(registry: ToolRegisterRegistry) -> RegisteredTool:
                 "properties": {
                     "manifest": {
                         **_MANIFEST_INPUT_SCHEMA,
-                        "description": (
-                            "Runtime tool manifest payload. The manifest defines how the "
-                            "runtime tool should be discovered and rebuilt."
-                        ),
+                        "description": "Runtime tool manifest.",
                     },
                     "replace_existing": {
                         "type": "boolean",
-                        "description": (
-                            "Optional overwrite flag for an existing runtime tool manifest "
-                            "with the same name."
-                        ),
+                        "description": "Optional overwrite flag.",
                     },
                     "approval_summary": {
                         "type": "string",
-                        "description": (
-                            "Short approval summary shown to the user before registration."
-                        ),
+                        "description": "Optional short approval summary.",
                     },
                     "approval_details": {
                         "type": "string",
-                        "description": (
-                            "Longer approval rationale shown to the user before registration."
-                        ),
+                        "description": "Optional longer approval rationale.",
                     },
                     "inspection_url": {
                         "type": "string",
-                        "description": (
-                            "Optional URL the user can inspect before approving the registration."
-                        ),
+                        "description": "Optional URL to inspect before approval.",
                     },
                 },
                 "required": ["manifest"],

@@ -224,10 +224,7 @@ def build_transcribe_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "audio_path": {
                         "type": "string",
-                        "description": (
-                            "Required workspace path to a supported audio or video file: "
-                            f"{', '.join(SUPPORTED_AUDIO_FORMATS)}."
-                        ),
+                        "description": "Required workspace audio or video file path.",
                     }
                 },
                 "required": ["audio_path"],
@@ -252,15 +249,6 @@ def build_transcribe_discoverable() -> DiscoverableTool:
             "Transcribe spoken audio from one workspace media file into plain text."
         ),
         detailed_description=_build_transcribe_tool_description(),
-        usage={
-            "arguments": [
-                {
-                    "name": "audio_path",
-                    "type": "string",
-                    "required": True,
-                }
-            ],
-        },
         backing_tool_name="transcribe",
     )
 

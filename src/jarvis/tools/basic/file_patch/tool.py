@@ -87,25 +87,18 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": _MAX_PATH_CHARS,
-                        "description": (
-                            "One workspace file path to edit. The file may be created or fully "
-                            "overwritten with a single write operation."
-                        ),
+                        "description": "Workspace file to edit.",
                     },
                     "operations": {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": _MAX_OPERATIONS,
-                        "description": (
-                            "Ordered patch operations for exactly one file. Use literal text "
-                            "matching only; regex and fuzzy matching are not supported."
-                        ),
+                        "description": "Ordered literal-text edits for one file.",
                         "items": {
                             "type": "object",
                             "description": (
-                                "One operation object. Use type=write with content only; "
-                                "type=replace with old/new; type=insert_before or "
-                                "insert_after with anchor/text; type=delete with text."
+                                "Use write with content, replace with old/new, insert_* with "
+                                "anchor/text, and delete with text."
                             ),
                             "properties": {
                                 "type": {
@@ -117,45 +110,32 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                                         "insert_after",
                                         "delete",
                                     ],
-                                    "description": "Operation kind.",
+                                    "description": "Edit kind.",
                                 },
                                 "content": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": (
-                                        "Required only for type=write. Replaces the full file "
-                                        "content and may create the file."
-                                    ),
+                                    "description": "For write: full file content.",
                                 },
                                 "old": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": (
-                                        "Required only for type=replace. Exact literal text to replace."
-                                    ),
+                                    "description": "For replace: exact text to replace.",
                                 },
                                 "new": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": (
-                                        "Required only for type=replace. Replacement text."
-                                    ),
+                                    "description": "For replace: replacement text.",
                                 },
                                 "anchor": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": (
-                                        "Required only for type=insert_before or "
-                                        "type=insert_after. Exact literal anchor text."
-                                    ),
+                                    "description": "For insert_before/insert_after: exact anchor text.",
                                 },
                                 "text": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": (
-                                        "Required for type=insert_before, type=insert_after, "
-                                        "and type=delete. Inserted or deleted exact literal text."
-                                    ),
+                                    "description": "For insert_before/insert_after/delete: text to insert or delete.",
                                 },
                             },
                             "required": ["type"],

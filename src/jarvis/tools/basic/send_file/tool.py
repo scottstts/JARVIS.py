@@ -102,22 +102,15 @@ def build_send_file_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": (
-                            "Path to a local file inside the workspace that should be sent to "
-                            "the user's Telegram chat."
-                        ),
+                        "description": "Workspace file to send to the user's Telegram chat.",
                     },
                     "caption": {
                         "type": "string",
-                        "description": (
-                            "Optional short Telegram caption to attach to the file."
-                        ),
+                        "description": "Optional Telegram caption.",
                     },
                     "filename": {
                         "type": "string",
-                        "description": (
-                            "Optional upload filename override. Defaults to the local basename."
-                        ),
+                        "description": "Optional upload filename.",
                     },
                 },
                 "required": ["path"],

@@ -1160,7 +1160,7 @@ class RuntimeToolManifestTests(unittest.TestCase):
         self.assertEqual([entry.name for entry in loaded.entries], ["google_workspace_cli"])
         self.assertEqual([manifest.name for manifest in loaded.manifests], ["google_workspace_cli"])
         self.assertEqual(loaded.entries[0].metadata["source"], "runtime_tools")
-        self.assertEqual(loaded.entries[0].metadata["operator"], "bash")
+        self.assertEqual(loaded.entries[0].usage["operator"], "bash")
         self.assertEqual(len(loaded.errors), 2)
         self.assertTrue(any("bad.json" in error for error in loaded.errors))
         self.assertTrue(any("conflicts with a built-in tool" in error for error in loaded.errors))
@@ -2821,11 +2821,13 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "runtime_tools",
         )
         self.assertEqual(
-            result.metadata["matches"][0]["metadata"]["operator"],
+            result.metadata["matches"][0]["usage"]["operator"],
             "bash",
         )
         self.assertIn("google_workspace_cli", result.content)
+        self.assertIn("source: runtime_tools", result.content)
         self.assertIn('"operator": "bash"', result.content)
+        self.assertNotIn("manifest_path", result.content)
 
     async def test_tool_search_reports_runtime_manifest_errors(self) -> None:
         runtime_dir = self.workspace_dir / "runtime_tools"
@@ -4139,8 +4141,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("aliases: zip_tools", result.content)
-        self.assertIn("usage:", result.content)
-        self.assertIn("metadata:", result.content)
+        self.assertIn("detailed_description: Use this for zip or tar workflows in the workspace.", result.content)
+        self.assertNotIn("usage:", result.content)
+        self.assertNotIn("metadata:", result.content)
+        self.assertNotIn("backing_tool_name:", result.content)
         self.assertEqual(result.metadata["match_count"], 1)
         self.assertEqual(
             result.metadata["activated_discoverable_tool_names"],
@@ -4183,7 +4187,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertIn("transcribe", result.content)
         self.assertIn("25 MB", result.content)
-        self.assertIn("audio_path", result.content)
+        self.assertNotIn("usage:", result.content)
         self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["transcribe"])
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],
@@ -4203,9 +4207,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertIn("email", result.content)
-        self.assertIn("to_email", result.content)
-        self.assertIn("attachment_paths", result.content)
         self.assertIn("SMTP", result.content)
+        self.assertNotIn("usage:", result.content)
         self.assertEqual(result.metadata["activated_discoverable_tool_names"], ["email"])
         self.assertEqual(
             [match["name"] for match in result.metadata["matches"]],

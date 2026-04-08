@@ -154,11 +154,13 @@ def _serialize_discoverable_entry(entry: DiscoverableTool) -> dict[str, Any]:
         payload["aliases"] = list(entry.aliases)
     if entry.detailed_description is not None:
         payload["detailed_description"] = entry.detailed_description
-    if entry.usage is not None:
-        payload["usage"] = entry.usage
-    if entry.metadata:
-        payload["metadata"] = dict(entry.metadata)
-    if entry.backing_tool_name is not None:
+    usage = _usage_for_high_verbosity(entry)
+    if usage is not None:
+        payload["usage"] = usage
+    metadata = _metadata_for_high_verbosity(entry)
+    if metadata is not None:
+        payload["metadata"] = metadata
+    if entry.backing_tool_name is not None and entry.backing_tool_name != entry.name:
         payload["backing_tool_name"] = entry.backing_tool_name
     return payload
 
@@ -195,8 +197,8 @@ def _format_tool_search_result(
         return "\n".join(content_lines)
 
     content_lines.append(
-        "High verbosity returns the full discoverable entry and activates matched backed "
-        "tools for the rest of this turn."
+        "High verbosity shows fuller discoverable docs and may activate matched backed "
+        "tools for this turn."
     )
     for index, entry in enumerate(matches, start=1):
         content_lines.extend(
@@ -209,18 +211,55 @@ def _format_tool_search_result(
             content_lines.append(f"aliases: {', '.join(entry.aliases)}")
         if entry.detailed_description is not None:
             content_lines.append(f"detailed_description: {entry.detailed_description}")
-        if entry.usage is not None:
+        usage = _usage_for_high_verbosity(entry)
+        if usage is not None:
             content_lines.append("usage:")
-            content_lines.append(_format_flexible_value(entry.usage))
-        if entry.metadata:
-            content_lines.append("metadata:")
-            content_lines.append(_format_flexible_value(entry.metadata))
-        if entry.backing_tool_name is not None:
+            content_lines.append(_format_flexible_value(usage))
+        metadata = _metadata_for_high_verbosity(entry)
+        if metadata is not None:
+            content_lines.append(f"source: {metadata['source']}")
+        if entry.backing_tool_name is not None and entry.backing_tool_name != entry.name:
             content_lines.append(f"backing_tool_name: {entry.backing_tool_name}")
     return "\n".join(content_lines)
+
+
+def _usage_for_high_verbosity(entry: DiscoverableTool) -> Any | None:
+    if entry.usage is None:
+        return None
+    if entry.backing_tool_name is None:
+        return entry.usage
+    if _is_minimal_argument_list_usage(entry.usage):
+        return None
+    return entry.usage
+
+
+def _metadata_for_high_verbosity(entry: DiscoverableTool) -> dict[str, Any] | None:
+    source = str(entry.metadata.get("source", "")).strip()
+    if source == "runtime_tools":
+        return {"source": source}
+    return None
+
+
+def _is_minimal_argument_list_usage(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"arguments"}:
+        return False
+    arguments = value.get("arguments")
+    if not isinstance(arguments, list) or not arguments:
+        return False
+    for item in arguments:
+        if not isinstance(item, dict):
+            return False
+        if not set(item).issubset({"name", "type", "required", "enum"}):
+            return False
+    return True
 
 
 def _format_flexible_value(value: Any) -> str:
     if isinstance(value, str):
         return value
-    return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(", ", ": "),
+    )

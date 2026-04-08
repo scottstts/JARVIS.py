@@ -419,7 +419,7 @@ def build_generate_edit_image_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required image instruction.",
+                        "description": "Required image prompt.",
                     },
                     "image_path": {
                         "type": "string",
@@ -427,25 +427,22 @@ def build_generate_edit_image_tool(settings: ToolSettings) -> RegisteredTool:
                     },
                     "output_path": {
                         "type": "string",
-                        "description": (
-                            "Required workspace output path. Parent directories are created "
-                            "automatically, and a safe image extension is added if needed."
-                        ),
+                        "description": "Required workspace output path.",
                     },
                     "provider": {
                         "type": "string",
                         "enum": list(_SUPPORTED_PROVIDERS),
-                        "description": "Optional provider: gemini or openai.",
+                        "description": "Optional provider.",
                     },
                     "quality": {
                         "type": "string",
                         "enum": list(_OPENAI_QUALITY_VALUES),
-                        "description": "Optional OpenAI-only quality override.",
+                        "description": "Optional OpenAI quality.",
                     },
                     "resolution": {
                         "type": "string",
                         "enum": list(_GEMINI_RESOLUTION_VALUES),
-                        "description": "Optional Gemini-only resolution override.",
+                        "description": "Optional Gemini resolution.",
                     },
                 },
                 "required": ["prompt", "output_path"],
@@ -471,43 +468,6 @@ def build_generate_edit_image_discoverable() -> DiscoverableTool:
             "with a text prompt."
         ),
         detailed_description=_build_generate_edit_image_tool_description(),
-        usage={
-            "arguments": [
-                {
-                    "name": "prompt",
-                    "type": "string",
-                    "required": True,
-                },
-                {
-                    "name": "image_path",
-                    "type": "string",
-                    "required": False,
-                },
-                {
-                    "name": "output_path",
-                    "type": "string",
-                    "required": True,
-                },
-                {
-                    "name": "provider",
-                    "type": "string",
-                    "required": False,
-                    "enum": list(_SUPPORTED_PROVIDERS),
-                },
-                {
-                    "name": "quality",
-                    "type": "string",
-                    "required": False,
-                    "enum": list(_OPENAI_QUALITY_VALUES),
-                },
-                {
-                    "name": "resolution",
-                    "type": "string",
-                    "required": False,
-                    "enum": list(_GEMINI_RESOLUTION_VALUES),
-                },
-            ],
-        },
         backing_tool_name="generate_edit_image",
     )
 

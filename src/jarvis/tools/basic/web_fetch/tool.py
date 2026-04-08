@@ -480,10 +480,7 @@ def build_web_fetch_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": (
-                            "Absolute public http:// or https:// URL to fetch and return as "
-                            "clean markdown."
-                        ),
+                        "description": "Absolute public http:// or https:// URL to fetch.",
                     },
                 },
                 "required": ["url"],
