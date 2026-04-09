@@ -142,7 +142,7 @@
 - LM Studio tool-capability gating happens before `/v1/responses`: Jarvis sends tools on normal user turns, so if the only loaded LM Studio LLM reports `capabilities.trained_for_tool_use = false`, the turn fails during `/api/v1/models` inspection and never reaches generation.
 - Gateway broad `internal_error` fallbacks should always log the underlying exception stack, or provider/configuration failures become opaque from Telegram warnings alone.
 - OpenRouter app attribution depends on `HTTP-Referer` plus title headers, so `providers.openrouter.site_url` must be set in workspace settings if you want requests to show up as a named app instead of `unknown`.
-- Grok is now a first-class chat-only provider: the adapter collapses all Jarvis system messages into one first xAI system message, maps `prompt_cache_key` to `x-grok-conv-id`, and uses xAI chat-completions instead of leaking provider statefulness into the core loop.
+- Grok now uses xAI Responses with `store=false`, replays assistant-side `response.output` from transcript `provider_metadata` when available, and keeps `x-grok-conv-id` as the routing hint for stateless prompt-cache reuse.
 - Codex keeps `codex` as a settings-level provider name but routes main and subagent actors through a separate host app-server backend, with host/container path translation and auth flow kept out of `src/jarvis/llm/`.
 - Codex is now backend-routed rather than provider-adapted: `RouteRuntime` and `SubagentManager` choose `CodexActorRuntime`, while direct `LLMService` use with provider `codex` fails fast by design.
 - Codex-backed subagents share the route-scoped Codex connection, and subagent disposal must call `loop.aclose()` so old `threadId` registrations do not linger in the coordinator.

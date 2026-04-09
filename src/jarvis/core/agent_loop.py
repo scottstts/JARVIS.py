@@ -1067,6 +1067,7 @@ class AgentLoop:
                 else ()
             ),
             tool_choice=ToolChoice.auto() if allow_tools else ToolChoice.none(),
+            prompt_cache_key=records[0].session_id if records else None,
         )
 
     def _build_tool_round_limit_recovery_request(
@@ -2742,6 +2743,7 @@ class AgentLoop:
             "model": response.model,
             "response_id": response.response_id,
             "finish_reason": response.finish_reason,
+            "provider_metadata": deepcopy(response.provider_metadata),
             "tool_calls": [
                 {
                     "call_id": call.call_id,

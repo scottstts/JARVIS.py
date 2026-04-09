@@ -12,6 +12,7 @@ The goal is:
 - avoid avoidable provider cache misses caused by transcript/replay drift
 
 This document is about unified replayable history, not about persisting provider-native wire JSON.
+Opaque provider-local replay artifacts may still live inside transcript metadata when needed, as long as the core loop treats them as opaque and the transcript remains unified at the message/content level.
 
 ## Scope
 
@@ -39,6 +40,7 @@ Primary code:
 3. `transcript_only` means archived but intentionally excluded from replay.
 4. Provider quirks stay in `src/jarvis/llm/providers/`.
 5. If replay would require inventing prompt-visible content, that is a bug unless the behavior is explicitly documented as a non-replay feature.
+6. Provider-specific replay aids may persist inside record metadata, but the core loop must not interpret them beyond round-tripping them back into `LLMMessage.metadata`.
 
 ## Implemented Behavior
 
@@ -63,6 +65,20 @@ The following are persisted when they are used:
 - tool results
 
 This applies to both streaming and non-streaming paths.
+
+### 2b. Assistant provider metadata persists as opaque replay aid
+
+Assistant transcript records persist `response.provider_metadata` when present.
+
+Rules:
+
+- the transcript remains normalized around role/content/tool-call history
+- the core loop treats `provider_metadata` as opaque transcript metadata
+- provider adapters may use it to reconstruct provider-native history more faithfully on replay
+
+Current example:
+
+- xAI Responses replay may reuse persisted assistant `response.output` items from transcript metadata instead of reconstructing the prior assistant turn only from flattened text and normalized tool calls
 
 ### 3. Streaming assistant persistence is canonical
 

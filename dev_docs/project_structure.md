@@ -191,7 +191,20 @@ Includes:
 - validation
 - service lifecycle
 - provider implementations under `llm/providers/`
-- provider-local translation for cache/state quirks such as LM Studio `previous_response_id` reuse and Grok `x-grok-conv-id` routing plus system-message collapsing
+- provider-local translation for cache/state quirks such as LM Studio `previous_response_id` reuse and Grok Responses replay via `x-grok-conv-id` plus persisted assistant `response.output` metadata
+
+Current Grok note:
+
+- Grok now uses xAI Responses, not chat-completions
+- Jarvis still manually rebuilds turn context from unified transcript history
+- the Grok adapter sends `store=false` and uses `x-grok-conv-id` as the provider-side routing hint for better prompt-cache reuse
+- assistant transcript records may carry opaque Grok `response.output` items inside `provider_metadata`, and the Grok adapter may replay those items directly on later turns to preserve faithful stateless history for cache continuity
+- reasoning-capable Grok model families request encrypted reasoning content through the adapter so later stateless replay can include the opaque reasoning item when needed
+
+Future note:
+
+- keep the transcript format unified and keep Grok-specific replay semantics inside the provider adapter
+- if xAI changes model-family naming or encrypted-reasoning behavior, update the Grok adapter heuristics there rather than leaking model-specific branching into the agent loop
 
 ### `src/jarvis/memory/`
 
