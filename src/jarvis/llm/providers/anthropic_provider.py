@@ -218,7 +218,23 @@ class AnthropicProvider:
                     unsupported_message=("Anthropic system history only supports text parts."),
                 )
                 if text:
-                    system_parts.append(text)
+                    if _anthropic_system_message_is_global(message):
+                        system_parts.append(text)
+                    else:
+                        if pending_tool_results:
+                            out_messages.append(
+                                {
+                                    "role": "user",
+                                    "content": pending_tool_results,
+                                }
+                            )
+                            pending_tool_results = []
+                        out_messages.append(
+                            {
+                                "role": "user",
+                                "content": [{"type": "text", "text": text}],
+                            }
+                        )
                 continue
 
             if message.role == "tool":
@@ -539,3 +555,14 @@ def _build_anthropic_system_blocks(
         "ttl": prompt_cache_ttl,
     }
     return blocks
+
+
+def _anthropic_system_message_is_global(message: LLMMessage) -> bool:
+    metadata = message.metadata
+    if not metadata:
+        return True
+    return bool(
+        metadata.get("bootstrap_identity")
+        or metadata.get("memory_bootstrap")
+        or metadata.get("summary_seed")
+    )

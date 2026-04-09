@@ -91,6 +91,51 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(kwargs["messages"][1]["content"][0]["type"], "text")
         self.assertEqual(kwargs["messages"][2]["role"], "user")
 
+    def test_turn_attached_system_messages_stay_inline_for_anthropic(self) -> None:
+        provider = AnthropicProvider(
+            settings=AnthropicProviderSettings(prompt_cache_ttl="5m"),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="claude-sonnet-4-6",
+            max_output_tokens=1024,
+            messages=(
+                LLMMessage(
+                    role="system",
+                    parts=(TextPart(text="PROGRAM"),),
+                    metadata={"bootstrap_identity": True},
+                ),
+                LLMMessage.text("user", "Hello"),
+                LLMMessage.text("assistant", "Hi there"),
+                LLMMessage(
+                    role="system",
+                    parts=(TextPart(text="Turn context marker"),),
+                    metadata={"turn_context": "datetime", "turn_id": "turn_2"},
+                ),
+                LLMMessage.text("user", "Second turn"),
+            ),
+        )
+
+        kwargs = provider._build_messages_create_kwargs(request)
+        self.assertEqual(
+            kwargs["system"],
+            [
+                {
+                    "type": "text",
+                    "text": "PROGRAM",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                }
+            ],
+        )
+        self.assertEqual(kwargs["messages"][0]["role"], "user")
+        self.assertEqual(kwargs["messages"][0]["content"][0]["text"], "Hello")
+        self.assertEqual(kwargs["messages"][1]["role"], "assistant")
+        self.assertEqual(kwargs["messages"][1]["content"][0]["text"], "Hi there")
+        self.assertEqual(kwargs["messages"][2]["role"], "user")
+        self.assertEqual(kwargs["messages"][2]["content"][0]["text"], "Turn context marker")
+        self.assertEqual(kwargs["messages"][3]["role"], "user")
+        self.assertEqual(kwargs["messages"][3]["content"][0]["text"], "Second turn")
+
     def test_tool_roundtrip_uses_tool_use_and_tool_result_blocks(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(),

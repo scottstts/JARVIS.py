@@ -3597,7 +3597,11 @@ def _record_to_llm_message(
             parts.append(TextPart(text=record.content))
         if not parts:
             return None
-        return LLMMessage(role=record.role, parts=tuple(parts))
+        return LLMMessage(
+            role=record.role,
+            parts=tuple(parts),
+            metadata=dict(record.metadata),
+        )
 
     if record.role == "assistant":
         parts: list[TextPart | ToolCall] = []
@@ -3627,7 +3631,11 @@ def _record_to_llm_message(
                 )
         if not parts:
             return None
-        return LLMMessage(role="assistant", parts=tuple(parts))
+        return LLMMessage(
+            role="assistant",
+            parts=tuple(parts),
+            metadata=dict(record.metadata),
+        )
 
     if record.role == "tool":
         call_id = str(record.metadata.get("call_id", "")).strip()
@@ -3644,6 +3652,7 @@ def _record_to_llm_message(
                     is_error=not bool(record.metadata.get("ok", False)),
                 ),
             ),
+            metadata=dict(record.metadata),
         )
 
     return None

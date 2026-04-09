@@ -102,6 +102,7 @@ MessagePart: TypeAlias = TextPart | ImagePart | ToolCall | ToolResultPart
 class LLMMessage:
     role: LLMRole
     parts: tuple[MessagePart, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.parts:
