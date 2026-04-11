@@ -147,19 +147,24 @@ def _log_runtime_provider_configuration(*, core_settings: CoreSettings) -> None:
     provider_configuration = _load_runtime_provider_configuration(
         core_settings=core_settings,
     )
-    LOGGER.info("=====================================")
-    LOGGER.info("  Main Agent LLM Provider: %s", provider_configuration["main_llm"])
-    LOGGER.info("  Subagent LLM Provider: %s", provider_configuration["subagent_llm"])
-    LOGGER.info("  Compaction LLM Provider: %s", provider_configuration["compaction_llm"])
-    LOGGER.info(
-        "  Memory Maintenance LLM Provider: %s",
-        provider_configuration["memory_maintenance_llm"],
-    )
-    LOGGER.info("  Embedding Model Provider: %s", provider_configuration["embedding"])
-    LOGGER.info("=====================================")
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(title="LLM Provider Configuration", show_header=True, header_style="bold magenta")
+    table.add_column("Role", style="cyan", no_wrap=True)
+    table.add_column("Provider", style="green")
+    table.add_column("Model", style="yellow")
+
+    table.add_row("Main Agent", *provider_configuration["main_llm"])
+    table.add_row("Subagent", *provider_configuration["subagent_llm"])
+    table.add_row("Compaction", *provider_configuration["compaction_llm"])
+    table.add_row("Memory Maintenance", *provider_configuration["memory_maintenance_llm"])
+    table.add_row("Embedding", *provider_configuration["embedding"])
+
+    Console().print(table)
 
 
-def _load_runtime_provider_configuration(*, core_settings: CoreSettings) -> dict[str, str]:
+def _load_runtime_provider_configuration(*, core_settings: CoreSettings) -> dict[str, tuple[str, str]]:
     llm_settings = LLMSettings.from_env()
     memory_settings = MemorySettings.from_workspace_dir(core_settings.workspace_dir)
     subagent_settings = SubagentSettings.from_workspace_dir(
@@ -180,7 +185,7 @@ def _resolve_runtime_provider_configuration(
     llm_settings: LLMSettings,
     memory_settings: MemorySettings,
     subagent_settings: SubagentSettings,
-) -> dict[str, str]:
+) -> dict[str, tuple[str, str]]:
     main_provider = llm_settings.default_provider
     subagent_provider = subagent_settings.provider or main_provider
     compaction_provider = core_settings.compaction.provider
@@ -230,8 +235,8 @@ def _chat_model_for_provider(*, llm_settings: LLMSettings, provider: str) -> str
     return "(unknown)"
 
 
-def _format_provider_target(*, provider: str, model: str) -> str:
-    return f"{provider} | {model}"
+def _format_provider_target(*, provider: str, model: str) -> tuple[str, str]:
+    return (provider, model)
 
 
 if __name__ == "__main__":

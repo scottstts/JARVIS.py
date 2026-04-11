@@ -181,11 +181,11 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             provider_configuration,
             {
-                "main_llm": "openai | gpt-5.4",
-                "subagent_llm": "openai | gpt-5.4",
-                "compaction_llm": "openai | gpt-5.4",
-                "memory_maintenance_llm": "anthropic | claude-maintenance",
-                "embedding": "openai | text-embedding-3-small",
+                "main_llm": ("openai", "gpt-5.4"),
+                "subagent_llm": ("openai", "gpt-5.4"),
+                "compaction_llm": ("openai", "gpt-5.4"),
+                "memory_maintenance_llm": ("anthropic", "claude-maintenance"),
+                "embedding": ("openai", "text-embedding-3-small"),
             },
         )
 
@@ -204,48 +204,38 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             turn_timezone="Europe/Dublin",
         )
 
+        import io
+        from contextlib import redirect_stdout
+
+        out = io.StringIO()
         with patch.object(
             jarvis_main,
             "_load_runtime_provider_configuration",
             return_value={
-                "main_llm": "openai | gpt-5.4",
-                "subagent_llm": "gemini | gemini-3.1-pro",
-                "compaction_llm": "anthropic | claude-3.7-sonnet",
-                "memory_maintenance_llm": "anthropic | claude-maintenance",
-                "embedding": "openai | text-embedding-3-small",
+                "main_llm": ("openai", "gpt-5.4"),
+                "subagent_llm": ("gemini", "gemini-3.1-pro"),
+                "compaction_llm": ("anthropic", "claude-3.7-sonnet"),
+                "memory_maintenance_llm": ("anthropic", "claude-maintenance"),
+                "embedding": ("openai", "text-embedding-3-small"),
             },
         ):
-            with self.assertLogs(jarvis_main.LOGGER.name, level="INFO") as captured_logs:
+            with redirect_stdout(out):
                 jarvis_main._log_runtime_provider_configuration(core_settings=core_settings)
 
-        self.assertIn(
-            "=====================================",
-            captured_logs.output[0],
-        )
-        self.assertIn(
-            "Main Agent LLM Provider: openai | gpt-5.4",
-            captured_logs.output[1],
-        )
-        self.assertIn(
-            "Subagent LLM Provider: gemini | gemini-3.1-pro",
-            captured_logs.output[2],
-        )
-        self.assertIn(
-            "Compaction LLM Provider: anthropic | claude-3.7-sonnet",
-            captured_logs.output[3],
-        )
-        self.assertIn(
-            "Memory Maintenance LLM Provider: anthropic | claude-maintenance",
-            captured_logs.output[4],
-        )
-        self.assertIn(
-            "Embedding Model Provider: openai | text-embedding-3-small",
-            captured_logs.output[5],
-        )
-        self.assertIn(
-            "=====================================",
-            captured_logs.output[6],
-        )
+        output = out.getvalue()
+        self.assertIn("LLM Provider Configuration", output)
+        self.assertIn("Main Agent", output)
+        self.assertIn("openai", output)
+        self.assertIn("gpt-5.4", output)
+        self.assertIn("Subagent", output)
+        self.assertIn("gemini", output)
+        self.assertIn("gemini-3.1-pro", output)
+        self.assertIn("Compaction", output)
+        self.assertIn("claude-3.7-sonnet", output)
+        self.assertIn("Memory Maintenance", output)
+        self.assertIn("claude-maintenance", output)
+        self.assertIn("Embedding", output)
+        self.assertIn("text-embedding-3-small", output)
 
     async def test_run_system_propagates_gateway_startup_failure(self) -> None:
         startup_error = RuntimeError("gateway boom")
