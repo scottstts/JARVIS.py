@@ -348,17 +348,12 @@ class TelegramGatewayBridge:
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
-        LOGGER.info(
-            "Telegram bridge online for bot @%s",
-            bot_profile.get("username", "unknown"),
-        )
-        LOGGER.info(
-            "Telegram temp dir is %s",
-            self._settings.telegram_temp_dir,
-        )
-        LOGGER.info(
-            "Telegram bridge restricted to the configured owner.",
-        )
+        from rich.console import Console
+        from rich.text import Text
+
+        text = Text("Telegram bridge online for bot @", style="bold green")
+        text.append(str(bot_profile.get("username", "unknown")), style="bold cyan")
+        Console().print(text)
 
         next_offset: int | None = None
         while True:
