@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,7 @@ from jarvis.codex_backend.actor_runtime import CodexActorRuntime
 from jarvis.codex_backend.config import CodexBackendSettings
 from jarvis.codex_backend.types import CodexNativeCapabilityError
 from jarvis.core import AgentIdentity, AgentMemoryMode, AgentRuntimeMessage
-from jarvis.llm import LLMMessage, ToolDefinition
+from jarvis.llm import LLMMessage, LLMResponse, LLMUsage, ToolDefinition
 from jarvis.storage import ConversationRecord, SessionStorage
 from jarvis.tools import ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 from tests.helpers import build_core_settings
@@ -77,6 +78,7 @@ def _build_runtime(
     tool_definitions_provider=None,
     tool_executor=None,
     runtime_messages_provider=None,
+    llm_service=None,
 ) -> tuple[CodexActorRuntime, SessionStorage, _FakeCoordinator]:
     core_settings = build_core_settings(root_dir=root_dir)
     workspace_dir = root_dir / "workspace"
@@ -98,7 +100,7 @@ def _build_runtime(
             approval_policy="untrusted",
             sandbox_network_access=False,
         ),
-        llm_service=object(),  # type: ignore[arg-type]
+        llm_service=llm_service or object(),  # type: ignore[arg-type]
         storage=storage,
         core_settings=core_settings,
         route_id="route_1",
@@ -119,6 +121,42 @@ def _build_runtime(
         runtime_messages_provider=runtime_messages_provider,
     )
     return runtime, storage, coordinator
+
+
+class _FakeCompactionLLMService:
+    async def generate(self, request):  # type: ignore[no-untyped-def]
+        return LLMResponse(
+            provider=request.provider or "openai",
+            model="fake-compactor",
+            text=json.dumps(
+                {
+                    "items": [
+                        {
+                            "type": "compaction",
+                            "role": "system",
+                            "kind": "session_frame",
+                            "content": "Session frame from compacted Codex history.",
+                        },
+                        {
+                            "type": "compaction",
+                            "role": "assistant",
+                            "kind": "condensed_span",
+                            "content": "Condensed work summary from the previous session.",
+                        },
+                        {
+                            "type": "compaction",
+                            "role": "system",
+                            "kind": "handover_state",
+                            "content": "Resume by continuing from the latest verified state.",
+                        },
+                    ]
+                }
+            ),
+            tool_calls=[],
+            finish_reason="stop",
+            usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+            response_id="resp_compact",
+        )
 
 
 class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -155,6 +193,110 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Codex dynamic tools bootstrap snapshot:", tool_snapshot.content)
             self.assertEqual(tool_snapshot.metadata["transcript_only"], True)
             self.assertEqual(tool_snapshot.metadata["tool_definitions"][0]["name"], "bash")
+
+    async def test_compact_command_rebuilds_session_with_replacement_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, storage, _coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                llm_service=_FakeCompactionLLMService(),
+            )
+
+            session_id = await runtime.prepare_session()
+            storage.append_record(
+                session_id,
+                ConversationRecord(
+                    record_id="user_1",
+                    session_id=session_id,
+                    created_at="2026-04-11T00:00:00+00:00",
+                    role="user",
+                    content="Keep marker CODE-12345.",
+                ),
+            )
+
+            events = [event async for event in runtime.stream_user_input("/compact keep marker")]
+
+            self.assertEqual(events[-1].type, "done")
+            self.assertTrue(events[-1].compaction_performed)
+            self.assertEqual(events[-1].response_text, "Context compacted into a new session.")
+
+            old_session = storage.get_session(session_id)
+            self.assertIsNotNone(old_session)
+            self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
+            old_records = storage.load_records(session_id, include_all_turns=True)
+            audit_records = [record for record in old_records if record.kind == "compaction"]
+            self.assertEqual(len(audit_records), 1)
+            self.assertTrue(audit_records[0].metadata["replacement_items"])
+
+            new_session = storage.get_active_session()
+            self.assertIsNotNone(new_session)
+            if new_session is None:
+                self.fail("Expected active compacted session.")
+            self.assertTrue(new_session.backend_state["compaction_seed_pending"])
+
+            new_records = storage.load_records(new_session.session_id, include_all_turns=True)
+            compaction_records = [
+                record for record in new_records if record.metadata.get("compaction_item")
+            ]
+            self.assertEqual(
+                [record.metadata["compaction_kind"] for record in compaction_records],
+                ["session_frame", "condensed_span", "handover_state"],
+            )
+
+    async def test_first_turn_after_compaction_seeds_codex_thread_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = _FakeCoordinator(turn_start_ids=["turn_1"])
+            runtime, storage, _coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                coordinator=coordinator,
+                llm_service=_FakeCompactionLLMService(),
+            )
+
+            session_id = await runtime.prepare_session()
+            storage.append_record(
+                session_id,
+                ConversationRecord(
+                    record_id="user_1",
+                    session_id=session_id,
+                    created_at="2026-04-11T00:00:00+00:00",
+                    role="user",
+                    content="Keep marker CODE-12345.",
+                ),
+            )
+            compact_events = [event async for event in runtime.stream_user_input("/compact")]
+            compact_done = compact_events[-1]
+            self.assertEqual(compact_done.type, "done")
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected active compacted session.")
+
+            events_task = asyncio.create_task(_collect_events(runtime.stream_turn(user_text="continue")))
+            await asyncio.sleep(0)
+            seed_input = coordinator.turn_start_requests[0]["input"]
+            self.assertGreaterEqual(len(seed_input), 2)
+            self.assertIn("Compacted prior-session history item:", seed_input[0]["text"])
+            self.assertIn("kind: session_frame", seed_input[0]["text"])
+            self.assertEqual(seed_input[-1]["text"], "continue")
+
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            )
+            await events_task
+
+            refreshed = storage.get_active_session()
+            self.assertIsNotNone(refreshed)
+            if refreshed is None:
+                self.fail("Expected refreshed active session.")
+            self.assertFalse(refreshed.backend_state["compaction_seed_pending"])
 
     async def test_stream_turn_maps_deltas_completion_and_persists_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

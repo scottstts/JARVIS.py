@@ -26,6 +26,45 @@ def _build_response(text: str) -> LLMResponse:
     )
 
 
+def _is_compaction_request(request: LLMRequest) -> bool:
+    return (
+        len(request.messages) == 2
+        and request.messages[0].role == "system"
+        and request.messages[1].role == "user"
+        and any(
+            isinstance(part, TextPart)
+            and "Compact the following transcript items into replacement history JSON." in part.text
+            for part in request.messages[1].parts
+        )
+    )
+
+
+def _build_compaction_response() -> LLMResponse:
+    payload = {
+        "items": [
+            {
+                "type": "compaction",
+                "role": "system",
+                "kind": "session_frame",
+                "content": "Session frame: interrupted streaming turn.",
+            },
+            {
+                "type": "compaction",
+                "role": "assistant",
+                "kind": "condensed_span",
+                "content": "The previous turn began streaming a reply and was superseded before it completed.",
+            },
+            {
+                "type": "compaction",
+                "role": "system",
+                "kind": "handover_state",
+                "content": "Handover state: resume from the superseded-turn boundary.",
+            },
+        ]
+    }
+    return _build_response(json.dumps(payload, ensure_ascii=False))
+
+
 class _FakeStreamingLLMService:
     async def generate(self, _request):
         return _build_response("non-stream-reply")
@@ -56,6 +95,8 @@ class _InterruptibleStreamingLLMService:
 
     async def generate(self, request: LLMRequest):
         self.generate_requests.append(request)
+        if _is_compaction_request(request):
+            return _build_compaction_response()
         return _build_response("next-turn")
 
     async def stream_generate(self, _request):

@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis import settings as app_settings
+from jarvis.llm.provider_names import LLM_PROVIDER_NAME_SET, LLM_PROVIDER_NAMES_TEXT
 from jarvis.storage.layout import resolve_transcript_archive_root
 from jarvis.workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
@@ -31,6 +32,25 @@ def _optional_env(name: str) -> str | None:
         return None
     value = raw.strip()
     return value or None
+
+
+def _required_lower_choice_env(name: str, default: str, *, disallowed: set[str] | None = None) -> str:
+    raw = os.getenv(name)
+    value = raw if raw is not None else default
+    normalized = str(value).strip().lower()
+    if not normalized:
+        raise CoreConfigurationError(f"{name} must not be blank.")
+    if normalized not in LLM_PROVIDER_NAME_SET:
+        raise CoreConfigurationError(
+            f"{name} must be one of: {LLM_PROVIDER_NAMES_TEXT}. Got: {normalized}"
+        )
+    blocked = disallowed or set()
+    if normalized in blocked:
+        blocked_text = ", ".join(sorted(blocked))
+        raise CoreConfigurationError(
+            f"{name} must not be one of: {blocked_text}. Got: {normalized}"
+        )
+    return normalized
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,10 +111,42 @@ class ContextPolicySettings:
 
 
 @dataclass(slots=True, frozen=True)
+class CompactionSettings:
+    """Provider selection for dedicated session compaction requests."""
+
+    provider: str
+
+    def __post_init__(self) -> None:
+        normalized = self.provider.strip().lower()
+        if not normalized:
+            raise CoreConfigurationError("JARVIS_COMPACTION_PROVIDER must not be blank.")
+        if normalized not in LLM_PROVIDER_NAME_SET:
+            raise CoreConfigurationError(
+                f"JARVIS_COMPACTION_PROVIDER must be one of: {LLM_PROVIDER_NAMES_TEXT}."
+            )
+        if normalized == "codex":
+            raise CoreConfigurationError(
+                "JARVIS_COMPACTION_PROVIDER cannot be 'codex'; compaction uses normal LLM providers only."
+            )
+        object.__setattr__(self, "provider", normalized)
+
+    @classmethod
+    def from_env(cls) -> "CompactionSettings":
+        return cls(
+            provider=_required_lower_choice_env(
+                "JARVIS_COMPACTION_PROVIDER",
+                app_settings.JARVIS_COMPACTION_PROVIDER,
+                disallowed={"codex"},
+            )
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class CoreSettings:
     """Core loop runtime settings."""
 
     context_policy: ContextPolicySettings
+    compaction: CompactionSettings
     workspace_dir: Path
     transcript_archive_dir: Path
     identities_dir: Path
@@ -129,6 +181,7 @@ class CoreSettings:
 
         return cls(
             context_policy=ContextPolicySettings.from_env(),
+            compaction=CompactionSettings.from_env(),
             workspace_dir=workspace_dir,
             transcript_archive_dir=transcript_archive_dir,
             identities_dir=identities_dir,

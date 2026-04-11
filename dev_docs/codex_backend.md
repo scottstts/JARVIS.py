@@ -201,9 +201,10 @@ Behavior:
 - new Jarvis session -> new Codex thread
 - resumed Jarvis session -> `thread/resume` with stored `thread_id`
 - `/new` -> archive current session and start a fresh Codex thread
-- `/compact` -> start a fresh Codex thread for the post-compaction session
+- `/compact` -> archive the current session, persist structured replacement-history items into a fresh session, and mark the next Codex turn to seed that new thread exactly once with the compacted handover history
 
-Jarvis does not try to replay old transcript history back into a new Codex thread.
+Jarvis still does not rebuild Codex continuity by replaying the full old transcript into a new thread.
+Instead, post-compaction Codex sessions persist compacted replacement-history records locally and inject them once into the first turn of the fresh thread.
 
 ## Main And Subagent Reuse
 

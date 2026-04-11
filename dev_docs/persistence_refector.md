@@ -180,7 +180,7 @@ Implication:
 
 ### 3. Compaction is an intentional cache boundary
 
-Once a session is compacted into a new summary-backed session, exact cache continuity is intentionally broken.
+Once a session is compacted into a new replacement-history-backed session, exact cache continuity is intentionally broken.
 
 That is expected.
 

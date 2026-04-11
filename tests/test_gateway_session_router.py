@@ -18,7 +18,7 @@ from jarvis.core import (
     AgentTurnResult,
 )
 from jarvis.llm import TextPart
-from jarvis.core.compaction import CompactionOutcome
+from jarvis.core.compaction import CompactionOutcome, CompactionReplacementItem
 from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
 from jarvis.gateway.route_events import (
     RouteAssistantMessageEvent,
@@ -905,7 +905,19 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                     runtime._main_loop._compactor,
                     "compact",
                     return_value=CompactionOutcome(
-                        summary_text="Compacted summary",
+                        items=(
+                            CompactionReplacementItem(
+                                role="system",
+                                kind="session_frame",
+                                content="Session frame",
+                            ),
+                            CompactionReplacementItem(
+                                role="system",
+                                kind="handover_state",
+                                content="Handover state",
+                            ),
+                        ),
+                        response_payload={"items": []},
                         model="fake-model",
                         provider="fake-provider",
                         input_tokens=10,

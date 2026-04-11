@@ -6,7 +6,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from jarvis.core.config import ContextPolicySettings, CoreSettings
+from jarvis.core.config import CompactionSettings, ContextPolicySettings, CoreSettings
 
 
 def build_core_settings(
@@ -16,6 +16,7 @@ def build_core_settings(
     compact_threshold_tokens: int = 350_000,
     compact_reserve_output_tokens: int = 16_000,
     compact_reserve_overhead_tokens: int = 10_000,
+    compaction_provider: str = "openai",
 ) -> CoreSettings:
     if os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"):
         shared_root_dir = Path(tempfile.mkdtemp(prefix="jarvis-test-", dir="/workspace"))
@@ -37,6 +38,7 @@ def build_core_settings(
             compact_reserve_output_tokens=compact_reserve_output_tokens,
             compact_reserve_overhead_tokens=compact_reserve_overhead_tokens,
         ),
+        compaction=CompactionSettings(provider=compaction_provider),
         workspace_dir=workspace_dir,
         transcript_archive_dir=root_dir / "archive" / "transcripts",
         identities_dir=identities_dir,

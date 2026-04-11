@@ -33,7 +33,12 @@ from jarvis.storage import ConversationRecord, SessionMetadata, SessionStorage
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 
 from .commands import ParsedCommand, parse_user_command
-from .compaction import CompactionOutcome, ContextCompactor
+from .compaction import (
+    CompactionOutcome,
+    CompactionReplacementItem,
+    ContextCompactor,
+    prune_compaction_source_records,
+)
 from .config import CoreSettings
 from .errors import ContextBudgetError
 from .identities import IdentityBootstrapLoader
@@ -290,7 +295,7 @@ class AgentLoop:
         self._compactor = ContextCompactor(
             llm_service=self._llm_service,
             context_policy=self._settings.context_policy,
-            provider=self._llm_provider,
+            provider=self._settings.compaction.provider,
         )
         memory_settings = MemorySettings.from_workspace_dir(self._settings.workspace_dir)
         memory_llm_service = self._llm_service if isinstance(self._llm_service, LLMService) else None
@@ -2427,7 +2432,7 @@ class AgentLoop:
         compacted = await self._compact_session(
             session,
             reason=reason,
-            include_turn_ids=(turn_id,),
+            excluded_turn_ids=(turn_id,),
         )
         if compacted is None:
             raise ContextBudgetError(_FOLLOWUP_COMPACTION_FAILED_TEXT)
@@ -2498,7 +2503,7 @@ class AgentLoop:
         *,
         start_reason: str,
         parent_session_id: str | None = None,
-        summary_text: str | None = None,
+        replacement_items: Sequence[CompactionReplacementItem] = (),
         compaction_count: int = 0,
     ) -> SessionMetadata:
         session = self._storage.create_session(
@@ -2549,16 +2554,11 @@ class AgentLoop:
                     content="Runtime ongoing memory bootstrap:\n\n" + ongoing_memory_bootstrap,
                     metadata={"memory_bootstrap": "ongoing"},
                 )
-        if summary_text:
-            self._append_message(
+        if replacement_items:
+            self._persist_compaction_replacement_items(
                 session_id=session.session_id,
-                role="system",
-                content=(
-                    "Summarized context from previous session compaction.\n"
-                    "Use this as prior conversational state:\n\n"
-                    f"{summary_text.strip()}"
-                ),
-                metadata={"summary_seed": True},
+                items=replacement_items,
+                generation=max(compaction_count, 1),
             )
 
         if compaction_count > 0:
@@ -2576,22 +2576,46 @@ class AgentLoop:
         *,
         reason: str,
         user_instruction: str | None = None,
-        include_turn_ids: tuple[str, ...] = (),
+        excluded_turn_ids: tuple[str, ...] = (),
     ) -> SessionMetadata | None:
+        excluded_turn_id_set = {
+            turn_id.strip()
+            for turn_id in excluded_turn_ids
+            if turn_id.strip()
+        }
         records = self._storage.load_records(
             session.session_id,
-            include_turn_ids=include_turn_ids,
+            include_all_turns=True,
         )
         compactable_records = [
             record
             for record in records
             if record.kind == "message"
-            and not record.metadata.get("bootstrap_identity", False)
-            and not record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)
-            and not record.metadata.get("memory_bootstrap")
-            and not record.metadata.get("summary_seed", False)
+            and str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip()
+            not in excluded_turn_id_set
         ]
-        if not compactable_records:
+        source_records = prune_compaction_source_records(compactable_records)
+        if not source_records:
+            if excluded_turn_id_set:
+                next_compaction_count = session.compaction_count + 1
+                self._storage.archive_session(session.session_id)
+                next_session = await self._start_session(
+                    start_reason="compaction",
+                    parent_session_id=session.session_id,
+                    replacement_items=(),
+                    compaction_count=next_compaction_count,
+                )
+                self._storage.update_session(
+                    next_session.session_id,
+                    pending_reactive_compaction=False,
+                    pending_interruption_notice=session.pending_interruption_notice,
+                    pending_interruption_notice_reason=session.pending_interruption_notice_reason,
+                )
+                await self._emit_local_notice(
+                    notice_kind="compaction_completed",
+                    text="Context compacted into a new session.",
+                )
+                return self._storage.get_session(next_session.session_id) or next_session
             self._storage.update_session(session.session_id, pending_reactive_compaction=False)
             return None
 
@@ -2610,7 +2634,7 @@ class AgentLoop:
                 LOGGER.exception("Memory pre-compaction flush failed.")
 
         outcome = await self._compactor.compact(
-            compactable_records,
+            source_records,
             user_instruction=user_instruction,
         )
         self._append_compaction_record(session.session_id, outcome=outcome, reason=reason)
@@ -2620,7 +2644,7 @@ class AgentLoop:
         next_session = await self._start_session(
             start_reason="compaction",
             parent_session_id=session.session_id,
-            summary_text=outcome.summary_text,
+            replacement_items=outcome.items,
             compaction_count=next_compaction_count,
         )
         self._storage.update_session(
@@ -2692,6 +2716,8 @@ class AgentLoop:
             "provider": outcome.provider,
             "model": outcome.model,
             "response_id": outcome.response_id,
+            "replacement_items": [item.to_dict() for item in outcome.items],
+            "response_payload": outcome.response_payload,
             "usage": {
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
@@ -2703,11 +2729,29 @@ class AgentLoop:
             session_id=session_id,
             created_at=_utc_now_iso(),
             role="system",
-            content=outcome.summary_text,
+            content=(
+                "Compaction replaced prior session history with "
+                f"{len(outcome.items)} structured handover items."
+            ),
             kind="compaction",
             metadata=metadata,
         )
         self._storage.append_record(session_id, record)
+
+    def _persist_compaction_replacement_items(
+        self,
+        *,
+        session_id: str,
+        items: Sequence[CompactionReplacementItem],
+        generation: int,
+    ) -> None:
+        for item in items:
+            self._append_message(
+                session_id=session_id,
+                role=item.role,
+                content=item.content,
+                metadata=item.record_metadata(generation=generation),
+            )
 
     def _build_message_record(
         self,

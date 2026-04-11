@@ -363,6 +363,7 @@ JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS: Final = _integer(
     "core.compact_reserve_overhead_tokens"
 )
 JARVIS_CORE_TIMEZONE: Final = _string("core.timezone")
+JARVIS_COMPACTION_PROVIDER: Final = _string("core.compaction.provider")
 
 # Core LLM routing/runtime.
 # The provider chosen here will determine which provider settings/token are needed below.

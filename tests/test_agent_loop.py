@@ -87,11 +87,11 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await llm_service.aclose()
 
-    async def test_manual_compaction_creates_new_session_with_summary_seed(self) -> None:
+    async def test_manual_compaction_creates_new_session_with_replacement_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(
                 root_dir=Path(tmp),
-                compact_reserve_output_tokens=256,
+                compact_reserve_output_tokens=2048,
                 compact_reserve_overhead_tokens=64,
             )
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -114,15 +114,22 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
                 old_records = storage.load_records(old_session_id)
                 self.assertTrue(any(record.kind == "compaction" for record in old_records))
+                audit_record = next(record for record in old_records if record.kind == "compaction")
+                self.assertIn("structured handover items", audit_record.content)
+                self.assertTrue(audit_record.metadata["replacement_items"])
 
                 new_records = storage.load_records(compacted.session_id)
-                summary_records = [
+                compaction_records = [
                     record
                     for record in new_records
-                    if record.role == "system" and record.metadata.get("summary_seed")
+                    if record.metadata.get("compaction_item")
                 ]
-                self.assertEqual(len(summary_records), 1)
-                self.assertTrue(summary_records[0].content.strip())
+                self.assertGreaterEqual(len(compaction_records), 2)
+                self.assertEqual(compaction_records[0].role, "system")
+                self.assertEqual(compaction_records[0].metadata["compaction_kind"], "session_frame")
+                self.assertEqual(compaction_records[-1].role, "system")
+                self.assertEqual(compaction_records[-1].metadata["compaction_kind"], "handover_state")
+                self.assertTrue(all(record.metadata["type"] == "compaction" for record in compaction_records))
 
                 follow_up = await loop.handle_user_input(
                     "What marker do you have from previous context?"
@@ -132,7 +139,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await llm_service.aclose()
 
-    async def test_new_command_starts_fresh_session_without_summary_seed(self) -> None:
+    async def test_new_command_starts_fresh_session_without_compaction_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(
                 root_dir=Path(tmp),
@@ -165,7 +172,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                     [record.role for record in message_records[:4]],
                     ["system", "system", "system", "system"],
                 )
-                self.assertFalse(any(record.metadata.get("summary_seed") for record in message_records))
+                self.assertFalse(any(record.metadata.get("compaction_item") for record in message_records))
 
                 continued = await loop.handle_user_input("Confirm reset session is active.")
                 self.assertEqual(continued.session_id, reset.session_id)

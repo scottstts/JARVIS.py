@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -91,20 +92,43 @@ def _is_compaction_request(request: LLMRequest) -> bool:
         and request.messages[1].role == "user"
         and any(
             isinstance(part, TextPart)
-            and "Compact the following transcript." in part.text
+            and "Compact the following transcript items into replacement history JSON." in part.text
             for part in request.messages[1].parts
         )
     )
 
 
-def _has_summary_seed_message(request: LLMRequest) -> bool:
+def _has_compaction_history_message(request: LLMRequest) -> bool:
     return any(
-        message.role == "system"
-        and isinstance(part, TextPart)
-        and "Summarized context from previous session compaction." in part.text
+        bool(message.metadata.get("compaction_item"))
         for message in request.messages
-        for part in message.parts
     )
+
+
+def _build_compaction_response(*, marker: str = "Compacted summary") -> LLMResponse:
+    payload = {
+        "items": [
+            {
+                "type": "compaction",
+                "role": "system",
+                "kind": "session_frame",
+                "content": f"Session frame: {marker}",
+            },
+            {
+                "type": "compaction",
+                "role": "assistant",
+                "kind": "condensed_span",
+                "content": marker,
+            },
+            {
+                "type": "compaction",
+                "role": "system",
+                "kind": "handover_state",
+                "content": "Handover state: continue from the latest task state.",
+            },
+        ]
+    }
+    return _build_response(json.dumps(payload, ensure_ascii=False))
 
 
 def _build_web_fetch_tool_result(
@@ -1058,7 +1082,7 @@ class _FakeFollowupPreflightCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_response("Compacted summary")
+            return _build_compaction_response()
 
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
@@ -1083,8 +1107,8 @@ class _FakeFollowupPreflightCompactionLLMService:
                 finish_reason="tool_calls",
             )
 
-        if not _has_summary_seed_message(request):
-            raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
+        if not _has_compaction_history_message(request):
+            raise AssertionError("Expected the compacted follow-up request to include replacement history.")
         if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
             raise AssertionError("Expected assistant/tool history to survive follow-up compaction.")
         return _build_response("Recovered after compaction.")
@@ -1099,7 +1123,7 @@ class _FakeStreamingFollowupOverflowCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_response("Compacted summary")
+            return _build_compaction_response()
         raise AssertionError("Non-compaction generate should not be used in this test.")
 
     async def stream_generate(self, request: LLMRequest):
@@ -1133,8 +1157,8 @@ class _FakeStreamingFollowupOverflowCompactionLLMService:
         if self.stream_calls == 3:
             raise ProviderBadRequestError("context_length_exceeded")
 
-        if not _has_summary_seed_message(request):
-            raise AssertionError("Expected the compacted streamed follow-up request to include a summary seed.")
+        if not _has_compaction_history_message(request):
+            raise AssertionError("Expected the compacted streamed follow-up request to include replacement history.")
         if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
             raise AssertionError("Expected assistant/tool history to survive streamed follow-up compaction.")
         yield TextDeltaEvent(delta="Recovered after compaction.")
@@ -1147,7 +1171,7 @@ class _FakeFollowupOverflowCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_response("Compacted summary")
+            return _build_compaction_response()
 
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
@@ -1174,8 +1198,8 @@ class _FakeFollowupOverflowCompactionLLMService:
         if self.generate_calls == 3:
             raise ProviderBadRequestError("context_length_exceeded")
 
-        if not _has_summary_seed_message(request):
-            raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
+        if not _has_compaction_history_message(request):
+            raise AssertionError("Expected the compacted follow-up request to include replacement history.")
         if request.messages[-2].role != "assistant" or request.messages[-1].role != "tool":
             raise AssertionError("Expected assistant/tool history to survive follow-up compaction.")
         return _build_response("Recovered after compaction.")
@@ -1266,7 +1290,15 @@ class _FakeCurrentTurnResidualCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_response("Compacted current-turn summary")
+            compaction_text = "\n".join(
+                part.text
+                for message in request.messages
+                for part in message.parts
+                if isinstance(part, TextPart)
+            )
+            if "L" * 512 in compaction_text:
+                raise AssertionError("Active-turn large tool output should not be included in compaction source.")
+            return _build_compaction_response(marker="Compacted current-turn summary")
 
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
@@ -1287,8 +1319,6 @@ class _FakeCurrentTurnResidualCompactionLLMService:
                 finish_reason="tool_calls",
             )
 
-        if not _has_summary_seed_message(request):
-            raise AssertionError("Expected the compacted follow-up request to include a summary seed.")
         tool_messages = [message for message in request.messages if message.role == "tool"]
         if len(tool_messages) != 1:
             raise AssertionError("Expected one carried-forward tool result message.")
@@ -1302,6 +1332,20 @@ class _FakeCurrentTurnResidualCompactionLLMService:
         if len(tool_text_parts[0]) >= 2_500:
             raise AssertionError("Expected carried-forward tool output to be compacted.")
         return _build_response("Recovered after compacting the current turn.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
+class _FakeCompactionProviderSplitLLMService:
+    def __init__(self) -> None:
+        self.request_providers: list[str | None] = []
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.request_providers.append(request.provider)
+        if _is_compaction_request(request):
+            return _build_compaction_response(marker="Compaction provider split test")
+        return _build_response("OK.")
 
     async def stream_generate(self, request: LLMRequest):
         raise AssertionError("Streaming is not expected in this test.")
@@ -1746,8 +1790,8 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             def _estimate_with_followup_overflow(request: LLMRequest) -> int:
                 has_tool_result = any(message.role == "tool" for message in request.messages)
-                has_summary_seed = _has_summary_seed_message(request)
-                if has_tool_result and not has_summary_seed:
+                has_compaction_history = _has_compaction_history_message(request)
+                if has_tool_result and not has_compaction_history:
                     return settings.context_policy.preflight_limit_tokens
                 return 10
 
@@ -1771,7 +1815,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(result.session_id)
             self.assertTrue(
-                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.metadata.get("compaction_item") for record in new_records)
             )
             self.assertEqual(new_records[-1].role, "assistant")
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
@@ -1803,6 +1847,27 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     ("compaction_completed", "Context compacted into a new session."),
                 ],
             )
+
+    async def test_manual_compaction_uses_dedicated_compaction_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(
+                root_dir=Path(tmp),
+                compaction_provider="openai",
+            )
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _FakeCompactionProviderSplitLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+                llm_provider="anthropic",
+            )
+
+            await loop.handle_user_input("Say OK.")
+            compacted = await loop.handle_user_input("/compact keep the latest state")
+
+            self.assertTrue(compacted.compaction_performed)
+            self.assertEqual(llm_service.request_providers, ["anthropic", "openai"])
 
     async def test_handle_user_input_auto_compacts_when_current_turn_itself_overflows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1844,9 +1909,6 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 if not tool_parts:
                     return 10
-                has_summary_seed = _has_summary_seed_message(request)
-                if not has_summary_seed:
-                    return settings.context_policy.preflight_limit_tokens
                 if max(len(content) for content in tool_parts) >= 2_500:
                     return settings.context_policy.preflight_limit_tokens
                 return 10
@@ -1866,9 +1928,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(new_session.parent_session_id)  # type: ignore[union-attr]
 
             new_records = storage.load_records(result.session_id, include_all_turns=True)
-            self.assertTrue(
-                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
-            )
+            self.assertFalse(any(record.metadata.get("compaction_item") for record in new_records))
             new_tool_records = [record for record in new_records if record.role == "tool"]
             self.assertEqual(len(new_tool_records), 1)
             self.assertTrue(new_tool_records[0].metadata.get("carry_forward_compacted"))
@@ -2413,7 +2473,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(result.session_id)
             self.assertTrue(
-                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.metadata.get("compaction_item") for record in new_records)
             )
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
             self.assertEqual(
@@ -2465,7 +2525,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             new_records = storage.load_records(done.session_id)
             self.assertTrue(
-                any(record.role == "system" and record.metadata.get("summary_seed") for record in new_records)
+                any(record.metadata.get("compaction_item") for record in new_records)
             )
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 

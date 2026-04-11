@@ -150,6 +150,7 @@ def _log_runtime_provider_configuration(*, core_settings: CoreSettings) -> None:
     LOGGER.info("=====================================")
     LOGGER.info("  Main Agent LLM Provider: %s", provider_configuration["main_llm"])
     LOGGER.info("  Subagent LLM Provider: %s", provider_configuration["subagent_llm"])
+    LOGGER.info("  Compaction LLM Provider: %s", provider_configuration["compaction_llm"])
     LOGGER.info(
         "  Memory Maintenance LLM Provider: %s",
         provider_configuration["memory_maintenance_llm"],
@@ -166,6 +167,7 @@ def _load_runtime_provider_configuration(*, core_settings: CoreSettings) -> dict
         transcript_archive_root=core_settings.transcript_archive_dir,
     )
     return _resolve_runtime_provider_configuration(
+        core_settings=core_settings,
         llm_settings=llm_settings,
         memory_settings=memory_settings,
         subagent_settings=subagent_settings,
@@ -174,12 +176,14 @@ def _load_runtime_provider_configuration(*, core_settings: CoreSettings) -> dict
 
 def _resolve_runtime_provider_configuration(
     *,
+    core_settings: CoreSettings,
     llm_settings: LLMSettings,
     memory_settings: MemorySettings,
     subagent_settings: SubagentSettings,
 ) -> dict[str, str]:
     main_provider = llm_settings.default_provider
     subagent_provider = subagent_settings.provider or main_provider
+    compaction_provider = core_settings.compaction.provider
     return {
         "main_llm": _format_provider_target(
             provider=main_provider,
@@ -188,6 +192,13 @@ def _resolve_runtime_provider_configuration(
         "subagent_llm": _format_provider_target(
             provider=subagent_provider,
             model=_chat_model_for_provider(llm_settings=llm_settings, provider=subagent_provider),
+        ),
+        "compaction_llm": _format_provider_target(
+            provider=compaction_provider,
+            model=_chat_model_for_provider(
+                llm_settings=llm_settings,
+                provider=compaction_provider,
+            ),
         ),
         "memory_maintenance_llm": _format_provider_target(
             provider=memory_settings.maintenance_provider,

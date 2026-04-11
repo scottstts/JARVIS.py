@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import jarvis.main as jarvis_main
 from jarvis.core import ContextPolicySettings, CoreSettings
+from jarvis.core.config import CompactionSettings
 from jarvis.gateway import GatewaySettings
 from jarvis.llm import (
     EmbeddingSettings,
@@ -130,6 +131,19 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
     def test_resolve_runtime_provider_configuration_falls_back_to_main_for_subagent(self) -> None:
         provider_configuration = jarvis_main._resolve_runtime_provider_configuration(
+            core_settings=CoreSettings(
+                context_policy=ContextPolicySettings(
+                    context_window_tokens=100_000,
+                    compact_threshold_tokens=60_000,
+                    compact_reserve_output_tokens=8_000,
+                    compact_reserve_overhead_tokens=2_000,
+                ),
+                compaction=CompactionSettings(provider="openai"),
+                workspace_dir=Path("/tmp/workspace"),
+                transcript_archive_dir=Path("/tmp/workspace/archive/transcripts"),
+                identities_dir=Path("/tmp/workspace/identities"),
+                turn_timezone="Europe/Dublin",
+            ),
             llm_settings=LLMSettings(
                 default_provider="openai",
                 embedding=EmbeddingSettings(provider="openai", model="text-embedding-3-small"),
@@ -169,6 +183,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             {
                 "main_llm": "openai | gpt-5.4",
                 "subagent_llm": "openai | gpt-5.4",
+                "compaction_llm": "openai | gpt-5.4",
                 "memory_maintenance_llm": "anthropic | claude-maintenance",
                 "embedding": "openai | text-embedding-3-small",
             },
@@ -182,6 +197,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
                 compact_reserve_output_tokens=8_000,
                 compact_reserve_overhead_tokens=2_000,
             ),
+            compaction=CompactionSettings(provider="openai"),
             workspace_dir=Path("/tmp/workspace"),
             transcript_archive_dir=Path("/tmp/workspace/archive/transcripts"),
             identities_dir=Path("/tmp/workspace/identities"),
@@ -194,6 +210,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             return_value={
                 "main_llm": "openai | gpt-5.4",
                 "subagent_llm": "gemini | gemini-3.1-pro",
+                "compaction_llm": "anthropic | claude-3.7-sonnet",
                 "memory_maintenance_llm": "anthropic | claude-maintenance",
                 "embedding": "openai | text-embedding-3-small",
             },
@@ -214,16 +231,20 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             captured_logs.output[2],
         )
         self.assertIn(
-            "Memory Maintenance LLM Provider: anthropic | claude-maintenance",
+            "Compaction LLM Provider: anthropic | claude-3.7-sonnet",
             captured_logs.output[3],
         )
         self.assertIn(
-            "Embedding Model Provider: openai | text-embedding-3-small",
+            "Memory Maintenance LLM Provider: anthropic | claude-maintenance",
             captured_logs.output[4],
         )
         self.assertIn(
-            "=====================================",
+            "Embedding Model Provider: openai | text-embedding-3-small",
             captured_logs.output[5],
+        )
+        self.assertIn(
+            "=====================================",
+            captured_logs.output[6],
         )
 
     async def test_run_system_propagates_gateway_startup_failure(self) -> None:

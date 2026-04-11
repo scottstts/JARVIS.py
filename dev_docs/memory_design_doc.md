@@ -897,7 +897,7 @@ Prompt policy note:
 1. identity system messages
 2. runtime core memory bootstrap
 3. runtime ongoing memory bootstrap
-4. session compaction seed, if present
+4. compacted replacement-history records, if present
 
 ### Bootstrap Message Role
 

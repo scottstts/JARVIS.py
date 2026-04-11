@@ -24,6 +24,12 @@ from jarvis.core.agent_loop import (
     AgentTurnStreamEvent,
     InterruptionReason,
 )
+from jarvis.core.compaction import (
+    CompactionOutcome,
+    CompactionReplacementItem,
+    ContextCompactor,
+    prune_compaction_source_records,
+)
 from jarvis.core.commands import ParsedCommand, parse_user_command
 from jarvis.llm import LLMUsage, LLMMessage, LLMService
 from jarvis.logging_setup import get_application_logger
@@ -171,6 +177,11 @@ class CodexActorRuntime:
         )
         self._tool_bridge = CodexToolBridge(
             tool_definitions_provider=tool_definitions_provider,
+        )
+        self._compactor = ContextCompactor(
+            llm_service=self._llm_service,
+            context_policy=self._core_settings.context_policy,
+            provider=self._core_settings.compaction.provider,
         )
         self._active_turn_id: str | None = None
         self._requested_interruption: InterruptionReason | None = None
@@ -561,10 +572,23 @@ class CodexActorRuntime:
 
     async def _stream_compact_command(
         self,
-        _command: ParsedCommand,
+        command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
-        session = await self._start_fresh_session(start_reason="manual_compaction")
-        response_text = "Context compacted into a new session."
+        session_id = await self.prepare_session()
+        active = self._require_session(session_id)
+        compacted = await self._compact_session(
+            active,
+            reason="manual",
+            user_instruction=command.body or None,
+        )
+        if compacted is None:
+            response_text = "No conversation history to compact yet."
+            session = active
+            compaction_performed = False
+        else:
+            response_text = "Context compacted into a new session."
+            session = compacted
+            compaction_performed = True
         yield AgentAssistantMessageEvent(
             session_id=session.session_id,
             text=response_text,
@@ -573,7 +597,7 @@ class CodexActorRuntime:
             session_id=session.session_id,
             response_text=response_text,
             command="/compact",
-            compaction_performed=True,
+            compaction_performed=compaction_performed,
         )
 
     async def _stream_message_turn(
@@ -606,6 +630,7 @@ class CodexActorRuntime:
             *pre_turn_messages,
         )
         await self._maybe_run_due_maintenance()
+        compaction_seed_records = self._pending_compaction_seed_records(session)
         thread_id = await self._ensure_thread_loaded(session)
         turn = _TurnState(
             session_id=session.session_id,
@@ -617,6 +642,7 @@ class CodexActorRuntime:
             input_items = self._build_turn_input_items(
                 user_text=user_text,
                 pre_turn_messages=all_pre_turn_messages,
+                compaction_seed_records=compaction_seed_records,
             )
             if not input_items:
                 raise CodexProtocolError("Codex turn input cannot be empty.")
@@ -657,6 +683,9 @@ class CodexActorRuntime:
                     "thread_id": thread_id,
                     "last_turn_id": provider_turn_id,
                     "dynamic_tools_signature": dynamic_tools_signature,
+                    "compaction_seed_pending": False if compaction_seed_records else bool(
+                        session.backend_state.get("compaction_seed_pending", False)
+                    ),
                     **(
                         {"last_synced_external_record_id": last_external_record_id}
                         if last_external_record_id is not None
@@ -987,6 +1016,19 @@ class CodexActorRuntime:
         await turn.queue.put(exc)
 
     async def _start_fresh_session(self, *, start_reason: str) -> SessionMetadata:
+        return await self._start_fresh_session_with_replacement_history(
+            start_reason=start_reason,
+            replacement_items=(),
+            compaction_count=None,
+        )
+
+    async def _start_fresh_session_with_replacement_history(
+        self,
+        *,
+        start_reason: str,
+        replacement_items: Sequence[CompactionReplacementItem],
+        compaction_count: int | None,
+    ) -> SessionMetadata:
         active = self._storage.get_active_session()
         if active is not None:
             self._storage.archive_session(active.session_id)
@@ -1000,6 +1042,22 @@ class CodexActorRuntime:
             start_reason=start_reason,
         )
         await self._persist_session_bootstrap(session.session_id)
+        if replacement_items:
+            self._persist_compaction_replacement_items(
+                session.session_id,
+                items=replacement_items,
+                generation=max(compaction_count or 0, 1),
+            )
+        updates: dict[str, Any] = {
+            "backend_state": {
+                **dict(session.backend_state),
+                "backend_kind": "codex",
+                "compaction_seed_pending": bool(replacement_items),
+            }
+        }
+        if compaction_count is not None:
+            updates["compaction_count"] = compaction_count
+        session = self._storage.update_session(session.session_id, **updates)
         self._loaded_thread_id = None
         self._loaded_session_id = None
         self._loaded_dynamic_tools_signature = None
@@ -1151,8 +1209,17 @@ class CodexActorRuntime:
         *,
         user_text: str | None,
         pre_turn_messages: Sequence[AgentRuntimeMessage],
+        compaction_seed_records: Sequence[ConversationRecord] = (),
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
+        for record in compaction_seed_records:
+            items.append(
+                {
+                    "type": "text",
+                    "text": _render_compaction_input_text(record),
+                    "text_elements": [],
+                }
+            )
         for message in pre_turn_messages:
             content = message.content.strip()
             if not content:
@@ -1173,6 +1240,105 @@ class CodexActorRuntime:
                 }
             )
         return items
+
+    async def _compact_session(
+        self,
+        session: SessionMetadata,
+        *,
+        reason: str,
+        user_instruction: str | None = None,
+    ) -> SessionMetadata | None:
+        records = self._storage.load_records(session.session_id, include_all_turns=True)
+        compactable_records = [record for record in records if record.kind == "message"]
+        source_records = prune_compaction_source_records(compactable_records)
+        if not source_records:
+            return None
+
+        if self._memory_mode.maintenance:
+            try:
+                await self._memory_service.flush_before_compaction(
+                    route_id=self._tool_context.route_id,
+                    session_id=session.session_id,
+                    records=tuple(records),
+                )
+            except Exception:
+                LOGGER.exception("Codex memory pre-compaction flush failed.")
+
+        outcome = await self._compactor.compact(
+            source_records,
+            user_instruction=user_instruction,
+        )
+        self._append_compaction_record(session.session_id, outcome=outcome, reason=reason)
+        next_session = await self._start_fresh_session_with_replacement_history(
+            start_reason="manual_compaction" if reason == "manual" else "compaction",
+            replacement_items=outcome.items,
+            compaction_count=session.compaction_count + 1,
+        )
+        return self._storage.get_session(next_session.session_id) or next_session
+
+    def _append_compaction_record(
+        self,
+        session_id: str,
+        *,
+        outcome: CompactionOutcome,
+        reason: str,
+    ) -> None:
+        self._storage.append_record(
+            session_id,
+            ConversationRecord(
+                record_id=uuid4().hex,
+                session_id=session_id,
+                created_at=_utc_now_iso(),
+                role="system",
+                content=(
+                    "Compaction replaced prior session history with "
+                    f"{len(outcome.items)} structured handover items."
+                ),
+                kind="compaction",
+                metadata={
+                    "reason": reason,
+                    "provider": outcome.provider,
+                    "model": outcome.model,
+                    "response_id": outcome.response_id,
+                    "replacement_items": [item.to_dict() for item in outcome.items],
+                    "response_payload": outcome.response_payload,
+                    "usage": {
+                        "input_tokens": outcome.input_tokens,
+                        "output_tokens": outcome.output_tokens,
+                        "total_tokens": outcome.total_tokens,
+                    },
+                },
+            ),
+        )
+
+    def _persist_compaction_replacement_items(
+        self,
+        session_id: str,
+        *,
+        items: Sequence[CompactionReplacementItem],
+        generation: int,
+    ) -> None:
+        for item in items:
+            self._storage.append_record(
+                session_id,
+                ConversationRecord(
+                    record_id=uuid4().hex,
+                    session_id=session_id,
+                    created_at=_utc_now_iso(),
+                    role=item.role,
+                    content=item.content,
+                    metadata=item.record_metadata(generation=generation),
+                ),
+            )
+
+    def _pending_compaction_seed_records(
+        self,
+        session: SessionMetadata,
+    ) -> tuple[ConversationRecord, ...]:
+        if not bool(session.backend_state.get("compaction_seed_pending", False)):
+            return ()
+        records = self._storage.load_records(session.session_id, include_all_turns=True)
+        return tuple(record for record in records if _is_compaction_replacement_record(record))
 
     def _reconcile_orphaned_turns(self, session_id: str) -> None:
         session = self._storage.get_session(session_id)
@@ -1646,6 +1812,25 @@ def _render_runtime_input_text(message: AgentRuntimeMessage) -> str:
     return message.content
 
 
+def _render_compaction_input_text(record: ConversationRecord) -> str:
+    metadata = record.metadata
+    lines = [
+        "Compacted prior-session history item:",
+        "type: compaction",
+        f"role: {record.role}",
+        f"kind: {str(metadata.get('compaction_kind', 'condensed_span')).strip() or 'condensed_span'}",
+    ]
+    if metadata.get("verbatim"):
+        lines.append("verbatim: true")
+    lines.extend(
+        [
+            "",
+            record.content,
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _collect_turn_activated_discoverable_tool_names(
     records: Sequence[ConversationRecord],
     *,
@@ -1704,4 +1889,17 @@ def _is_external_runtime_record(record: ConversationRecord) -> bool:
     metadata = record.metadata
     if metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY):
         return False
+    if _is_compaction_replacement_record(record):
+        return False
     return _optional_string(metadata.get(_TURN_ID_METADATA_KEY)) is None
+
+
+def _is_compaction_replacement_record(record: ConversationRecord) -> bool:
+    if record.kind != "message":
+        return False
+    metadata = record.metadata
+    return bool(
+        metadata.get("compaction_item")
+        and metadata.get("type") == "compaction"
+        and record.role in {"system", "user", "assistant"}
+    )

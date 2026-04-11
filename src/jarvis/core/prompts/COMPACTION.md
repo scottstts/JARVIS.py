@@ -1,60 +1,61 @@
-You are generating a COMPACTION CHECKPOINT for an AI agent.
-Goal: maximize the agent's ability to continue work seamlessly with minimal re-reading, minimal drift, and minimal re-work.
-Optimize for machine usefulness, not human prose.
+You are generating REPLACEMENT HISTORY for an AI agent session compaction.
+
+Goal:
+- maximize seamless handover into a fresh session
+- preserve critical intent, corrections, decisions, flow, direction, and end-state
+- compress the prior session into a shorter replacement history that still reads like condensed conversation history plus handover
+
+You will receive transcript items as JSONL.
+Each line is one whole transcript item.
+Treat the item list as ordered chronology.
 
 Hard rules:
-- Preserve exact identifiers, names, file paths, commands, IDs, API routes, error strings, and important numbers.
-- Preserve user corrections, constraints, and redirects verbatim when they changed behavior.
-- Preserve mission, success criteria, non-goals, and guardrails that constrain future actions.
-- Preserve what was active at the end of the session (recency-weighted working set).
-- Preserve outcomes of attempts, including failures, with the reason they failed.
-- If uncertain, mark as assumption and include what would confirm or falsify it.
-- Do not invent details.
+- Output valid JSON only. No markdown fences. No prose before or after the JSON.
+- Output one top-level object with exactly one key: `items`.
+- `items` must be an ordered array of replacement history items.
+- Every replacement history item must include:
+  - `type` and it must equal `"compaction"`
+  - `role` and it must be one of `"system"`, `"user"`, `"assistant"`
+  - `kind` and it must be one of `"session_frame"`, `"preserved_message"`, `"condensed_span"`, `"handover_state"`
+  - `content` as a non-empty string
+- The first item must be:
+  - `type="compaction"`
+  - `role="system"`
+  - `kind="session_frame"`
+- The last item must be:
+  - `type="compaction"`
+  - `role="system"`
+  - `kind="handover_state"`
+- `preserved_message` items must preserve exact wording from the source and must include `verbatim: true`.
+- Do not emit `tool` role items.
+- Do not restate bootstrap identity, tool definitions, or harness policy.
+- Do not invent facts.
 
-Compression policy:
-- Drop redundant tool outputs, logs, and chatter.
-- Keep only high-signal facts that change future decisions.
-- For large outputs, keep one key takeaway plus a pointer to where full data lives.
-- Prefer pointers to payloads (file paths, record IDs, URLs, functions, commands, commits).
+What the replacement history should contain:
+- one compact `session_frame` item that quickly frames the mission, durable constraints, corrections already in force, and the main thread of work
+- exact critical preserved user or assistant messages when the exact wording matters for continuation
+- one or more `condensed_span` assistant items that compress the general flow of the session:
+  - what happened
+  - what changed
+  - what failed
+  - what succeeded
+  - the direction, pace, and nuance of the work
+- one final `handover_state` item that states the true end-state, open threads, and the best next move
 
-Output format (strict):
-<CHECKPOINT>
-MISSION:
-- User request (verbatim if possible):
-- Success criteria / definition of done:
-- Constraints / non-goals:
+Writing rules:
+- Preserve exact identifiers, file paths, commands, IDs, URLs, error strings, and other small literals when they matter.
+- Preserve exact user corrections, redirects, acceptance criteria, and constraints when they matter.
+- Preserve exact assistant commitments or explicit results when they matter.
+- Use `condensed_span` items to collapse long execution-heavy stretches into compact assistant narration.
+- The output should feel like compacted prior conversation history, not like a taxonomy-heavy checkpoint report.
+- Keep it compact. Collapse repetitive execution chatter aggressively, but preserve the actual shape of the session.
+- Source provenance is optional. If useful, include `source_record_ids` and/or `source_range`.
 
-CURRENT STATE:
-- Current phase / what was being worked on last:
-- Completed items (with evidence/pointers):
-- Failed attempts (symptom -> cause -> fix attempt -> result):
-- Active assumptions:
+Preferred shape:
+1. `session_frame`
+2. critical preserved user or assistant messages when needed
+3. condensed flow spans
+4. more preserved messages only when they materially affect continuation
+5. final `handover_state`
 
-DECISIONS_AND_RATIONALE:
-- Decision:
-- Reason:
-- Alternatives rejected (only if it changes future work):
-
-WORKING_SET_REFERENCES:
-- Key artifacts to reopen (files/paths/URLs/records):
-- Key commands/tools used (and why):
-- Critical tiny signatures/snippets only if required; otherwise point to file+line:
-- Persistent memory updates already written (if any):
-
-REPO_ENV_STATE:
-- Repo root:
-- Branch:
-- Uncommitted changes (high level):
-- Tests/status and reproduction commands:
-- Recent files touched (top 5-10) and why:
-
-OPEN_ITEMS:
-- Ordered TODOs:
-- Open questions / blockers:
-- Risks to watch:
-
-RESUME_PLAN:
-1.
-2.
-3.
-</CHECKPOINT>
+Return JSON only.

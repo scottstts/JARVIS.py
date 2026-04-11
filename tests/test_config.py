@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from jarvis import settings as app_settings
 
-from jarvis.core.config import ContextPolicySettings, CoreSettings
+from jarvis.core.config import CompactionSettings, ContextPolicySettings, CoreSettings
 from jarvis.core.errors import CoreConfigurationError
 from jarvis.gateway import GatewaySettings
 
@@ -56,6 +56,7 @@ class CoreSettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.identities_dir, Path("/workspace/identities"))
         self.assertEqual(settings.turn_timezone, app_settings.JARVIS_CORE_TIMEZONE)
+        self.assertEqual(settings.compaction.provider, app_settings.JARVIS_COMPACTION_PROVIDER)
 
     def test_requires_agent_workspace_for_host_runs(self) -> None:
         with patch.dict(
@@ -114,6 +115,19 @@ class CoreSettingsTests(unittest.TestCase):
                 "JARVIS_CORE_TIMEZONE must be a valid IANA timezone",
             ):
                 CoreSettings.from_env()
+
+
+class CompactionSettingsTests(unittest.TestCase):
+    def test_rejects_codex_provider(self) -> None:
+        with self.assertRaisesRegex(
+            CoreConfigurationError,
+            "JARVIS_COMPACTION_PROVIDER cannot be 'codex'",
+        ):
+            CompactionSettings(provider="codex")
+
+    def test_normalizes_provider_name(self) -> None:
+        settings = CompactionSettings(provider=" OpenAI ")
+        self.assertEqual(settings.provider, "openai")
 
 
 class GatewaySettingsTests(unittest.TestCase):

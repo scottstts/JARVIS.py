@@ -434,6 +434,23 @@ core:
       description: "IANA timezone name used for turn timestamps and memory logic."
       type: "text"
       value: "Europe/Dublin"
+  groups:
+    compaction:
+      title: "Compaction"
+      description: "Dedicated provider used only for session compaction."
+      fields:
+        provider:
+          label: "Compaction Provider"
+          description: "Provider used only for compaction requests."
+          type: "select"
+          options:
+            - "openai"
+            - "anthropic"
+            - "gemini"
+            - "grok"
+            - "openrouter"
+            - "lmstudio"
+          value: "openai"
 
 llm:
   title: "LLM Routing"
