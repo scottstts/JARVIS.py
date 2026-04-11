@@ -408,7 +408,7 @@ This keeps:
 
 - model-visible replay natural, because replay still sees role + content text
 - structural provenance available in transcript metadata
-- future compactions able to identify and drop prior compaction items cleanly
+- future compactions able to identify replayable compaction-history records separately from the old-session `kind="compaction"` audit record
 
 ### Old-session compaction audit record
 
@@ -551,7 +551,7 @@ Add or update tests for all of the following:
 - invalid roles, kinds, missing `type=compaction`, or empty content are rejected or dropped
 - new session is rebuilt from replacement-history records rather than one `summary_seed`
 - persisted replacement items keep structural metadata
-- future compactions prune old compaction items cleanly
+- future compactions keep replayable compaction-history records but prune the old-session `kind="compaction"` audit record
 - mid-turn compaction excludes active-turn source records but still carries current-turn rebound records
 - Codex manual `/compact` rebuilds a fresh thread from replacement history
 
