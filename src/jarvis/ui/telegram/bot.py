@@ -522,6 +522,14 @@ class TelegramGatewayBridge:
                     message=exc.message,
                 )
             )
+        except TelegramAPIError as exc:
+            LOGGER.exception(
+                "Telegram route event delivery failed for chat %s (code=%s, message=%s).",
+                chat_id,
+                exc.code or "telegram_error",
+                exc.message or "",
+            )
+            self._finish_all_submitted_turns(chat_id=chat_id)
         except Exception:
             LOGGER.exception("Unexpected route event worker failure.")
             await self._handle_route_event(
@@ -1019,6 +1027,29 @@ class TelegramGatewayBridge:
                     )
                     self._submitted_turns_by_chat[chat_id] = filtered
         self._update_chat_idle_state(chat_id)
+
+    def _finish_all_submitted_turns(self, *, chat_id: int) -> None:
+        client_message_ids: list[str] = []
+        active_turn = self._active_turn_by_chat.get(chat_id)
+        if active_turn is not None:
+            client_message_ids.append(active_turn.client_message_id)
+        client_message_ids.extend(
+            turn.client_message_id
+            for turn in self._submitted_turns_by_chat.get(chat_id, ())
+        )
+        seen_client_message_ids: set[str] = set()
+        for client_message_id in client_message_ids:
+            normalized_client_message_id = client_message_id.strip()
+            if (
+                not normalized_client_message_id
+                or normalized_client_message_id in seen_client_message_ids
+            ):
+                continue
+            seen_client_message_ids.add(normalized_client_message_id)
+            self._finish_submitted_turn(
+                chat_id=chat_id,
+                client_message_id=normalized_client_message_id,
+            )
 
     def _update_chat_idle_state(self, chat_id: int) -> None:
         turns = self._submitted_turns_by_chat.get(chat_id)

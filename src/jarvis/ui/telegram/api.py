@@ -41,6 +41,30 @@ class TelegramRemoteFile:
     file_size: int | None = None
 
 
+def _redact_token(value: str, *, token: str) -> str:
+    if not token:
+        return value
+    return value.replace(token, "[REDACTED]")
+
+
+def _describe_request_error(exc: httpx.RequestError, *, token: str) -> str:
+    detail = _redact_token(str(exc).strip(), token=token)
+    if detail:
+        return f"{type(exc).__name__}: {detail}"
+    return type(exc).__name__
+
+
+def _sanitize_request_error(
+    exc: httpx.RequestError,
+    *,
+    token: str,
+) -> httpx.RequestError:
+    sanitized_message = _redact_token(str(exc).strip(), token=token)
+    if sanitized_message:
+        exc.args = (sanitized_message,)
+    return exc
+
+
 class TelegramBotAPIClient:
     """Async client facade using httpx under the hood."""
 
@@ -154,11 +178,14 @@ class TelegramBotAPIClient:
                     async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
                         if chunk:
                             handle.write(chunk)
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
             raise TelegramAPIError(
                 code="telegram_http_error",
-                message=f"Telegram file download failed for path '{remote_file_path}'.",
-            ) from None
+                message=(
+                    f"Telegram file download failed for path '{remote_file_path}': "
+                    f"{_describe_request_error(exc, token=self._token)}"
+                ),
+            ) from _sanitize_request_error(exc, token=self._token)
         return destination
 
     async def send_message(
@@ -268,11 +295,14 @@ class TelegramBotAPIClient:
                     files=files,
                     timeout=self._file_transfer_timeout_seconds,
                 )
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
                 raise TelegramAPIError(
                     code="telegram_http_error",
-                    message="Telegram request failed for method 'sendDocument'.",
-                ) from None
+                    message=(
+                        "Telegram request failed for method 'sendDocument': "
+                        f"{_describe_request_error(exc, token=self._token)}"
+                    ),
+                ) from _sanitize_request_error(exc, token=self._token)
 
         result = self._parse_method_response(response, method="sendDocument")
         if not isinstance(result, dict):
@@ -297,11 +327,14 @@ class TelegramBotAPIClient:
         url = f"{self._api_base_url}/bot{self._token}/{method}"
         try:
             response = await self._session.post(url, json=payload, timeout=timeout)
-        except httpx.RequestError:
+        except httpx.RequestError as exc:
             raise TelegramAPIError(
                 code="telegram_http_error",
-                message=f"Telegram request failed for method '{method}'.",
-            ) from None
+                message=(
+                    f"Telegram request failed for method '{method}': "
+                    f"{_describe_request_error(exc, token=self._token)}"
+                ),
+            ) from _sanitize_request_error(exc, token=self._token)
 
         return self._parse_method_response(response, method=method)
 

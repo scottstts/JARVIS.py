@@ -2328,6 +2328,62 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_messages[0].text, "**bold**")
         self.assertIsNone(telegram.sent_messages[0].parse_mode)
 
+    async def test_route_event_worker_logs_telegram_delivery_errors_without_relabeling_them(
+        self,
+    ) -> None:
+        telegram = _FakeTelegramClient(
+            message_errors=[
+                TelegramAPIError(
+                    code="telegram_http_error",
+                    message=(
+                        "Telegram request failed for method 'sendMessage': "
+                        "ReadTimeout: timed out"
+                    ),
+                )
+            ]
+        )
+        session = _PersistentFakeRouteSession()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_PersistentFakeGatewayClient(session),
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="/new"),
+        )
+        client_message_id = session.sent_messages[0][1]
+
+        with self.assertLogs("ui.telegram.bot", level="ERROR") as captured_logs:
+            await session.emit(
+                GatewayTurnStartedEvent(
+                    route_id="tg_777",
+                    session_id="session_1",
+                    turn_id="turn_1",
+                    turn_kind="user",
+                    client_message_id=client_message_id,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                )
+            )
+            await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertNotIn(777, bridge._active_turn_by_chat)
+        self.assertNotIn(777, bridge._submitted_turns_by_chat)
+        self.assertTrue(
+            any(
+                "Telegram route event delivery failed for chat 777 "
+                "(code=telegram_http_error, message=Telegram request failed for method "
+                "'sendMessage': ReadTimeout: timed out)."
+                in line
+                for line in captured_logs.output
+            )
+        )
+        self.assertFalse(
+            any("gateway_unavailable" in line for line in captured_logs.output)
+        )
+
     async def test_approval_callback_gateway_error_is_suppressed(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(

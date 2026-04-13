@@ -409,7 +409,9 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
-    async def test_send_message_hides_token_when_transport_fails(self) -> None:
+    async def test_send_message_preserves_transport_error_details_without_leaking_token(
+        self,
+    ) -> None:
         session = _RequestErrorSession(
             httpx.RequestError(
                 "network down",
@@ -425,11 +427,14 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TelegramAPIError) as context:
             await client.send_message(chat_id=123, text="hi")
 
-        self.assertTrue(context.exception.__suppress_context__)
-        self.assertIsNone(context.exception.__cause__)
+        self.assertIn("RequestError: network down", str(context.exception))
         self.assertNotIn("123456:secret", str(context.exception))
+        self.assertIsInstance(context.exception.__cause__, httpx.RequestError)
+        self.assertEqual(str(context.exception.__cause__), "network down")
 
-    async def test_download_file_hides_token_when_transport_fails(self) -> None:
+    async def test_download_file_preserves_transport_error_details_without_leaking_token(
+        self,
+    ) -> None:
         session = _RequestErrorSession(
             httpx.RequestError(
                 "network down",
@@ -449,11 +454,14 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
                     destination_path=Path(tmp) / "report.pdf",
                 )
 
-        self.assertTrue(context.exception.__suppress_context__)
-        self.assertIsNone(context.exception.__cause__)
+        self.assertIn("RequestError: network down", str(context.exception))
         self.assertNotIn("123456:secret", str(context.exception))
+        self.assertIsInstance(context.exception.__cause__, httpx.RequestError)
+        self.assertEqual(str(context.exception.__cause__), "network down")
 
-    async def test_send_document_hides_token_when_transport_fails(self) -> None:
+    async def test_send_document_preserves_transport_error_details_without_leaking_token(
+        self,
+    ) -> None:
         session = _RequestErrorSession(
             httpx.RequestError(
                 "network down",
@@ -473,6 +481,7 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(TelegramAPIError) as context:
                 await client.send_document(chat_id=123, file_path=file_path)
 
-        self.assertTrue(context.exception.__suppress_context__)
-        self.assertIsNone(context.exception.__cause__)
+        self.assertIn("RequestError: network down", str(context.exception))
         self.assertNotIn("123456:secret", str(context.exception))
+        self.assertIsInstance(context.exception.__cause__, httpx.RequestError)
+        self.assertEqual(str(context.exception.__cause__), "network down")
