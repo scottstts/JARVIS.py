@@ -48,6 +48,11 @@ _FILENAME_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _APPROVAL_CALLBACK_PREFIX = "appr"
 _APPROVAL_COMMAND_PREVIEW_CHARS = 1500
+_LIST_ITEM_PREFIX_PATTERN = re.compile(r"^\s*(?:[-*+] |\d+[.)] )")
+_SENTENCE_BREAK_PATTERN = re.compile(r'[.!?](?:["\')\]]+)?(?:\s+|$)')
+_WHITESPACE_BREAK_PATTERN = re.compile(r"\s+")
+_TYPING_ACTION = "typing"
+_TYPING_INITIAL_DELAY_SECONDS = 0.5
 
 
 class GatewayClientLike(Protocol):
@@ -135,6 +140,14 @@ class TelegramClientLike(Protocol):
     ) -> bool:
         """Sends/updates Telegram draft message content."""
 
+    async def send_chat_action(
+        self,
+        *,
+        chat_id: int,
+        action: str,
+    ) -> bool:
+        """Broadcasts a Telegram chat action such as typing."""
+
     async def send_document(
         self,
         *,
@@ -206,15 +219,19 @@ class _ActiveTelegramTurn:
     turn_id: str
     completion: asyncio.Future[None]
     current_draft_id: int
+    stream_transport: str
     show_new_session_notice: bool = False
     accumulated_text: str = ""
-    last_draft_text: str = ""
-    last_draft_at: float = 0.0
+    published_text: str = ""
+    last_publish_at: float = 0.0
     segment_started_at: float = 0.0
     delivered_any_segment: bool = False
     pending_finalized_text_for_dedup: str | None = None
     drafts_enabled: bool = True
     suppress_compaction_completion_text: bool = False
+    current_stream_message_id: int | None = None
+    current_stream_message_text: str = ""
+    typing_task: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
@@ -704,42 +721,16 @@ class TelegramGatewayBridge:
             if not event.delta:
                 return
             active_turn.accumulated_text += event.delta
-            if output_paused or not active_turn.drafts_enabled:
+            if output_paused:
                 return
-            now = time.monotonic()
-            if _should_flush_draft(
-                current_text=active_turn.accumulated_text,
-                last_sent_text=active_turn.last_draft_text,
-                last_sent_monotonic=active_turn.last_draft_at,
-                segment_started_monotonic=active_turn.segment_started_at,
-                min_chars=self._settings.stream_draft_min_chars,
-                min_interval_seconds=self._draft_min_interval_for_chat(chat_id),
-                now_monotonic=now,
-            ):
-                try:
-                    await self._send_draft(
-                        chat_id=chat_id,
-                        draft_id=active_turn.current_draft_id,
-                        text=active_turn.accumulated_text,
-                    )
-                    active_turn.last_draft_text = active_turn.accumulated_text
-                    active_turn.last_draft_at = now
-                    self._record_draft_success(chat_id=chat_id)
-                except TelegramAPIError as exc:
-                    active_turn.drafts_enabled = False
-                    self._record_draft_backoff(chat_id=chat_id, exc=exc)
-                    if exc.retry_after_seconds is not None:
-                        LOGGER.warning(
-                            "sendMessageDraft rate-limited; pausing drafts for %ss.",
-                            exc.retry_after_seconds,
-                        )
-                    else:
-                        LOGGER.exception(
-                            "sendMessageDraft failed; continuing this turn without drafts."
-                        )
+            await self._maybe_publish_stream_chunks(
+                chat_id=chat_id,
+                active_turn=active_turn,
+            )
             return
         if isinstance(event, GatewayLocalNoticeEvent):
             if not output_paused:
+                self._stop_typing_indicator(active_turn)
                 await self._send_html_message(
                     chat_id=chat_id,
                     html_text=_format_local_system_notice(event.text),
@@ -765,23 +756,26 @@ class TelegramGatewayBridge:
                 )
                 and final_text != active_turn.pending_finalized_text_for_dedup
             ):
-                await self._send_final_text(chat_id=chat_id, text=final_text)
-                active_turn.delivered_any_segment = True
+                await self._finalize_stream_segment(
+                    chat_id=chat_id,
+                    active_turn=active_turn,
+                    final_text=final_text,
+                )
             active_turn.pending_finalized_text_for_dedup = None
-            active_turn.accumulated_text = ""
-            active_turn.last_draft_text = ""
-            active_turn.last_draft_at = 0.0
-            active_turn.segment_started_at = time.monotonic()
-            active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+            self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayToolCallEvent):
             flushed_text = _coalesce_visible_text(active_turn.accumulated_text)
             if not output_paused and flushed_text is not None:
-                await self._send_final_text(chat_id=chat_id, text=flushed_text)
-                active_turn.delivered_any_segment = True
+                await self._finalize_stream_segment(
+                    chat_id=chat_id,
+                    active_turn=active_turn,
+                    final_text=flushed_text,
+                )
                 active_turn.pending_finalized_text_for_dedup = flushed_text
             notices_sent = False
             if not output_paused:
+                self._stop_typing_indicator(active_turn)
                 notices_sent = await self._send_tool_usage_notices(
                     chat_id=chat_id,
                     event=event,
@@ -789,28 +783,25 @@ class TelegramGatewayBridge:
                 )
             if notices_sent:
                 active_turn.delivered_any_segment = True
-            active_turn.accumulated_text = ""
-            active_turn.last_draft_text = ""
-            active_turn.last_draft_at = 0.0
-            active_turn.segment_started_at = time.monotonic()
-            active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+            self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayApprovalRequestEvent):
             flushed_text = _coalesce_visible_text(active_turn.accumulated_text)
             if not output_paused and flushed_text is not None:
-                await self._send_final_text(chat_id=chat_id, text=flushed_text)
-                active_turn.delivered_any_segment = True
+                await self._finalize_stream_segment(
+                    chat_id=chat_id,
+                    active_turn=active_turn,
+                    final_text=flushed_text,
+                )
                 active_turn.pending_finalized_text_for_dedup = flushed_text
             if not output_paused:
+                self._stop_typing_indicator(active_turn)
                 await self._send_approval_request_message(chat_id=chat_id, approval=event)
-            active_turn.accumulated_text = ""
-            active_turn.last_draft_text = ""
-            active_turn.last_draft_at = 0.0
-            active_turn.segment_started_at = time.monotonic()
-            active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+            self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayAuthRequiredEvent):
             if not output_paused:
+                self._stop_typing_indicator(active_turn)
                 await self._send_html_message(
                     chat_id=chat_id,
                     html_text=_format_auth_required_message(event),
@@ -836,7 +827,11 @@ class TelegramGatewayBridge:
                     and event.command == "/compact"
                     and final_text == "Context compacted into a new session."
                 ):
-                    await self._send_final_text(chat_id=chat_id, text=final_text)
+                    await self._finalize_stream_segment(
+                        chat_id=chat_id,
+                        active_turn=active_turn,
+                        final_text=final_text,
+                    )
             self._finish_submitted_turn(
                 chat_id=chat_id,
                 client_message_id=active_turn.client_message_id,
@@ -854,6 +849,7 @@ class TelegramGatewayBridge:
             turn_id=turn_id,
             completion=submitted_turn.completion,
             current_draft_id=self._next_draft_id_for_chat(chat_id),
+            stream_transport=self._settings.stream_transport,
             show_new_session_notice=submitted_turn.show_new_session_notice,
             segment_started_at=time.monotonic(),
             drafts_enabled=(
@@ -867,7 +863,222 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 html_text=_format_local_system_notice("Started a new session."),
             )
+        active_turn.typing_task = asyncio.create_task(
+            self._typing_indicator_loop(chat_id=chat_id, active_turn=active_turn),
+            name=f"jarvis-telegram-typing-{chat_id}",
+        )
         return active_turn
+
+    async def _typing_indicator_loop(
+        self,
+        *,
+        chat_id: int,
+        active_turn: _ActiveTelegramTurn,
+    ) -> None:
+        initial_delay = min(
+            _TYPING_INITIAL_DELAY_SECONDS,
+            self._settings.stream_typing_indicator_interval_seconds,
+        )
+        try:
+            await asyncio.sleep(initial_delay)
+            while not active_turn.delivered_any_segment and not self._chat_output_paused(chat_id):
+                await self._telegram.send_chat_action(
+                    chat_id=chat_id,
+                    action=_TYPING_ACTION,
+                )
+                await asyncio.sleep(self._settings.stream_typing_indicator_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+        except TelegramAPIError:
+            LOGGER.exception("Failed to send Telegram typing indicator.")
+
+    def _stop_typing_indicator(self, active_turn: _ActiveTelegramTurn) -> None:
+        typing_task = active_turn.typing_task
+        if typing_task is None:
+            return
+        typing_task.cancel()
+        active_turn.typing_task = None
+
+    async def _maybe_publish_stream_chunks(
+        self,
+        *,
+        chat_id: int,
+        active_turn: _ActiveTelegramTurn,
+    ) -> None:
+        if active_turn.stream_transport == "draft" and not active_turn.drafts_enabled:
+            return
+        now = time.monotonic()
+        while True:
+            idle_flush_seconds = self._settings.stream_chunk_idle_flush_seconds
+            if active_turn.stream_transport == "draft":
+                idle_flush_seconds = self._draft_min_interval_for_chat(chat_id)
+            next_chunk = _next_stream_chunk(
+                current_text=active_turn.accumulated_text,
+                published_text=active_turn.published_text,
+                segment_started_monotonic=active_turn.segment_started_at,
+                last_publish_monotonic=active_turn.last_publish_at,
+                min_chars=self._settings.stream_chunk_min_chars,
+                max_chars=self._settings.stream_chunk_max_chars,
+                idle_flush_seconds=idle_flush_seconds,
+                now_monotonic=now,
+            )
+            if next_chunk is None:
+                return
+            try:
+                await self._publish_stream_text(
+                    chat_id=chat_id,
+                    active_turn=active_turn,
+                    text=active_turn.published_text + next_chunk,
+                )
+            except TelegramAPIError as exc:
+                if active_turn.stream_transport != "draft":
+                    raise
+                active_turn.drafts_enabled = False
+                self._record_draft_backoff(chat_id=chat_id, exc=exc)
+                if exc.retry_after_seconds is not None:
+                    LOGGER.warning(
+                        "sendMessageDraft rate-limited; pausing drafts for %ss.",
+                        exc.retry_after_seconds,
+                    )
+                else:
+                    LOGGER.exception(
+                        "sendMessageDraft failed; continuing this turn without draft streaming."
+                    )
+                return
+            active_turn.published_text += next_chunk
+            active_turn.last_publish_at = now
+            active_turn.delivered_any_segment = True
+            if active_turn.stream_transport == "draft":
+                self._record_draft_success(chat_id=chat_id)
+
+    async def _finalize_stream_segment(
+        self,
+        *,
+        chat_id: int,
+        active_turn: _ActiveTelegramTurn,
+        final_text: str,
+    ) -> None:
+        normalized_text = _coalesce_visible_text(final_text)
+        if normalized_text is None:
+            return
+        if active_turn.stream_transport == "draft":
+            self._stop_typing_indicator(active_turn)
+            await self._send_final_text(chat_id=chat_id, text=normalized_text)
+            active_turn.published_text = normalized_text
+            active_turn.last_publish_at = time.monotonic()
+            active_turn.delivered_any_segment = True
+            return
+        if not normalized_text.startswith(active_turn.published_text):
+            self._stop_typing_indicator(active_turn)
+            await self._send_final_text(chat_id=chat_id, text=normalized_text)
+            active_turn.delivered_any_segment = True
+            return
+        try:
+            await self._publish_stream_text(
+                chat_id=chat_id,
+                active_turn=active_turn,
+                text=normalized_text,
+            )
+        except TelegramAPIError:
+            if active_turn.stream_transport != "draft":
+                raise
+            active_turn.drafts_enabled = False
+            self._stop_typing_indicator(active_turn)
+            await self._send_final_text(chat_id=chat_id, text=normalized_text)
+            active_turn.delivered_any_segment = True
+            return
+        active_turn.published_text = normalized_text
+        active_turn.last_publish_at = time.monotonic()
+        active_turn.delivered_any_segment = True
+        if active_turn.stream_transport == "draft":
+            self._record_draft_success(chat_id=chat_id)
+
+    async def _publish_stream_text(
+        self,
+        *,
+        chat_id: int,
+        active_turn: _ActiveTelegramTurn,
+        text: str,
+    ) -> None:
+        normalized_text = _coalesce_visible_text(text)
+        if normalized_text is None or normalized_text == active_turn.published_text:
+            return
+        self._stop_typing_indicator(active_turn)
+        if active_turn.stream_transport == "draft":
+            await self._send_draft(
+                chat_id=chat_id,
+                draft_id=active_turn.current_draft_id,
+                text=normalized_text,
+            )
+            return
+        await self._append_text_via_edit_transport(
+            chat_id=chat_id,
+            active_turn=active_turn,
+            text=normalized_text,
+        )
+
+    async def _append_text_via_edit_transport(
+        self,
+        *,
+        chat_id: int,
+        active_turn: _ActiveTelegramTurn,
+        text: str,
+    ) -> None:
+        if text == active_turn.published_text:
+            return
+        append_text = text[len(active_turn.published_text) :]
+        while append_text:
+            if active_turn.current_stream_message_id is None:
+                initial_chunk = append_text[: self._settings.telegram_max_message_chars]
+                response = await self._send_formatted_message_returning_response(
+                    chat_id=chat_id,
+                    text=initial_chunk,
+                )
+                message_id = response.get("message_id")
+                if not isinstance(message_id, int):
+                    raise TelegramAPIError(
+                        code="invalid_telegram_response",
+                        message="Telegram sendMessage did not include a message_id.",
+                    )
+                active_turn.current_stream_message_id = message_id
+                active_turn.current_stream_message_text = initial_chunk
+                append_text = append_text[len(initial_chunk) :]
+                continue
+
+            remaining_capacity = (
+                self._settings.telegram_max_message_chars
+                - len(active_turn.current_stream_message_text)
+            )
+            if remaining_capacity <= 0:
+                active_turn.current_stream_message_id = None
+                active_turn.current_stream_message_text = ""
+                continue
+            piece = append_text[:remaining_capacity]
+            updated_text = active_turn.current_stream_message_text + piece
+            await self._edit_formatted_message(
+                chat_id=chat_id,
+                message_id=active_turn.current_stream_message_id,
+                text=updated_text,
+            )
+            active_turn.current_stream_message_text = updated_text
+            append_text = append_text[len(piece) :]
+            if len(active_turn.current_stream_message_text) >= self._settings.telegram_max_message_chars:
+                active_turn.current_stream_message_id = None
+                active_turn.current_stream_message_text = ""
+
+    def _reset_stream_segment(
+        self,
+        *,
+        chat_id: int,
+        active_turn: _ActiveTelegramTurn,
+    ) -> None:
+        active_turn.accumulated_text = ""
+        active_turn.published_text = ""
+        active_turn.last_publish_at = 0.0
+        active_turn.segment_started_at = time.monotonic()
+        active_turn.current_draft_id = self._next_draft_id_for_chat(chat_id)
+        active_turn.current_stream_message_id = None
+        active_turn.current_stream_message_text = ""
 
     async def _handle_background_route_event(
         self,
@@ -1003,7 +1214,9 @@ class TelegramGatewayBridge:
         return idle_event
 
     def _finish_submitted_turn(self, *, chat_id: int, client_message_id: str) -> None:
-        self._active_turn_by_chat.pop(chat_id, None)
+        active_turn = self._active_turn_by_chat.pop(chat_id, None)
+        if active_turn is not None:
+            self._stop_typing_indicator(active_turn)
         self._clear_chat_output_resume_candidate_if_matches(
             chat_id=chat_id,
             client_message_id=client_message_id,
@@ -1170,6 +1383,9 @@ class TelegramGatewayBridge:
             self._output_pause_state_by_chat[chat_id] = state
         state.paused = True
         state.resume_client_message_id = None
+        active_turn = self._active_turn_by_chat.get(chat_id)
+        if active_turn is not None:
+            self._stop_typing_indicator(active_turn)
 
     def _chat_output_paused(self, chat_id: int) -> bool:
         state = self._output_pause_state_by_chat.get(chat_id)
@@ -1338,6 +1554,42 @@ class TelegramGatewayBridge:
             await self._send_formatted_message(chat_id=chat_id, text=chunk)
 
     async def _send_formatted_message(self, *, chat_id: int, text: str) -> None:
+        await self._send_formatted_message_returning_response(chat_id=chat_id, text=text)
+
+    async def _send_formatted_message_returning_response(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+    ) -> dict[str, Any]:
+        plain_text = text.strip()
+        if not plain_text:
+            raise TelegramAPIError(
+                code="telegram_api_error_400",
+                message="Bad Request: text must be non-empty",
+            )
+
+        formatted_text = render_markdown_to_telegram_html(plain_text)
+        if _has_visible_telegram_text(formatted_text):
+            try:
+                return await self._telegram.send_message(
+                    chat_id=chat_id,
+                    text=formatted_text,
+                    parse_mode="HTML",
+                )
+            except TelegramAPIError as exc:
+                if not _is_formatting_error(exc):
+                    raise
+
+        return await self._telegram.send_message(chat_id=chat_id, text=plain_text)
+
+    async def _edit_formatted_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+    ) -> None:
         plain_text = text.strip()
         if not plain_text:
             return
@@ -1345,8 +1597,9 @@ class TelegramGatewayBridge:
         formatted_text = render_markdown_to_telegram_html(plain_text)
         if _has_visible_telegram_text(formatted_text):
             try:
-                await self._telegram.send_message(
+                await self._telegram.edit_message_text(
                     chat_id=chat_id,
+                    message_id=message_id,
                     text=formatted_text,
                     parse_mode="HTML",
                 )
@@ -1355,7 +1608,11 @@ class TelegramGatewayBridge:
                 if not _is_formatting_error(exc):
                     raise
 
-        await self._telegram.send_message(chat_id=chat_id, text=plain_text)
+        await self._telegram.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=plain_text,
+        )
 
     async def _send_html_message(self, *, chat_id: int, html_text: str) -> None:
         normalized_html = html_text.strip()
@@ -1420,7 +1677,7 @@ class TelegramGatewayBridge:
     def _record_draft_backoff(self, *, chat_id: int, exc: TelegramAPIError) -> None:
         if exc.retry_after_seconds is None:
             return
-        base_interval = self._settings.stream_draft_min_interval_seconds
+        base_interval = self._settings.stream_chunk_idle_flush_seconds
         current_interval = self._draft_min_interval_by_chat.get(chat_id, base_interval)
         backed_off_interval = max(
             base_interval,
@@ -1433,7 +1690,7 @@ class TelegramGatewayBridge:
         )
 
     def _record_draft_success(self, *, chat_id: int) -> None:
-        base_interval = self._settings.stream_draft_min_interval_seconds
+        base_interval = self._settings.stream_chunk_idle_flush_seconds
         current_interval = self._draft_min_interval_by_chat.get(chat_id)
         if current_interval is None or current_interval <= base_interval:
             self._draft_min_interval_by_chat.pop(chat_id, None)
@@ -1447,7 +1704,7 @@ class TelegramGatewayBridge:
     def _draft_min_interval_for_chat(self, chat_id: int) -> float:
         return self._draft_min_interval_by_chat.get(
             chat_id,
-            self._settings.stream_draft_min_interval_seconds,
+            self._settings.stream_chunk_idle_flush_seconds,
         )
 
     def _next_draft_id_for_chat(self, chat_id: int) -> int:
@@ -1931,32 +2188,130 @@ async def _maintain_temp_dir(temp_dir: Path) -> None:
         LOGGER.info("Cleared Telegram temp dir %s", temp_dir)
 
 
-def _should_flush_draft(
+def _next_stream_chunk(
     *,
     current_text: str,
-    last_sent_text: str,
-    last_sent_monotonic: float,
+    published_text: str,
     segment_started_monotonic: float,
+    last_publish_monotonic: float,
     min_chars: int,
-    min_interval_seconds: float,
+    max_chars: int,
+    idle_flush_seconds: float,
     now_monotonic: float,
-) -> bool:
-    if not current_text or current_text == last_sent_text:
-        return False
+) -> str | None:
+    if not current_text or current_text == published_text:
+        return None
+    if not current_text.startswith(published_text):
+        return None
 
-    unsent_chars = len(current_text) - len(last_sent_text)
-    if unsent_chars <= 0:
-        return False
+    pending_text = current_text[len(published_text) :]
+    if not pending_text:
+        return None
 
-    if last_sent_monotonic == 0.0:
-        if unsent_chars < min_chars:
-            return False
-        return (now_monotonic - segment_started_monotonic) >= min_interval_seconds
+    last_activity_at = (
+        last_publish_monotonic
+        if last_publish_monotonic > 0.0
+        else segment_started_monotonic
+    )
+    idle_elapsed = (now_monotonic - last_activity_at) >= idle_flush_seconds
+    if len(pending_text) < min_chars and len(pending_text) < max_chars:
+        return None
+    if len(pending_text) < max_chars:
+        if not idle_elapsed:
+            return None
+        preferred_boundary = _preferred_stream_boundary(
+            pending_text,
+            min_chars=min_chars,
+            max_chars=max_chars,
+            prefix_text=published_text,
+            include_whitespace=False,
+        )
+        if preferred_boundary is not None:
+            return pending_text[:preferred_boundary]
+        if _inside_open_fence(published_text + pending_text):
+            return None
+        return pending_text
 
-    if (now_monotonic - last_sent_monotonic) < min_interval_seconds:
-        return False
+    preferred_boundary = _preferred_stream_boundary(
+        pending_text,
+        min_chars=min_chars,
+        max_chars=max_chars,
+        prefix_text=published_text,
+        include_whitespace=True,
+    )
+    if preferred_boundary is not None:
+        return pending_text[:preferred_boundary]
+    return pending_text[:max_chars]
 
-    return True
+
+def _preferred_stream_boundary(
+    pending_text: str,
+    *,
+    min_chars: int,
+    max_chars: int,
+    prefix_text: str,
+    include_whitespace: bool,
+) -> int | None:
+    search_text = pending_text[:max_chars]
+    candidate_groups: tuple[tuple[int, ...], ...] = (
+        _paragraph_break_candidates(search_text),
+        _list_item_break_candidates(search_text),
+        _sentence_break_candidates(search_text),
+        _newline_break_candidates(search_text),
+    )
+    if include_whitespace:
+        candidate_groups += (_whitespace_break_candidates(search_text),)
+    for candidates in candidate_groups:
+        for candidate in reversed(candidates):
+            if candidate < min_chars:
+                continue
+            if _inside_open_fence(prefix_text + search_text[:candidate]):
+                continue
+            return candidate
+    return None
+
+
+def _paragraph_break_candidates(text: str) -> tuple[int, ...]:
+    candidates: list[int] = []
+    start = 0
+    while True:
+        index = text.find("\n\n", start)
+        if index == -1:
+            break
+        candidate = index + 2
+        if candidate <= len(text):
+            candidates.append(candidate)
+        start = index + 2
+    return tuple(candidates)
+
+
+def _list_item_break_candidates(text: str) -> tuple[int, ...]:
+    candidates: list[int] = []
+    line_start = 0
+    for index, char in enumerate(text):
+        if char != "\n":
+            continue
+        line = text[line_start:index]
+        if _LIST_ITEM_PREFIX_PATTERN.match(line):
+            candidates.append(index + 1)
+        line_start = index + 1
+    return tuple(candidates)
+
+
+def _sentence_break_candidates(text: str) -> tuple[int, ...]:
+    return tuple(match.end() for match in _SENTENCE_BREAK_PATTERN.finditer(text))
+
+
+def _newline_break_candidates(text: str) -> tuple[int, ...]:
+    return tuple(index + 1 for index, char in enumerate(text) if char == "\n")
+
+
+def _whitespace_break_candidates(text: str) -> tuple[int, ...]:
+    return tuple(match.end() for match in _WHITESPACE_BREAK_PATTERN.finditer(text))
+
+
+def _inside_open_fence(text: str) -> bool:
+    return text.count("```") % 2 == 1
 
 
 def _has_visible_telegram_text(text: str) -> bool:

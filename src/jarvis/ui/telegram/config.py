@@ -153,10 +153,15 @@ class UISettings:
     poll_error_backoff_seconds: float = app_settings.JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS
     gateway_ws_base_url: str = _DEFAULT_GATEWAY_WS_BASE_URL
     gateway_connect_timeout_seconds: float = app_settings.JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS
-    stream_draft_min_interval_seconds: float = (
+    stream_transport: str = app_settings.JARVIS_UI_STREAM_TRANSPORT
+    stream_chunk_idle_flush_seconds: float = (
         app_settings.JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS
     )
-    stream_draft_min_chars: int = app_settings.JARVIS_UI_STREAM_DRAFT_MIN_CHARS
+    stream_chunk_min_chars: int = app_settings.JARVIS_UI_STREAM_DRAFT_MIN_CHARS
+    stream_chunk_max_chars: int = app_settings.JARVIS_UI_STREAM_CHUNK_MAX_CHARS
+    stream_typing_indicator_interval_seconds: float = (
+        app_settings.JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS
+    )
     telegram_max_message_chars: int = app_settings.JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS
 
     def __post_init__(self) -> None:
@@ -182,12 +187,24 @@ class UISettings:
             raise UIConfigurationError(
                 "JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS must be > 0."
             )
-        if self.stream_draft_min_interval_seconds < 0:
+        if self.stream_transport not in {"edit", "draft"}:
+            raise UIConfigurationError(
+                "JARVIS_UI_STREAM_TRANSPORT must be either 'edit' or 'draft'."
+            )
+        if self.stream_chunk_idle_flush_seconds < 0:
             raise UIConfigurationError(
                 "JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS must be >= 0."
             )
-        if self.stream_draft_min_chars <= 0:
+        if self.stream_chunk_min_chars <= 0:
             raise UIConfigurationError("JARVIS_UI_STREAM_DRAFT_MIN_CHARS must be > 0.")
+        if self.stream_chunk_max_chars < self.stream_chunk_min_chars:
+            raise UIConfigurationError(
+                "JARVIS_UI_STREAM_CHUNK_MAX_CHARS must be >= JARVIS_UI_STREAM_DRAFT_MIN_CHARS."
+            )
+        if self.stream_typing_indicator_interval_seconds <= 0:
+            raise UIConfigurationError(
+                "JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS must be > 0."
+            )
         if self.telegram_max_message_chars <= 0:
             raise UIConfigurationError("JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS must be > 0.")
         _normalize_gateway_ws_base_url(self.gateway_ws_base_url)
@@ -243,13 +260,25 @@ class UISettings:
                 "JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS",
                 app_settings.JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS,
             ),
-            stream_draft_min_interval_seconds=_parse_float_env(
+            stream_transport=_optional_env(
+                "JARVIS_UI_STREAM_TRANSPORT",
+                app_settings.JARVIS_UI_STREAM_TRANSPORT,
+            ),
+            stream_chunk_idle_flush_seconds=_parse_float_env(
                 "JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS",
                 app_settings.JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS,
             ),
-            stream_draft_min_chars=_parse_int_env(
+            stream_chunk_min_chars=_parse_int_env(
                 "JARVIS_UI_STREAM_DRAFT_MIN_CHARS",
                 app_settings.JARVIS_UI_STREAM_DRAFT_MIN_CHARS,
+            ),
+            stream_chunk_max_chars=_parse_int_env(
+                "JARVIS_UI_STREAM_CHUNK_MAX_CHARS",
+                app_settings.JARVIS_UI_STREAM_CHUNK_MAX_CHARS,
+            ),
+            stream_typing_indicator_interval_seconds=_parse_float_env(
+                "JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS",
+                app_settings.JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS,
             ),
             telegram_max_message_chars=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS",

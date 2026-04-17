@@ -143,6 +143,7 @@
 - Gateway broad `internal_error` fallbacks should always log the underlying exception stack, or provider/configuration failures become opaque from Telegram warnings alone.
 - Telegram Bot API transport failures must preserve the sanitized `httpx` exception type/message in logs and must not be re-labeled as `gateway_unavailable` by the route worker.
 - OpenRouter app attribution depends on `HTTP-Referer` plus title headers, so `providers.openrouter.site_url` must be set in workspace settings if you want requests to show up as a named app instead of `unknown`.
+- OpenRouter chat payloads now always send `provider.sort="throughput"` so routing prefers the highest-throughput backend instead of default load balancing.
 - Grok now uses xAI Responses with `store=false`, replays assistant-side `response.output` from transcript `provider_metadata` when available, and keeps `x-grok-conv-id` as the routing hint for stateless prompt-cache reuse.
 - Codex keeps `codex` as a settings-level provider name but routes main and subagent actors through a separate host app-server backend, with host/container path translation and auth flow kept out of `src/jarvis/llm/`.
 - Codex is now backend-routed rather than provider-adapted: `RouteRuntime` and `SubagentManager` choose `CodexActorRuntime`, while direct `LLMService` use with provider `codex` fails fast by design.
@@ -157,3 +158,4 @@
 - Main-agent subagent progress notes now include the latest child assistant report for finalize/inspect cases so Codex can answer from the child’s actual output instead of wasting a follow-up on `subagent_monitor` or `subagent_step_in`.
 - Approved compaction target: separate `core.compaction.provider`, item-level only pre/post pruning, and replacement history as structured `type=compaction` transcript items mixing frame, preserved messages, condensed spans, and final handover state instead of one summary seed.
 - Replayable `type=compaction` message records must stay in later compaction source; only the non-replayable `kind="compaction"` audit record should be pruned, or multi-generation compaction loses earlier context.
+- Telegram streaming now defaults to editing one real message in place with paragraph/list/sentence-aware chunk boundaries plus a pre-first-chunk `sendChatAction("typing")`; `sendMessageDraft` remains an optional fallback transport and still keeps per-chat backoff on 429s.

@@ -254,6 +254,19 @@ class TelegramBotAPIClient:
         result = await self._call_method("answerCallbackQuery", payload=payload)
         return bool(result)
 
+    async def send_chat_action(
+        self,
+        *,
+        chat_id: int,
+        action: str,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "action": action,
+        }
+        result = await self._call_method("sendChatAction", payload=payload)
+        return bool(result)
+
     async def send_message_draft(
         self,
         *,

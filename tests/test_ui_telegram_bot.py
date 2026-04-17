@@ -17,7 +17,7 @@ from jarvis.ui.telegram.bot import (
     IncomingTelegramFile,
     IncomingTextMessage,
     TelegramGatewayBridge,
-    _should_flush_draft,
+    _next_stream_chunk,
     _clear_directory_contents,
     chat_id_for_route_id,
     parse_incoming_approval_callback,
@@ -86,6 +86,12 @@ class _AnsweredCallback:
     show_alert: bool
 
 
+@dataclass(slots=True)
+class _SentChatAction:
+    chat_id: int
+    action: str
+
+
 class _FakeTelegramClient:
     def __init__(
         self,
@@ -107,6 +113,7 @@ class _FakeTelegramClient:
         self.sent_documents: list[_SentDocument] = []
         self.edited_messages: list[_EditedMessage] = []
         self.answered_callbacks: list[_AnsweredCallback] = []
+        self.sent_chat_actions: list[_SentChatAction] = []
         self.message_attempts = 0
         self.draft_attempts = 0
         self.closed = False
@@ -205,6 +212,17 @@ class _FakeTelegramClient:
                 text=text,
                 show_alert=show_alert,
             )
+        )
+        return True
+
+    async def send_chat_action(
+        self,
+        *,
+        chat_id: int,
+        action: str,
+    ) -> bool:
+        self.sent_chat_actions.append(
+            _SentChatAction(chat_id=chat_id, action=action)
         )
         return True
 
@@ -382,8 +400,11 @@ def _settings(**overrides: object) -> UISettings:
     values: dict[str, object] = {
         "telegram_token": "test-token",
         "telegram_allowed_user_id": 777,
-        "stream_draft_min_interval_seconds": 0.0,
-        "stream_draft_min_chars": 1,
+        "stream_transport": "edit",
+        "stream_chunk_idle_flush_seconds": 0.0,
+        "stream_chunk_min_chars": 1,
+        "stream_chunk_max_chars": 4096,
+        "stream_typing_indicator_interval_seconds": 4.0,
     }
     values.update(overrides)
     return UISettings(**values)
@@ -607,7 +628,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_messages, [])
         self.assertEqual(telegram.edited_messages, [])
 
-    async def test_handle_message_streams_drafts_then_final_message(self) -> None:
+    async def test_handle_message_streams_single_official_message_via_edits(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             events=[
@@ -628,20 +649,54 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            [draft.draft.text for draft in telegram.sent_drafts],
-            ["stream-", "stream-reply"],
+            [message.text for message in telegram.sent_messages],
+            ["stream-"],
         )
         self.assertEqual(
-            [message.text for message in telegram.sent_messages],
+            [message.parse_mode for message in telegram.sent_messages],
+            ["HTML"],
+        )
+        self.assertEqual(
+            [message.text for message in telegram.edited_messages],
             ["stream-reply"],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.edited_messages],
+            ["HTML"],
+        )
+        self.assertEqual(telegram.sent_drafts, [])
+
+    async def test_handle_message_streams_drafts_when_draft_transport_enabled(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayDeltaEvent(session_id="session", delta="stream-"),
+                GatewayDeltaEvent(session_id="session", delta="reply"),
+                GatewayMessageEvent(session_id="session", text="stream-reply"),
+                GatewayTurnDoneEvent(session_id="session", response_text="stream-reply"),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_transport="draft"),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [draft.draft.text for draft in telegram.sent_drafts],
+            ["stream-", "stream-reply"],
         )
         self.assertEqual(
             [draft.parse_mode for draft in telegram.sent_drafts],
             ["HTML", "HTML"],
         )
         self.assertEqual(
-            [message.parse_mode for message in telegram.sent_messages],
-            ["HTML"],
+            [message.text for message in telegram.sent_messages],
+            ["stream-reply"],
         )
 
     async def test_handle_message_suppresses_blank_final_turn(self) -> None:
@@ -686,17 +741,11 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            [draft.draft.id for draft in telegram.sent_drafts],
-            [1, 2],
-        )
-        self.assertEqual(
-            [draft.draft.text for draft in telegram.sent_drafts],
-            ["Working on it.", "Done."],
-        )
-        self.assertEqual(
             [message.text for message in telegram.sent_messages],
             ["Working on it.", "Done."],
         )
+        self.assertEqual(telegram.edited_messages, [])
+        self.assertEqual(telegram.sent_drafts, [])
 
     async def test_handle_message_emits_normalized_tool_notice(self) -> None:
         telegram = _FakeTelegramClient()
@@ -710,7 +759,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -737,7 +786,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -777,7 +826,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -808,7 +857,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -844,7 +893,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -906,7 +955,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -954,7 +1003,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_chars=999),
+            settings=_settings(stream_chunk_min_chars=999),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -990,6 +1039,72 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.draft_attempts, 0)
         self.assertEqual(telegram.sent_drafts, [])
         self.assertEqual([message.text for message in telegram.sent_messages], ["pong"])
+
+    async def test_dispatch_message_sends_typing_indicator_before_first_chunk(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+            )
+        )
+
+        await asyncio.sleep(0.6)
+
+        self.assertEqual(
+            [(action.chat_id, action.action) for action in telegram.sent_chat_actions],
+            [(777, "typing")],
+        )
+
+        await session.emit(
+            GatewayDeltaEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                delta="hello",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                text="hello",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                response_text="hello",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual([message.text for message in telegram.sent_messages], ["hello"])
+        self.assertEqual(len(telegram.sent_chat_actions), 1)
 
     async def test_dispatch_message_repeats_tool_notice_when_same_tool_is_used_in_next_turn(
         self,
@@ -1183,7 +1298,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([message.text for message in telegram.sent_messages], ["done"])
-        self.assertEqual([draft.draft.text for draft in telegram.sent_drafts], ["done"])
+        self.assertEqual(telegram.sent_drafts, [])
 
     async def test_handle_message_skips_invisible_unicode_only_assistant_segment(self) -> None:
         telegram = _FakeTelegramClient()
@@ -1208,7 +1323,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([message.text for message in telegram.sent_messages], ["done"])
-        self.assertEqual([draft.draft.text for draft in telegram.sent_drafts], ["done"])
+        self.assertEqual(telegram.sent_drafts, [])
 
     async def test_handle_message_falls_back_to_plain_text_for_empty_html_drafts(self) -> None:
         telegram = _FakeTelegramClient()
@@ -1220,7 +1335,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(),
+            settings=_settings(stream_transport="draft"),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -2110,7 +2225,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         bridge = TelegramGatewayBridge(
-            settings=_settings(),
+            settings=_settings(stream_transport="draft"),
             telegram_client=telegram,
             gateway_client=gateway,
         )
@@ -2419,57 +2534,65 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramBotHelpersTests(unittest.TestCase):
-    def test_should_flush_draft_waits_for_initial_interval(self) -> None:
-        self.assertFalse(
-            _should_flush_draft(
+    def test_next_stream_chunk_waits_for_idle_flush(self) -> None:
+        self.assertIsNone(
+            _next_stream_chunk(
                 current_text="hello world, this is enough text",
-                last_sent_text="",
-                last_sent_monotonic=0.0,
+                published_text="",
                 segment_started_monotonic=10.0,
+                last_publish_monotonic=0.0,
                 min_chars=10,
-                min_interval_seconds=1.0,
+                max_chars=100,
+                idle_flush_seconds=1.0,
                 now_monotonic=10.5,
             )
         )
-        self.assertTrue(
-            _should_flush_draft(
+        self.assertEqual(
+            _next_stream_chunk(
                 current_text="hello world, this is enough text",
-                last_sent_text="",
-                last_sent_monotonic=0.0,
+                published_text="",
                 segment_started_monotonic=10.0,
+                last_publish_monotonic=0.0,
                 min_chars=10,
-                min_interval_seconds=1.0,
+                max_chars=100,
+                idle_flush_seconds=1.0,
                 now_monotonic=11.0,
-            )
+            ),
+            "hello world, this is enough text",
         )
 
-    def test_should_flush_draft_respects_interval_after_first_send(self) -> None:
-        self.assertFalse(
-            _should_flush_draft(
-                current_text="hello world with more text",
-                last_sent_text="hello world",
-                last_sent_monotonic=20.0,
-                segment_started_monotonic=19.0,
-                min_chars=5,
-                min_interval_seconds=1.0,
-                now_monotonic=20.5,
-            )
+    def test_next_stream_chunk_prefers_paragraph_boundary(self) -> None:
+        self.assertEqual(
+            _next_stream_chunk(
+                current_text="First paragraph.\n\nSecond paragraph keeps going.",
+                published_text="",
+                segment_started_monotonic=5.0,
+                last_publish_monotonic=0.0,
+                min_chars=10,
+                max_chars=80,
+                idle_flush_seconds=0.0,
+                now_monotonic=5.0,
+            ),
+            "First paragraph.\n\n",
         )
-        self.assertTrue(
-            _should_flush_draft(
-                current_text="hello world with more text",
-                last_sent_text="hello world",
-                last_sent_monotonic=20.0,
-                segment_started_monotonic=19.0,
+
+    def test_next_stream_chunk_avoids_open_fenced_code_blocks(self) -> None:
+        self.assertIsNone(
+            _next_stream_chunk(
+                current_text="```python\nprint('hello')\n",
+                published_text="",
+                segment_started_monotonic=1.0,
+                last_publish_monotonic=0.0,
                 min_chars=5,
-                min_interval_seconds=1.0,
-                now_monotonic=21.1,
+                max_chars=80,
+                idle_flush_seconds=0.0,
+                now_monotonic=1.0,
             )
         )
 
     def test_draft_backoff_increases_interval_and_success_decays_it(self) -> None:
         bridge = TelegramGatewayBridge(
-            settings=_settings(stream_draft_min_interval_seconds=1.0),
+            settings=_settings(stream_chunk_idle_flush_seconds=1.0),
             telegram_client=_FakeTelegramClient(),
             gateway_client=_FakeGatewayClient(),
         )

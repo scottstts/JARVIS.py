@@ -380,22 +380,44 @@ ui:
           value: 4096
     streaming:
       title: "Streaming"
-      description: "Draft update cadence for streaming replies."
+      description: "Chunked Telegram streaming behavior for in-progress replies."
       fields:
+        transport:
+          label: "Telegram Stream Transport"
+          description: "How Telegram should show in-progress text."
+          type: "select"
+          options:
+            - "edit"
+            - "draft"
+          value: "edit"
         draft_min_interval_seconds:
-          label: "Draft Min Interval Seconds"
-          description: "Minimum delay between streamed draft updates."
+          label: "Chunk Idle Flush Seconds"
+          description: "Maximum idle delay before Jarvis publishes the next natural text chunk."
           type: "float"
           min: 0
           step: 0.1
-          value: 1
+          value: 1.2
         draft_min_chars:
-          label: "Draft Min Characters"
-          description: "Minimum accumulated draft size before the UI sends an update."
+          label: "Chunk Min Characters"
+          description: "Minimum buffered text before Jarvis looks for a natural chunk boundary."
           type: "integer"
           min: 1
           step: 1
-          value: 20
+          value: 80
+        chunk_max_chars:
+          label: "Chunk Max Characters"
+          description: "Hard cap for one streamed append before Jarvis forces a boundary."
+          type: "integer"
+          min: 1
+          step: 1
+          value: 350
+        typing_indicator_interval_seconds:
+          label: "Typing Indicator Interval Seconds"
+          description: "How often Telegram typing status is refreshed before the first visible chunk."
+          type: "float"
+          min: 0.5
+          step: 0.5
+          value: 4
 
 core:
   title: "Core Session Policy"
@@ -999,7 +1021,7 @@ providers:
           label: "OpenRouter Chat Model"
           description: "Default OpenRouter chat model name."
           type: "text"
-          value: "moonshotai/kimi-k2.5"
+          value: "z-ai/glm-5.1"
         site_url:
           label: "OpenRouter Site URL"
           description: "Optional app URL sent in OpenRouter attribution headers."

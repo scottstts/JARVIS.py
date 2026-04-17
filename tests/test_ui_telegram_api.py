@@ -287,6 +287,27 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0]["json"]["callback_query_id"], "callback_1")
         self.assertEqual(session.calls[0]["json"]["text"], "Approved")
 
+    async def test_send_chat_action_posts_expected_payload(self) -> None:
+        session = _FakeSession(
+            post_responses=[
+                _FakeResponse(
+                    status_code=200,
+                    payload={"ok": True, "result": True},
+                )
+            ]
+        )
+        client = TelegramBotAPIClient(token="token")
+        client._session = session
+
+        result = await client.send_chat_action(chat_id=123, action="typing")
+
+        self.assertTrue(result)
+        self.assertEqual(session.calls[0]["url"].split("/")[-1], "sendChatAction")
+        self.assertEqual(
+            session.calls[0]["json"],
+            {"chat_id": 123, "action": "typing"},
+        )
+
     async def test_get_file_returns_remote_file_metadata(self) -> None:
         session = _FakeSession(
             post_responses=[

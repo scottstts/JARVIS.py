@@ -343,10 +343,15 @@ JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS: Final = _integer(
 )
 JARVIS_UI_TELEGRAM_POLL_LIMIT: Final = _integer("ui.telegram.poll_limit")
 JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS: Final = _float("ui.telegram.poll_error_backoff_seconds")
+JARVIS_UI_STREAM_TRANSPORT: Final = _string("ui.streaming.transport")
 JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS: Final = _float(
     "ui.streaming.draft_min_interval_seconds"
 )
 JARVIS_UI_STREAM_DRAFT_MIN_CHARS: Final = _integer("ui.streaming.draft_min_chars")
+JARVIS_UI_STREAM_CHUNK_MAX_CHARS: Final = _integer("ui.streaming.chunk_max_chars")
+JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS: Final = _float(
+    "ui.streaming.typing_indicator_interval_seconds"
+)
 JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS: Final = _integer("ui.telegram.max_message_chars")
 
 # Leave unset to derive from the gateway host/port/path settings above.
