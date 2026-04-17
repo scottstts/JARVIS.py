@@ -208,6 +208,7 @@ class OpenRouterProvider:
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": [self._to_openrouter_message(message) for message in request.messages],
+            "provider": {"sort": "throughput"},
             "stream": stream,
         }
         if request.temperature is not None:
