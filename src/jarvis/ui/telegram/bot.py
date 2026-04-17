@@ -232,6 +232,7 @@ class _ActiveTelegramTurn:
     current_stream_message_id: int | None = None
     current_stream_message_text: str = ""
     typing_task: asyncio.Task[None] | None = None
+    typing_reset_event: asyncio.Event | None = None
 
 
 @dataclass(slots=True)
@@ -730,11 +731,11 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayLocalNoticeEvent):
             if not output_paused:
-                self._stop_typing_indicator(active_turn)
                 await self._send_html_message(
                     chat_id=chat_id,
                     html_text=_format_local_system_notice(event.text),
                 )
+                self._refresh_typing_indicator(active_turn)
                 if event.notice_kind == "compaction_completed":
                     active_turn.suppress_compaction_completion_text = True
             return
@@ -775,7 +776,6 @@ class TelegramGatewayBridge:
                 active_turn.pending_finalized_text_for_dedup = flushed_text
             notices_sent = False
             if not output_paused:
-                self._stop_typing_indicator(active_turn)
                 notices_sent = await self._send_tool_usage_notices(
                     chat_id=chat_id,
                     event=event,
@@ -783,6 +783,7 @@ class TelegramGatewayBridge:
                 )
             if notices_sent:
                 active_turn.delivered_any_segment = True
+                self._refresh_typing_indicator(active_turn)
             self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayApprovalRequestEvent):
@@ -863,6 +864,7 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 html_text=_format_local_system_notice("Started a new session."),
             )
+        active_turn.typing_reset_event = asyncio.Event()
         active_turn.typing_task = asyncio.create_task(
             self._typing_indicator_loop(chat_id=chat_id, active_turn=active_turn),
             name=f"jarvis-telegram-typing-{chat_id}",
@@ -879,18 +881,37 @@ class TelegramGatewayBridge:
             _TYPING_INITIAL_DELAY_SECONDS,
             self._settings.stream_typing_indicator_interval_seconds,
         )
+        next_delay = initial_delay
         try:
-            await asyncio.sleep(initial_delay)
-            while not active_turn.delivered_any_segment and not self._chat_output_paused(chat_id):
+            while not self._chat_output_paused(chat_id):
+                reset_event = active_turn.typing_reset_event
+                if reset_event is None:
+                    return
+                try:
+                    await asyncio.wait_for(reset_event.wait(), timeout=next_delay)
+                except TimeoutError:
+                    pass
+                else:
+                    reset_event.clear()
+                    next_delay = initial_delay
+                    continue
+                if self._chat_output_paused(chat_id):
+                    continue
                 await self._telegram.send_chat_action(
                     chat_id=chat_id,
                     action=_TYPING_ACTION,
                 )
-                await asyncio.sleep(self._settings.stream_typing_indicator_interval_seconds)
+                next_delay = self._settings.stream_typing_indicator_interval_seconds
         except asyncio.CancelledError:
             raise
         except TelegramAPIError:
             LOGGER.exception("Failed to send Telegram typing indicator.")
+
+    def _refresh_typing_indicator(self, active_turn: _ActiveTelegramTurn) -> None:
+        reset_event = active_turn.typing_reset_event
+        if reset_event is None:
+            return
+        reset_event.set()
 
     def _stop_typing_indicator(self, active_turn: _ActiveTelegramTurn) -> None:
         typing_task = active_turn.typing_task
@@ -898,6 +919,7 @@ class TelegramGatewayBridge:
             return
         typing_task.cancel()
         active_turn.typing_task = None
+        active_turn.typing_reset_event = None
 
     async def _maybe_publish_stream_chunks(
         self,
@@ -962,15 +984,15 @@ class TelegramGatewayBridge:
         if normalized_text is None:
             return
         if active_turn.stream_transport == "draft":
-            self._stop_typing_indicator(active_turn)
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
+            self._refresh_typing_indicator(active_turn)
             active_turn.published_text = normalized_text
             active_turn.last_publish_at = time.monotonic()
             active_turn.delivered_any_segment = True
             return
         if not normalized_text.startswith(active_turn.published_text):
-            self._stop_typing_indicator(active_turn)
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
+            self._refresh_typing_indicator(active_turn)
             active_turn.delivered_any_segment = True
             return
         try:
@@ -983,8 +1005,8 @@ class TelegramGatewayBridge:
             if active_turn.stream_transport != "draft":
                 raise
             active_turn.drafts_enabled = False
-            self._stop_typing_indicator(active_turn)
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
+            self._refresh_typing_indicator(active_turn)
             active_turn.delivered_any_segment = True
             return
         active_turn.published_text = normalized_text
@@ -1003,19 +1025,20 @@ class TelegramGatewayBridge:
         normalized_text = _coalesce_visible_text(text)
         if normalized_text is None or normalized_text == active_turn.published_text:
             return
-        self._stop_typing_indicator(active_turn)
         if active_turn.stream_transport == "draft":
             await self._send_draft(
                 chat_id=chat_id,
                 draft_id=active_turn.current_draft_id,
                 text=normalized_text,
             )
+            self._refresh_typing_indicator(active_turn)
             return
         await self._append_text_via_edit_transport(
             chat_id=chat_id,
             active_turn=active_turn,
             text=normalized_text,
         )
+        self._refresh_typing_indicator(active_turn)
 
     async def _append_text_via_edit_transport(
         self,

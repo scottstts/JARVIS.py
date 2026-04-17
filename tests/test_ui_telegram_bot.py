@@ -1106,6 +1106,82 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([message.text for message in telegram.sent_messages], ["hello"])
         self.assertEqual(len(telegram.sent_chat_actions), 1)
 
+    async def test_dispatch_message_resumes_typing_after_mid_turn_tool_notice(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+            )
+        )
+
+        await asyncio.sleep(0.6)
+        self.assertEqual(len(telegram.sent_chat_actions), 1)
+
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                tool_names=("bash",),
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["🔧 <b>Jarvis</b> used <b>bash</b> tool."],
+        )
+
+        await asyncio.sleep(0.6)
+        self.assertEqual(
+            [(action.chat_id, action.action) for action in telegram.sent_chat_actions],
+            [(777, "typing"), (777, "typing")],
+        )
+
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                text="done",
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                response_text="done",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["🔧 <b>Jarvis</b> used <b>bash</b> tool.", "done"],
+        )
+
     async def test_dispatch_message_repeats_tool_notice_when_same_tool_is_used_in_next_turn(
         self,
     ) -> None:
