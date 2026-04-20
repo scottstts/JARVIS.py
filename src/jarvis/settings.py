@@ -259,6 +259,12 @@ def _boolean(path: str) -> bool:
 
 
 # Tool defaults that remain user-facing.
+JARVIS_TOOL_GENERATE_EDIT_IMAGE_OPENAI_MODEL: Final = _string(
+    "tools.generate_edit_image.openai_model"
+)
+JARVIS_TOOL_GENERATE_EDIT_IMAGE_GEMINI_MODEL: Final = _string(
+    "tools.generate_edit_image.gemini_model"
+)
 JARVIS_TOOL_EMAIL_SMTP_HOST: Final = _string("tools.email.smtp_host")
 JARVIS_TOOL_EMAIL_SMTP_PORT: Final = _integer("tools.email.smtp_port")
 JARVIS_TOOL_EMAIL_SMTP_SECURITY: Final = _string("tools.email.smtp_security")

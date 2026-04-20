@@ -3776,14 +3776,14 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metadata["provider"], "openai")
         self.assertEqual(
             result.metadata["model"],
-            "gpt-image-1.5",
+            self.settings.generate_edit_image_openai_model,
         )
         self.assertEqual(result.metadata["mime_type"], "image/png")
         self.assertEqual(result.metadata["file_size_bytes"], len(fake_image_bytes))
         self.assertEqual(
             captured["generate_kwargs"],
             {
-                "model": "gpt-image-1.5",
+                "model": self.settings.generate_edit_image_openai_model,
                 "prompt": "A matte black coffee grinder on a white studio background.",
                 "quality": "medium",
                 "output_format": "png",
@@ -3801,6 +3801,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         input_path = self.workspace_dir / "temp" / "input.png"
         input_path.parent.mkdir(parents=True, exist_ok=True)
         input_path.write_bytes(b"\x89PNG\r\n\x1a\nfake_png_payload")
+        gemini_model = self.settings.generate_edit_image_gemini_model
 
         class _FakeUsageMetadata:
             def model_dump(self, *, exclude_none: bool = False) -> dict[str, int]:
@@ -3816,7 +3817,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "_FakeGeminiResponse",
                     (),
                     {
-                        "model_version": "gemini-3.1-flash-image-preview",
+                        "model_version": gemini_model,
                         "response_id": "resp_gemini_123",
                         "usage_metadata": _FakeUsageMetadata(),
                         "candidates": [
@@ -3884,7 +3885,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metadata["provider"], "gemini")
         self.assertEqual(
             result.metadata["model"],
-            "gemini-3.1-flash-image-preview",
+            self.settings.generate_edit_image_gemini_model,
         )
         self.assertEqual(
             Path(result.metadata["image_path"]).resolve(strict=False),
@@ -3893,7 +3894,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metadata["input_media_type"], "image/png")
         self.assertNotIn("provider_text", result.metadata)
         self.assertEqual(captured["api_key"], "test-google-key")
-        self.assertEqual(captured["model"], "gemini-3.1-flash-image-preview")
+        self.assertEqual(captured["model"], self.settings.generate_edit_image_gemini_model)
         config = captured["config"]
         self.assertEqual(config.response_modalities, ["IMAGE"])
         self.assertEqual(config.image_config.image_size, "1K")
@@ -3907,6 +3908,8 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output_path.read_bytes(), b"gemini-image-bytes")
 
     async def test_generate_edit_image_reports_gemini_no_image_diagnostics(self) -> None:
+        gemini_model = self.settings.generate_edit_image_gemini_model
+
         class _FakeGeminiModels:
             def generate_content(self, *, model, contents, config):
                 _ = model, contents, config
@@ -3914,7 +3917,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "_FakeGeminiResponse",
                     (),
                     {
-                        "model_version": "gemini-3.1-flash-image-preview",
+                        "model_version": gemini_model,
                         "response_id": "resp_gemini_missing_image",
                         "prompt_feedback": type(
                             "_FakePromptFeedback",

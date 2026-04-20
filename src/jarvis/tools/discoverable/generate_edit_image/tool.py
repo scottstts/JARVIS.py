@@ -38,8 +38,6 @@ from ...types import (
 
 _DEFAULT_PROVIDER = "gemini"
 _SUPPORTED_PROVIDERS = ("gemini", "openai")
-_OPENAI_IMAGE_MODEL = "gpt-image-1.5"
-_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
 _OPENAI_QUALITY_VALUES = ("low", "medium", "high")
 _DEFAULT_OPENAI_QUALITY = "medium"
 _GEMINI_RESOLUTION_VALUES = ("512", "1K", "2K", "4K")
@@ -71,8 +69,18 @@ class GeneratedImagePayload:
     usage: dict[str, Any] | None = None
 
 
+@dataclass(slots=True, frozen=True)
 class GenerateEditImageToolExecutor:
     """Generates or edits one image through Gemini or OpenAI."""
+
+    openai_model: str
+    gemini_model: str
+
+    def __post_init__(self) -> None:
+        if not self.openai_model.strip():
+            raise ValueError("openai_model cannot be empty.")
+        if not self.gemini_model.strip():
+            raise ValueError("gemini_model cannot be empty.")
 
     async def __call__(
         self,
@@ -264,7 +272,7 @@ class GenerateEditImageToolExecutor:
         try:
             if image_path is None:
                 response = client.images.generate(
-                    model=_OPENAI_IMAGE_MODEL,
+                    model=self.openai_model,
                     prompt=prompt,
                     quality=quality,
                     output_format="png",
@@ -272,7 +280,7 @@ class GenerateEditImageToolExecutor:
             else:
                 with image_path.open("rb") as image_handle:
                     response = client.images.edit(
-                        model=_OPENAI_IMAGE_MODEL,
+                        model=self.openai_model,
                         image=image_handle,
                         prompt=prompt,
                         quality=quality,
@@ -298,7 +306,7 @@ class GenerateEditImageToolExecutor:
 
         return GeneratedImagePayload(
             provider="openai",
-            model=_OPENAI_IMAGE_MODEL,
+            model=self.openai_model,
             image_bytes=image_bytes,
             mime_type="image/png",
             revised_prompt=_normalize_optional_string(image_data.revised_prompt),
@@ -347,7 +355,7 @@ class GenerateEditImageToolExecutor:
         )
         try:
             response = client.models.generate_content(
-                model=_GEMINI_IMAGE_MODEL,
+                model=self.gemini_model,
                 contents=contents,
                 config=config,
             )
@@ -357,7 +365,7 @@ class GenerateEditImageToolExecutor:
         provider_text, image_bytes, mime_type = _extract_gemini_response_payload(response)
         return GeneratedImagePayload(
             provider="gemini",
-            model=str(getattr(response, "model_version", None) or _GEMINI_IMAGE_MODEL),
+            model=str(getattr(response, "model_version", None) or self.gemini_model),
             image_bytes=image_bytes,
             mime_type=mime_type,
             provider_text=provider_text,
@@ -407,7 +415,6 @@ class GenerateEditImageToolExecutor:
 def build_generate_edit_image_tool(settings: ToolSettings) -> RegisteredTool:
     """Build the generate_edit_image registry entry."""
 
-    _ = settings
     return RegisteredTool(
         name="generate_edit_image",
         exposure="discoverable",
@@ -449,7 +456,10 @@ def build_generate_edit_image_tool(settings: ToolSettings) -> RegisteredTool:
                 "additionalProperties": False,
             },
         ),
-        executor=GenerateEditImageToolExecutor(),
+        executor=GenerateEditImageToolExecutor(
+            openai_model=settings.generate_edit_image_openai_model,
+            gemini_model=settings.generate_edit_image_gemini_model,
+        ),
     )
 
 

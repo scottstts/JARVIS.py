@@ -104,6 +104,8 @@ class ToolSettings:
     email_smtp_host: str
     email_smtp_port: int
     email_smtp_security: str
+    generate_edit_image_openai_model: str
+    generate_edit_image_gemini_model: str
     email_timeout_seconds: float
     email_sender_address: str | None
     email_max_subject_chars: int
@@ -162,6 +164,10 @@ class ToolSettings:
             raise ValueError(
                 "email_smtp_security must be one of: ssl, starttls, none."
             )
+        if not self.generate_edit_image_openai_model.strip():
+            raise ValueError("generate_edit_image_openai_model cannot be empty.")
+        if not self.generate_edit_image_gemini_model.strip():
+            raise ValueError("generate_edit_image_gemini_model cannot be empty.")
         if self.email_timeout_seconds <= 0:
             raise ValueError("email_timeout_seconds must be > 0.")
         if self.email_sender_address is not None and not self.email_sender_address.strip():
@@ -270,6 +276,12 @@ class ToolSettings:
                 _optional_env("SMTP_SECURITY")
                 or app_settings.JARVIS_TOOL_EMAIL_SMTP_SECURITY
             ).lower(),
+            generate_edit_image_openai_model=(
+                app_settings.JARVIS_TOOL_GENERATE_EDIT_IMAGE_OPENAI_MODEL
+            ),
+            generate_edit_image_gemini_model=(
+                app_settings.JARVIS_TOOL_GENERATE_EDIT_IMAGE_GEMINI_MODEL
+            ),
             email_timeout_seconds=_parse_float_env(
                 "SMTP_TIMEOUT_SECONDS",
                 DEFAULT_EMAIL_TIMEOUT_SECONDS,

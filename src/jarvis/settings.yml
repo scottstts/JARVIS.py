@@ -315,6 +315,20 @@ tools:
   title: "Tools"
   description: "User-facing tool integration settings."
   groups:
+    generate_edit_image:
+      title: "Generate/Edit Image"
+      description: "Model defaults for the generate_edit_image tool."
+      fields:
+        openai_model:
+          label: "OpenAI Image Model"
+          description: "OpenAI model used when generate_edit_image runs with provider openai."
+          type: "text"
+          value: "gpt-image-1.5"
+        gemini_model:
+          label: "Gemini Image Model"
+          description: "Gemini model used when generate_edit_image runs with provider gemini."
+          type: "text"
+          value: "gemini-3.1-flash-image-preview"
     email:
       title: "Email"
       description: "SMTP defaults for outbound email."

@@ -811,8 +811,8 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - creates missing parent directories for `output_path` automatically before writing the image
 - appends a provider-safe image extension automatically when `output_path` has no suffix
 - resolves edit inputs from `/workspace` and only accepts provider-safe image formats shared by the current implementation (`image/png`, `image/jpeg`, `image/webp`)
-- defaults to Gemini with model `gemini-3.1-flash-image-preview`
-- uses OpenAI model `gpt-image-1.5` when `provider="openai"`
+- reads its default Gemini and OpenAI model names from `tools.generate_edit_image` in `settings.yml`
+- packaged defaults are Gemini `gemini-3.1-flash-image-preview` and OpenAI `gpt-image-1.5`
 - applies OpenAI `quality` only for the OpenAI path, defaulting to `medium`
 - applies Gemini `resolution` only for the Gemini path, defaulting to `1K`
 - forces Gemini image-only responses with `response_modalities=['Image']` so the tool does not intermittently receive text-only payloads

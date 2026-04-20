@@ -56,6 +56,11 @@ class SettingsModuleTests(unittest.TestCase):
 
         self.assertEqual(module.SETTINGS_SOURCE_PATH, _PACKAGED_TEMPLATE_PATH.resolve())
         self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "openai")
+        self.assertEqual(module.JARVIS_TOOL_GENERATE_EDIT_IMAGE_OPENAI_MODEL, "gpt-image-1.5")
+        self.assertEqual(
+            module.JARVIS_TOOL_GENERATE_EDIT_IMAGE_GEMINI_MODEL,
+            "gemini-3.1-flash-image-preview",
+        )
 
     def test_prefers_workspace_settings_file_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
