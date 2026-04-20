@@ -163,3 +163,5 @@
 - `src/jarvis/settings.yml` is now limited to user-facing settings; gateway/tool/UI/runtime wiring and other internal tunables moved to subsystem-local config modules or hardcoded local defaults.
 - Any follow-up system/runtime note added after an assistant tool call must be staged behind the matching tool result or unexecuted-tool notice in replay order, especially for deferred `view_image` successes.
 - When one assistant message emits multiple deferred `view_image` calls, persist all tool-result records before any attachment follow-up records, or replay sees later calls as unresolved.
+- Container startup now seeds `workspace/settings/settings.yml` and `workspace/identities/*.md` only if missing, while always refreshing `workspace/settings/settings_gui.html` and `workspace/migrate.sh`.
+- `workspace/migrate.sh --all` now excludes `node_modules/` so workspace exports do not balloon from frontend dependency trees.

@@ -213,7 +213,7 @@ providers:
           label: "Chat Model"
           description: "Default OpenRouter chat model name."
           type: "text"
-          value: "z-ai/glm-5.1"
+          value: "moonshotai/kimi-k2.6"
         temperature:
           label: "Temperature"
           description: "Sampling temperature for OpenRouter requests."

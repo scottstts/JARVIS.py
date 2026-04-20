@@ -176,7 +176,7 @@ Source-controlled identity/bootstrap prompt files:
 - `USER.md`
 - `ARMOR.md`
 
-These files are part of the installed package, but at runtime the `jarvis_runtime` container also overwrites the workspace copies in `/workspace/identities/` so the shared workspace stays aligned with the repo starter files.
+These files are part of the installed package, and at runtime the `jarvis_runtime` container seeds missing workspace copies in `/workspace/identities/` from them without overwriting existing workspace Markdown files.
 
 ### `src/jarvis/llm/`
 

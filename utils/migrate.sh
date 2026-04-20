@@ -12,7 +12,7 @@ Default targets:
   archive/ memory/ runtime_tools/ settings/
 
 Options:
-  --all   Archive every entry in the current directory.
+  --all   Archive every entry in the current directory except node_modules/.
   --help  Show this help.
 EOF
 }
@@ -69,6 +69,9 @@ if ((archive_all)); then
         if [[ "${cwd_real}" == "${script_dir}" && "${entry_name}" == "${script_name}" ]]; then
             continue
         fi
+        if [[ "${entry_name}" == "node_modules" ]]; then
+            continue
+        fi
         targets+=("${entry_name}")
     done
     shopt -u dotglob nullglob
@@ -89,5 +92,17 @@ if ((${#targets[@]} == 0)); then
     exit 1
 fi
 
-zip -rq "${archive_name}" "${targets[@]}"
+declare -a zip_excludes=()
+if ((archive_all)); then
+    zip_excludes=(
+        "node_modules/*"
+        "*/node_modules/*"
+    )
+fi
+
+if ((${#zip_excludes[@]} > 0)); then
+    zip -rq "${archive_name}" "${targets[@]}" -x "${zip_excludes[@]}"
+else
+    zip -rq "${archive_name}" "${targets[@]}"
+fi
 echo "Created $(pwd)/${archive_name}"

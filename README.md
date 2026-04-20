@@ -73,10 +73,10 @@ On the first Codex-backed message, Jarvis will send you a browser login URL. Ope
 
 ### BTWs
 
-- At container startup time, `jarvis_runtime` reseeds workspace starter files from the repo and overwrites the previous copies: `workspace/settings/settings.yml`, `workspace/settings/settings_gui.html`, `workspace/identities/*`, and `workspace/migrate.sh`
+- At container startup time, `jarvis_runtime` seeds `workspace/settings/settings.yml` and `workspace/identities/*.md` only when they are missing, but always refreshes `workspace/settings/settings_gui.html` and `workspace/migrate.sh` from the repo copies
 - Jarvis reads runtime settings from `workspace/settings/settings.yml` when it exists, and falls back to the packaged template YAML only if that workspace file is absent.
 - Settings GUI is also available in `workspace/settings/settings_gui.html`. Open or drag in `settings.yml` there, edit the settings in the GUI, and save edited settings.
-- `workspace/migrate.sh` creates a zip archive of `archive/`, `memory/`, `runtime_tools/`, and `settings/` from the current directory. Pass `--all` to archive everything in the current directory instead.
+- `workspace/migrate.sh` creates a zip archive of `archive/`, `memory/`, `runtime_tools/`, and `settings/` from the current directory. Pass `--all` to archive everything in the current directory except `node_modules/`.
 
 ## Run Jarvis
 
