@@ -863,7 +863,7 @@ class AgentLoop:
         pending_subagent_ids: Sequence[str],
         turn_id: str,
         extra_records: Sequence[ConversationRecord] = (),
-    ) -> tuple[LLMRequest, int]:
+    ) -> tuple[LLMRequest, int, tuple[ConversationRecord, ...]]:
         if pending_detached_job_ids or pending_subagent_ids:
             return self._build_orchestrator_monitored_waiting_request(
                 session_id=session_id,
@@ -874,11 +874,12 @@ class AgentLoop:
                 turn_id=turn_id,
                 extra_records=extra_records,
             )
-        return self._build_followup_request(
+        request, estimated_input_tokens = self._build_followup_request(
             base_records=base_records,
             pending_records=pending_records,
             extra_records=extra_records,
         )
+        return request, estimated_input_tokens, ()
 
     def _deferred_tool_success_records(
         self,
@@ -887,6 +888,7 @@ class AgentLoop:
         records: list[ConversationRecord] = []
         for deferred in deferred_tool_successes:
             records.append(deferred.tool_record)
+        for deferred in deferred_tool_successes:
             records.extend(deferred.extra_records)
         return tuple(records)
 
@@ -903,12 +905,27 @@ class AgentLoop:
                 pending_records=pending_records,
                 record=deferred.tool_record,
             )
+        for deferred in deferred_tool_successes:
             for record in deferred.extra_records:
                 self._append_turn_record(
                     session_id=session_id,
                     pending_records=pending_records,
                     record=record,
                 )
+
+    def _commit_staged_followup_records(
+        self,
+        *,
+        session_id: str,
+        pending_records: list[ConversationRecord],
+        records: Sequence[ConversationRecord],
+    ) -> None:
+        for record in records:
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=record,
+            )
 
     def _persist_failed_deferred_tool_successes(
         self,
@@ -999,7 +1016,35 @@ class AgentLoop:
         pending_subagent_ids: Sequence[str],
         turn_id: str,
         extra_records: Sequence[ConversationRecord] = (),
-    ) -> tuple[LLMRequest, int]:
+    ) -> tuple[LLMRequest, int, tuple[ConversationRecord, ...]]:
+        waiting_record = self._build_orchestrator_monitored_waiting_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            pending_detached_job_ids=pending_detached_job_ids,
+            pending_subagent_ids=pending_subagent_ids,
+            turn_id=turn_id,
+        )
+        staged_records = ((waiting_record,) if waiting_record is not None else ())
+        request, estimated_input_tokens = self._build_followup_request(
+            base_records=base_records,
+            pending_records=pending_records,
+            allow_tools=False,
+            extra_records=tuple(extra_records) + staged_records,
+        )
+        return request, estimated_input_tokens, staged_records
+
+    def _build_orchestrator_monitored_waiting_record(
+        self,
+        *,
+        session_id: str,
+        pending_records: Sequence[ConversationRecord],
+        pending_detached_job_ids: Sequence[str],
+        pending_subagent_ids: Sequence[str],
+        turn_id: str,
+    ) -> ConversationRecord | None:
+        if any(record.metadata.get("orchestrator_monitored_waiting") for record in pending_records):
+            return None
+
         metadata: dict[str, Any] = {}
         if pending_detached_job_ids:
             metadata["detached_bash_jobs_pending"] = True
@@ -1007,28 +1052,18 @@ class AgentLoop:
         if pending_subagent_ids:
             metadata["subagents_pending"] = True
             metadata["pending_subagent_ids"] = list(pending_subagent_ids)
-        if not any(record.metadata.get("orchestrator_monitored_waiting") for record in pending_records):
-            self._append_turn_record(
-                session_id=session_id,
-                pending_records=pending_records,
-                        record=self._build_runtime_message_record(
-                    session_id=session_id,
-                    message=AgentRuntimeMessage(
-                        role="system",
-                        metadata={
-                            "orchestrator_monitored_waiting": True,
-                            **metadata,
-                        },
-                        content=_ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT,
-                    ),
-                    turn_id=turn_id,
-                ),
-            )
-        return self._build_followup_request(
-            base_records=base_records,
-            pending_records=pending_records,
-            allow_tools=False,
-            extra_records=extra_records,
+
+        return self._build_runtime_message_record(
+            session_id=session_id,
+            message=AgentRuntimeMessage(
+                role="system",
+                metadata={
+                    "orchestrator_monitored_waiting": True,
+                    **metadata,
+                },
+                content=_ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT,
+            ),
+            turn_id=turn_id,
         )
 
     def _build_tool_round_limit_record(
@@ -1469,6 +1504,7 @@ class AgentLoop:
 
                 followup_compaction_attempted = False
                 deferred_tool_successes: tuple[_DeferredToolSuccess, ...] = ()
+                staged_followup_records: tuple[ConversationRecord, ...] = ()
                 try:
                     ephemeral_image_records: list[ConversationRecord] = []
                     staged_image_tool_successes: list[_DeferredToolSuccess] = []
@@ -1644,7 +1680,11 @@ class AgentLoop:
                             interruption_reason=interrupted.interruption_reason,
                         )
                         return
-                    request, final_estimated_input_tokens = self._build_followup_attempt_request(
+                    (
+                        request,
+                        final_estimated_input_tokens,
+                        staged_followup_records,
+                    ) = self._build_followup_attempt_request(
                         session_id=session.session_id,
                         base_records=base_records,
                         pending_records=pending_records,
@@ -1660,6 +1700,7 @@ class AgentLoop:
                             pending_records=pending_records,
                             deferred_tool_successes=deferred_tool_successes,
                         )
+                    staged_followup_records = ()
                     (
                         session,
                         base_records,
@@ -1684,13 +1725,21 @@ class AgentLoop:
                     deferred_committed = False
                     try:
                         async for event in self._llm_service.stream_generate(request):
-                            if deferred_tool_successes and not deferred_committed:
-                                self._commit_deferred_tool_successes(
-                                    session_id=session.session_id,
-                                    pending_records=pending_records,
-                                    deferred_tool_successes=deferred_tool_successes,
-                                )
-                                deferred_tool_successes = ()
+                            if not deferred_committed:
+                                if deferred_tool_successes:
+                                    self._commit_deferred_tool_successes(
+                                        session_id=session.session_id,
+                                        pending_records=pending_records,
+                                        deferred_tool_successes=deferred_tool_successes,
+                                    )
+                                    deferred_tool_successes = ()
+                                if staged_followup_records:
+                                    self._commit_staged_followup_records(
+                                        session_id=session.session_id,
+                                        pending_records=pending_records,
+                                        records=staged_followup_records,
+                                    )
+                                    staged_followup_records = ()
                                 deferred_committed = True
                             if event.type == "text_delta":
                                 emitted_any = True
@@ -1744,13 +1793,21 @@ class AgentLoop:
                                     return
                             elif event.type == "done":
                                 streamed_response = event.response
-                        if deferred_tool_successes and not deferred_committed:
-                            self._commit_deferred_tool_successes(
-                                session_id=session.session_id,
-                                pending_records=pending_records,
-                                deferred_tool_successes=deferred_tool_successes,
-                            )
-                            deferred_tool_successes = ()
+                        if not deferred_committed:
+                            if deferred_tool_successes:
+                                self._commit_deferred_tool_successes(
+                                    session_id=session.session_id,
+                                    pending_records=pending_records,
+                                    deferred_tool_successes=deferred_tool_successes,
+                                )
+                                deferred_tool_successes = ()
+                            if staged_followup_records:
+                                self._commit_staged_followup_records(
+                                    session_id=session.session_id,
+                                    pending_records=pending_records,
+                                    records=staged_followup_records,
+                                )
+                                staged_followup_records = ()
                         break
                     except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
                         if (
@@ -1766,7 +1823,11 @@ class AgentLoop:
                             turn_id=turn_id,
                         )
                         deferred_tool_successes = ()
-                        request, final_estimated_input_tokens = self._build_followup_attempt_request(
+                        (
+                            request,
+                            final_estimated_input_tokens,
+                            staged_followup_records,
+                        ) = self._build_followup_attempt_request(
                             session_id=session.session_id,
                             base_records=base_records,
                             pending_records=pending_records,
@@ -1789,7 +1850,11 @@ class AgentLoop:
                                 turn_id=turn_id,
                             )
                             deferred_tool_successes = ()
-                            request, final_estimated_input_tokens = self._build_followup_attempt_request(
+                            (
+                                request,
+                                final_estimated_input_tokens,
+                                staged_followup_records,
+                            ) = self._build_followup_attempt_request(
                                 session_id=session.session_id,
                                 base_records=base_records,
                                 pending_records=pending_records,
@@ -1810,6 +1875,13 @@ class AgentLoop:
                                 deferred_tool_successes=deferred_tool_successes,
                             )
                             deferred_tool_successes = ()
+                        if staged_followup_records:
+                            self._commit_staged_followup_records(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                records=staged_followup_records,
+                            )
+                            staged_followup_records = ()
                         if followup_compaction_attempted:
                             raise ContextBudgetError(
                                 _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
@@ -2207,6 +2279,7 @@ class AgentLoop:
                 break
 
             followup_compaction_attempted = False
+            staged_followup_records: tuple[ConversationRecord, ...] = ()
             try:
                 tool_execution_outcome = await self._execute_tool_calls(
                     session_id=current_session.session_id,
@@ -2277,7 +2350,11 @@ class AgentLoop:
                         approval_rejected,
                         (),
                     )
-                request, current_estimated_input_tokens = self._build_followup_attempt_request(
+                (
+                    request,
+                    current_estimated_input_tokens,
+                    staged_followup_records,
+                ) = self._build_followup_attempt_request(
                     session_id=current_session.session_id,
                     base_records=current_base_records,
                     pending_records=pending_records,
@@ -2293,6 +2370,7 @@ class AgentLoop:
                         pending_records=pending_records,
                         deferred_tool_successes=deferred_tool_successes,
                     )
+                staged_followup_records = ()
                 (
                     current_session,
                     current_base_records,
@@ -2318,6 +2396,14 @@ class AgentLoop:
                             pending_records=pending_records,
                             deferred_tool_successes=deferred_tool_successes,
                         )
+                        deferred_tool_successes = ()
+                    if staged_followup_records:
+                        self._commit_staged_followup_records(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            records=staged_followup_records,
+                        )
+                        staged_followup_records = ()
                     break
                 except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
                     if (
@@ -2333,7 +2419,11 @@ class AgentLoop:
                         turn_id=turn_id,
                     )
                     deferred_tool_successes = ()
-                    request, current_estimated_input_tokens = self._build_followup_attempt_request(
+                    (
+                        request,
+                        current_estimated_input_tokens,
+                        staged_followup_records,
+                    ) = self._build_followup_attempt_request(
                         session_id=current_session.session_id,
                         base_records=current_base_records,
                         pending_records=pending_records,
@@ -2355,7 +2445,11 @@ class AgentLoop:
                             turn_id=turn_id,
                         )
                         deferred_tool_successes = ()
-                        request, current_estimated_input_tokens = self._build_followup_attempt_request(
+                        (
+                            request,
+                            current_estimated_input_tokens,
+                            staged_followup_records,
+                        ) = self._build_followup_attempt_request(
                             session_id=current_session.session_id,
                             base_records=current_base_records,
                             pending_records=pending_records,
@@ -2373,6 +2467,13 @@ class AgentLoop:
                             deferred_tool_successes=deferred_tool_successes,
                         )
                         deferred_tool_successes = ()
+                    if staged_followup_records:
+                        self._commit_staged_followup_records(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            records=staged_followup_records,
+                        )
+                        staged_followup_records = ()
                     if followup_compaction_attempted:
                         raise ContextBudgetError(
                             _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT

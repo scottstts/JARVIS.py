@@ -161,3 +161,5 @@
 - Telegram streaming now defaults to editing one real message in place with paragraph/list/sentence-aware chunk boundaries plus a pre-first-chunk `sendChatAction("typing")`; `sendMessageDraft` remains an optional fallback transport and still keeps per-chat backoff on 429s.
 - Telegram typing heartbeat now lives for the whole active user turn, resets after visible mid-turn output so it can reappear during later silent work, and only stops on true turn pause/finish; approval/auth prompts remain effectively terminal because the turn ends right after they are sent.
 - `src/jarvis/settings.yml` is now limited to user-facing settings; gateway/tool/UI/runtime wiring and other internal tunables moved to subsystem-local config modules or hardcoded local defaults.
+- Any follow-up system/runtime note added after an assistant tool call must be staged behind the matching tool result or unexecuted-tool notice in replay order, especially for deferred `view_image` successes.
+- When one assistant message emits multiple deferred `view_image` calls, persist all tool-result records before any attachment follow-up records, or replay sees later calls as unresolved.

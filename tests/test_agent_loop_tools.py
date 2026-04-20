@@ -18,6 +18,7 @@ from jarvis.core import (
     AgentApprovalRequestEvent,
     AgentAssistantMessageEvent,
     AgentLoop,
+    AgentRuntimeMessage,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
 )
@@ -471,6 +472,94 @@ class _FakeViewImageLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FakeMultiViewImageLLMService:
+    def __init__(self, expected_image_bytes_a: bytes, expected_image_bytes_b: bytes) -> None:
+        self._expected_image_bytes_a = expected_image_bytes_a
+        self._expected_image_bytes_b = expected_image_bytes_b
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.generate_calls == 1:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="view_image_a",
+                        name="view_image",
+                        arguments={"path": "temp/sample-a.png", "detail": "high"},
+                        raw_arguments='{"path":"temp/sample-a.png","detail":"high"}',
+                    ),
+                    ToolCall(
+                        call_id="view_image_b",
+                        name="view_image",
+                        arguments={"path": "temp/sample-b.png", "detail": "high"},
+                        raw_arguments='{"path":"temp/sample-b.png","detail":"high"}',
+                    ),
+                ],
+                finish_reason="tool_calls",
+            )
+
+        assistant_message = request.messages[-5]
+        tool_message_a = request.messages[-4]
+        tool_message_b = request.messages[-3]
+        attachment_message_a = request.messages[-2]
+        attachment_message_b = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool results.")
+        if tool_message_a.role != "tool" or tool_message_b.role != "tool":
+            raise AssertionError("Expected both tool results before attachment follow-up.")
+        if attachment_message_a.role != "user" or attachment_message_b.role != "user":
+            raise AssertionError("Expected attachment messages after all tool results.")
+
+        assistant_tool_parts = [
+            part for part in assistant_message.parts if isinstance(part, ToolCall)
+        ]
+        if [part.call_id for part in assistant_tool_parts] != ["view_image_a", "view_image_b"]:
+            raise AssertionError("Expected both view_image tool calls in assistant history.")
+
+        for tool_message, expected_path in (
+            (tool_message_a, "sample-a.png"),
+            (tool_message_b, "sample-b.png"),
+        ):
+            tool_result_parts = [
+                part for part in tool_message.parts if isinstance(part, ToolResultPart)
+            ]
+            if len(tool_result_parts) != 1:
+                raise AssertionError("Expected one tool result part for each view_image call.")
+            if "Image attachment prepared" not in tool_result_parts[0].content:
+                raise AssertionError("Expected tool result content to mention prepared image attachment.")
+            if expected_path not in tool_result_parts[0].content:
+                raise AssertionError(f"Expected tool result content to mention {expected_path}.")
+
+        for attachment_message, expected_bytes in (
+            (attachment_message_a, self._expected_image_bytes_a),
+            (attachment_message_b, self._expected_image_bytes_b),
+        ):
+            image_parts = [
+                part for part in attachment_message.parts if isinstance(part, ImagePart)
+            ]
+            if len(image_parts) != 1:
+                raise AssertionError("Expected one image attachment part in follow-up history.")
+            payload = image_parts[0].data_url_payload()
+            if payload is None:
+                raise AssertionError("Expected attachment image to be encoded as a data URL.")
+            _media_type, data_base64 = payload
+            if b64decode(data_base64) != expected_bytes:
+                raise AssertionError("Attachment bytes did not match the workspace file.")
+
+        return _build_response("Images inspected.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _FakeViewImageFailureLLMService:
     def __init__(self, expected_image_bytes: bytes) -> None:
         self._expected_image_bytes = expected_image_bytes
@@ -642,6 +731,184 @@ class _FakeStreamingViewImageFailureLLMService:
         ):
             raise AssertionError("Recovered follow-up request should not retain the image attachment.")
         yield DoneEvent(response=_build_response("Image unavailable."))
+
+
+class _FakeStreamingMultiViewImageLLMService:
+    def __init__(self, expected_image_bytes_a: bytes, expected_image_bytes_b: bytes) -> None:
+        self._expected_image_bytes_a = expected_image_bytes_a
+        self._expected_image_bytes_b = expected_image_bytes_b
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generation is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
+
+        if self.stream_calls == 1:
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="view_image_a",
+                            name="view_image",
+                            arguments={"path": "temp/sample-a.png", "detail": "high"},
+                            raw_arguments='{"path":"temp/sample-a.png","detail":"high"}',
+                        ),
+                        ToolCall(
+                            call_id="view_image_b",
+                            name="view_image",
+                            arguments={"path": "temp/sample-b.png", "detail": "high"},
+                            raw_arguments='{"path":"temp/sample-b.png","detail":"high"}',
+                        ),
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        assistant_message = request.messages[-5]
+        tool_message_a = request.messages[-4]
+        tool_message_b = request.messages[-3]
+        attachment_message_a = request.messages[-2]
+        attachment_message_b = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool results.")
+        if tool_message_a.role != "tool" or tool_message_b.role != "tool":
+            raise AssertionError("Expected both tool results before attachment follow-up.")
+        if attachment_message_a.role != "user" or attachment_message_b.role != "user":
+            raise AssertionError("Expected attachment messages after all tool results.")
+
+        for tool_message, expected_path in (
+            (tool_message_a, "sample-a.png"),
+            (tool_message_b, "sample-b.png"),
+        ):
+            tool_result_parts = [
+                part for part in tool_message.parts if isinstance(part, ToolResultPart)
+            ]
+            if len(tool_result_parts) != 1:
+                raise AssertionError("Expected one tool result part for each view_image call.")
+            if "Image attachment prepared" not in tool_result_parts[0].content:
+                raise AssertionError("Expected tool result content to mention prepared image attachment.")
+            if expected_path not in tool_result_parts[0].content:
+                raise AssertionError(f"Expected tool result content to mention {expected_path}.")
+
+        for attachment_message, expected_bytes in (
+            (attachment_message_a, self._expected_image_bytes_a),
+            (attachment_message_b, self._expected_image_bytes_b),
+        ):
+            image_parts = [
+                part for part in attachment_message.parts if isinstance(part, ImagePart)
+            ]
+            if len(image_parts) != 1:
+                raise AssertionError("Expected one image attachment part in follow-up history.")
+            payload = image_parts[0].data_url_payload()
+            if payload is None:
+                raise AssertionError("Expected attachment image to be encoded as a data URL.")
+            _media_type, data_base64 = payload
+            if b64decode(data_base64) != expected_bytes:
+                raise AssertionError("Attachment bytes did not match the workspace file.")
+
+        yield DoneEvent(response=_build_response("Images inspected."))
+
+
+class _FakeStreamingViewImageWaitingLLMService:
+    def __init__(
+        self,
+        expected_image_bytes: bytes,
+        *,
+        waiting_metadata: dict[str, object],
+    ) -> None:
+        self._expected_image_bytes = expected_image_bytes
+        self._waiting_metadata = waiting_metadata
+        self.stream_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generation is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        names = [tool.name for tool in request.tools]
+
+        if self.stream_calls == 1:
+            if names != _EXPECTED_BASIC_TOOL_NAMES:
+                raise AssertionError(
+                    f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+                )
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="view_image_1",
+                            name="view_image",
+                            arguments={"path": "temp/sample.png", "detail": "high"},
+                            raw_arguments='{"path":"temp/sample.png","detail":"high"}',
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        if names:
+            raise AssertionError("Expected follow-up waiting request to disable tools.")
+
+        assistant_message = request.messages[-4]
+        tool_message = request.messages[-3]
+        attachment_message = request.messages[-2]
+        waiting_message = request.messages[-1]
+        if assistant_message.role != "assistant":
+            raise AssertionError("Expected assistant tool-call message before tool result.")
+        if tool_message.role != "tool":
+            raise AssertionError("Expected tool result message before attachment follow-up.")
+        if attachment_message.role != "user":
+            raise AssertionError("Expected transient user attachment message before waiting note.")
+        if waiting_message.role != "system":
+            raise AssertionError("Expected orchestrator waiting note after the image attachment.")
+
+        tool_result_parts = [
+            part for part in tool_message.parts if isinstance(part, ToolResultPart)
+        ]
+        if len(tool_result_parts) != 1:
+            raise AssertionError("Expected one tool result part before the waiting note.")
+        if "Image attachment prepared" not in tool_result_parts[0].content:
+            raise AssertionError("Expected view_image success before waiting follow-up.")
+
+        image_parts = [
+            part for part in attachment_message.parts if isinstance(part, ImagePart)
+        ]
+        if len(image_parts) != 1:
+            raise AssertionError("Expected one image attachment part in follow-up history.")
+        payload = image_parts[0].data_url_payload()
+        if payload is None:
+            raise AssertionError("Expected attachment image to be encoded as a data URL.")
+        _media_type, data_base64 = payload
+        if b64decode(data_base64) != self._expected_image_bytes:
+            raise AssertionError("Attachment bytes did not match the workspace file.")
+
+        if waiting_message.metadata.get("orchestrator_monitored_waiting") is not True:
+            raise AssertionError("Expected orchestrator waiting metadata on the final system note.")
+        for key, expected in self._waiting_metadata.items():
+            if waiting_message.metadata.get(key) != expected:
+                raise AssertionError(
+                    f"Expected waiting metadata {key}={expected!r}, got {waiting_message.metadata.get(key)!r}."
+                )
+        waiting_text = "".join(
+            part.text
+            for part in waiting_message.parts
+            if isinstance(part, TextPart)
+        )
+        if "Background work is being monitored by the orchestrator" not in waiting_text:
+            raise AssertionError("Expected orchestrator waiting guidance in the final system note.")
+
+        yield DoneEvent(response=_build_response("Waiting on background work."))
 
 
 class _FakeFilePatchLLMService:
@@ -2560,6 +2827,46 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Image attachment prepared", message_records[-2].content)
             self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
 
+    async def test_handle_user_input_executes_multiple_view_image_tools_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            image_dir = settings.workspace_dir / "temp"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            image_bytes_a = b"\x89PNG\r\n\x1a\nfake_png_payload_a"
+            image_bytes_b = b"\x89PNG\r\n\x1a\nfake_png_payload_b"
+            (image_dir / "sample-a.png").write_bytes(image_bytes_a)
+            (image_dir / "sample-b.png").write_bytes(image_bytes_b)
+
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeMultiViewImageLLMService(
+                    image_bytes_a,
+                    image_bytes_b,
+                ),
+                settings=settings,
+                storage=storage,
+            )
+
+            result = await loop.handle_user_input(
+                "Inspect the images at local_path: temp/sample-a.png and temp/sample-b.png."
+            )
+
+            self.assertEqual(result.response_text, "Images inspected.")
+
+            records = storage.load_records(result.session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(
+                [record.role for record in message_records[-5:]],
+                ["user", "assistant", "tool", "tool", "assistant"],
+            )
+            self.assertEqual(
+                [tool["name"] for tool in message_records[-4].metadata["tool_calls"]],
+                ["view_image", "view_image"],
+            )
+            self.assertIn("sample-a.png", message_records[-3].content)
+            self.assertIn("sample-b.png", message_records[-2].content)
+            self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
+
     async def test_handle_user_input_converts_view_image_provider_rejection_into_tool_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -2593,6 +2900,48 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Current model does not support image inputs.", message_records[-2].content)
             self.assertFalse(message_records[-2].metadata["ok"])
 
+    async def test_stream_user_input_executes_multiple_view_image_tools_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            image_dir = settings.workspace_dir / "temp"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            image_bytes_a = b"\x89PNG\r\n\x1a\nfake_png_payload_a"
+            image_bytes_b = b"\x89PNG\r\n\x1a\nfake_png_payload_b"
+            (image_dir / "sample-a.png").write_bytes(image_bytes_a)
+            (image_dir / "sample-b.png").write_bytes(image_bytes_b)
+
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeStreamingMultiViewImageLLMService(
+                    image_bytes_a,
+                    image_bytes_b,
+                ),
+                settings=settings,
+                storage=storage,
+            )
+
+            events = [event async for event in loop.stream_user_input(
+                "Inspect the images at local_path: temp/sample-a.png and temp/sample-b.png."
+            )]
+
+            done_events = [event for event in events if isinstance(event, AgentTurnDoneEvent)]
+            self.assertEqual(len(done_events), 1)
+            self.assertEqual(done_events[0].response_text, "Images inspected.")
+
+            records = storage.load_records(done_events[0].session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(
+                [record.role for record in message_records[-5:]],
+                ["user", "assistant", "tool", "tool", "assistant"],
+            )
+            self.assertEqual(
+                [tool["name"] for tool in message_records[-4].metadata["tool_calls"]],
+                ["view_image", "view_image"],
+            )
+            self.assertIn("sample-a.png", message_records[-3].content)
+            self.assertIn("sample-b.png", message_records[-2].content)
+            self.assertTrue(all(not record.metadata.get("transient", False) for record in message_records))
+
     async def test_stream_user_input_converts_view_image_provider_rejection_into_tool_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -2625,6 +2974,98 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("View image failed", message_records[-2].content)
             self.assertIn("Current model does not support image inputs.", message_records[-2].content)
             self.assertFalse(message_records[-2].metadata["ok"])
+
+    async def test_stream_turn_keeps_waiting_note_after_view_image_with_pending_detached_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            image_path = settings.workspace_dir / "temp" / "sample.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_bytes = b"\x89PNG\r\n\x1a\nfake_png_payload"
+            image_path.write_bytes(image_bytes)
+
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeStreamingViewImageWaitingLLMService(
+                    image_bytes,
+                    waiting_metadata={
+                        "detached_bash_jobs_pending": True,
+                        "detached_bash_job_ids": ["job_1"],
+                    },
+                ),
+                settings=settings,
+                storage=storage,
+            )
+
+            events = [event async for event in loop.stream_turn(
+                user_text="Inspect the image at local_path: temp/sample.png.",
+                pre_turn_messages=(
+                    AgentRuntimeMessage(
+                        role="system",
+                        content="Detached bash job job_1 is still running.",
+                        metadata={"detached_bash_job_ids": ["job_1"]},
+                    ),
+                ),
+            )]
+
+            done_events = [event for event in events if isinstance(event, AgentTurnDoneEvent)]
+            self.assertEqual(len(done_events), 1)
+            self.assertEqual(done_events[0].response_text, "Waiting on background work.")
+
+            records = storage.load_records(done_events[0].session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "assistant")
+            self.assertEqual(message_records[-4].metadata["tool_calls"][0]["name"], "view_image")
+            self.assertEqual(message_records[-3].role, "tool")
+            self.assertEqual(message_records[-2].role, "system")
+            self.assertTrue(message_records[-2].metadata["orchestrator_monitored_waiting"])
+            self.assertEqual(message_records[-2].metadata["detached_bash_job_ids"], ["job_1"])
+            self.assertEqual(message_records[-1].role, "assistant")
+
+    async def test_stream_turn_keeps_waiting_note_after_view_image_with_pending_subagent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            image_path = settings.workspace_dir / "temp" / "sample.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_bytes = b"\x89PNG\r\n\x1a\nfake_png_payload"
+            image_path.write_bytes(image_bytes)
+
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FakeStreamingViewImageWaitingLLMService(
+                    image_bytes,
+                    waiting_metadata={
+                        "subagents_pending": True,
+                        "pending_subagent_ids": ["subagent_1"],
+                    },
+                ),
+                settings=settings,
+                storage=storage,
+            )
+
+            events = [event async for event in loop.stream_turn(
+                user_text="Inspect the image at local_path: temp/sample.png.",
+                pre_turn_messages=(
+                    AgentRuntimeMessage(
+                        role="system",
+                        content="Subagent subagent_1 is still running.",
+                        metadata={"pending_subagent_ids": ["subagent_1"]},
+                    ),
+                ),
+            )]
+
+            done_events = [event for event in events if isinstance(event, AgentTurnDoneEvent)]
+            self.assertEqual(len(done_events), 1)
+            self.assertEqual(done_events[0].response_text, "Waiting on background work.")
+
+            records = storage.load_records(done_events[0].session_id)
+            message_records = [record for record in records if record.kind == "message"]
+            self.assertEqual(message_records[-4].role, "assistant")
+            self.assertEqual(message_records[-4].metadata["tool_calls"][0]["name"], "view_image")
+            self.assertEqual(message_records[-3].role, "tool")
+            self.assertEqual(message_records[-2].role, "system")
+            self.assertTrue(message_records[-2].metadata["orchestrator_monitored_waiting"])
+            self.assertEqual(message_records[-2].metadata["pending_subagent_ids"], ["subagent_1"])
+            self.assertEqual(message_records[-1].role, "assistant")
 
     async def test_handle_user_input_executes_file_patch_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
