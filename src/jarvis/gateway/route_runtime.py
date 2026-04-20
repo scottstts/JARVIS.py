@@ -6,6 +6,9 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+import traceback
 from typing import Any
 from uuid import uuid4
 
@@ -37,6 +40,7 @@ from jarvis.core.identities import IdentityBootstrapLoader
 from jarvis.llm import LLMMessage, LLMService, ProviderTimeoutError, ToolCall, ToolDefinition
 from jarvis.logging_setup import get_application_logger
 from jarvis.storage import SessionStorage
+from jarvis.storage.layout import transcript_archive_root_from_runtime_path
 from jarvis.subagent import (
     SUBAGENT_PRIMITIVE_NAMES,
     SubagentManager,
@@ -258,6 +262,77 @@ class RouteRuntime:
 
     def active_session_id(self) -> str | None:
         return self._main_loop.active_session_id()
+
+    def _runtime_error_log_dir(self) -> Path:
+        transcript_root = transcript_archive_root_from_runtime_path(
+            transcript_archive_dir=self._core_settings.transcript_archive_dir,
+            route_id=self._route_id,
+        )
+        return transcript_root.parent / "error_logs"
+
+    def _runtime_error_log_path(self, *, session_id: str | None) -> Path:
+        stem = (session_id or f"route_{self._route_id}_unbound").strip()
+        if not stem:
+            stem = f"route_{self._route_id}_unbound"
+        sanitized = stem.replace("/", "_")
+        return self._runtime_error_log_dir() / f"{sanitized}.jsonl"
+
+    def _write_runtime_error_log(
+        self,
+        *,
+        request: _RouteTurnRequest,
+        session_id: str | None,
+        turn_id: str | None,
+        published_turn_kind: str | None,
+        published_client_message_id: str | None,
+        parsed_command_kind: str | None,
+        exc: Exception,
+    ) -> Path:
+        error_log_path = self._runtime_error_log_path(session_id=session_id)
+        error_log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        entry = {
+            "schema": "jarvis.runtime_error.v1",
+            "logged_at": timestamp,
+            "component": "gateway.route_runtime",
+            "event": "main_turn_runtime_error",
+            "level": "ERROR",
+            "route_id": self._route_id,
+            "agent_kind": "main",
+            "message": (
+                f"Route {self._route_id} main turn failed while processing "
+                f"client_message_id={request.client_message_id}."
+            ),
+            "error_code": "internal_error",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "request_turn_kind": "user" if request.user_initiated else "runtime",
+            "published_turn_kind": published_turn_kind,
+            "client_message_id": request.client_message_id,
+            "published_client_message_id": published_client_message_id,
+            "user_initiated": request.user_initiated,
+            "parse_commands": request.parse_commands,
+            "parsed_command_kind": parsed_command_kind,
+            "runtime_turn_kind": request.runtime_turn_kind,
+            "force_session_id": request.force_session_id,
+            "exception_type": type(exc).__name__,
+            "exception_module": type(exc).__module__,
+            "exception_message": str(exc),
+            "traceback": traceback_text,
+        }
+        with error_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False))
+            handle.write("\n")
+        return error_log_path
+
+    def _print_runtime_error_notice(self, *, error_log_path: Path) -> None:
+        from rich.console import Console
+        from rich.text import Text
+
+        text = Text("Runtime error. Details written to ", style="bold white on red")
+        text.append(str(error_log_path), style="bold cyan")
+        Console(stderr=True).print(text, highlight=False)
 
     def request_stop(self) -> bool:
         main_stop_requested = self._main_loop.request_stop(reason="user_stop")
@@ -594,12 +669,7 @@ class RouteRuntime:
                         message=str(exc),
                     )
                 )
-            except Exception:
-                LOGGER.exception(
-                    "Route %s main turn failed while processing client_message_id=%s.",
-                    self._route_id,
-                    request.client_message_id,
-                )
+            except Exception as exc:
                 error_turn_kind: str | None = "user" if request.user_initiated else "runtime"
                 error_client_message_id = request.client_message_id
                 if (
@@ -610,6 +680,16 @@ class RouteRuntime:
                 ):
                     error_turn_kind = None
                     error_client_message_id = None
+                error_log_path = self._write_runtime_error_log(
+                    request=request,
+                    session_id=self._main_loop.active_session_id() or request.force_session_id,
+                    turn_id=self._main_loop.active_turn_id(),
+                    published_turn_kind=error_turn_kind,
+                    published_client_message_id=error_client_message_id,
+                    parsed_command_kind=parsed_command.kind if parsed_command is not None else None,
+                    exc=exc,
+                )
+                self._print_runtime_error_notice(error_log_path=error_log_path)
                 await self.publish_event(
                     RouteErrorEvent(
                         route_id=self._route_id,
@@ -1008,12 +1088,6 @@ class RouteRuntime:
         self._clear_pending_main_subagent_notices()
         try:
             await self._subagent_manager.reset_for_new_session()
-        except Exception:
-            LOGGER.exception(
-                "Failed to reset subagents before starting a new session for route %s.",
-                self._route_id,
-            )
-            raise
         finally:
             self._subagent_reset_in_progress = False
         self._clear_pending_main_subagent_notices()

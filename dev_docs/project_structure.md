@@ -166,6 +166,7 @@ Key responsibilities:
 - session routing
 - route event publication
 - detached bash-job observation
+- route-scoped runtime error capture, with full tracebacks persisted as JSONL entries under `/workspace/archive/error_logs/<session_id>.jsonl` and only a short Rich terminal reminder emitted inline
 
 ### `src/jarvis/identities/`
 

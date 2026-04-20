@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -450,6 +451,84 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(event.turn_kind)
             self.assertIsNone(event.client_message_id)
             self.assertFalse(stream_called)
+
+            runtime.unsubscribe(subscriber_id)
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_internal_error_writes_session_scoped_error_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            session_id_holder: dict[str, str] = {}
+
+            async def _stream_user_input(_user_text: str):
+                session_id = await runtime._main_loop.prepare_session()
+                session_id_holder["session_id"] = session_id
+                raise RuntimeError("boom")
+                yield  # pragma: no cover
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            with patch.object(runtime, "_print_runtime_error_notice") as print_notice:
+                await runtime._user_message_queue.put(
+                    _RouteTurnRequest(
+                        user_text="hello",
+                        client_message_id="msg_1",
+                        parse_commands=True,
+                        user_initiated=True,
+                    )
+                )
+                runtime._queue_wakeup.set()
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            event = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertIsInstance(event, RouteErrorEvent)
+            if not isinstance(event, RouteErrorEvent):
+                self.fail("Expected internal failure to publish a route error event.")
+            self.assertEqual(event.code, "internal_error")
+            self.assertEqual(event.client_message_id, "msg_1")
+
+            session_id = session_id_holder["session_id"]
+            error_log_path = (
+                runtime._core_settings.transcript_archive_dir.parent / "error_logs" / f"{session_id}.jsonl"
+            )
+            self.assertEqual(
+                print_notice.call_args.kwargs["error_log_path"],
+                error_log_path,
+            )
+            self.assertTrue(error_log_path.exists())
+            entries = [
+                json.loads(line)
+                for line in error_log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(entries), 1)
+            entry = entries[0]
+            self.assertEqual(entry["schema"], "jarvis.runtime_error.v1")
+            self.assertEqual(entry["route_id"], "route_1")
+            self.assertEqual(entry["session_id"], session_id)
+            self.assertEqual(entry["client_message_id"], "msg_1")
+            self.assertEqual(entry["published_client_message_id"], "msg_1")
+            self.assertEqual(entry["request_turn_kind"], "user")
+            self.assertEqual(entry["published_turn_kind"], "user")
+            self.assertEqual(entry["exception_type"], "RuntimeError")
+            self.assertEqual(entry["exception_message"], "boom")
+            self.assertEqual(
+                entry["message"],
+                "Route route_1 main turn failed while processing client_message_id=msg_1.",
+            )
+            self.assertIn("RuntimeError: boom", entry["traceback"])
+            self.assertIn("Traceback (most recent call last):", entry["traceback"])
+            self.assertIn("logged_at", entry)
 
             runtime.unsubscribe(subscriber_id)
             worker = runtime._message_worker

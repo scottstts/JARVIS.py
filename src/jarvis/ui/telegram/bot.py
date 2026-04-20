@@ -708,12 +708,6 @@ class TelegramGatewayBridge:
     ) -> None:
         output_paused = self._chat_output_paused(chat_id)
         if isinstance(event, GatewayErrorEvent):
-            LOGGER.warning(
-                "Suppressing gateway error for Telegram chat %s (code=%s, message=%s).",
-                chat_id,
-                event.code or "gateway_error",
-                event.message or "",
-            )
             if not output_paused:
                 self._stop_typing_indicator(active_turn)
                 await self._send_final_text(
@@ -1117,13 +1111,6 @@ class TelegramGatewayBridge:
         event: GatewayRouteEvent,
     ) -> None:
         if self._chat_output_paused(chat_id):
-            if isinstance(event, GatewayErrorEvent):
-                LOGGER.warning(
-                    "Suppressing background gateway error for Telegram chat %s (code=%s, message=%s).",
-                    chat_id,
-                    event.code or "gateway_error",
-                    event.message or "",
-                )
             return
         if isinstance(event, GatewayTurnStartedEvent):
             return
@@ -1171,12 +1158,6 @@ class TelegramGatewayBridge:
             )
             return
         if isinstance(event, GatewayErrorEvent):
-            LOGGER.warning(
-                "Suppressing background gateway error for Telegram chat %s (code=%s, message=%s).",
-                chat_id,
-                event.code or "gateway_error",
-                event.message or "",
-            )
             return
 
     async def handle_message(self, message: IncomingTelegramMessage) -> None:
