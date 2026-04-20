@@ -55,7 +55,7 @@ class SettingsModuleTests(unittest.TestCase):
                 module = importlib.reload(app_settings)
 
         self.assertEqual(module.SETTINGS_SOURCE_PATH, _PACKAGED_TEMPLATE_PATH.resolve())
-        self.assertEqual(module.JARVIS_GATEWAY_HOST, "127.0.0.1")
+        self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "openai")
 
     def test_prefers_workspace_settings_file_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,12 +67,8 @@ class SettingsModuleTests(unittest.TestCase):
             payload = yaml.safe_load(_PACKAGED_TEMPLATE_PATH.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 self.fail("Expected packaged settings template to be a mapping.")
-            _set_field_value(payload, ("gateway", "fields", "host"), "0.0.0.0")
-            _set_field_value(
-                payload,
-                ("tools", "groups", "python", "fields", "starter_packages"),
-                ["pyyaml", "requests"],
-            )
+            _set_field_value(payload, ("llm", "fields", "default_provider"), "grok")
+            _set_field_value(payload, ("providers", "groups", "grok", "fields", "chat_model"), "grok-test")
             workspace_settings_path.write_text(
                 yaml.safe_dump(payload, sort_keys=False),
                 encoding="utf-8",
@@ -84,15 +80,12 @@ class SettingsModuleTests(unittest.TestCase):
                     "AGENT_WORKSPACE": str(workspace_dir),
                 },
                 clear=True,
-            ):
-                module = importlib.reload(app_settings)
+                ):
+                    module = importlib.reload(app_settings)
 
         self.assertEqual(module.SETTINGS_SOURCE_PATH, workspace_settings_path.resolve())
-        self.assertEqual(module.JARVIS_GATEWAY_HOST, "0.0.0.0")
-        self.assertEqual(
-            module.JARVIS_TOOL_CENTRAL_PYTHON_STARTER_PACKAGES,
-            ("pyyaml", "requests"),
-        )
+        self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "grok")
+        self.assertEqual(module.JARVIS_GROK_CHAT_MODEL, "grok-test")
 
     def test_invalid_workspace_settings_fail_with_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,7 +97,7 @@ class SettingsModuleTests(unittest.TestCase):
             payload = yaml.safe_load(_PACKAGED_TEMPLATE_PATH.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 self.fail("Expected packaged settings template to be a mapping.")
-            del payload["gateway"]["fields"]["host"]
+            del payload["llm"]["fields"]["default_provider"]
             workspace_settings_path.write_text(
                 yaml.safe_dump(payload, sort_keys=False),
                 encoding="utf-8",
@@ -119,6 +112,6 @@ class SettingsModuleTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    rf"{workspace_settings_path.resolve()}'.*gateway\.host",
+                    rf"{workspace_settings_path.resolve()}'.*llm\.default_provider",
                 ):
                     importlib.reload(app_settings)

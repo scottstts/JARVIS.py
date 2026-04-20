@@ -8,6 +8,39 @@ from pathlib import Path
 
 from jarvis import settings as app_settings
 from jarvis.workspace_paths import resolve_workspace_dir
+from jarvis.tools.basic.bash.configs import (
+    DEFAULT_BASH_DANGEROUSLY_SKIP_PERMISSION,
+    DEFAULT_BASH_DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_BASH_EXECUTABLE,
+    DEFAULT_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS,
+    DEFAULT_BASH_JOB_LOG_MAX_BYTES,
+    DEFAULT_BASH_JOB_RETENTION_SECONDS,
+    DEFAULT_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES,
+    DEFAULT_BASH_MAX_OUTPUT_CHARS,
+    DEFAULT_BASH_MAX_TIMEOUT_SECONDS,
+    DEFAULT_CENTRAL_PYTHON_STARTER_PACKAGES,
+    DEFAULT_CENTRAL_PYTHON_VENV,
+)
+from jarvis.tools.basic.web_fetch.configs import (
+    DEFAULT_WEB_FETCH_MAX_MARKDOWN_CHARS,
+    DEFAULT_WEB_FETCH_TIMEOUT_SECONDS,
+)
+from jarvis.tools.basic.web_search.configs import (
+    DEFAULT_WEB_SEARCH_RESULT_COUNT,
+    DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
+)
+from jarvis.tools.discoverable.email.configs import (
+    DEFAULT_EMAIL_MAX_ATTACHMENT_COUNT,
+    DEFAULT_EMAIL_MAX_BODY_CHARS,
+    DEFAULT_EMAIL_MAX_SUBJECT_CHARS,
+    DEFAULT_EMAIL_MAX_TOTAL_ATTACHMENT_BYTES,
+    DEFAULT_EMAIL_TIMEOUT_SECONDS,
+)
+
+
+_DEFAULT_TOOL_RUNTIME_TIMEOUT_SECONDS = 135.0
+_DEFAULT_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS = 5.0
+_DEFAULT_MAX_TOOL_ROUNDS_PER_TURN = 100
 
 
 def _optional_env(name: str) -> str | None:
@@ -148,10 +181,7 @@ class ToolSettings:
 
     @classmethod
     def from_workspace_dir(cls, workspace_dir: Path) -> "ToolSettings":
-        tool_runtime_base_url = (
-            _optional_env("JARVIS_TOOL_RUNTIME_BASE_URL")
-            or app_settings.JARVIS_TOOL_RUNTIME_BASE_URL
-        )
+        tool_runtime_base_url = _optional_env("JARVIS_TOOL_RUNTIME_BASE_URL")
         if tool_runtime_base_url is not None:
             tool_runtime_base_url = tool_runtime_base_url.rstrip("/")
 
@@ -160,75 +190,73 @@ class ToolSettings:
             tool_runtime_base_url=tool_runtime_base_url,
             tool_runtime_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_RUNTIME_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_RUNTIME_TIMEOUT_SECONDS,
+                _DEFAULT_TOOL_RUNTIME_TIMEOUT_SECONDS,
             ),
             tool_runtime_healthcheck_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS,
+                _DEFAULT_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS,
             ),
             bash_executable=(
                 _optional_env("JARVIS_TOOL_BASH_EXECUTABLE")
-                or app_settings.JARVIS_TOOL_BASH_EXECUTABLE
+                or DEFAULT_BASH_EXECUTABLE
             ),
             bash_default_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_BASH_DEFAULT_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_BASH_DEFAULT_TIMEOUT_SECONDS,
+                DEFAULT_BASH_DEFAULT_TIMEOUT_SECONDS,
             ),
             bash_max_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_BASH_MAX_TIMEOUT_SECONDS,
+                DEFAULT_BASH_MAX_TIMEOUT_SECONDS,
             ),
             bash_foreground_soft_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS,
+                DEFAULT_BASH_FOREGROUND_SOFT_TIMEOUT_SECONDS,
             ),
             bash_max_output_chars=_parse_int_env(
                 "JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS",
-                app_settings.JARVIS_TOOL_BASH_MAX_OUTPUT_CHARS,
+                DEFAULT_BASH_MAX_OUTPUT_CHARS,
             ),
             bash_job_log_max_bytes=_parse_int_env(
                 "JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES",
-                app_settings.JARVIS_TOOL_BASH_JOB_LOG_MAX_BYTES,
+                DEFAULT_BASH_JOB_LOG_MAX_BYTES,
             ),
             bash_job_total_storage_budget_bytes=_parse_int_env(
                 "JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES",
-                app_settings.JARVIS_TOOL_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES,
+                DEFAULT_BASH_JOB_TOTAL_STORAGE_BUDGET_BYTES,
             ),
             bash_job_retention_seconds=_parse_float_env(
                 "JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS",
-                app_settings.JARVIS_TOOL_BASH_JOB_RETENTION_SECONDS,
+                DEFAULT_BASH_JOB_RETENTION_SECONDS,
             ),
             bash_dangerously_skip_permission=_parse_bool_env(
                 "BASH_DANGEROUSLY_SKIP_PERMISSION",
-                app_settings.BASH_DANGEROUSLY_SKIP_PERMISSION,
+                DEFAULT_BASH_DANGEROUSLY_SKIP_PERMISSION,
             ),
             central_python_venv=Path(
                 _optional_env("JARVIS_TOOL_CENTRAL_PYTHON_VENV")
                 or _optional_env("JARVIS_TOOL_PYTHON_INTERPRETER_VENV")
-                or app_settings.JARVIS_TOOL_CENTRAL_PYTHON_VENV
+                or str(DEFAULT_CENTRAL_PYTHON_VENV)
             ).expanduser(),
-            central_python_starter_packages=tuple(
-                app_settings.JARVIS_TOOL_CENTRAL_PYTHON_STARTER_PACKAGES
-            ),
+            central_python_starter_packages=DEFAULT_CENTRAL_PYTHON_STARTER_PACKAGES,
             max_tool_rounds_per_turn=_parse_int_env(
                 "JARVIS_TOOL_MAX_ROUNDS_PER_TURN",
-                app_settings.JARVIS_TOOL_MAX_ROUNDS_PER_TURN,
+                _DEFAULT_MAX_TOOL_ROUNDS_PER_TURN,
             ),
             web_search_result_count=_parse_int_env(
                 "JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT",
-                app_settings.JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT,
+                DEFAULT_WEB_SEARCH_RESULT_COUNT,
             ),
             web_search_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_WEB_SEARCH_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_WEB_SEARCH_TIMEOUT_SECONDS,
+                DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
             ),
             web_fetch_timeout_seconds=_parse_float_env(
                 "JARVIS_TOOL_WEB_FETCH_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_WEB_FETCH_TIMEOUT_SECONDS,
+                DEFAULT_WEB_FETCH_TIMEOUT_SECONDS,
             ),
             web_fetch_max_markdown_chars=_parse_int_env(
                 "JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS",
-                app_settings.JARVIS_TOOL_WEB_FETCH_MAX_MARKDOWN_CHARS,
+                DEFAULT_WEB_FETCH_MAX_MARKDOWN_CHARS,
             ),
             email_smtp_host=(
                 _optional_env("SMTP_HOST")
@@ -244,23 +272,23 @@ class ToolSettings:
             ).lower(),
             email_timeout_seconds=_parse_float_env(
                 "SMTP_TIMEOUT_SECONDS",
-                app_settings.JARVIS_TOOL_EMAIL_TIMEOUT_SECONDS,
+                DEFAULT_EMAIL_TIMEOUT_SECONDS,
             ),
             email_sender_address=_optional_env("SENDER_EMAIL_ADDRESS"),
             email_max_subject_chars=_parse_int_env(
                 "JARVIS_TOOL_EMAIL_MAX_SUBJECT_CHARS",
-                app_settings.JARVIS_TOOL_EMAIL_MAX_SUBJECT_CHARS,
+                DEFAULT_EMAIL_MAX_SUBJECT_CHARS,
             ),
             email_max_body_chars=_parse_int_env(
                 "JARVIS_TOOL_EMAIL_MAX_BODY_CHARS",
-                app_settings.JARVIS_TOOL_EMAIL_MAX_BODY_CHARS,
+                DEFAULT_EMAIL_MAX_BODY_CHARS,
             ),
             email_max_attachment_count=_parse_int_env(
                 "JARVIS_TOOL_EMAIL_MAX_ATTACHMENT_COUNT",
-                app_settings.JARVIS_TOOL_EMAIL_MAX_ATTACHMENT_COUNT,
+                DEFAULT_EMAIL_MAX_ATTACHMENT_COUNT,
             ),
             email_max_total_attachment_bytes=_parse_int_env(
                 "JARVIS_TOOL_EMAIL_MAX_TOTAL_ATTACHMENT_BYTES",
-                app_settings.JARVIS_TOOL_EMAIL_MAX_TOTAL_ATTACHMENT_BYTES,
+                DEFAULT_EMAIL_MAX_TOTAL_ATTACHMENT_BYTES,
             ),
         )

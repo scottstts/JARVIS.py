@@ -190,7 +190,7 @@ class CoreSettings:
         transcript_archive_dir = resolve_transcript_archive_root(workspace_dir)
         identities_dir = resolve_workspace_child(
             env_name="JARVIS_IDENTITIES_DIR",
-            configured_default=app_settings.JARVIS_IDENTITIES_DIR,
+            configured_default=None,
             workspace_dir=workspace_dir,
             child_name="identities",
         )

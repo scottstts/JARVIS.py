@@ -548,7 +548,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - calls Brave `GET /res/v1/web/search`
 - always forces `result_filter=web`
 - disables Brave spellcheck so the query stays deterministic
-- returns up to `JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT` results (default `10`)
+- returns up to the internal web-search default result count (`10`)
 - normalizes each result to a concise structure centered on `title`, `url`, `snippet`, and source hostname
 - includes query metadata such as `original`, `cleaned`, and `more_results_available` when Brave returns it
 - converts request failures, missing API key errors, timeouts, and non-200 Brave responses into normalized tool-error results

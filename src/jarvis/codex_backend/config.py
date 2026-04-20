@@ -14,6 +14,12 @@ _REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _REASONING_SUMMARIES = {"none", "auto", "concise", "detailed"}
 _PERSONALITIES = {"none", "friendly", "pragmatic"}
 _APPROVAL_POLICIES = {"untrusted", "on-failure", "on-request", "never"}
+_DEFAULT_CODEX_WS_URL = "ws://host.docker.internal:4500"
+_DEFAULT_CODEX_REASONING_SUMMARY = "none"
+_DEFAULT_CODEX_PERSONALITY = "pragmatic"
+_DEFAULT_CODEX_SERVICE_NAME = "Jarvis"
+_DEFAULT_CODEX_APPROVAL_POLICY = "untrusted"
+_DEFAULT_CODEX_SANDBOX_NETWORK_ACCESS = False
 
 
 def _optional_env(name: str, default: object) -> str | None:
@@ -85,8 +91,8 @@ class CodexBackendSettings:
     @classmethod
     def from_env(cls) -> "CodexBackendSettings":
         return cls(
-            ws_url=_optional_env("JARVIS_CODEX_WS_URL", app_settings.JARVIS_CODEX_WS_URL)
-            or "ws://host.docker.internal:4500",
+            ws_url=_optional_env("JARVIS_CODEX_WS_URL", _DEFAULT_CODEX_WS_URL)
+            or _DEFAULT_CODEX_WS_URL,
             model=_optional_env("JARVIS_CODEX_MODEL", app_settings.JARVIS_CODEX_MODEL),
             reasoning_effort=_optional_choice(
                 name="JARVIS_CODEX_REASONING_EFFORT",
@@ -95,36 +101,27 @@ class CodexBackendSettings:
             ),
             reasoning_summary=_optional_choice(
                 name="JARVIS_CODEX_REASONING_SUMMARY",
-                default=app_settings.JARVIS_CODEX_REASONING_SUMMARY,
+                default=_DEFAULT_CODEX_REASONING_SUMMARY,
                 allowed=_REASONING_SUMMARIES,
             ),
             personality=_optional_choice(
                 name="JARVIS_CODEX_PERSONALITY",
-                default=app_settings.JARVIS_CODEX_PERSONALITY,
+                default=_DEFAULT_CODEX_PERSONALITY,
                 allowed=_PERSONALITIES,
             ),
-            service_name=_optional_env(
-                "JARVIS_CODEX_SERVICE_NAME",
-                app_settings.JARVIS_CODEX_SERVICE_NAME,
-            )
-            or "Jarvis",
-            host_repo_root=_optional_path(
-                "JARVIS_CODEX_HOST_REPO_ROOT",
-                app_settings.JARVIS_CODEX_HOST_REPO_ROOT,
-            ),
-            host_workspace_root=_optional_path(
-                "JARVIS_CODEX_HOST_WORKSPACE_ROOT",
-                app_settings.JARVIS_CODEX_HOST_WORKSPACE_ROOT,
-            ),
+            service_name=_optional_env("JARVIS_CODEX_SERVICE_NAME", _DEFAULT_CODEX_SERVICE_NAME)
+            or _DEFAULT_CODEX_SERVICE_NAME,
+            host_repo_root=_optional_path("JARVIS_CODEX_HOST_REPO_ROOT", None),
+            host_workspace_root=_optional_path("JARVIS_CODEX_HOST_WORKSPACE_ROOT", None),
             approval_policy=_optional_choice(
                 name="JARVIS_CODEX_APPROVAL_POLICY",
-                default=app_settings.JARVIS_CODEX_APPROVAL_POLICY,
+                default=_DEFAULT_CODEX_APPROVAL_POLICY,
                 allowed=_APPROVAL_POLICIES,
             )
-            or "untrusted",
+            or _DEFAULT_CODEX_APPROVAL_POLICY,
             sandbox_network_access=_bool_env(
                 "JARVIS_CODEX_SANDBOX_NETWORK_ACCESS",
-                app_settings.JARVIS_CODEX_SANDBOX_NETWORK_ACCESS,
+                _DEFAULT_CODEX_SANDBOX_NETWORK_ACCESS,
             ),
             ws_bearer_token=_optional_env("JARVIS_CODEX_WS_BEARER_TOKEN", None),
         )

@@ -6,8 +6,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-from jarvis import settings as app_settings
-
 from jarvis.llm.config import (
     EmbeddingSettings,
     GrokProviderSettings,
@@ -24,13 +22,14 @@ class LMStudioConfigTests(unittest.TestCase):
             EmbeddingSettings(provider="lmstudio", model="embed-model")
 
     def test_lmstudio_can_be_the_default_provider(self) -> None:
-        settings = LLMSettings(
-            default_provider="lmstudio",
-            embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
-        )
+        with patch.dict(os.environ, {}, clear=True):
+            settings = LLMSettings(
+                default_provider="lmstudio",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            )
 
         self.assertEqual(settings.default_provider, "lmstudio")
-        self.assertEqual(settings.lmstudio.base_url, app_settings.JARVIS_LMSTUDIO_BASE_URL)
+        self.assertEqual(settings.lmstudio.base_url, "http://127.0.0.1:1234")
 
     def test_lmstudio_settings_reads_base_url_override(self) -> None:
         with patch.dict(
@@ -44,11 +43,12 @@ class LMStudioConfigTests(unittest.TestCase):
 
 
 class OpenRouterConfigTests(unittest.TestCase):
-    def test_openrouter_settings_read_yaml_site_url_default(self) -> None:
-        settings = OpenRouterProviderSettings.from_env()
+    def test_openrouter_settings_read_local_site_url_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = OpenRouterProviderSettings.from_env()
 
-        self.assertEqual(settings.site_url, app_settings.OPENROUTER_SITE_URL)
-        self.assertEqual(settings.app_name, app_settings.OPENROUTER_APP_NAME)
+        self.assertEqual(settings.site_url, "https://github.com/scottstts/JARVIS.py")
+        self.assertEqual(settings.app_name, "Jarvis")
 
     def test_openrouter_settings_reads_site_url_override(self) -> None:
         with patch.dict(
@@ -67,13 +67,14 @@ class OpenRouterConfigTests(unittest.TestCase):
 
 class GrokConfigTests(unittest.TestCase):
     def test_grok_can_be_the_default_provider(self) -> None:
-        settings = LLMSettings(
-            default_provider="grok",
-            embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
-        )
+        with patch.dict(os.environ, {}, clear=True):
+            settings = LLMSettings(
+                default_provider="grok",
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            )
 
         self.assertEqual(settings.default_provider, "grok")
-        self.assertEqual(settings.grok.chat_model, app_settings.JARVIS_GROK_CHAT_MODEL)
+        self.assertEqual(settings.grok.chat_model, "grok-4.20-0309-non-reasoning")
 
     def test_grok_settings_reads_model_override(self) -> None:
         with patch.dict(

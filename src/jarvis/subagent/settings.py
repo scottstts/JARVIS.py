@@ -10,6 +10,27 @@ from jarvis import settings as app_settings
 from jarvis.llm.provider_names import LLM_PROVIDER_NAME_SET, LLM_PROVIDER_NAMES_TEXT
 
 
+_DEFAULT_SUBAGENT_MAX_ACTIVE = 7
+_DEFAULT_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT = 8
+_DEFAULT_SUBAGENT_CODENAME_POOL = (
+    "Friday",
+    "Edith",
+    "Karen",
+    "Jocasta",
+    "Tadashi",
+    "Homer",
+    "Ultron",
+)
+_DEFAULT_SUBAGENT_BUILTIN_TOOL_BLOCKLIST = (
+    "memory_search",
+    "memory_get",
+    "memory_write",
+    "memory_admin",
+    "send_file",
+    "email",
+)
+
+
 def _parse_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -66,19 +87,19 @@ class SubagentSettings:
             ),
             max_active=_parse_int_env(
                 "JARVIS_SUBAGENT_MAX_ACTIVE",
-                app_settings.JARVIS_SUBAGENT_MAX_ACTIVE,
+                _DEFAULT_SUBAGENT_MAX_ACTIVE,
             ),
             codename_pool=_parse_csv_env(
                 "JARVIS_SUBAGENT_CODENAME_POOL",
-                app_settings.JARVIS_SUBAGENT_CODENAME_POOL,
+                _DEFAULT_SUBAGENT_CODENAME_POOL,
             ),
             archive_dir=archive_dir,
             builtin_tool_blocklist=_parse_csv_env(
                 "JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST",
-                app_settings.JARVIS_SUBAGENT_BUILTIN_TOOL_BLOCKLIST,
+                _DEFAULT_SUBAGENT_BUILTIN_TOOL_BLOCKLIST,
             ),
             main_context_event_limit=_parse_int_env(
                 "JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT",
-                app_settings.JARVIS_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT,
+                _DEFAULT_SUBAGENT_MAIN_CONTEXT_EVENT_LIMIT,
             ),
         )

@@ -6,15 +6,17 @@ import os
 
 import uvicorn
 
-from jarvis import settings as app_settings
+
+_DEFAULT_SERVICE_HOST = "0.0.0.0"
+_DEFAULT_SERVICE_PORT = 8081
 
 
 def main() -> None:
-    host = os.getenv("JARVIS_TOOL_RUNTIME_SERVICE_HOST", app_settings.JARVIS_TOOL_RUNTIME_SERVICE_HOST)
+    host = os.getenv("JARVIS_TOOL_RUNTIME_SERVICE_HOST", _DEFAULT_SERVICE_HOST)
     port = int(
         os.getenv(
             "JARVIS_TOOL_RUNTIME_SERVICE_PORT",
-            str(app_settings.JARVIS_TOOL_RUNTIME_SERVICE_PORT),
+            str(_DEFAULT_SERVICE_PORT),
         )
     )
     uvicorn.run(

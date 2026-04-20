@@ -134,12 +134,12 @@ src/jarvis/
   - combined runtime entrypoint for running gateway + UI together
   - backs the `jarvis` script
 - `settings.py`
-  - compatibility layer that exports the runtime setting constants consumed by the app
+  - compatibility layer that exports the user-facing runtime setting constants consumed by the app
   - extracts grouped runtime values from metadata-rich `settings.yml` or the workspace override file
 - `settings.yml`
-  - shipped non-secret runtime settings template plus UI metadata
-  - grouped, user-facing YAML source for both the `settings.py` compatibility layer and `settings_gui.html`
-  - provider-specific HTTP attribution defaults such as OpenRouter `site_url` and `app_name` live here, and workspace overrides take precedence at runtime
+  - shipped non-secret user-facing settings template plus UI metadata
+  - grouped YAML source for `settings.py` and `settings_gui.html`
+  - internal runtime defaults live in subsystem-local config modules instead of here
 - `runtime_env.py`
   - Docker secret loading and runtime environment bootstrap
 - `logging_setup.py`

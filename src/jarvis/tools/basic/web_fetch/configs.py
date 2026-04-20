@@ -1,0 +1,4 @@
+"""Internal defaults for the web fetch tool."""
+
+DEFAULT_WEB_FETCH_TIMEOUT_SECONDS = 20.0
+DEFAULT_WEB_FETCH_MAX_MARKDOWN_CHARS = 250_000

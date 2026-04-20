@@ -6,12 +6,26 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from jarvis import settings as app_settings
+from jarvis.gateway.config import GatewaySettings
 from jarvis.workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
 
 class UIConfigurationError(ValueError):
     """Raised when UI runtime settings are invalid."""
+
+
+_DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org"
+_DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30
+_DEFAULT_TELEGRAM_POLL_LIMIT = 100
+_DEFAULT_POLL_ERROR_BACKOFF_SECONDS = 2.0
+_DEFAULT_GATEWAY_CONNECT_TIMEOUT_SECONDS = 15.0
+_DEFAULT_STREAM_TRANSPORT = "edit"
+_DEFAULT_STREAM_CHUNK_IDLE_FLUSH_SECONDS = 1.2
+_DEFAULT_STREAM_CHUNK_MIN_CHARS = 80
+_DEFAULT_STREAM_CHUNK_MAX_CHARS = 350
+_DEFAULT_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS = 4.0
+_DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS = 4096
+_DEFAULT_TELEGRAM_TEMP_DIR = Path("/workspace/temp")
 
 
 def _required_env(name: str) -> str:
@@ -109,60 +123,33 @@ def _normalize_gateway_ws_base_url(raw_url: str) -> str:
 
 
 def _derive_gateway_ws_base_url() -> str:
-    host = _normalize_gateway_host(
-        _optional_env("JARVIS_GATEWAY_HOST", app_settings.JARVIS_GATEWAY_HOST)
-    )
-    port = _parse_int_env("JARVIS_GATEWAY_PORT", app_settings.JARVIS_GATEWAY_PORT)
-    if port <= 0 or port > 65_535:
-        raise UIConfigurationError("JARVIS_GATEWAY_PORT must be between 1 and 65535.")
-    ws_path = _normalize_ws_path(
-        _optional_env("JARVIS_GATEWAY_WS_PATH", app_settings.JARVIS_GATEWAY_WS_PATH)
-    )
-    return f"ws://{host}:{port}{ws_path}"
+    settings = GatewaySettings.from_env()
+    host = _normalize_gateway_host(settings.host)
+    return f"ws://{host}:{settings.port}{_normalize_ws_path(settings.websocket_path)}"
 
 
-_DEFAULT_GATEWAY_WS_BASE_URL = (
-    _normalize_gateway_ws_base_url(app_settings.JARVIS_UI_GATEWAY_WS_BASE_URL)
-    if app_settings.JARVIS_UI_GATEWAY_WS_BASE_URL is not None
-    else _normalize_gateway_ws_base_url(
-        f"ws://{_normalize_gateway_host(app_settings.JARVIS_GATEWAY_HOST)}:"
-        f"{app_settings.JARVIS_GATEWAY_PORT}"
-        f"{_normalize_ws_path(app_settings.JARVIS_GATEWAY_WS_PATH)}"
-    )
-)
-
-
-def _default_telegram_temp_dir() -> Path:
-    configured = app_settings.JARVIS_UI_TELEGRAM_TEMP_DIR
-    if configured is not None and configured.strip():
-        return Path(configured).expanduser()
-    return Path("/workspace/temp")
+_DEFAULT_GATEWAY_WS_BASE_URL = _derive_gateway_ws_base_url()
 
 
 @dataclass(slots=True, frozen=True)
 class UISettings:
     telegram_token: str = field(repr=False)
-    telegram_api_base_url: str = app_settings.TELEGRAM_API_BASE_URL
-    telegram_allowed_user_id: int | None = field(
-        default=app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID,
-        repr=False,
-    )
-    telegram_temp_dir: Path = _default_telegram_temp_dir()
-    telegram_poll_timeout_seconds: int = app_settings.JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS
-    telegram_poll_limit: int = app_settings.JARVIS_UI_TELEGRAM_POLL_LIMIT
-    poll_error_backoff_seconds: float = app_settings.JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS
+    telegram_api_base_url: str = _DEFAULT_TELEGRAM_API_BASE_URL
+    telegram_allowed_user_id: int | None = field(default=None, repr=False)
+    telegram_temp_dir: Path = _DEFAULT_TELEGRAM_TEMP_DIR
+    telegram_poll_timeout_seconds: int = _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS
+    telegram_poll_limit: int = _DEFAULT_TELEGRAM_POLL_LIMIT
+    poll_error_backoff_seconds: float = _DEFAULT_POLL_ERROR_BACKOFF_SECONDS
     gateway_ws_base_url: str = _DEFAULT_GATEWAY_WS_BASE_URL
-    gateway_connect_timeout_seconds: float = app_settings.JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS
-    stream_transport: str = app_settings.JARVIS_UI_STREAM_TRANSPORT
-    stream_chunk_idle_flush_seconds: float = (
-        app_settings.JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS
-    )
-    stream_chunk_min_chars: int = app_settings.JARVIS_UI_STREAM_DRAFT_MIN_CHARS
-    stream_chunk_max_chars: int = app_settings.JARVIS_UI_STREAM_CHUNK_MAX_CHARS
+    gateway_connect_timeout_seconds: float = _DEFAULT_GATEWAY_CONNECT_TIMEOUT_SECONDS
+    stream_transport: str = _DEFAULT_STREAM_TRANSPORT
+    stream_chunk_idle_flush_seconds: float = _DEFAULT_STREAM_CHUNK_IDLE_FLUSH_SECONDS
+    stream_chunk_min_chars: int = _DEFAULT_STREAM_CHUNK_MIN_CHARS
+    stream_chunk_max_chars: int = _DEFAULT_STREAM_CHUNK_MAX_CHARS
     stream_typing_indicator_interval_seconds: float = (
-        app_settings.JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS
+        _DEFAULT_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS
     )
-    telegram_max_message_chars: int = app_settings.JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS
+    telegram_max_message_chars: int = _DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS
 
     def __post_init__(self) -> None:
         if not self.telegram_token.strip():
@@ -212,22 +199,17 @@ class UISettings:
     @classmethod
     def from_env(cls) -> "UISettings":
         gateway_raw = os.getenv("JARVIS_UI_GATEWAY_WS_BASE_URL")
-        if gateway_raw is None:
-            gateway_raw = app_settings.JARVIS_UI_GATEWAY_WS_BASE_URL
         gateway_ws_base_url = (
             _normalize_gateway_ws_base_url(gateway_raw)
             if gateway_raw is not None
             else _derive_gateway_ws_base_url()
         )
         telegram_token = _required_env("TELEGRAM_TOKEN")
-        telegram_allowed_user_id = _required_int_env(
-            "JARVIS_UI_TELEGRAM_ALLOWED_USER_ID",
-            app_settings.JARVIS_UI_TELEGRAM_ALLOWED_USER_ID,
-        )
+        telegram_allowed_user_id = _required_int_env("JARVIS_UI_TELEGRAM_ALLOWED_USER_ID", None)
         workspace_dir = resolve_workspace_dir(error_type=UIConfigurationError)
         default_telegram_temp_dir = resolve_workspace_child(
             env_name="JARVIS_UI_TELEGRAM_TEMP_DIR",
-            configured_default=app_settings.JARVIS_UI_TELEGRAM_TEMP_DIR,
+            configured_default=None,
             workspace_dir=workspace_dir,
             child_name="temp",
         )
@@ -236,7 +218,7 @@ class UISettings:
             telegram_token=telegram_token,
             telegram_api_base_url=_optional_env(
                 "TELEGRAM_API_BASE_URL",
-                app_settings.TELEGRAM_API_BASE_URL,
+                _DEFAULT_TELEGRAM_API_BASE_URL,
             ).rstrip("/"),
             telegram_allowed_user_id=telegram_allowed_user_id,
             telegram_temp_dir=_parse_path_env(
@@ -245,43 +227,43 @@ class UISettings:
             ),
             telegram_poll_timeout_seconds=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS",
-                app_settings.JARVIS_UI_TELEGRAM_POLL_TIMEOUT_SECONDS,
+                _DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
             ),
             telegram_poll_limit=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_POLL_LIMIT",
-                app_settings.JARVIS_UI_TELEGRAM_POLL_LIMIT,
+                _DEFAULT_TELEGRAM_POLL_LIMIT,
             ),
             poll_error_backoff_seconds=_parse_float_env(
                 "JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS",
-                app_settings.JARVIS_UI_POLL_ERROR_BACKOFF_SECONDS,
+                _DEFAULT_POLL_ERROR_BACKOFF_SECONDS,
             ),
             gateway_ws_base_url=gateway_ws_base_url,
             gateway_connect_timeout_seconds=_parse_float_env(
                 "JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS",
-                app_settings.JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS,
+                _DEFAULT_GATEWAY_CONNECT_TIMEOUT_SECONDS,
             ),
             stream_transport=_optional_env(
                 "JARVIS_UI_STREAM_TRANSPORT",
-                app_settings.JARVIS_UI_STREAM_TRANSPORT,
+                _DEFAULT_STREAM_TRANSPORT,
             ),
             stream_chunk_idle_flush_seconds=_parse_float_env(
                 "JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS",
-                app_settings.JARVIS_UI_STREAM_DRAFT_MIN_INTERVAL_SECONDS,
+                _DEFAULT_STREAM_CHUNK_IDLE_FLUSH_SECONDS,
             ),
             stream_chunk_min_chars=_parse_int_env(
                 "JARVIS_UI_STREAM_DRAFT_MIN_CHARS",
-                app_settings.JARVIS_UI_STREAM_DRAFT_MIN_CHARS,
+                _DEFAULT_STREAM_CHUNK_MIN_CHARS,
             ),
             stream_chunk_max_chars=_parse_int_env(
                 "JARVIS_UI_STREAM_CHUNK_MAX_CHARS",
-                app_settings.JARVIS_UI_STREAM_CHUNK_MAX_CHARS,
+                _DEFAULT_STREAM_CHUNK_MAX_CHARS,
             ),
             stream_typing_indicator_interval_seconds=_parse_float_env(
                 "JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS",
-                app_settings.JARVIS_UI_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS,
+                _DEFAULT_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS,
             ),
             telegram_max_message_chars=_parse_int_env(
                 "JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS",
-                app_settings.JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS,
+                _DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
             ),
         )

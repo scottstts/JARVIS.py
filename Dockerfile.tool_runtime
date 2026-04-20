@@ -87,7 +87,7 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 
 RUN uv sync --locked --no-dev --no-editable \
-  && export JARVIS_PYTHON_TOOL_PACKAGES="$(${UV_PROJECT_ENVIRONMENT}/bin/python -c "from jarvis import settings as module; print(' '.join(module.JARVIS_TOOL_CENTRAL_PYTHON_STARTER_PACKAGES))")" \
+  && export JARVIS_PYTHON_TOOL_PACKAGES="$(${UV_PROJECT_ENVIRONMENT}/bin/python -c "import runpy; module = runpy.run_path('/app/src/jarvis/tools/basic/bash/configs.py'); print(' '.join(module['DEFAULT_CENTRAL_PYTHON_STARTER_PACKAGES']))")" \
   && uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" ${JARVIS_PYTHON_TOOL_PACKAGES}
 
 WORKDIR /workspace

@@ -89,23 +89,17 @@ This selection is applied independently to:
 
 ## Settings Surface
 
-`settings.yml` keeps `codex` as a selectable provider for:
+`settings.yml` keeps `codex` as a selectable/defaultable model provider for:
 
 - `llm.default_provider`
 - `subagent.provider`
 
-Codex backend-specific settings live under `providers.codex`:
+User-facing Codex model settings live under `providers.codex`:
 
-- `ws_url`
 - `model`
 - `reasoning_effort`
-- `reasoning_summary`
-- `personality`
-- `service_name`
-- `host_repo_root`
-- `host_workspace_root`
-- `approval_policy`
-- `sandbox_network_access`
+
+Codex backend transport/runtime defaults such as websocket URL, reasoning summary, sandbox policy, host-path mapping, and service identity now live in `src/jarvis/codex_backend/config.py` and env/secret inputs, not in `settings.yml`.
 
 The websocket bearer token is intentionally not stored in `settings.yml`.
 If needed, Jarvis reads it only from the secret/env var `JARVIS_CODEX_WS_BEARER_TOKEN`.

@@ -10,6 +10,22 @@ from jarvis import settings as app_settings
 from jarvis.workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
 
+_DEFAULT_BOOTSTRAP_MAX_TOKENS = 5000
+_DEFAULT_CORE_BOOTSTRAP_MAX_TOKENS = _DEFAULT_BOOTSTRAP_MAX_TOKENS // 2
+_DEFAULT_ONGOING_BOOTSTRAP_MAX_TOKENS = (
+    _DEFAULT_BOOTSTRAP_MAX_TOKENS - _DEFAULT_CORE_BOOTSTRAP_MAX_TOKENS
+)
+_DEFAULT_GRAPH_DEFAULT_EXPAND = 1
+_DEFAULT_LEXICAL_CANDIDATE_COUNT = 30
+_DEFAULT_SEMANTIC_CANDIDATE_COUNT = 30
+_DEFAULT_GRAPH_CANDIDATE_COUNT = 20
+_DEFAULT_HYBRID_RESULT_COUNT = 8
+_DEFAULT_SEMANTIC_SCORE_FLOOR = 0.30
+_DEFAULT_SEMANTIC_ONLY_SCORE_FLOOR = 0.55
+_DEFAULT_WEAK_RESULT_SCORE_THRESHOLD = 0.45
+_DEFAULT_RETRIEVAL_FALLBACK_MAX_QUERIES = 2
+
+
 def _optional_env(name: str) -> str | None:
     raw = os.getenv(name)
     if raw is None:
@@ -37,13 +53,6 @@ def _parse_bool_env(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean-like value.")
 
 
-def _parse_float_env(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return float(raw)
-
-
 @dataclass(slots=True, frozen=True)
 class MemorySettings:
     workspace_dir: Path
@@ -62,14 +71,14 @@ class MemorySettings:
     enable_auto_apply_core: bool
     enable_auto_apply_ongoing: bool
     graph_default_expand: int
-    lexical_candidate_count: int = 30
-    semantic_candidate_count: int = 30
-    graph_candidate_count: int = 20
-    hybrid_result_count: int = 8
-    semantic_score_floor: float = 0.30
-    semantic_only_score_floor: float = 0.55
-    weak_result_score_threshold: float = 0.45
-    retrieval_fallback_max_queries: int = 2
+    lexical_candidate_count: int = _DEFAULT_LEXICAL_CANDIDATE_COUNT
+    semantic_candidate_count: int = _DEFAULT_SEMANTIC_CANDIDATE_COUNT
+    graph_candidate_count: int = _DEFAULT_GRAPH_CANDIDATE_COUNT
+    hybrid_result_count: int = _DEFAULT_HYBRID_RESULT_COUNT
+    semantic_score_floor: float = _DEFAULT_SEMANTIC_SCORE_FLOOR
+    semantic_only_score_floor: float = _DEFAULT_SEMANTIC_ONLY_SCORE_FLOOR
+    weak_result_score_threshold: float = _DEFAULT_WEAK_RESULT_SCORE_THRESHOLD
+    retrieval_fallback_max_queries: int = _DEFAULT_RETRIEVAL_FALLBACK_MAX_QUERIES
 
     def __post_init__(self) -> None:
         if self.bootstrap_max_tokens <= 0:
@@ -154,18 +163,9 @@ class MemorySettings:
                 "JARVIS_MEMORY_MAINTENANCE_LLM_MAX_OUTPUT_TOKENS",
                 app_settings.JARVIS_MEMORY_MAINTENANCE_LLM_MAX_OUTPUT_TOKENS,
             ),
-            bootstrap_max_tokens=_parse_int_env(
-                "JARVIS_MEMORY_BOOTSTRAP_MAX_TOKENS",
-                app_settings.JARVIS_MEMORY_BOOTSTRAP_MAX_TOKENS,
-            ),
-            core_bootstrap_max_tokens=_parse_int_env(
-                "JARVIS_MEMORY_CORE_BOOTSTRAP_MAX_TOKENS",
-                app_settings.JARVIS_MEMORY_CORE_BOOTSTRAP_MAX_TOKENS,
-            ),
-            ongoing_bootstrap_max_tokens=_parse_int_env(
-                "JARVIS_MEMORY_ONGOING_BOOTSTRAP_MAX_TOKENS",
-                app_settings.JARVIS_MEMORY_ONGOING_BOOTSTRAP_MAX_TOKENS,
-            ),
+            bootstrap_max_tokens=_DEFAULT_BOOTSTRAP_MAX_TOKENS,
+            core_bootstrap_max_tokens=_DEFAULT_CORE_BOOTSTRAP_MAX_TOKENS,
+            ongoing_bootstrap_max_tokens=_DEFAULT_ONGOING_BOOTSTRAP_MAX_TOKENS,
             search_default_top_k=_parse_int_env(
                 "JARVIS_MEMORY_SEARCH_DEFAULT_TOP_K",
                 app_settings.JARVIS_MEMORY_SEARCH_DEFAULT_TOP_K,
@@ -186,42 +186,15 @@ class MemorySettings:
                 "JARVIS_MEMORY_ENABLE_AUTO_APPLY_ONGOING",
                 app_settings.JARVIS_MEMORY_ENABLE_AUTO_APPLY_ONGOING,
             ),
-            graph_default_expand=_parse_int_env(
-                "JARVIS_MEMORY_GRAPH_DEFAULT_EXPAND",
-                app_settings.JARVIS_MEMORY_GRAPH_DEFAULT_EXPAND,
-            ),
-            lexical_candidate_count=_parse_int_env(
-                "JARVIS_MEMORY_LEXICAL_CANDIDATE_COUNT",
-                app_settings.JARVIS_MEMORY_LEXICAL_CANDIDATE_COUNT,
-            ),
-            semantic_candidate_count=_parse_int_env(
-                "JARVIS_MEMORY_SEMANTIC_CANDIDATE_COUNT",
-                app_settings.JARVIS_MEMORY_SEMANTIC_CANDIDATE_COUNT,
-            ),
-            graph_candidate_count=_parse_int_env(
-                "JARVIS_MEMORY_GRAPH_CANDIDATE_COUNT",
-                app_settings.JARVIS_MEMORY_GRAPH_CANDIDATE_COUNT,
-            ),
-            hybrid_result_count=_parse_int_env(
-                "JARVIS_MEMORY_HYBRID_RESULT_COUNT",
-                app_settings.JARVIS_MEMORY_HYBRID_RESULT_COUNT,
-            ),
-            semantic_score_floor=_parse_float_env(
-                "JARVIS_MEMORY_SEMANTIC_SCORE_FLOOR",
-                app_settings.JARVIS_MEMORY_SEMANTIC_SCORE_FLOOR,
-            ),
-            semantic_only_score_floor=_parse_float_env(
-                "JARVIS_MEMORY_SEMANTIC_ONLY_SCORE_FLOOR",
-                app_settings.JARVIS_MEMORY_SEMANTIC_ONLY_SCORE_FLOOR,
-            ),
-            weak_result_score_threshold=_parse_float_env(
-                "JARVIS_MEMORY_WEAK_RESULT_SCORE_THRESHOLD",
-                app_settings.JARVIS_MEMORY_WEAK_RESULT_SCORE_THRESHOLD,
-            ),
-            retrieval_fallback_max_queries=_parse_int_env(
-                "JARVIS_MEMORY_RETRIEVAL_FALLBACK_MAX_QUERIES",
-                app_settings.JARVIS_MEMORY_RETRIEVAL_FALLBACK_MAX_QUERIES,
-            ),
+            graph_default_expand=_DEFAULT_GRAPH_DEFAULT_EXPAND,
+            lexical_candidate_count=_DEFAULT_LEXICAL_CANDIDATE_COUNT,
+            semantic_candidate_count=_DEFAULT_SEMANTIC_CANDIDATE_COUNT,
+            graph_candidate_count=_DEFAULT_GRAPH_CANDIDATE_COUNT,
+            hybrid_result_count=_DEFAULT_HYBRID_RESULT_COUNT,
+            semantic_score_floor=_DEFAULT_SEMANTIC_SCORE_FLOOR,
+            semantic_only_score_floor=_DEFAULT_SEMANTIC_ONLY_SCORE_FLOOR,
+            weak_result_score_threshold=_DEFAULT_WEAK_RESULT_SCORE_THRESHOLD,
+            retrieval_fallback_max_queries=_DEFAULT_RETRIEVAL_FALLBACK_MAX_QUERIES,
         )
 
     @property

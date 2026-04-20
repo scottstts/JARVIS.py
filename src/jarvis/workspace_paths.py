@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from jarvis import settings as app_settings
-
 _CONTAINER_WORKSPACE = Path("/workspace")
 
 
@@ -36,13 +34,6 @@ def resolve_workspace_dir(*, error_type: type[Exception] = ValueError) -> Path:
     explicit_workspace = _optional_env("AGENT_WORKSPACE")
     if explicit_workspace is not None:
         return Path(explicit_workspace).expanduser()
-
-    configured_workspace = app_settings.AGENT_WORKSPACE
-    if configured_workspace is not None and configured_workspace.strip():
-        resolved_workspace = Path(configured_workspace).expanduser()
-        if resolved_workspace == _CONTAINER_WORKSPACE and not _running_in_container():
-            raise error_type(_host_workspace_error_message())
-        return resolved_workspace
 
     if _running_in_container():
         return _CONTAINER_WORKSPACE

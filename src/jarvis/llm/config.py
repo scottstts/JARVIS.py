@@ -16,6 +16,14 @@ from .provider_names import (
 )
 
 
+_DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 60.0
+_DEFAULT_LLM_RETRY_ATTEMPTS = 2
+_DEFAULT_LLM_RETRY_BACKOFF_SECONDS = 0.5
+_DEFAULT_OPENROUTER_SITE_URL = "https://github.com/scottstts/JARVIS.py"
+_DEFAULT_OPENROUTER_APP_NAME = "Jarvis"
+_DEFAULT_LMSTUDIO_BASE_URL = "http://127.0.0.1:1234"
+
+
 def _normalize_optional_value(value: object) -> str | None:
     if value is None:
         return None
@@ -318,8 +326,8 @@ class OpenRouterProviderSettings:
                 "JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS",
                 app_settings.JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS,
             ),
-            site_url=_optional_setting("OPENROUTER_SITE_URL", app_settings.OPENROUTER_SITE_URL),
-            app_name=_optional_setting("OPENROUTER_APP_NAME", app_settings.OPENROUTER_APP_NAME),
+            site_url=_optional_env("OPENROUTER_SITE_URL") or _DEFAULT_OPENROUTER_SITE_URL,
+            app_name=_optional_env("OPENROUTER_APP_NAME") or _DEFAULT_OPENROUTER_APP_NAME,
         )
 
 
@@ -357,7 +365,7 @@ class GrokProviderSettings:
 
 @dataclass(slots=True, frozen=True)
 class LMStudioProviderSettings:
-    base_url: str = "http://localhost:1234"
+    base_url: str = _DEFAULT_LMSTUDIO_BASE_URL
 
     def __post_init__(self) -> None:
         if not self.base_url.strip():
@@ -365,21 +373,16 @@ class LMStudioProviderSettings:
 
     @classmethod
     def from_env(cls) -> "LMStudioProviderSettings":
-        return cls(
-            base_url=_required_setting(
-                "JARVIS_LMSTUDIO_BASE_URL",
-                app_settings.JARVIS_LMSTUDIO_BASE_URL,
-            ),
-        )
+        return cls(base_url=_optional_env("JARVIS_LMSTUDIO_BASE_URL") or _DEFAULT_LMSTUDIO_BASE_URL)
 
 
 @dataclass(slots=True, frozen=True)
 class LLMSettings:
     default_provider: str = ""
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings.from_env)
-    request_timeout_seconds: float = 60.0
-    retry_attempts: int = 2
-    retry_backoff_seconds: float = 0.5
+    request_timeout_seconds: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
+    retry_attempts: int = _DEFAULT_LLM_RETRY_ATTEMPTS
+    retry_backoff_seconds: float = _DEFAULT_LLM_RETRY_BACKOFF_SECONDS
     openai: OpenAIProviderSettings = field(default_factory=OpenAIProviderSettings.from_env)
     anthropic: AnthropicProviderSettings = field(default_factory=AnthropicProviderSettings.from_env)
     gemini: GeminiProviderSettings = field(default_factory=GeminiProviderSettings.from_env)
@@ -409,15 +412,15 @@ class LLMSettings:
             embedding=EmbeddingSettings.from_env(),
             request_timeout_seconds=_parse_float_env(
                 "JARVIS_LLM_TIMEOUT_SECONDS",
-                app_settings.JARVIS_LLM_TIMEOUT_SECONDS,
+                _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
             ),
             retry_attempts=_parse_int_env(
                 "JARVIS_LLM_RETRY_ATTEMPTS",
-                app_settings.JARVIS_LLM_RETRY_ATTEMPTS,
+                _DEFAULT_LLM_RETRY_ATTEMPTS,
             ),
             retry_backoff_seconds=_parse_float_env(
                 "JARVIS_LLM_RETRY_BACKOFF_SECONDS",
-                app_settings.JARVIS_LLM_RETRY_BACKOFF_SECONDS,
+                _DEFAULT_LLM_RETRY_BACKOFF_SECONDS,
             ),
             openai=OpenAIProviderSettings.from_env(),
             anthropic=AnthropicProviderSettings.from_env(),

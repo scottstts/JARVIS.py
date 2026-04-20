@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from jarvis import settings as app_settings
 from jarvis.workspace_paths import resolve_workspace_child
 
 _MAIN_AGENT_NAMESPACE = "jarvis"
@@ -16,7 +15,7 @@ def resolve_transcript_archive_root(workspace_dir: Path) -> Path:
 
     return resolve_workspace_child(
         env_name="JARVIS_TRANSCRIPT_ARCHIVE_DIR",
-        configured_default=app_settings.JARVIS_TRANSCRIPT_ARCHIVE_DIR,
+        configured_default=None,
         workspace_dir=workspace_dir,
         child_name="archive/transcripts",
     )

@@ -5,12 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from jarvis import settings as app_settings
-
 from .config import CodexBackendSettings
 from .types import CodexConfigurationError
 
 _CONTAINER_REPO_ROOT = Path("/repo")
+_CONTAINER_WORKSPACE_ROOT = Path("/workspace")
 
 
 @dataclass(slots=True, frozen=True)
@@ -20,7 +19,7 @@ class CodexPathMapper:
     host_repo_root: Path
     host_workspace_root: Path
     container_repo_root: Path = _CONTAINER_REPO_ROOT
-    container_workspace_root: Path = Path(app_settings.AGENT_WORKSPACE or "/workspace")
+    container_workspace_root: Path = _CONTAINER_WORKSPACE_ROOT
 
     @classmethod
     def from_settings(cls, settings: CodexBackendSettings) -> "CodexPathMapper":
