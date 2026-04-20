@@ -72,7 +72,10 @@ def _serialize_message(message: LLMMessage) -> dict[str, Any]:
                     "type": "tool_call",
                     "call_id": part.call_id,
                     "name": part.name,
-                    "arguments": part.arguments,
+                    # Replay sends the serialized tool-call payload back to providers, so
+                    # preflight estimation should track raw_arguments rather than the
+                    # parsed arguments dict.
+                    "raw_arguments": part.raw_arguments,
                     "provider_metadata": part.provider_metadata,
                 }
             )

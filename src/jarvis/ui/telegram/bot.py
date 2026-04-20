@@ -53,6 +53,7 @@ _SENTENCE_BREAK_PATTERN = re.compile(r'[.!?](?:["\')\]]+)?(?:\s+|$)')
 _WHITESPACE_BREAK_PATTERN = re.compile(r"\s+")
 _TYPING_ACTION = "typing"
 _TYPING_INITIAL_DELAY_SECONDS = 0.5
+_ACTIVE_TURN_RUNTIME_ERROR_TEXT = "❌ Error occurred. Try again."
 
 
 class GatewayClientLike(Protocol):
@@ -713,6 +714,12 @@ class TelegramGatewayBridge:
                 event.code or "gateway_error",
                 event.message or "",
             )
+            if not output_paused:
+                self._stop_typing_indicator(active_turn)
+                await self._send_final_text(
+                    chat_id=chat_id,
+                    text=_ACTIVE_TURN_RUNTIME_ERROR_TEXT,
+                )
             self._finish_submitted_turn(
                 chat_id=chat_id,
                 client_message_id=active_turn.client_message_id,

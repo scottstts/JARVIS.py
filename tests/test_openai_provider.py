@@ -8,8 +8,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from jarvis.llm.config import OpenAIProviderSettings
+from jarvis.llm.errors import ProviderTemporaryError, StreamProtocolError
 from jarvis.llm.providers.openai_provider import OpenAIProvider
-from jarvis.llm.types import ImagePart, LLMMessage, LLMRequest, ToolCall, ToolDefinition, ToolResultPart
+from jarvis.llm.types import (
+    DoneEvent,
+    ImagePart,
+    LLMMessage,
+    LLMRequest,
+    ToolCall,
+    ToolDefinition,
+    ToolResultPart,
+    UsageDeltaEvent,
+)
 from jarvis.tools.basic.file_patch.tool import build_file_patch_tool
 from jarvis.tools.config import ToolSettings
 
@@ -252,6 +262,105 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
         kwargs = provider._build_response_create_kwargs(request, stream=False)
         image_item = kwargs["input"][0]["content"][0]
         self.assertEqual(image_item["detail"], "high")
+
+
+class _FakeAsyncEventStream:
+    def __init__(self, events: list[object]) -> None:
+        self._events = list(events)
+
+    def __aiter__(self) -> "_FakeAsyncEventStream":
+        return self
+
+    async def __anext__(self) -> object:
+        if not self._events:
+            raise StopAsyncIteration
+        return self._events.pop(0)
+
+
+class OpenAIProviderStreamingTests(unittest.IsolatedAsyncioTestCase):
+    def _provider_with_stream(self, *events: object) -> OpenAIProvider:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+
+        async def _create(**_kwargs):
+            return _FakeAsyncEventStream(list(events))
+
+        provider._client = SimpleNamespace(responses=SimpleNamespace(create=_create))  # type: ignore[assignment]
+        return provider
+
+    def _request(self) -> LLMRequest:
+        return LLMRequest(
+            model="gpt-5.4-2026-03-05",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+
+    def _response(
+        self,
+        *,
+        status: str,
+        incomplete_reason: str | None = None,
+        output_text: str = "done",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            id="resp_123",
+            model="gpt-5.4-2026-03-05",
+            status=status,
+            output_text=output_text,
+            output=[],
+            usage=SimpleNamespace(input_tokens=11, output_tokens=3, total_tokens=14),
+            incomplete_details=(
+                SimpleNamespace(reason=incomplete_reason)
+                if incomplete_reason is not None
+                else None
+            ),
+        )
+
+    async def test_stream_generate_treats_response_incomplete_as_terminal(self) -> None:
+        provider = self._provider_with_stream(
+            SimpleNamespace(
+                type="response.incomplete",
+                response=self._response(
+                    status="incomplete",
+                    incomplete_reason="max_tokens",
+                    output_text="partial",
+                ),
+            )
+        )
+
+        events = [event async for event in provider.stream_generate(self._request())]
+
+        self.assertEqual(len(events), 2)
+        self.assertIsInstance(events[0], UsageDeltaEvent)
+        self.assertIsInstance(events[1], DoneEvent)
+        self.assertEqual(events[1].response.text, "partial")
+        self.assertEqual(events[1].response.finish_reason, "length")
+        self.assertEqual(
+            events[1].response.provider_metadata["incomplete_reason"],
+            "max_output_tokens",
+        )
+
+    async def test_stream_generate_raises_temporary_error_when_stream_closes_before_any_output(
+        self,
+    ) -> None:
+        provider = self._provider_with_stream()
+
+        with self.assertRaisesRegex(ProviderTemporaryError, "without a terminal event"):
+            _events = [event async for event in provider.stream_generate(self._request())]
+
+    async def test_stream_generate_raises_protocol_error_after_partial_output_without_terminal_event(
+        self,
+    ) -> None:
+        provider = self._provider_with_stream(
+            SimpleNamespace(type="response.output_text.delta", delta="hel")
+        )
+
+        with self.assertRaisesRegex(
+            StreamProtocolError,
+            "last_event=response.output_text.delta",
+        ):
+            _events = [event async for event in provider.stream_generate(self._request())]
 
 
 class GeminiNormalizationRegressionTests(unittest.TestCase):

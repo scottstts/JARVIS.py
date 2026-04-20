@@ -23,6 +23,8 @@ from openai import (
     RateLimitError,
 )
 
+from jarvis.logging_setup import get_application_logger
+
 from ..config import OpenAIProviderSettings
 from ..errors import (
     LLMConfigurationError,
@@ -63,6 +65,8 @@ from ..validation import (
     validate_tool_call_arguments,
 )
 from ..errors import ToolCallValidationError
+
+LOGGER = get_application_logger(__name__)
 
 
 class OpenAIProvider:
@@ -107,14 +111,32 @@ class OpenAIProvider:
 
         tool_name_by_item_id: dict[str, str] = {}
         call_id_by_item_id: dict[str, str] = {}
-        saw_completion = False
+        saw_terminal_event = False
+        saw_text_delta = False
+        saw_tool_delta = False
+        last_event_type = ""
+        last_response_id: str | None = None
+        last_response_status: str | None = None
+        last_incomplete_reason: str | None = None
+
+        def _capture_response_state(response: Any) -> None:
+            nonlocal last_response_id, last_response_status, last_incomplete_reason
+            last_response_id = getattr(response, "id", None)
+            status = getattr(response, "status", None)
+            last_response_status = str(status) if status is not None else None
+            last_incomplete_reason = _normalize_openai_incomplete_reason(
+                getattr(getattr(response, "incomplete_details", None), "reason", None)
+            )
 
         try:
             stream = await client.responses.create(**kwargs)
             async for event in stream:
                 event_type = getattr(event, "type", "")
+                last_event_type = event_type
 
                 if event_type == "response.output_text.delta":
+                    if event.delta:
+                        saw_text_delta = True
                     yield TextDeltaEvent(delta=event.delta)
                     continue
 
@@ -128,6 +150,8 @@ class OpenAIProvider:
                     continue
 
                 if event_type == "response.function_call_arguments.delta":
+                    if event.delta:
+                        saw_tool_delta = True
                     call_id = call_id_by_item_id.get(event.item_id, event.item_id)
                     yield ToolCallDeltaEvent(
                         call_id=call_id,
@@ -137,6 +161,8 @@ class OpenAIProvider:
                     continue
 
                 if event_type == "response.function_call_arguments.done":
+                    if event.arguments:
+                        saw_tool_delta = True
                     call_id = call_id_by_item_id.get(event.item_id, event.item_id)
                     yield ToolCallDeltaEvent(
                         call_id=call_id,
@@ -145,7 +171,8 @@ class OpenAIProvider:
                     )
                     continue
 
-                if event_type == "response.completed":
+                if event_type in {"response.completed", "response.incomplete"}:
+                    _capture_response_state(event.response)
                     normalized = self._normalize_response(
                         request=request,
                         response=event.response,
@@ -153,27 +180,50 @@ class OpenAIProvider:
                     if normalized.usage is not None:
                         yield UsageDeltaEvent(usage=normalized.usage)
                     yield DoneEvent(response=normalized)
-                    saw_completion = True
+                    saw_terminal_event = True
                     continue
 
                 if event_type == "response.failed":
+                    saw_terminal_event = True
                     message = "OpenAI streaming response failed."
                     response_error = getattr(event.response, "error", None)
                     if response_error is not None:
                         message = response_error.message
+                    _capture_response_state(event.response)
                     raise ProviderResponseError(message)
 
                 if event_type == "error":
+                    saw_terminal_event = True
                     raise ProviderResponseError(event.message)
         except Exception as exc:
-            if isinstance(exc, (ProviderResponseError, StreamProtocolError)):
+            if isinstance(
+                exc,
+                (
+                    ProviderAuthenticationError,
+                    ProviderBadRequestError,
+                    ProviderRateLimitError,
+                    ProviderResponseError,
+                    ProviderTemporaryError,
+                    ProviderTimeoutError,
+                    StreamProtocolError,
+                ),
+            ):
                 raise
             raise self._map_error(exc) from exc
 
-        if not saw_completion:
-            raise StreamProtocolError(
-                "OpenAI stream closed without a response.completed event."
+        if not saw_terminal_event:
+            message = _build_openai_unexpected_stream_close_message(
+                last_event_type=last_event_type,
+                last_response_id=last_response_id,
+                last_response_status=last_response_status,
+                last_incomplete_reason=last_incomplete_reason,
+                saw_text_delta=saw_text_delta,
+                saw_tool_delta=saw_tool_delta,
             )
+            LOGGER.warning(message)
+            if saw_text_delta or saw_tool_delta:
+                raise StreamProtocolError(message)
+            raise ProviderTemporaryError(message)
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         if request.model is None:
@@ -449,7 +499,7 @@ class OpenAIProvider:
             response_id=response.id,
             provider_metadata={
                 "status": response.status,
-                "incomplete_reason": (
+                "incomplete_reason": _normalize_openai_incomplete_reason(
                     response.incomplete_details.reason
                     if response.incomplete_details is not None
                     else None
@@ -528,7 +578,9 @@ class OpenAIProvider:
         if status == "failed":
             return "error"
         if status == "incomplete":
-            reason = getattr(response.incomplete_details, "reason", None)
+            reason = _normalize_openai_incomplete_reason(
+                getattr(getattr(response, "incomplete_details", None), "reason", None)
+            )
             if reason == "max_output_tokens":
                 return "length"
             if reason == "content_filter":
@@ -540,7 +592,19 @@ class OpenAIProvider:
         return "unknown"
 
     def _map_error(self, error: Exception) -> Exception:
-        if isinstance(error, ProviderResponseError | StreamProtocolError):
+        if isinstance(
+            error,
+            (
+                LLMConfigurationError,
+                ProviderAuthenticationError,
+                ProviderBadRequestError,
+                ProviderRateLimitError,
+                ProviderResponseError,
+                ProviderTemporaryError,
+                ProviderTimeoutError,
+                StreamProtocolError,
+            ),
+        ):
             return error
         if isinstance(error, (AuthenticationError, PermissionDeniedError)):
             return ProviderAuthenticationError(str(error))
@@ -563,6 +627,37 @@ class OpenAIProvider:
         if isinstance(error, OpenAIError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _normalize_openai_incomplete_reason(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    normalized = str(reason).strip()
+    if not normalized:
+        return None
+    if normalized == "max_tokens":
+        return "max_output_tokens"
+    return normalized
+
+
+def _build_openai_unexpected_stream_close_message(
+    *,
+    last_event_type: str,
+    last_response_id: str | None,
+    last_response_status: str | None,
+    last_incomplete_reason: str | None,
+    saw_text_delta: bool,
+    saw_tool_delta: bool,
+) -> str:
+    details = [
+        f"last_event={last_event_type or 'none'}",
+        f"response_id={last_response_id or 'unknown'}",
+        f"status={last_response_status or 'unknown'}",
+        f"incomplete_reason={last_incomplete_reason or 'none'}",
+        f"saw_text_delta={saw_text_delta}",
+        f"saw_tool_delta={saw_tool_delta}",
+    ]
+    return "OpenAI stream closed without a terminal event (" + ", ".join(details) + ")."
 
 
 def _normalize_openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:

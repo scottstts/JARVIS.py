@@ -6,10 +6,10 @@ import asyncio
 import unittest
 
 from jarvis.llm.config import EmbeddingSettings, LLMSettings
-from jarvis.llm.errors import LLMConfigurationError, ProviderTimeoutError
+from jarvis.llm.errors import LLMConfigurationError, ProviderTemporaryError, ProviderTimeoutError
 from jarvis.llm.protocols import ProviderCapabilities
 from jarvis.llm.service import LLMService
-from jarvis.llm.types import LLMMessage, LLMRequest
+from jarvis.llm.types import DoneEvent, LLMMessage, LLMRequest, LLMResponse, LLMUsage
 
 
 class _FakeProvider:
@@ -47,6 +47,27 @@ class _SlowProvider(_FakeProvider):
     async def stream_generate(self, request):
         await asyncio.sleep(3600)
         yield None
+
+
+class _RetryableStreamProvider(_FakeProvider):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.stream_attempts = 0
+
+    async def stream_generate(self, request):
+        self.stream_attempts += 1
+        if self.stream_attempts == 1:
+            raise ProviderTemporaryError("transient stream failure")
+        yield DoneEvent(
+            response=LLMResponse(
+                provider=self.name,
+                model=request.model or "retry-model",
+                text="recovered",
+                tool_calls=[],
+                finish_reason="stop",
+                usage=LLMUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
 
 
 class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -114,6 +135,32 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 )
             ):
                 pass
+
+    async def test_stream_generate_retries_retryable_pre_output_errors(self) -> None:
+        provider = _RetryableStreamProvider("openai")
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openai",
+                retry_attempts=1,
+                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+            ),
+            providers=(provider,),
+        )
+
+        events = [
+            event
+            async for event in service.stream_generate(
+                LLMRequest(
+                    model="gpt-5.4-2026-03-05",
+                    messages=(LLMMessage.text("user", "hello"),),
+                )
+            )
+        ]
+
+        self.assertEqual(provider.stream_attempts, 2)
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], DoneEvent)
+        self.assertEqual(events[0].response.text, "recovered")
 
     async def test_generate_rejects_codex_backend_provider_with_clear_error(self) -> None:
         service = LLMService(

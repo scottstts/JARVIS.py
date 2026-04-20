@@ -116,6 +116,8 @@ Current reconciliation behavior:
 - append a persisted orphaned-turn recovery system note
 - mark the turn `interrupted`
 
+Current same-process runtime-failure behavior uses the same normalization immediately for the active turn instead of waiting for a later session access.
+
 This prevents persisted prompt-visible records from disappearing just because the old process died before it could finalize turn status.
 
 ### 6. Superseded turns stay replayable and keep their explicit interruption reason

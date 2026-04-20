@@ -165,3 +165,5 @@
 - When one assistant message emits multiple deferred `view_image` calls, persist all tool-result records before any attachment follow-up records, or replay sees later calls as unresolved.
 - Container startup now seeds `workspace/settings/settings.yml` and `workspace/identities/*.md` only if missing, while always refreshing `workspace/settings/settings_gui.html` and `workspace/migrate.sh`.
 - `workspace/migrate.sh --all` now excludes `node_modules/` so workspace exports do not balloon from frontend dependency trees.
+- Same-process main-loop failures now immediately normalize the active turn with the same orphaned-turn recovery records used on later session reconciliation, instead of leaving it `in_progress`.
+- Telegram now sends the non-persisted text `❌ Error occurred. Try again.` only when an active user turn ends on a gateway/runtime error; background route errors remain suppressed.

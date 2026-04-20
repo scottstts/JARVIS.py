@@ -1432,6 +1432,15 @@ class _FakeStreamingFollowupOverflowCompactionLLMService:
         yield DoneEvent(response=_build_response("Recovered after compaction."))
 
 
+class _FailingStreamingLLMService:
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming path is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise RuntimeError("stream exploded")
+        yield DoneEvent(response=_build_response("unreachable"))
+
+
 class _FakeFollowupOverflowCompactionLLMService:
     def __init__(self) -> None:
         self.generate_calls = 0
@@ -2210,6 +2219,54 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(archived_tool_records), 1)
             self.assertEqual(archived_tool_records[0].content, large_output)
 
+    async def test_clone_carry_forward_record_compacts_large_assistant_tool_call_arguments(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            loop = AgentLoop(
+                llm_service=_FakeToolLLMService(),
+                settings=settings,
+                storage=SessionStorage(settings.transcript_archive_dir),
+            )
+            large_arguments = {"content": "A" * 4_000}
+            original_record = loop._build_assistant_record(
+                "session_1",
+                _build_response(
+                    "Tool completed.",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="file_patch_1",
+                            name="file_patch",
+                            arguments=large_arguments,
+                            raw_arguments=json.dumps(large_arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                ),
+            )
+
+            cloned_record = loop._clone_carry_forward_record_for_session(
+                "session_2",
+                original_record,
+            )
+
+            original_tool_call = original_record.metadata["tool_calls"][0]
+            cloned_tool_call = cloned_record.metadata["tool_calls"][0]
+            self.assertEqual(
+                original_tool_call["arguments"],
+                large_arguments,
+            )
+            self.assertGreater(len(original_tool_call["raw_arguments"]), 1_200)
+            self.assertTrue(cloned_record.metadata.get("carry_forward_compacted"))
+            self.assertTrue(cloned_record.metadata.get("carry_forward_tool_calls_compacted"))
+            self.assertLess(len(cloned_tool_call["raw_arguments"]), 400)
+            self.assertTrue(cloned_tool_call["arguments"]["compacted"])
+            self.assertIn(
+                "archived session transcript",
+                cloned_tool_call["arguments"]["note"],
+            )
+
     async def test_stream_user_input_completes_tool_round_and_emits_done(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -2633,6 +2690,50 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Treat them as not run.", recovered_records[-2].content)
             self.assertTrue(
                 recovered_records[-1].metadata.get("orphaned_turn_recovery")
+            )
+
+    async def test_stream_user_input_fail_closes_turn_after_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=_FailingStreamingLLMService(),
+                settings=settings,
+                storage=storage,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "stream exploded"):
+                _events = [event async for event in loop.stream_user_input("Trigger a failure.")]
+
+            session = storage.get_active_session()
+            self.assertIsNotNone(session)
+            in_progress_turn_ids = [
+                turn_id
+                for turn_id, status in session.turn_states.items()  # type: ignore[union-attr]
+                if status == "in_progress"
+            ]
+            self.assertEqual(in_progress_turn_ids, [])
+            interrupted_turn_ids = [
+                turn_id
+                for turn_id, status in session.turn_states.items()  # type: ignore[union-attr]
+                if status == "interrupted"
+            ]
+            self.assertEqual(len(interrupted_turn_ids), 1)
+
+            failed_turn_records = [
+                record
+                for record in storage.load_records(
+                    session.session_id,  # type: ignore[union-attr]
+                    include_all_turns=True,
+                )
+                if str(record.metadata.get("turn_id", "")).strip() == interrupted_turn_ids[0]
+            ]
+            self.assertEqual(
+                [record.role for record in failed_turn_records[-2:]],
+                ["user", "system"],
+            )
+            self.assertTrue(
+                failed_turn_records[-1].metadata.get("orphaned_turn_recovery")
             )
 
     async def test_stream_user_input_stops_after_large_tool_batch_without_compacting(self) -> None:

@@ -734,6 +734,12 @@ class AgentLoop:
                 compaction_performed=did_compaction,
                 approval_rejected=approval_rejected,
             )
+        except Exception:
+            self._fail_turn_after_runtime_error(
+                session_id=session.session_id,
+                turn_id=turn_id,
+            )
+            raise
         finally:
             self._clear_turn_control(turn_id)
 
@@ -1996,6 +2002,12 @@ class AgentLoop:
                 compaction_performed=did_compaction,
                 approval_rejected=turn_approval_rejected,
             )
+        except Exception:
+            self._fail_turn_after_runtime_error(
+                session_id=session.session_id,
+                turn_id=turn_id,
+            )
+            raise
         finally:
             self._clear_turn_control(turn_id)
 
@@ -3189,8 +3201,34 @@ class AgentLoop:
             )
             return
 
-        if not any(_record_is_unexecuted_tool_call_notice(record) for record in turn_records):
-            unresolved_tool_names = _collect_unexecuted_tool_call_names(turn_records)
+        self._finalize_incomplete_turn_records(
+            session_id=session_id,
+            turn_id=turn_id,
+            turn_records=turn_records,
+        )
+
+    def _finalize_incomplete_turn_records(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        turn_records: Sequence[ConversationRecord] | None = None,
+    ) -> None:
+        records = list(turn_records) if turn_records is not None else [
+            record
+            for record in self._storage.load_records(session_id, include_all_turns=True)
+            if str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip() == turn_id
+        ]
+        if not records:
+            self._storage.set_turn_status(
+                session_id,
+                turn_id=turn_id,
+                status="interrupted",
+            )
+            return
+
+        if not any(_record_is_unexecuted_tool_call_notice(record) for record in records):
+            unresolved_tool_names = _collect_unexecuted_tool_call_names(records)
             if unresolved_tool_names:
                 self._storage.append_record(
                     session_id,
@@ -3203,7 +3241,7 @@ class AgentLoop:
 
         if not any(
             record.metadata.get(_ORPHANED_TURN_RECOVERY_METADATA_KEY, False)
-            for record in turn_records
+            for record in records
         ):
             self._storage.append_record(
                 session_id,
@@ -3217,6 +3255,20 @@ class AgentLoop:
             session_id,
             turn_id=turn_id,
             status="interrupted",
+        )
+
+    def _fail_turn_after_runtime_error(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        session = self._storage.get_session(session_id)
+        if session is None or session.turn_states.get(turn_id) != "in_progress":
+            return
+        self._finalize_incomplete_turn_records(
+            session_id=session_id,
+            turn_id=turn_id,
         )
 
     def _begin_turn(self, *, session_id: str, turn_id: str) -> None:
@@ -3480,16 +3532,20 @@ class AgentLoop:
         self,
         record: ConversationRecord,
     ) -> ConversationRecord:
+        compacted = record
         limit = _carry_forward_soft_limit(record)
-        if limit is None or len(record.content) <= limit:
-            return record
-        return _copy_record_with_content(
-            record,
-            content=_truncate_carry_forward_text(record.content, limit=limit),
-            metadata_updates={
-                "carry_forward_compacted": True,
-                "carry_forward_compaction_strength": "soft",
-            },
+        if limit is not None and len(record.content) > limit:
+            compacted = _copy_record_with_content(
+                compacted,
+                content=_truncate_carry_forward_text(record.content, limit=limit),
+                metadata_updates={
+                    "carry_forward_compacted": True,
+                    "carry_forward_compaction_strength": "soft",
+                },
+            )
+        return _compact_carry_forward_tool_call_metadata(
+            compacted,
+            strength="soft",
         )
 
     def _strongly_compact_carry_forward_record(
@@ -3500,15 +3556,19 @@ class AgentLoop:
             return record
         if record.role not in {"user", "assistant", "tool"}:
             return record
-        if not record.content:
-            return record
-        return _copy_record_with_content(
-            record,
-            content=_strong_carry_forward_text(record),
-            metadata_updates={
-                "carry_forward_compacted": True,
-                "carry_forward_compaction_strength": "strong",
-            },
+        compacted = record
+        if record.content:
+            compacted = _copy_record_with_content(
+                compacted,
+                content=_strong_carry_forward_text(record),
+                metadata_updates={
+                    "carry_forward_compacted": True,
+                    "carry_forward_compaction_strength": "strong",
+                },
+            )
+        return _compact_carry_forward_tool_call_metadata(
+            compacted,
+            strength="strong",
         )
 
     def _build_turn_context_text(self) -> str:
@@ -3930,6 +3990,78 @@ def _strong_carry_forward_text(record: ConversationRecord) -> str:
     return (
         "User message compacted after mid-turn overflow.\n"
         "See the archived session transcript for the full user text."
+    )
+
+
+def _compact_carry_forward_tool_call_metadata(
+    record: ConversationRecord,
+    *,
+    strength: Literal["soft", "strong"],
+) -> ConversationRecord:
+    if record.role != "assistant":
+        return record
+
+    raw_tool_calls = record.metadata.get("tool_calls")
+    if not isinstance(raw_tool_calls, list):
+        return record
+
+    compacted_tool_calls: list[Any] = []
+    did_change = False
+    for raw_tool_call in raw_tool_calls:
+        if not isinstance(raw_tool_call, dict):
+            compacted_tool_calls.append(deepcopy(raw_tool_call))
+            continue
+
+        tool_call = deepcopy(raw_tool_call)
+        arguments = tool_call.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+        original_raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
+        canonical_raw_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        needs_placeholder = (
+            strength == "strong"
+            or len(canonical_raw_arguments) > 1_200
+            or len(original_raw_arguments) > 1_200
+        )
+        if needs_placeholder:
+            compacted_arguments = {
+                "compacted": True,
+                "reason": "carry_forward_compaction",
+                "compaction_strength": strength,
+                "original_argument_chars": len(original_raw_arguments or canonical_raw_arguments),
+                "note": (
+                    "Tool arguments compacted after mid-turn overflow. "
+                    "See the archived session transcript for the full arguments."
+                ),
+            }
+            tool_call["arguments"] = compacted_arguments
+            tool_call["raw_arguments"] = json.dumps(
+                compacted_arguments,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            did_change = True
+        elif canonical_raw_arguments != original_raw_arguments:
+            tool_call["raw_arguments"] = canonical_raw_arguments
+            did_change = True
+        compacted_tool_calls.append(tool_call)
+
+    if not did_change:
+        return record
+
+    return _copy_record_with_content(
+        record,
+        content=record.content,
+        metadata_updates={
+            "tool_calls": compacted_tool_calls,
+            "carry_forward_compacted": True,
+            "carry_forward_compaction_strength": strength,
+            "carry_forward_tool_calls_compacted": True,
+        },
     )
 
 

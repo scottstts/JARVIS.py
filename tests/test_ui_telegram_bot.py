@@ -1522,7 +1522,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(telegram.sent_messages[0].text), 4096)
         self.assertEqual(len(telegram.sent_messages[1].text), 904)
 
-    async def test_gateway_error_does_not_send_error_message(self) -> None:
+    async def test_gateway_error_sends_runtime_error_message_for_active_turn(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             error=GatewayBridgeError(code="internal_error", message="gateway failed"),
@@ -1537,7 +1537,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
-        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["❌ Error occurred. Try again."],
+        )
 
     async def test_handle_message_does_not_send_placeholder_for_interrupted_turn(self) -> None:
         telegram = _FakeTelegramClient()
