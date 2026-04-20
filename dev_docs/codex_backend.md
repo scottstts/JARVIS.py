@@ -91,8 +91,8 @@ This selection is applied independently to:
 
 `settings.yml` keeps `codex` as a selectable/defaultable model provider for:
 
-- `llm.default_provider`
-- `subagent.provider`
+- `main_agent_provider`
+- `subagent_provider`
 
 User-facing Codex model settings live under `providers.codex`:
 

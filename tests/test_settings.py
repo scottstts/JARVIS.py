@@ -67,7 +67,7 @@ class SettingsModuleTests(unittest.TestCase):
             payload = yaml.safe_load(_PACKAGED_TEMPLATE_PATH.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 self.fail("Expected packaged settings template to be a mapping.")
-            _set_field_value(payload, ("llm", "fields", "default_provider"), "grok")
+            _set_field_value(payload, ("main_agent_provider",), "grok")
             _set_field_value(payload, ("providers", "groups", "grok", "fields", "chat_model"), "grok-test")
             workspace_settings_path.write_text(
                 yaml.safe_dump(payload, sort_keys=False),
@@ -97,7 +97,7 @@ class SettingsModuleTests(unittest.TestCase):
             payload = yaml.safe_load(_PACKAGED_TEMPLATE_PATH.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 self.fail("Expected packaged settings template to be a mapping.")
-            del payload["llm"]["fields"]["default_provider"]
+            del payload["main_agent_provider"]
             workspace_settings_path.write_text(
                 yaml.safe_dump(payload, sort_keys=False),
                 encoding="utf-8",
@@ -112,6 +112,6 @@ class SettingsModuleTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    rf"{workspace_settings_path.resolve()}'.*llm\.default_provider",
+                    rf"{workspace_settings_path.resolve()}'.*main_agent_provider",
                 ):
                     importlib.reload(app_settings)

@@ -117,7 +117,7 @@ providers:
           options:
             - "5m"
             - "1h"
-          value: "5m"
+          value: "1h"
     gemini:
       title: "Gemini"
       description: "Default model and thinking settings for Gemini."
@@ -227,63 +227,55 @@ providers:
           type: "integer"
           min: 1
           step: 100
-          value: 10000
+          value: 32000
 
-llm:
-  title: "LLM Routing"
-  description: "Main chat provider and embedding defaults."
-  fields:
-    default_provider:
-      label: "Default Chat Provider"
-      description: "Default provider used by Jarvis for chat completions."
-      type: "select"
-      options:
-        - "codex"
-        - "openai"
-        - "anthropic"
-        - "gemini"
-        - "grok"
-        - "openrouter"
-        - "lmstudio"
-      value: "openai"
-  groups:
-    embedding:
-      title: "Embeddings"
-      description: "Default embedding provider and model."
-      fields:
-        provider:
-          label: "Embedding Provider"
-          description: "Provider used for embedding requests."
-          type: "select"
-          options:
-            - "openai"
-            - "gemini"
-            - "openrouter"
-          value: "openai"
-        model:
-          label: "Embedding Model"
-          description: "Embedding model name used across the app."
-          type: "text"
-          value: "text-embedding-3-small"
+main_agent_provider:
+  label: "Main Agent Provider"
+  description: "Provider used by Jarvis the main-agent."
+  type: "select"
+  options:
+    - "codex"
+    - "openai"
+    - "anthropic"
+    - "gemini"
+    - "grok"
+    - "openrouter"
+    - "lmstudio"
+  value: "openai"
 
-subagent:
-  title: "Subagents"
-  description: "Default provider choice for subagent runs."
+subagent_provider:
+  label: "Subagent Provider"
+  description: "Provider used by subagents."
+  type: "select"
+  nullable: true
+  options:
+    - "codex"
+    - "openai"
+    - "anthropic"
+    - "gemini"
+    - "grok"
+    - "openrouter"
+    - "lmstudio"
+  value: "openai"
+
+embedding:
+  title: "Embeddings"
+  description: "Default embedding provider and model."
   fields:
     provider:
-      label: "Subagent Provider"
-      description: "Optional provider override used for subagent runs."
+      label: "Embedding Provider"
+      description: "Provider used for embedding requests."
       type: "select"
-      nullable: true
       options:
-        - "codex"
         - "openai"
-        - "anthropic"
         - "gemini"
-        - "grok"
         - "openrouter"
-        - "lmstudio"
       value: "openai"
+    model:
+      label: "Embedding Model"
+      description: "Embedding model name used across the app."
+      type: "text"
+      value: "text-embedding-3-small"
 
 core:
   title: "Core Session Policy"
@@ -318,7 +310,7 @@ core:
             - "openrouter"
             - "lmstudio"
           value: "openai"
-          
+
 tools:
   title: "Tools"
   description: "User-facing tool integration settings."

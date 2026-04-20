@@ -268,10 +268,10 @@ JARVIS_CONTEXT_WINDOW_TOKENS: Final = _integer("core.context_window_tokens")
 JARVIS_CORE_TIMEZONE: Final = _string("core.timezone")
 JARVIS_COMPACTION_PROVIDER: Final = _string("core.compaction.provider")
 
-# Global LLM routing.
-JARVIS_LLM_DEFAULT_PROVIDER: Final = _string("llm.default_provider")
-JARVIS_EMBEDDING_PROVIDER: Final = _string("llm.embedding.provider")
-JARVIS_EMBEDDING_MODEL: Final = _string("llm.embedding.model")
+# Main-provider and embedding routing.
+JARVIS_LLM_DEFAULT_PROVIDER: Final = _string("main_agent_provider")
+JARVIS_EMBEDDING_PROVIDER: Final = _string("embedding.provider")
+JARVIS_EMBEDDING_MODEL: Final = _string("embedding.model")
 
 # Memory behavior settings.
 JARVIS_MEMORY_MAINTENANCE_LLM_PROVIDER: Final = _string("memory.maintenance.provider")
@@ -292,7 +292,7 @@ JARVIS_MEMORY_ENABLE_AUTO_APPLY_ONGOING: Final = _boolean(
 )
 
 # Subagent behavior settings.
-JARVIS_SUBAGENT_PROVIDER: Final[str | None] = _optional_string("subagent.provider")
+JARVIS_SUBAGENT_PROVIDER: Final[str | None] = _optional_string("subagent_provider")
 
 # OpenAI provider defaults.
 JARVIS_OPENAI_CHAT_MODEL: Final = _string("providers.openai.chat_model")
