@@ -362,11 +362,6 @@ JARVIS_UI_GATEWAY_CONNECT_TIMEOUT_SECONDS: Final = _float(
 
 # Core context/session policy.
 JARVIS_CONTEXT_WINDOW_TOKENS: Final = _integer("core.context_window_tokens")
-JARVIS_COMPACT_THRESHOLD_TOKENS: Final = _integer("core.compact_threshold_tokens")
-JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS: Final = _integer("core.compact_reserve_output_tokens")
-JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS: Final = _integer(
-    "core.compact_reserve_overhead_tokens"
-)
 JARVIS_CORE_TIMEZONE: Final = _string("core.timezone")
 JARVIS_COMPACTION_PROVIDER: Final = _string("core.compaction.provider")
 

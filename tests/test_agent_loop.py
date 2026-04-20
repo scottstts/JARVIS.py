@@ -40,11 +40,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
             root = Path(tmp)
             (root / "README.md").write_text("README SHOULD NOT BE INJECTED", encoding="utf-8")
 
-            settings = build_core_settings(
-                root_dir=root,
-                compact_reserve_output_tokens=256,
-                compact_reserve_overhead_tokens=64,
-            )
+            settings = build_core_settings(root_dir=root)
             storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = LLMService()
             loop = AgentLoop(
@@ -89,11 +85,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_compaction_creates_new_session_with_replacement_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            settings = build_core_settings(
-                root_dir=Path(tmp),
-                compact_reserve_output_tokens=2048,
-                compact_reserve_overhead_tokens=64,
-            )
+            settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = LLMService()
             loop = AgentLoop(
@@ -141,11 +133,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_command_starts_fresh_session_without_compaction_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            settings = build_core_settings(
-                root_dir=Path(tmp),
-                compact_reserve_output_tokens=256,
-                compact_reserve_overhead_tokens=64,
-            )
+            settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = LLMService()
             loop = AgentLoop(

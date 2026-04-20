@@ -709,11 +709,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_agent_loop_injects_memory_bootstrap_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            settings = build_core_settings(
-                root_dir=root,
-                compact_reserve_output_tokens=256,
-                compact_reserve_overhead_tokens=64,
-            )
+            settings = build_core_settings(root_dir=root)
             memory_service = MemoryService(
                 settings=MemorySettings.from_workspace_dir(settings.workspace_dir),
                 llm_service=None,

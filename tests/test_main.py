@@ -132,12 +132,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
     def test_resolve_runtime_provider_configuration_falls_back_to_main_for_subagent(self) -> None:
         provider_configuration = jarvis_main._resolve_runtime_provider_configuration(
             core_settings=CoreSettings(
-                context_policy=ContextPolicySettings(
-                    context_window_tokens=100_000,
-                    compact_threshold_tokens=60_000,
-                    compact_reserve_output_tokens=8_000,
-                    compact_reserve_overhead_tokens=2_000,
-                ),
+                context_policy=ContextPolicySettings(context_window_tokens=100_000),
                 compaction=CompactionSettings(provider="openai"),
                 workspace_dir=Path("/tmp/workspace"),
                 transcript_archive_dir=Path("/tmp/workspace/archive/transcripts"),
@@ -191,12 +186,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
     def test_log_runtime_provider_configuration_logs_effective_providers(self) -> None:
         core_settings = CoreSettings(
-            context_policy=ContextPolicySettings(
-                context_window_tokens=100_000,
-                compact_threshold_tokens=60_000,
-                compact_reserve_output_tokens=8_000,
-                compact_reserve_overhead_tokens=2_000,
-            ),
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
             compaction=CompactionSettings(provider="openai"),
             workspace_dir=Path("/tmp/workspace"),
             transcript_archive_dir=Path("/tmp/workspace/archive/transcripts"),

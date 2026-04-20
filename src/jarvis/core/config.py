@@ -15,6 +15,13 @@ from jarvis.workspace_paths import resolve_workspace_child, resolve_workspace_di
 from .errors import CoreConfigurationError
 
 
+_COMPACT_THRESHOLD_PERCENT = 90
+_COMPACT_RESERVE_OUTPUT_PERCENT = 6
+_COMPACT_RESERVE_OUTPUT_MIN_TOKENS = 10_000
+_COMPACT_RESERVE_OVERHEAD_PERCENT = 3
+_COMPACT_RESERVE_OVERHEAD_MIN_TOKENS = 5_000
+
+
 def _parse_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -53,14 +60,37 @@ def _required_lower_choice_env(name: str, default: str, *, disallowed: set[str] 
     return normalized
 
 
+def _ceil_percentage(value: int, percent: int) -> int:
+    return (value * percent + 99) // 100
+
+
 @dataclass(slots=True, frozen=True)
 class ContextPolicySettings:
     """Global, provider-agnostic context compaction policy."""
 
     context_window_tokens: int
-    compact_threshold_tokens: int
-    compact_reserve_output_tokens: int
-    compact_reserve_overhead_tokens: int
+
+    @property
+    def compact_threshold_tokens(self) -> int:
+        threshold_from_window = (self.context_window_tokens * _COMPACT_THRESHOLD_PERCENT) // 100
+        threshold_from_preflight = (
+            self.preflight_limit_tokens - self.compact_reserve_overhead_tokens
+        )
+        return min(threshold_from_window, threshold_from_preflight)
+
+    @property
+    def compact_reserve_output_tokens(self) -> int:
+        return max(
+            _ceil_percentage(self.context_window_tokens, _COMPACT_RESERVE_OUTPUT_PERCENT),
+            _COMPACT_RESERVE_OUTPUT_MIN_TOKENS,
+        )
+
+    @property
+    def compact_reserve_overhead_tokens(self) -> int:
+        return max(
+            _ceil_percentage(self.context_window_tokens, _COMPACT_RESERVE_OVERHEAD_PERCENT),
+            _COMPACT_RESERVE_OVERHEAD_MIN_TOKENS,
+        )
 
     @property
     def reserve_tokens(self) -> int:
@@ -73,19 +103,17 @@ class ContextPolicySettings:
     def __post_init__(self) -> None:
         if self.context_window_tokens <= 0:
             raise CoreConfigurationError("JARVIS_CONTEXT_WINDOW_TOKENS must be > 0.")
-        if self.compact_threshold_tokens <= 0:
-            raise CoreConfigurationError("JARVIS_COMPACT_THRESHOLD_TOKENS must be > 0.")
-        if self.compact_reserve_output_tokens <= 0:
-            raise CoreConfigurationError("JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS must be > 0.")
-        if self.compact_reserve_overhead_tokens < 0:
-            raise CoreConfigurationError("JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS must be >= 0.")
-        if self.compact_threshold_tokens >= self.context_window_tokens:
-            raise CoreConfigurationError(
-                "JARVIS_COMPACT_THRESHOLD_TOKENS must be less than JARVIS_CONTEXT_WINDOW_TOKENS."
-            )
         if self.reserve_tokens >= self.context_window_tokens:
             raise CoreConfigurationError(
-                "Combined reserve tokens must be less than JARVIS_CONTEXT_WINDOW_TOKENS."
+                "JARVIS_CONTEXT_WINDOW_TOKENS must be greater than the derived reserve budget."
+            )
+        if self.compact_threshold_tokens <= 0:
+            raise CoreConfigurationError(
+                "JARVIS_CONTEXT_WINDOW_TOKENS must be large enough for the derived compaction threshold."
+            )
+        if self.compact_threshold_tokens >= self.preflight_limit_tokens:
+            raise CoreConfigurationError(
+                "Derived compact threshold must be less than the preflight context budget."
             )
 
     @classmethod
@@ -94,18 +122,6 @@ class ContextPolicySettings:
             context_window_tokens=_parse_int_env(
                 "JARVIS_CONTEXT_WINDOW_TOKENS",
                 app_settings.JARVIS_CONTEXT_WINDOW_TOKENS,
-            ),
-            compact_threshold_tokens=_parse_int_env(
-                "JARVIS_COMPACT_THRESHOLD_TOKENS",
-                app_settings.JARVIS_COMPACT_THRESHOLD_TOKENS,
-            ),
-            compact_reserve_output_tokens=_parse_int_env(
-                "JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS",
-                app_settings.JARVIS_COMPACT_RESERVE_OUTPUT_TOKENS,
-            ),
-            compact_reserve_overhead_tokens=_parse_int_env(
-                "JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS",
-                app_settings.JARVIS_COMPACT_RESERVE_OVERHEAD_TOKENS,
             ),
         )
 

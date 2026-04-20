@@ -7,7 +7,7 @@
 - Added a custom `src/jarvis/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
 - Implemented file-backed `src/jarvis/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
 - Session bootstrap now injects `src/jarvis/identities/PROGRAM.md`, `src/jarvis/identities/REACTOR.md`, `src/jarvis/identities/USER.md`, and `src/jarvis/identities/ARMOR.md`, and compacted sessions additionally inject the generated summary seed.
-- Compaction policy is now provider-agnostic and driven by global environment settings: `JARVIS_CONTEXT_WINDOW_TOKENS`, `JARVIS_COMPACT_THRESHOLD_TOKENS`, and reserve settings.
+- Compaction policy is now provider-agnostic and driven by a single `JARVIS_CONTEXT_WINDOW_TOKENS` setting; reactive threshold and reserve budgets are derived automatically from that max context length.
 - Preflight token estimation no longer counts inline image base64 payloads as text; image inputs now use small detail-based heuristic token costs instead.
 - Follow-up tool rounds now compact and continue on a new session when the follow-up request overflows preflight budget or gets a provider context-length error before any streamed follow-up output is emitted.
 - Compaction prompt is externalized to `src/jarvis/core/prompts/COMPACTION.md` and loaded from disk by the compactor.

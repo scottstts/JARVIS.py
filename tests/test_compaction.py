@@ -152,12 +152,7 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         }
         compactor = ContextCompactor(
             llm_service=_FakeCompactionLLMService(json.dumps(payload)),
-            context_policy=ContextPolicySettings(
-                context_window_tokens=100_000,
-                compact_threshold_tokens=60_000,
-                compact_reserve_output_tokens=8_000,
-                compact_reserve_overhead_tokens=2_000,
-            ),
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
             provider="openai",
         )
 
@@ -189,12 +184,7 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         }
         compactor = ContextCompactor(
             llm_service=_FakeCompactionLLMService(json.dumps(payload)),
-            context_policy=ContextPolicySettings(
-                context_window_tokens=100_000,
-                compact_threshold_tokens=60_000,
-                compact_reserve_output_tokens=8_000,
-                compact_reserve_overhead_tokens=2_000,
-            ),
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
             provider="openai",
         )
 

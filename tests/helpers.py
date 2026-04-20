@@ -13,9 +13,6 @@ def build_core_settings(
     *,
     root_dir: Path,
     context_window_tokens: int = 400_000,
-    compact_threshold_tokens: int = 350_000,
-    compact_reserve_output_tokens: int = 16_000,
-    compact_reserve_overhead_tokens: int = 10_000,
     compaction_provider: str = "openai",
 ) -> CoreSettings:
     if os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"):
@@ -32,12 +29,7 @@ def build_core_settings(
     (identities_dir / "ARMOR.md").write_text("ARMOR PROMPT", encoding="utf-8")
 
     return CoreSettings(
-        context_policy=ContextPolicySettings(
-            context_window_tokens=context_window_tokens,
-            compact_threshold_tokens=compact_threshold_tokens,
-            compact_reserve_output_tokens=compact_reserve_output_tokens,
-            compact_reserve_overhead_tokens=compact_reserve_overhead_tokens,
-        ),
+        context_policy=ContextPolicySettings(context_window_tokens=context_window_tokens),
         compaction=CompactionSettings(provider=compaction_provider),
         workspace_dir=workspace_dir,
         transcript_archive_dir=root_dir / "archive" / "transcripts",

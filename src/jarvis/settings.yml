@@ -421,36 +421,15 @@ ui:
 
 core:
   title: "Core Session Policy"
-  description: "Conversation compaction thresholds, context budgets, and timezone defaults."
+  description: "Conversation context budget, derived compaction buffers, and timezone defaults."
   fields:
     context_window_tokens:
-      label: "Context Window Tokens"
-      description: "Maximum context window size used for turn budgeting."
+      label: "Max Context Length Tokens"
+      description: "Maximum context length used for turn budgeting; compaction threshold and reserve buffers are derived from this value."
       type: "integer"
       min: 1
       step: 1000
-      value: 400000
-    compact_threshold_tokens:
-      label: "Compact Threshold Tokens"
-      description: "Threshold that triggers proactive context compaction."
-      type: "integer"
-      min: 1
-      step: 1000
-      value: 350000
-    compact_reserve_output_tokens:
-      label: "Reserve Output Tokens"
-      description: "Reserved token budget for model output."
-      type: "integer"
-      min: 1
-      step: 1000
-      value: 16000
-    compact_reserve_overhead_tokens:
-      label: "Reserve Overhead Tokens"
-      description: "Extra token reserve used for overhead and safety margin."
-      type: "integer"
-      min: 0
-      step: 1000
-      value: 10000
+      value: 250000
     timezone:
       label: "Core Timezone"
       description: "IANA timezone name used for turn timestamps and memory logic."
