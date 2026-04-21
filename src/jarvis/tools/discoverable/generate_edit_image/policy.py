@@ -12,7 +12,13 @@ _ALLOWED_PROVIDERS = {"gemini", "openai"}
 _GLOB_PATTERN = re.compile(r"[*?\[]")
 _MAX_PROMPT_CHARS = 8_000
 _MAX_PROMPT_WORDS = 1_200
-_OPENAI_QUALITY_VALUES = {"low", "medium", "high"}
+_OPENAI_QUALITY_VALUES = {"auto", "low", "medium", "high"}
+_OPENAI_SIZE_AUTO = "auto"
+_OPENAI_BACKGROUND_VALUES = {"auto", "opaque"}
+_OPENAI_MAX_IMAGE_EDGE_PX = 3_840
+_OPENAI_MIN_IMAGE_PIXELS = 655_360
+_OPENAI_MAX_IMAGE_PIXELS = 8_294_400
+_OPENAI_MAX_IMAGE_ASPECT_RATIO = 3.0
 _GEMINI_RESOLUTION_VALUES = {"512", "1K", "2K", "4K"}
 
 
@@ -100,6 +106,32 @@ class GenerateEditImagePolicy:
                 ),
             )
 
+        size = arguments.get("size")
+        if size is not None and _normalize_openai_size(size) is None:
+            return ToolPolicyDecision(
+                allowed=False,
+                reason=(
+                    "generate_edit_image size must be 'auto' or WIDTHxHEIGHT "
+                    "with both edges <= 3840px, both edges multiples of 16, "
+                    "an aspect ratio no greater than 3:1, and total pixels "
+                    "between 655360 and 8294400."
+                ),
+            )
+
+        background = arguments.get("background")
+        if (
+            background is not None
+            and _normalize_openai_background(background) is None
+        ):
+            allowed = ", ".join(sorted(_OPENAI_BACKGROUND_VALUES))
+            return ToolPolicyDecision(
+                allowed=False,
+                reason=(
+                    "generate_edit_image background must be one of: "
+                    f"{allowed}."
+                ),
+            )
+
         resolution = arguments.get("resolution")
         if resolution is not None and _normalize_gemini_resolution(resolution) is None:
             allowed = ", ".join(sorted(_GEMINI_RESOLUTION_VALUES))
@@ -150,7 +182,7 @@ def _normalize_optional_string(value: Any) -> str | None:
 def _normalize_provider(value: Any) -> str:
     normalized = _normalize_optional_string(value)
     if normalized is None:
-        return "gemini"
+        return "openai"
     return normalized.lower()
 
 
@@ -160,6 +192,48 @@ def _normalize_openai_quality(value: Any) -> str | None:
         return None
     lowered = normalized.lower()
     if lowered in _OPENAI_QUALITY_VALUES:
+        return lowered
+    return None
+
+
+def _normalize_openai_size(value: Any) -> str | None:
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered == _OPENAI_SIZE_AUTO:
+        return lowered
+    match = re.fullmatch(r"(\d+)x(\d+)", lowered)
+    if match is None:
+        return None
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if _is_valid_openai_size(width=width, height=height):
+        return f"{width}x{height}"
+    return None
+
+
+def _is_valid_openai_size(*, width: int, height: int) -> bool:
+    if width <= 0 or height <= 0:
+        return False
+    if width > _OPENAI_MAX_IMAGE_EDGE_PX or height > _OPENAI_MAX_IMAGE_EDGE_PX:
+        return False
+    if width % 16 != 0 or height % 16 != 0:
+        return False
+    pixels = width * height
+    if pixels < _OPENAI_MIN_IMAGE_PIXELS or pixels > _OPENAI_MAX_IMAGE_PIXELS:
+        return False
+    long_edge = max(width, height)
+    short_edge = min(width, height)
+    return long_edge / short_edge <= _OPENAI_MAX_IMAGE_ASPECT_RATIO
+
+
+def _normalize_openai_background(value: Any) -> str | None:
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered in _OPENAI_BACKGROUND_VALUES:
         return lowered
     return None
 

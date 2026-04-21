@@ -2113,6 +2113,47 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("quality", decision.reason or "")
 
+    def test_generate_edit_image_denies_invalid_openai_size(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+                "size": "4096x4096",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("size", decision.reason or "")
+
+    def test_generate_edit_image_denies_invalid_openai_background(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+                "background": "transparent",
+            },
+            context=self.context,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("background", decision.reason or "")
+
+    def test_generate_edit_image_allows_gpt_image_2_size_options(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="generate_edit_image",
+            arguments={
+                "prompt": "A minimal product photo of a coffee mug.",
+                "output_path": "artifacts/mug.png",
+                "provider": "openai",
+                "quality": "auto",
+                "size": "2048x2048",
+                "background": "opaque",
+            },
+            context=self.context,
+        )
+        self.assertTrue(decision.allowed, decision.reason)
+
     def test_generate_edit_image_denies_invalid_resolution(self) -> None:
         decision = self.policy.authorize(
             tool_name="generate_edit_image",
@@ -3763,11 +3804,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         arguments={
                             "prompt": "A matte black coffee grinder on a white studio background.",
                             "output_path": "artifacts/openai/grinder",
-                            "provider": "openai",
                         },
                         raw_arguments=(
                             '{"prompt":"A matte black coffee grinder on a white studio '
-                            'background.","output_path":"artifacts/openai/grinder","provider":"openai"}'
+                            'background.","output_path":"artifacts/openai/grinder"}'
                         ),
                     ),
                     context=self.context,
@@ -3786,12 +3826,17 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {
                 "model": self.settings.generate_edit_image_openai_model,
                 "prompt": "A matte black coffee grinder on a white studio background.",
-                "quality": "medium",
+                "quality": "auto",
+                "size": "auto",
+                "background": "auto",
                 "output_format": "png",
             },
         )
         self.assertTrue(captured["closed"])
-        self.assertEqual(result.metadata["quality"], "medium")
+        self.assertEqual(result.metadata["quality"], "auto")
+        self.assertEqual(result.metadata["size"], "auto")
+        self.assertEqual(result.metadata["background"], "auto")
+        self.assertEqual(result.metadata["output_format"], "png")
         output_path = Path(result.metadata["output_path"])
         self.assertTrue(output_path.exists())
         self.assertEqual(output_path.name, "grinder.png")
@@ -3873,10 +3918,13 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                             "prompt": "Replace the background with a sunrise gradient.",
                             "image_path": "temp/input.png",
                             "output_path": "artifacts/gemini/edited-input.png",
+                            "provider": "gemini",
                         },
                         raw_arguments=(
                             '{"prompt":"Replace the background with a sunrise gradient.",'
-                            '"image_path":"temp/input.png","output_path":"artifacts/gemini/edited-input.png"}'
+                            '"image_path":"temp/input.png",'
+                            '"output_path":"artifacts/gemini/edited-input.png",'
+                            '"provider":"gemini"}'
                         ),
                     ),
                     context=self.context,
@@ -3978,10 +4026,12 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         arguments={
                             "prompt": "An abstract machine mind in darkness.",
                             "output_path": "artifacts/gemini/missing-image.png",
+                            "provider": "gemini",
                         },
                         raw_arguments=(
                             '{"prompt":"An abstract machine mind in darkness.",'
-                            '"output_path":"artifacts/gemini/missing-image.png"}'
+                            '"output_path":"artifacts/gemini/missing-image.png",'
+                            '"provider":"gemini"}'
                         ),
                     ),
                     context=self.context,

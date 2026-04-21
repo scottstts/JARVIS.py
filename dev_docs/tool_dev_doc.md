@@ -841,8 +841,10 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - `prompt: string` required
 - `image_path: string` optional; include it only for edit mode
 - `output_path: string` required; output file path inside `/workspace`
-- `provider: string` optional enum `gemini | openai`; defaults to `gemini`
-- `quality: string` optional enum `low | medium | high`; OpenAI only, defaults to `medium`
+- `provider: string` optional enum `openai | gemini`; defaults to `openai`
+- `quality: string` optional enum `auto | low | medium | high`; OpenAI only, defaults to `auto`
+- `size: string` optional; OpenAI only, defaults to `auto`; accepts `auto` or a `WIDTHxHEIGHT` value matching `gpt-image-2` constraints
+- `background: string` optional enum `auto | opaque`; OpenAI only, defaults to `auto`
 - `resolution: string` optional enum `512 | 1K | 2K | 4K`; Gemini only, defaults to `1K`
 
 #### Executor Behavior
@@ -854,8 +856,11 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - appends a provider-safe image extension automatically when `output_path` has no suffix
 - resolves edit inputs from `/workspace` and only accepts provider-safe image formats shared by the current implementation (`image/png`, `image/jpeg`, `image/webp`)
 - reads its default Gemini and OpenAI model names from `tools.generate_edit_image` in `settings.yml`
-- packaged defaults are Gemini `gemini-3.1-flash-image-preview` and OpenAI `gpt-image-1.5`
-- applies OpenAI `quality` only for the OpenAI path, defaulting to `medium`
+- packaged defaults are Gemini `gemini-3.1-flash-image-preview` and OpenAI `gpt-image-2`
+- uses OpenAI by default; Gemini is opt-in by setting `provider` to `gemini`
+- applies OpenAI `quality`, `size`, and `background` only for the OpenAI path, defaulting each to `auto`
+- keeps OpenAI output format fixed to PNG
+- omits OpenAI `input_fidelity` because `gpt-image-2` always processes image inputs at high fidelity
 - applies Gemini `resolution` only for the Gemini path, defaulting to `1K`
 - forces Gemini image-only responses with `response_modalities=['Image']` so the tool does not intermittently receive text-only payloads
 - returns normalized tool-result metadata including operation, provider, model, output path, MIME type, and provider usage metadata when available
@@ -864,8 +869,10 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 
 - `prompt` must be non-empty and stay within the configured hard caps
 - `output_path` must be non-empty
-- `provider` must be either `gemini` or `openai`
-- `quality`, when present, must be one of `low`, `medium`, or `high`
+- `provider` must be either `openai` or `gemini`
+- `quality`, when present, must be one of `auto`, `low`, `medium`, or `high`
+- `size`, when present, must be `auto` or a `WIDTHxHEIGHT` value matching `gpt-image-2` constraints: maximum edge <= `3840px`, both edges multiples of `16px`, long-edge ratio <= `3:1`, and total pixels between `655360` and `8294400`
+- `background`, when present, must be `auto` or `opaque`; `transparent` is intentionally rejected for `gpt-image-2`
 - `resolution`, when present, must be one of `512`, `1K`, `2K`, or `4K`
 - `image_path` is optional, but if present it must be an explicit path inside `/workspace`
 - `output_path` must also stay inside `/workspace`
@@ -874,7 +881,7 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 #### Current Limitations
 
 - v1 supports a single input image only; no masks or multi-image compositing yet
-- output settings are intentionally minimal; the tool does not yet expose aspect ratio or background controls
+- OpenAI `size` controls output dimensions directly; Gemini still exposes only `resolution`
 - the tool saves the image locally but does not automatically send it to Telegram; a later `send_file` call is still needed for delivery
 
 ### `transcribe`

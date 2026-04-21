@@ -7,6 +7,7 @@ import base64
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import httpx
@@ -36,12 +37,20 @@ from ...types import (
     ToolExecutionResult,
 )
 
-_DEFAULT_PROVIDER = "gemini"
-_SUPPORTED_PROVIDERS = ("gemini", "openai")
-_OPENAI_QUALITY_VALUES = ("low", "medium", "high")
-_DEFAULT_OPENAI_QUALITY = "medium"
+_DEFAULT_PROVIDER = "openai"
+_SUPPORTED_PROVIDERS = ("openai", "gemini")
+_OPENAI_QUALITY_VALUES = ("auto", "low", "medium", "high")
+_DEFAULT_OPENAI_QUALITY = "auto"
+_OPENAI_SIZE_AUTO = "auto"
+_DEFAULT_OPENAI_SIZE = _OPENAI_SIZE_AUTO
+_OPENAI_BACKGROUND_VALUES = ("auto", "opaque")
+_DEFAULT_OPENAI_BACKGROUND = "auto"
 _GEMINI_RESOLUTION_VALUES = ("512", "1K", "2K", "4K")
 _DEFAULT_GEMINI_RESOLUTION = "1K"
+_OPENAI_MAX_IMAGE_EDGE_PX = 3_840
+_OPENAI_MIN_IMAGE_PIXELS = 655_360
+_OPENAI_MAX_IMAGE_PIXELS = 8_294_400
+_OPENAI_MAX_IMAGE_ASPECT_RATIO = 3.0
 _SUPPORTED_IMAGE_MEDIA_TYPES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -91,7 +100,15 @@ class GenerateEditImageToolExecutor:
     ) -> ToolExecutionResult:
         prompt = str(arguments["prompt"]).strip()
         provider = _normalize_provider(arguments.get("provider"))
-        quality = _normalize_openai_quality(arguments.get("quality")) or _DEFAULT_OPENAI_QUALITY
+        quality = (
+            _normalize_openai_quality(arguments.get("quality"))
+            or _DEFAULT_OPENAI_QUALITY
+        )
+        size = _normalize_openai_size(arguments.get("size")) or _DEFAULT_OPENAI_SIZE
+        background = (
+            _normalize_openai_background(arguments.get("background"))
+            or _DEFAULT_OPENAI_BACKGROUND
+        )
         resolution = (
             _normalize_gemini_resolution(arguments.get("resolution"))
             or _DEFAULT_GEMINI_RESOLUTION
@@ -159,6 +176,8 @@ class GenerateEditImageToolExecutor:
                     prompt,
                     resolved_input_path,
                     quality,
+                    size,
+                    background,
                 )
             else:
                 generated = await asyncio.to_thread(
@@ -214,6 +233,9 @@ class GenerateEditImageToolExecutor:
             content_lines.append(f"provider_text: {generated.provider_text}")
         if provider == "openai":
             content_lines.append(f"quality: {quality}")
+            content_lines.append(f"size: {size}")
+            content_lines.append(f"background: {background}")
+            content_lines.append("output_format: png")
         else:
             content_lines.append(f"resolution: {resolution}")
 
@@ -231,6 +253,9 @@ class GenerateEditImageToolExecutor:
         }
         if provider == "openai":
             metadata["quality"] = quality
+            metadata["size"] = size
+            metadata["background"] = background
+            metadata["output_format"] = "png"
         else:
             metadata["resolution"] = resolution
         if generated.revised_prompt is not None:
@@ -257,6 +282,8 @@ class GenerateEditImageToolExecutor:
         prompt: str,
         image_path: Path | None,
         quality: str,
+        size: str,
+        background: str,
     ) -> GeneratedImagePayload:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -275,6 +302,8 @@ class GenerateEditImageToolExecutor:
                     model=self.openai_model,
                     prompt=prompt,
                     quality=quality,
+                    size=size,
+                    background=background,
                     output_format="png",
                 )
             else:
@@ -284,6 +313,8 @@ class GenerateEditImageToolExecutor:
                         image=image_handle,
                         prompt=prompt,
                         quality=quality,
+                        size=size,
+                        background=background,
                         output_format="png",
                     )
         except Exception as exc:
@@ -426,30 +457,39 @@ def build_generate_edit_image_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required image prompt.",
+                        "description": "What to create or change.",
                     },
                     "image_path": {
                         "type": "string",
-                        "description": "Optional workspace source image.",
+                        "description": "Workspace image to edit; omit for text-to-image.",
                     },
                     "output_path": {
                         "type": "string",
-                        "description": "Required workspace output path.",
+                        "description": "Workspace path to write the result.",
                     },
                     "provider": {
                         "type": "string",
                         "enum": list(_SUPPORTED_PROVIDERS),
-                        "description": "Optional provider.",
+                        "description": "Default is openai; use gemini only when requested.",
                     },
                     "quality": {
                         "type": "string",
                         "enum": list(_OPENAI_QUALITY_VALUES),
-                        "description": "Optional OpenAI quality.",
+                        "description": "OpenAI only; unset for auto.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "OpenAI only; unset for auto or use WIDTHxHEIGHT.",
+                    },
+                    "background": {
+                        "type": "string",
+                        "enum": list(_OPENAI_BACKGROUND_VALUES),
+                        "description": "OpenAI only; unset for auto.",
                     },
                     "resolution": {
                         "type": "string",
                         "enum": list(_GEMINI_RESOLUTION_VALUES),
-                        "description": "Optional Gemini resolution.",
+                        "description": "Gemini only; unset for 1K.",
                     },
                 },
                 "required": ["prompt", "output_path"],
@@ -474,8 +514,7 @@ def build_generate_edit_image_discoverable() -> DiscoverableTool:
             "create image",
         ),
         purpose=(
-            "Generate a new image from a text prompt or edit an existing workspace image "
-            "with a text prompt."
+            "Generate an image or edit a workspace image."
         ),
         detailed_description=_build_generate_edit_image_tool_description(),
         backing_tool_name="generate_edit_image",
@@ -484,9 +523,10 @@ def build_generate_edit_image_discoverable() -> DiscoverableTool:
 
 def _build_generate_edit_image_tool_description() -> str:
     return (
-        "Generate from `prompt` or edit `image_path`, writing the result to workspace "
-        "`output_path`. Default to `provider='gemini'`; use `openai` only when needed. "
-        "Leave `quality` and `resolution` unset unless the user asks for a specific tradeoff."
+        "Generate from `prompt` or edit `image_path`, writing to `output_path`. "
+        "Use OpenAI by default; set `provider='gemini'` only when requested. "
+        "OpenAI options: `quality`, `size`, `background` default to `auto`; output is PNG. "
+        "Gemini option: `resolution` defaults to `1K`."
     )
 
 
@@ -513,6 +553,48 @@ def _normalize_openai_quality(value: Any) -> str | None:
         return None
     lowered = normalized.lower()
     if lowered in _OPENAI_QUALITY_VALUES:
+        return lowered
+    return None
+
+
+def _normalize_openai_size(value: Any) -> str | None:
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered == _OPENAI_SIZE_AUTO:
+        return lowered
+    match = re.fullmatch(r"(\d+)x(\d+)", lowered)
+    if match is None:
+        return None
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if _is_valid_openai_size(width=width, height=height):
+        return f"{width}x{height}"
+    return None
+
+
+def _is_valid_openai_size(*, width: int, height: int) -> bool:
+    if width <= 0 or height <= 0:
+        return False
+    if width > _OPENAI_MAX_IMAGE_EDGE_PX or height > _OPENAI_MAX_IMAGE_EDGE_PX:
+        return False
+    if width % 16 != 0 or height % 16 != 0:
+        return False
+    pixels = width * height
+    if pixels < _OPENAI_MIN_IMAGE_PIXELS or pixels > _OPENAI_MAX_IMAGE_PIXELS:
+        return False
+    long_edge = max(width, height)
+    short_edge = min(width, height)
+    return long_edge / short_edge <= _OPENAI_MAX_IMAGE_ASPECT_RATIO
+
+
+def _normalize_openai_background(value: Any) -> str | None:
+    normalized = _normalize_optional_string(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered in _OPENAI_BACKGROUND_VALUES:
         return lowered
     return None
 
