@@ -38,6 +38,7 @@ services:
       - |
         mkdir -p /workspace/identities
         mkdir -p /workspace/settings
+        mkdir -p /workspace/skills
         if [ ! -f /workspace/settings/settings.yml ]; then
           cp /repo/src/jarvis/settings.yml /workspace/settings/settings.yml
         fi

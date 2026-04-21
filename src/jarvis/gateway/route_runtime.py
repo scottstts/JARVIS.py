@@ -1284,6 +1284,8 @@ class RouteRuntime:
         lines = ["Detached bash update."]
         for notice in notices:
             lines.append(f"- {self._format_main_bash_job_notice_line(notice)}")
+            if notice.skill_import_notice:
+                lines.extend(notice.skill_import_notice.splitlines())
         lines.append(f"recommendation={recommendation}")
         guidance = (
             "This is a system update from the orchestrator, not a new user message. Detached bash is orchestrator-monitored; react to this update and update the user accordingly instead of polling unless the user asks for immediate inspection."

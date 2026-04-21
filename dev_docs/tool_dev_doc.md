@@ -292,6 +292,7 @@ Current active policy:
 - `view_image` may only read explicit image files inside `/workspace`
 - `tool_search` allows an optional short query and `low` / `high` verbosity only
 - `tool_register` always requires exact-action approval and binds approval to the manifest payload hash
+- `get_skills` exposes `search` only when skills are not bootstrapped, always allows `get` for canonical skill ids, and reads only from `/workspace/skills`
 
 ### Transcript And Follow-Up Tool Rounds
 
@@ -639,6 +640,46 @@ For backed discoverables, `Detailed Description` should normally mirror the exec
 - activation only applies to discoverable entries that link to a real executable tool
 - search does not currently index arbitrary `usage` or `metadata` payload contents
 
+### `get_skills`
+
+- Status: implemented
+- Exposure: `basic`
+- Package: `src/jarvis/tools/basic/get_skills/`
+- Purpose: search installed workspace skills when headers are not bootstrapped, and open one installed skill before applying it
+
+#### Input Schema
+
+- `mode: string` required enum `get` or `search`; `search` appears only when `skills.bootstrap_headers=false`
+- `query: string` optional for `search`
+- `skill_id: string` required for `get`
+
+#### Executor Behavior
+
+- imports recognized staged installer output from workspace skill-client directories into `/workspace/skills` before execution
+- `search` returns compact installed skill headers only
+- `get` returns one full `SKILL.md` plus a bounded bundled-resource listing
+- full reference or asset contents are not read automatically
+- scanner warnings and import summaries are returned in tool metadata; import changes and conflicts are also added to the visible tool result
+
+#### Bash Install UX
+
+- skill-install-shaped `bash` commands are post-processed after command exit
+- success returns a normalized `Skill install result` with only `status`, `skill`, and canonical `installed_at`
+- install command failures report `failed_stage: install`
+- import, conflict, or cleanup failures report `failed_stage: normalization`
+
+#### Policy
+
+- denies `search` when skill headers are bootstrapped in session context
+- bounds search query length and word count
+- requires `skill_id` to be a canonical directory name, not a path
+- all reads must stay inside `/workspace/skills/<skill_id>/`
+
+#### Current Limitations
+
+- search is deterministic lexical matching only; no embeddings
+- unusual installer output may still require the agent to inspect and create `/workspace/skills/<skill_id>/SKILL.md` manually
+
 ### `memory_search`
 
 - Status: implemented
@@ -952,6 +993,6 @@ These should stay hidden by default and only be surfaced through `tool_search`.
 
 ## Current Snapshot
 
-- Implemented tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`
-- Implemented basic tools: `bash`, `file_patch`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
+- Implemented tools: `bash`, `file_patch`, `get_skills`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`, `email`, `memory_admin`, `generate_edit_image`, `transcribe`
+- Implemented basic tools: `bash`, `file_patch`, `get_skills`, `memory_search`, `memory_get`, `memory_write`, `web_search`, `web_fetch`, `view_image`, `send_file`, `tool_search`
 - Implemented discoverable tools: `email`, `ffmpeg` (docs-only), `memory_admin`, `generate_edit_image`, `transcribe`

@@ -269,6 +269,9 @@ JARVIS_TOOL_EMAIL_SMTP_HOST: Final = _string("tools.email.smtp_host")
 JARVIS_TOOL_EMAIL_SMTP_PORT: Final = _integer("tools.email.smtp_port")
 JARVIS_TOOL_EMAIL_SMTP_SECURITY: Final = _string("tools.email.smtp_security")
 
+# Skills behavior settings.
+JARVIS_SKILLS_BOOTSTRAP_HEADERS: Final = _boolean("skills.bootstrap_headers")
+
 # Core session settings.
 JARVIS_CONTEXT_WINDOW_TOKENS: Final = _integer("core.context_window_tokens")
 JARVIS_CORE_TIMEZONE: Final = _string("core.timezone")

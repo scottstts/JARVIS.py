@@ -1087,6 +1087,8 @@ class SubagentManager:
         lines = ["Detached bash update."]
         for notice in notices:
             lines.append(f"- {self._format_bash_job_notice_line(notice)}")
+            if notice.skill_import_notice:
+                lines.extend(notice.skill_import_notice.splitlines())
         lines.append(f"recommendation={recommendation}")
         lines.append(
             "This is a system update from the orchestrator, not a new user message or a "

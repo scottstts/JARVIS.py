@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from jarvis.skills import SkillsSettings
+
 from .basic.bash import BashCommandPolicy
 from .basic.file_patch import FilePatchPolicy
+from .basic.get_skills import GetSkillsPolicy
 from .basic.memory_get import MemoryGetPolicy
 from .basic.memory_search import MemorySearchPolicy
 from .basic.memory_write import MemoryWritePolicy
@@ -94,6 +97,19 @@ class ToolPolicy:
                 context=context,
             )
 
+        if tool_name == "get_skills":
+            settings = SkillsSettings.from_workspace_dir(context.workspace_dir)
+            raw_query = arguments.get("query")
+            query = None if raw_query is None else str(raw_query)
+            raw_skill_id = arguments.get("skill_id")
+            skill_id = None if raw_skill_id is None else str(raw_skill_id)
+            return GetSkillsPolicy(settings).authorize(
+                mode=str(arguments.get("mode", "")),
+                query=query,
+                skill_id=skill_id,
+                context=context,
+            )
+
         if tool_name == "tool_register":
             return ToolRegisterPolicy().authorize(
                 arguments=arguments,
@@ -133,6 +149,7 @@ class ToolPolicy:
             "web_fetch",
             "view_image",
             "send_file",
+            "get_skills",
             "tool_search",
             "tool_register",
             "email",

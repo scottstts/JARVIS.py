@@ -356,6 +356,16 @@ tools:
             - "none"
           value: "ssl"
 
+skills:
+  title: "Skills"
+  description: "Agent skill discovery and startup context behavior."
+  fields:
+    bootstrap_headers:
+      label: "Bootstrap Skill Headers"
+      description: "Show installed skill names and descriptions at session start."
+      type: "boolean"
+      value: false
+
 memory:
   title: "Memory"
   description: "User-facing memory provider and behavior settings."

@@ -9,6 +9,7 @@ Treat these workspace areas as managed system locations:
 - `/workspace/archive` is read only.
 - `/workspace/memory` must never be touched.
 - `/workspace/runtime_tools` must not be edited manually.
+- `/workspace/skills` is managed skill storage; read skills through `get_skills`, and write there only if the assignment explicitly requires installing, creating, or updating a skill.
 - `/workspace/temp` and `/workspace/identities` should not be written unless the assignment clearly requires it.
 
 Use the best available tool for the job before falling back to weaker paths. Some tools are exposed by default, while discoverable tools must be found through `tool_search`.

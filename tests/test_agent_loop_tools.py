@@ -55,6 +55,7 @@ _EXPECTED_BASIC_TOOL_NAMES = [
     "memory_search",
     "memory_get",
     "memory_write",
+    "get_skills",
     "web_search",
     "web_fetch",
     "view_image",

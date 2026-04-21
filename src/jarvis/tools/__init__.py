@@ -4,6 +4,7 @@ from .basic.bash import BashCommandPolicy
 from .config import ToolSettings
 from .types import DiscoverableTool
 from .basic.file_patch import FilePatchPolicy
+from .basic.get_skills import GetSkillsPolicy
 from .basic.memory_get import MemoryGetPolicy
 from .basic.memory_search import MemorySearchPolicy
 from .basic.memory_write import MemoryWritePolicy
@@ -34,6 +35,7 @@ __all__ = [
     "EmailPolicy",
     "FilePatchPolicy",
     "GenerateEditImagePolicy",
+    "GetSkillsPolicy",
     "MemoryAdminPolicy",
     "MemoryGetPolicy",
     "MemorySearchPolicy",

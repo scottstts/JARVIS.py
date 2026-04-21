@@ -1266,6 +1266,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "memory_search",
                     "memory_get",
                     "memory_write",
+                    "get_skills",
                     "web_search",
                     "web_fetch",
                     "view_image",

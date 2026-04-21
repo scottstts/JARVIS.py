@@ -119,6 +119,7 @@ src/jarvis/
 ├── identities/
 ├── llm/
 ├── memory/
+├── skills/
 ├── storage/
 ├── subagent/
 ├── tool_runtime_service/
@@ -222,6 +223,17 @@ Includes:
 - graph handling
 - memory-specific config and types
 
+### `src/jarvis/skills/`
+
+Workspace-backed agent skill support.
+
+Includes:
+
+- parsing `/workspace/skills/<skill_id>/SKILL.md`
+- deterministic skill search
+- staged installer output import into `/workspace/skills`
+- compact renderers for skill bootstrap and `get_skills`
+
 ### `src/jarvis/storage/`
 
 Conversation/session persistence and related storage types.
@@ -300,6 +312,7 @@ Examples inside `/workspace`:
 
 - transcript archives
 - memory state
+- installed skills
 - copied identities
 - temporary files
 - tool artifacts

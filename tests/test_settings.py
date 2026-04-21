@@ -56,6 +56,7 @@ class SettingsModuleTests(unittest.TestCase):
 
         self.assertEqual(module.SETTINGS_SOURCE_PATH, _PACKAGED_TEMPLATE_PATH.resolve())
         self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "openai")
+        self.assertTrue(module.JARVIS_SKILLS_BOOTSTRAP_HEADERS)
         self.assertEqual(module.JARVIS_TOOL_GENERATE_EDIT_IMAGE_OPENAI_MODEL, "gpt-image-1.5")
         self.assertEqual(
             module.JARVIS_TOOL_GENERATE_EDIT_IMAGE_GEMINI_MODEL,

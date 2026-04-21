@@ -29,6 +29,13 @@ from jarvis.llm import (
     UnsupportedCapabilityError,
 )
 from jarvis.memory import MemoryService, MemorySettings
+from jarvis.skills import (
+    SkillsSettings,
+    import_staged_skills,
+    load_skill_catalog,
+    render_skill_bootstrap_headers,
+    render_skill_search_guidance,
+)
 from jarvis.storage import ConversationRecord, SessionMetadata, SessionStorage
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 
@@ -69,6 +76,7 @@ _TOOL_ROUND_LIMIT_METADATA_KEY = "tool_round_limit"
 _UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY = "unexecuted_tool_call_notice"
 _ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
+_SKILLS_BOOTSTRAP_METADATA_KEY = "skills_bootstrap"
 _TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
     "I reached the per-turn tool round limit before finishing. "
     "Continue in a new turn if you want me to keep using tools."
@@ -306,6 +314,7 @@ class AgentLoop:
             llm_service=memory_llm_service,
         )
         self._tool_settings = ToolSettings.from_workspace_dir(self._settings.workspace_dir)
+        self._skills_settings = SkillsSettings.from_workspace_dir(self._settings.workspace_dir)
         self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
         self._tool_definitions_provider = tool_definitions_provider or self._default_tool_definitions
@@ -2645,6 +2654,8 @@ class AgentLoop:
                 },
             )
 
+        self._append_skills_bootstrap(session.session_id)
+
         if self._memory_mode.bootstrap:
             try:
                 core_memory_bootstrap, ongoing_memory_bootstrap = (
@@ -3047,6 +3058,30 @@ class AgentLoop:
             }
             for definition in definitions
         ]
+
+    def _append_skills_bootstrap(self, session_id: str) -> None:
+        if not self._skills_settings.bootstrap_headers:
+            self._append_message(
+                session_id=session_id,
+                role="system",
+                content=render_skill_search_guidance(),
+                metadata={_SKILLS_BOOTSTRAP_METADATA_KEY: "search_guidance"},
+            )
+            return
+        try:
+            import_staged_skills(self._skills_settings)
+        except Exception:
+            LOGGER.exception("Skill import scan before session bootstrap failed.")
+        catalog = load_skill_catalog(self._skills_settings)
+        content = render_skill_bootstrap_headers(catalog)
+        if content is None:
+            return
+        self._append_message(
+            session_id=session_id,
+            role="system",
+            content=content,
+            metadata={_SKILLS_BOOTSTRAP_METADATA_KEY: "headers"},
+        )
 
     def _default_tool_definitions(
         self,

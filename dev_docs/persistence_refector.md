@@ -51,6 +51,8 @@ The following are persisted as normal transcript records before the model call:
 - turn context datetime message
 - interruption notice message
 - runtime messages from orchestrator or subagent plumbing
+- skill bootstrap headers, when `skills.bootstrap_headers` is enabled and installed skills exist
+- skill search guidance, when `skills.bootstrap_headers` is disabled
 
 This keeps initial request-visible context replayable on later turns.
 
@@ -265,6 +267,7 @@ The refactor removes avoidable transcript/replay drift, but it does not prevent 
 - provider setting change
 - tool registry change
 - runtime tool manifest change
+- skill installation or skill file change
 - intentionally current-turn-only discoverable activation boundaries
 
 Those are not transcript-fidelity bugs.

@@ -34,6 +34,13 @@ from jarvis.core.commands import ParsedCommand, parse_user_command
 from jarvis.llm import LLMUsage, LLMMessage, LLMService
 from jarvis.logging_setup import get_application_logger
 from jarvis.memory import MemoryService, MemorySettings
+from jarvis.skills import (
+    SkillsSettings,
+    import_staged_skills,
+    load_skill_catalog,
+    render_skill_bootstrap_headers,
+    render_skill_search_guidance,
+)
 from jarvis.storage import ConversationRecord, SessionMetadata, SessionStorage
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolSettings
 
@@ -149,6 +156,7 @@ class CodexActorRuntime:
         self._runtime_messages_provider = runtime_messages_provider
         self._path_mapper = CodexPathMapper.from_settings(settings)
         self._tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+        self._skills_settings = SkillsSettings.from_workspace_dir(core_settings.workspace_dir)
         memory_settings = MemorySettings.from_workspace_dir(core_settings.workspace_dir)
         memory_llm_service = llm_service if memory_mode.reflection else None
         if memory_llm_service is None:
@@ -911,6 +919,9 @@ class CodexActorRuntime:
                 sections.append("Memory bootstrap:\n" + core_text)
             if ongoing_text:
                 sections.append("Active ongoing memory:\n" + ongoing_text)
+        skills_text = self._render_skill_bootstrap_headers()
+        if skills_text:
+            sections.append(skills_text)
         sections.append(
             "Tooling boundary:\n"
             "- The only allowed external capabilities are the Jarvis dynamic tools in this thread.\n"
@@ -930,6 +941,16 @@ class CodexActorRuntime:
             "tool with the matching responsibility or continue without that capability."
         )
         return "\n\n".join(section.strip() for section in sections if section.strip())
+
+    def _render_skill_bootstrap_headers(self) -> str | None:
+        if not self._skills_settings.bootstrap_headers:
+            return render_skill_search_guidance()
+        try:
+            import_staged_skills(self._skills_settings)
+        except Exception:
+            LOGGER.exception("Codex actor skill import scan before bootstrap failed.")
+        catalog = load_skill_catalog(self._skills_settings)
+        return render_skill_bootstrap_headers(catalog)
 
     async def _persist_session_bootstrap(self, session_id: str) -> None:
         developer_instructions = await self._build_developer_instructions()

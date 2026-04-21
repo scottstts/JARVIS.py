@@ -8,6 +8,11 @@ from datetime import UTC, datetime
 from typing import Awaitable, Callable
 
 from jarvis.logging_setup import get_application_logger
+from jarvis.skills import (
+    SkillsSettings,
+    import_staged_skills,
+    render_skill_import_notice,
+)
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
     BashJobRecord,
@@ -57,6 +62,7 @@ class BashJobNotice:
     stdout_bytes_dropped: int
     stderr_bytes_dropped: int
     progress_hint: str | None
+    skill_import_notice: str | None = None
 
 
 class BashJobSupervisor:
@@ -306,6 +312,7 @@ class BashJobSupervisor:
             stderr_bytes_dropped=stderr_bytes_dropped,
             progress_hint=progress_hint,
         )
+        exit_code = _optional_int(status_result.metadata.get("exit_code"))
         return BashJobNotice(
             job_id=job_id,
             notice_kind=notice_kind,
@@ -321,7 +328,7 @@ class BashJobSupervisor:
             last_update_at=_optional_string(status_result.metadata.get("last_update_at")),
             finished_at=_optional_string(status_result.metadata.get("finished_at")),
             cancelled_at=_optional_string(status_result.metadata.get("cancelled_at")),
-            exit_code=_optional_int(status_result.metadata.get("exit_code")),
+            exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
             stdout_bytes_seen=_optional_int(status_result.metadata.get("stdout_bytes_seen")) or 0,
@@ -329,6 +336,10 @@ class BashJobSupervisor:
             stdout_bytes_dropped=stdout_bytes_dropped,
             stderr_bytes_dropped=stderr_bytes_dropped,
             progress_hint=progress_hint,
+            skill_import_notice=self._skill_import_notice_for_terminal_success(
+                status=status,
+                exit_code=exit_code,
+            ),
         )
 
     async def _dispatch_main_notices(self, notices: tuple[BashJobNotice, ...]) -> None:
@@ -368,6 +379,23 @@ class BashJobSupervisor:
             arguments=dict(arguments),
             context=context,
         )
+
+    def _skill_import_notice_for_terminal_success(
+        self,
+        *,
+        status: str,
+        exit_code: int | None,
+    ) -> str | None:
+        if status != "finished" or exit_code != 0:
+            return None
+        try:
+            import_result = import_staged_skills(
+                SkillsSettings.from_workspace_dir(self._workspace_dir)
+            )
+        except Exception:
+            LOGGER.exception("Skill import scan after detached bash completion failed.")
+            return None
+        return render_skill_import_notice(import_result)
 
     def _owner_matches_context(
         self,

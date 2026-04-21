@@ -199,6 +199,8 @@ def _should_drop_source_record(record: ConversationRecord) -> bool:
         return True
     if metadata.get("memory_bootstrap"):
         return True
+    if metadata.get("skills_bootstrap"):
+        return True
     if metadata.get("summary_seed"):
         return True
     if metadata.get("turn_context") == "datetime":
