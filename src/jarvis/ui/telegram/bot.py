@@ -37,6 +37,7 @@ from .gateway_client import (
     GatewayRouteEvent,
     GatewayRouteSession,
     GatewaySystemNoticeEvent,
+    GatewayTaskStatusEvent,
     GatewayToolCallEvent,
     GatewayTurnStartedEvent,
     GatewayTurnDoneEvent,
@@ -232,8 +233,12 @@ class _ActiveTelegramTurn:
     suppress_compaction_completion_text: bool = False
     current_stream_message_id: int | None = None
     current_stream_message_text: str = ""
-    typing_task: asyncio.Task[None] | None = None
-    typing_reset_event: asyncio.Event | None = None
+
+
+@dataclass(slots=True)
+class _ChatTypingIndicatorState:
+    task: asyncio.Task[None] | None = None
+    reset_event: asyncio.Event | None = None
 
 
 @dataclass(slots=True)
@@ -364,6 +369,8 @@ class TelegramGatewayBridge:
         self._approval_message_html_by_key: dict[tuple[int, int], str] = {}
         self._tool_notice_state_by_chat: dict[int, dict[tuple[str, str], _ToolNoticeState]] = {}
         self._output_pause_state_by_chat: dict[int, _ChatOutputPauseState] = {}
+        self._typing_indicator_by_chat: dict[int, _ChatTypingIndicatorState] = {}
+        self._task_status_active_by_chat: dict[int, bool] = {}
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -548,6 +555,8 @@ class TelegramGatewayBridge:
                 exc.code or "telegram_error",
                 exc.message or "",
             )
+            self._task_status_active_by_chat.pop(chat_id, None)
+            self._stop_typing_indicator(chat_id)
             self._finish_all_submitted_turns(chat_id=chat_id)
         except Exception:
             LOGGER.exception("Unexpected route event worker failure.")
@@ -631,6 +640,9 @@ class TelegramGatewayBridge:
         chat_id: int,
         event: GatewayRouteEvent,
     ) -> None:
+        if isinstance(event, GatewayTaskStatusEvent):
+            self._handle_task_status_event(chat_id=chat_id, event=event)
+            return
         self._maybe_resume_chat_output_from_event(chat_id=chat_id, event=event)
         if (
             isinstance(event, GatewayTurnStartedEvent)
@@ -709,7 +721,8 @@ class TelegramGatewayBridge:
         output_paused = self._chat_output_paused(chat_id)
         if isinstance(event, GatewayErrorEvent):
             if not output_paused:
-                self._stop_typing_indicator(active_turn)
+                self._task_status_active_by_chat.pop(chat_id, None)
+                self._stop_typing_indicator(chat_id)
                 await self._send_final_text(
                     chat_id=chat_id,
                     text=_ACTIVE_TURN_RUNTIME_ERROR_TEXT,
@@ -736,7 +749,7 @@ class TelegramGatewayBridge:
                     chat_id=chat_id,
                     html_text=_format_local_system_notice(event.text),
                 )
-                self._refresh_typing_indicator(active_turn)
+                self._refresh_typing_indicator(chat_id)
                 if event.notice_kind == "compaction_completed":
                     active_turn.suppress_compaction_completion_text = True
             return
@@ -784,7 +797,7 @@ class TelegramGatewayBridge:
                 )
             if notices_sent:
                 active_turn.delivered_any_segment = True
-                self._refresh_typing_indicator(active_turn)
+                self._refresh_typing_indicator(chat_id)
             self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayApprovalRequestEvent):
@@ -797,13 +810,13 @@ class TelegramGatewayBridge:
                 )
                 active_turn.pending_finalized_text_for_dedup = flushed_text
             if not output_paused:
-                self._stop_typing_indicator(active_turn)
+                self._stop_typing_indicator(chat_id)
                 await self._send_approval_request_message(chat_id=chat_id, approval=event)
             self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayAuthRequiredEvent):
             if not output_paused:
-                self._stop_typing_indicator(active_turn)
+                self._stop_typing_indicator(chat_id)
                 await self._send_html_message(
                     chat_id=chat_id,
                     html_text=_format_auth_required_message(event),
@@ -865,18 +878,14 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 html_text=_format_local_system_notice("Started a new session."),
             )
-        active_turn.typing_reset_event = asyncio.Event()
-        active_turn.typing_task = asyncio.create_task(
-            self._typing_indicator_loop(chat_id=chat_id, active_turn=active_turn),
-            name=f"jarvis-telegram-typing-{chat_id}",
-        )
+        self._ensure_typing_indicator(chat_id)
         return active_turn
 
     async def _typing_indicator_loop(
         self,
         *,
         chat_id: int,
-        active_turn: _ActiveTelegramTurn,
+        state: _ChatTypingIndicatorState,
     ) -> None:
         initial_delay = min(
             _TYPING_INITIAL_DELAY_SECONDS,
@@ -885,7 +894,7 @@ class TelegramGatewayBridge:
         next_delay = initial_delay
         try:
             while not self._chat_output_paused(chat_id):
-                reset_event = active_turn.typing_reset_event
+                reset_event = state.reset_event
                 if reset_event is None:
                     return
                 try:
@@ -898,29 +907,64 @@ class TelegramGatewayBridge:
                     continue
                 if self._chat_output_paused(chat_id):
                     continue
-                await self._telegram.send_chat_action(
-                    chat_id=chat_id,
-                    action=_TYPING_ACTION,
-                )
+                try:
+                    await self._telegram.send_chat_action(
+                        chat_id=chat_id,
+                        action=_TYPING_ACTION,
+                    )
+                except TelegramAPIError:
+                    LOGGER.exception("Failed to send Telegram typing indicator.")
                 next_delay = self._settings.stream_typing_indicator_interval_seconds
         except asyncio.CancelledError:
             raise
-        except TelegramAPIError:
-            LOGGER.exception("Failed to send Telegram typing indicator.")
 
-    def _refresh_typing_indicator(self, active_turn: _ActiveTelegramTurn) -> None:
-        reset_event = active_turn.typing_reset_event
+    def _handle_task_status_event(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayTaskStatusEvent,
+    ) -> None:
+        if event.active and not self._chat_output_paused(chat_id):
+            self._task_status_active_by_chat[chat_id] = True
+            self._ensure_typing_indicator(chat_id)
+            return
+        self._task_status_active_by_chat.pop(chat_id, None)
+        self._stop_typing_indicator(chat_id)
+
+    def _ensure_typing_indicator(self, chat_id: int) -> None:
+        if self._chat_output_paused(chat_id):
+            return
+        state = self._typing_indicator_by_chat.get(chat_id)
+        if state is not None and state.task is not None and not state.task.done():
+            return
+        state = _ChatTypingIndicatorState(reset_event=asyncio.Event())
+        state.task = asyncio.create_task(
+            self._typing_indicator_loop(chat_id=chat_id, state=state),
+            name=f"jarvis-telegram-typing-{chat_id}",
+        )
+        self._typing_indicator_by_chat[chat_id] = state
+
+    def _refresh_typing_indicator(self, chat_id: int) -> None:
+        if self._task_status_active_by_chat.get(chat_id):
+            self._ensure_typing_indicator(chat_id)
+        state = self._typing_indicator_by_chat.get(chat_id)
+        if state is None:
+            return
+        reset_event = state.reset_event
         if reset_event is None:
             return
         reset_event.set()
 
-    def _stop_typing_indicator(self, active_turn: _ActiveTelegramTurn) -> None:
-        typing_task = active_turn.typing_task
+    def _stop_typing_indicator(self, chat_id: int) -> None:
+        state = self._typing_indicator_by_chat.pop(chat_id, None)
+        if state is None:
+            return
+        typing_task = state.task
         if typing_task is None:
             return
         typing_task.cancel()
-        active_turn.typing_task = None
-        active_turn.typing_reset_event = None
+        state.task = None
+        state.reset_event = None
 
     async def _maybe_publish_stream_chunks(
         self,
@@ -986,14 +1030,14 @@ class TelegramGatewayBridge:
             return
         if active_turn.stream_transport == "draft":
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
-            self._refresh_typing_indicator(active_turn)
+            self._refresh_typing_indicator(chat_id)
             active_turn.published_text = normalized_text
             active_turn.last_publish_at = time.monotonic()
             active_turn.delivered_any_segment = True
             return
         if not normalized_text.startswith(active_turn.published_text):
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
-            self._refresh_typing_indicator(active_turn)
+            self._refresh_typing_indicator(chat_id)
             active_turn.delivered_any_segment = True
             return
         try:
@@ -1007,7 +1051,7 @@ class TelegramGatewayBridge:
                 raise
             active_turn.drafts_enabled = False
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
-            self._refresh_typing_indicator(active_turn)
+            self._refresh_typing_indicator(chat_id)
             active_turn.delivered_any_segment = True
             return
         active_turn.published_text = normalized_text
@@ -1032,14 +1076,14 @@ class TelegramGatewayBridge:
                 draft_id=active_turn.current_draft_id,
                 text=normalized_text,
             )
-            self._refresh_typing_indicator(active_turn)
+            self._refresh_typing_indicator(chat_id)
             return
         await self._append_text_via_edit_transport(
             chat_id=chat_id,
             active_turn=active_turn,
             text=normalized_text,
         )
-        self._refresh_typing_indicator(active_turn)
+        self._refresh_typing_indicator(chat_id)
 
     async def _append_text_via_edit_transport(
         self,
@@ -1115,18 +1159,22 @@ class TelegramGatewayBridge:
         if isinstance(event, GatewayTurnStartedEvent):
             return
         if isinstance(event, GatewayToolCallEvent):
-            await self._send_tool_usage_notices(
+            notices_sent = await self._send_tool_usage_notices(
                 chat_id=chat_id,
                 event=event,
             )
+            if notices_sent:
+                self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayApprovalRequestEvent):
+            self._stop_typing_indicator(chat_id)
             await self._send_approval_request_message(
                 chat_id=chat_id,
                 approval=event,
             )
             return
         if isinstance(event, GatewayAuthRequiredEvent):
+            self._stop_typing_indicator(chat_id)
             await self._send_html_message(
                 chat_id=chat_id,
                 html_text=_format_auth_required_message(event),
@@ -1137,12 +1185,14 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 html_text=_format_local_system_notice(event.text),
             )
+            self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewaySystemNoticeEvent):
             await self._send_html_message(
                 chat_id=chat_id,
                 html_text=_format_system_notice(event),
             )
+            self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayTurnDoneEvent):
             if event.agent_kind != "main":
@@ -1156,6 +1206,7 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 text=final_text,
             )
+            self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayErrorEvent):
             return
@@ -1199,12 +1250,23 @@ class TelegramGatewayBridge:
         for route_session in route_sessions:
             with suppress(asyncio.CancelledError):
                 await route_session.event_task
+        typing_states = tuple(self._typing_indicator_by_chat.values())
+        for state in typing_states:
+            if state.task is not None:
+                state.task.cancel()
+        for state in typing_states:
+            task = state.task
+            if task is not None:
+                with suppress(asyncio.CancelledError):
+                    await task
         self._route_sessions.clear()
         self._chat_workers.clear()
         self._chat_queues.clear()
         self._submitted_turns_by_chat.clear()
         self._submitted_turns_by_message_id.clear()
         self._active_turn_by_chat.clear()
+        self._typing_indicator_by_chat.clear()
+        self._task_status_active_by_chat.clear()
         self._chat_idle_events.clear()
         self._pending_turn_events_by_chat.clear()
         self._tool_notice_state_by_chat.clear()
@@ -1226,8 +1288,8 @@ class TelegramGatewayBridge:
 
     def _finish_submitted_turn(self, *, chat_id: int, client_message_id: str) -> None:
         active_turn = self._active_turn_by_chat.pop(chat_id, None)
-        if active_turn is not None:
-            self._stop_typing_indicator(active_turn)
+        if active_turn is not None and not self._task_status_active_by_chat.get(chat_id):
+            self._stop_typing_indicator(chat_id)
         self._clear_chat_output_resume_candidate_if_matches(
             chat_id=chat_id,
             client_message_id=client_message_id,
@@ -1394,9 +1456,8 @@ class TelegramGatewayBridge:
             self._output_pause_state_by_chat[chat_id] = state
         state.paused = True
         state.resume_client_message_id = None
-        active_turn = self._active_turn_by_chat.get(chat_id)
-        if active_turn is not None:
-            self._stop_typing_indicator(active_turn)
+        self._task_status_active_by_chat.pop(chat_id, None)
+        self._stop_typing_indicator(chat_id)
 
     def _chat_output_paused(self, chat_id: int) -> bool:
         state = self._output_pause_state_by_chat.get(chat_id)

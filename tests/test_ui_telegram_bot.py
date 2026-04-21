@@ -35,6 +35,7 @@ from jarvis.ui.telegram.gateway_client import (
     GatewayLocalNoticeEvent,
     GatewayMessageEvent,
     GatewaySystemNoticeEvent,
+    GatewayTaskStatusEvent,
     GatewayToolCallEvent,
     GatewayTurnStartedEvent,
     GatewayTurnDoneEvent,
@@ -1181,6 +1182,68 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             [message.text for message in telegram.sent_messages],
             ["🔧 <b>Jarvis</b> used <b>bash</b> tool.", "done"],
         )
+
+    async def test_task_status_keeps_typing_after_user_turn_done(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_typing_indicator_interval_seconds=0.05),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTaskStatusEvent(
+                route_id="tg_777",
+                active=True,
+                reason="user_message_queued",
+            )
+        )
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+            )
+        )
+
+        await asyncio.sleep(0.08)
+        self.assertGreaterEqual(len(telegram.sent_chat_actions), 1)
+
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                response_text="",
+                interrupted=True,
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        actions_after_user_turn = len(telegram.sent_chat_actions)
+        await asyncio.sleep(0.08)
+        self.assertGreater(len(telegram.sent_chat_actions), actions_after_user_turn)
+
+        await session.emit(
+            GatewayTaskStatusEvent(
+                route_id="tg_777",
+                active=False,
+                reason="turn_worker_idle",
+            )
+        )
+        actions_after_task_done = len(telegram.sent_chat_actions)
+        await asyncio.sleep(0.08)
+        self.assertEqual(len(telegram.sent_chat_actions), actions_after_task_done)
 
     async def test_dispatch_message_repeats_tool_notice_when_same_tool_is_used_in_next_turn(
         self,

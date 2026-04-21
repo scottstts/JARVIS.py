@@ -104,6 +104,13 @@ class GatewaySystemNoticeEvent(GatewayRouteEventBase):
 
 
 @dataclass(slots=True, frozen=True)
+class GatewayTaskStatusEvent(GatewayRouteEventBase):
+    active: bool = False
+    reason: str = ""
+    type: str = "task_status"
+
+
+@dataclass(slots=True, frozen=True)
 class GatewayErrorEvent(GatewayRouteEventBase):
     code: str = ""
     message: str = ""
@@ -120,6 +127,7 @@ GatewayRouteEvent = (
     | GatewayTurnDoneEvent
     | GatewayLocalNoticeEvent
     | GatewaySystemNoticeEvent
+    | GatewayTaskStatusEvent
     | GatewayErrorEvent
 )
 
@@ -565,6 +573,12 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
             **base_kwargs,
             notice_kind=str(payload.get("notice_kind", "")),
             text=str(payload.get("text", "")),
+        )
+    if event_type == "task_status":
+        return GatewayTaskStatusEvent(
+            **base_kwargs,
+            active=bool(payload.get("active", False)),
+            reason=str(payload.get("reason", "")),
         )
     if event_type == "error":
         return GatewayErrorEvent(

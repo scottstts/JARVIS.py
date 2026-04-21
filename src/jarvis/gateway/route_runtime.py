@@ -64,6 +64,7 @@ from .route_events import (
     RouteEvent,
     RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
+    RouteTaskStatusEvent,
     RouteToolCallEvent,
     RouteTurnStartedEvent,
     RouteTurnDoneEvent,
@@ -190,6 +191,7 @@ class RouteRuntime:
         self._pending_main_subagent_notices: dict[str, RouteSystemNoticeEvent] = {}
         self._main_subagent_runtime_turn_queued = False
         self._subagent_reset_in_progress = False
+        self._published_task_active = False
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
         self._codex_settings = CodexBackendSettings.from_env()
@@ -346,6 +348,7 @@ class RouteRuntime:
         if stop_requested and not self._main_resume_requires_user_message:
             self._main_resume_requires_user_message = True
             self._invalidate_stale_internal_followups()
+            self._published_task_active = False
         if affected_subagents:
             self._append_user_stop_subagent_note(affected_subagents)
         if pending_bash_jobs:
@@ -382,6 +385,7 @@ class RouteRuntime:
             )
         )
         self._queue_wakeup.set()
+        await self._publish_task_status_if_changed(reason="user_message_queued")
         if command.kind == "new":
             self._request_new_session_supersede()
         else:
@@ -399,6 +403,44 @@ class RouteRuntime:
             return
         await self._event_bus.publish(event)
         await self._maybe_enqueue_subagent_supervisor_followup(event)
+        await self._publish_task_status_if_changed(reason=f"route_event:{event.type}")
+
+    async def _publish_task_status_if_changed(self, *, reason: str) -> None:
+        active = self._route_task_active()
+        if active == self._published_task_active:
+            return
+        self._published_task_active = active
+        await self._event_bus.publish(
+            RouteTaskStatusEvent(
+                route_id=self._route_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                session_id=self._main_loop.active_session_id(),
+                turn_id=self._main_loop.active_turn_id(),
+                active=active,
+                reason=reason,
+            )
+        )
+
+    def _route_task_active(self) -> bool:
+        if self._main_resume_requires_user_message:
+            return False
+        if self._active_turn_request is not None:
+            return True
+        if self._main_loop.has_active_turn():
+            return True
+        if not self._user_message_queue.empty() or not self._message_queue.empty():
+            return True
+        if self._main_bash_runtime_turn_queued or self._main_subagent_runtime_turn_queued:
+            return True
+        if self._pending_main_bash_notices or self._pending_main_subagent_notices:
+            return True
+        if self._bash_job_supervisor.has_pending_jobs():
+            return True
+        return any(
+            snapshot.status in {"running", "waiting_background"}
+            for snapshot in self._subagent_manager.active_snapshots()
+        )
 
     async def _publish_main_local_notice(self, notice_kind: str, text: str) -> None:
         request = self._active_turn_request
@@ -707,6 +749,7 @@ class RouteRuntime:
                 self._active_turn_request = None
                 source_queue.task_done()
                 await self._maybe_schedule_deferred_internal_followups()
+                await self._publish_task_status_if_changed(reason="turn_worker_idle")
 
     async def _maybe_enqueue_subagent_supervisor_followup(self, event: RouteEvent) -> None:
         if self._subagent_reset_in_progress:

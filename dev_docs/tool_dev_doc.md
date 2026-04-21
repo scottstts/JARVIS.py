@@ -311,6 +311,7 @@ Current standard:
 - detached-bash notices are batched and deduped per owner so multiple job updates coalesce into one revival instead of one turn per job
 - delegated subagent progress is now orchestrator-owned too: after `subagent_invoke` or `subagent_step_in`, the main turn parks instead of polling, and later subagent checkpoints revive Jarvis through concise agent-only system notices plus a fresh runtime turn
 - wait-only orchestrator progress turns can now disable tool use for that one turn, so Jarvis emits a status update and waits instead of burning tool rounds on reactive polling
+- route runtimes publish public `task_status` control events whenever route-level task activity starts or fully drains; Telegram uses this non-message signal to keep `sendChatAction("typing")` alive across parked main turns, background subagents, and detached bash follow-ups
 - route-level `/stop` now also suppresses detached-bash auto-followups until the next user message, but it does not cancel already-running foreground or background bash executions
 
 Current provider-native follow-up handling:

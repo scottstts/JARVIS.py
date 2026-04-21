@@ -19,6 +19,7 @@ RouteEventType = Literal[
     "auth_required",
     "local_notice",
     "system_notice",
+    "task_status",
     "error",
 ]
 RouteTurnKind = Literal["user", "runtime"]
@@ -110,6 +111,13 @@ class RouteSystemNoticeEvent(RouteEventBase):
 
 
 @dataclass(slots=True, frozen=True)
+class RouteTaskStatusEvent(RouteEventBase):
+    active: bool = False
+    reason: str = ""
+    type: Literal["task_status"] = "task_status"
+
+
+@dataclass(slots=True, frozen=True)
 class RouteErrorEvent(RouteEventBase):
     code: str = ""
     message: str = ""
@@ -126,6 +134,7 @@ RouteEvent = (
     | RouteTurnDoneEvent
     | RouteLocalNoticeEvent
     | RouteSystemNoticeEvent
+    | RouteTaskStatusEvent
     | RouteErrorEvent
 )
 

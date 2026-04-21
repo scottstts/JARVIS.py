@@ -26,6 +26,7 @@ from jarvis.gateway.route_events import (
     RouteErrorEvent,
     RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
+    RouteTaskStatusEvent,
 )
 from jarvis.gateway.route_runtime import (
     CompositeMainBootstrapLoader,
@@ -256,6 +257,107 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_message_publishes_task_status_until_turn_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+
+            async def _stream_user_input(_user_text: str):
+                yield AgentTurnDoneEvent(
+                    session_id="main_session",
+                    response_text="done",
+                )
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            await runtime.enqueue_user_message("hi", client_message_id="msg_1")
+            await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            seen_task_status: list[RouteTaskStatusEvent] = []
+            while len(seen_task_status) < 2:
+                event = await asyncio.wait_for(queue.get(), timeout=1)
+                if isinstance(event, RouteTaskStatusEvent):
+                    seen_task_status.append(event)
+
+            self.assertTrue(seen_task_status[0].active)
+            self.assertEqual(seen_task_status[0].reason, "user_message_queued")
+            self.assertFalse(seen_task_status[1].active)
+            self.assertEqual(seen_task_status[1].reason, "turn_worker_idle")
+
+            runtime.unsubscribe(subscriber_id)
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_task_status_stays_active_while_subagent_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            running_snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="running",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="turn_1",
+                current_subagent_session_id="sub_session",
+            )
+
+            async def _stream_user_input(_user_text: str):
+                yield AgentTurnDoneEvent(
+                    session_id="main_session",
+                    response_text="waiting on subagent",
+                )
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            with patch.object(
+                runtime._subagent_manager,
+                "active_snapshots",
+                return_value=(running_snapshot,),
+            ):
+                await runtime.enqueue_user_message("hi", client_message_id="msg_1")
+                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            queued_events = []
+            while not queue.empty():
+                queued_events.append(queue.get_nowait())
+            seen_task_status = [
+                event for event in queued_events if isinstance(event, RouteTaskStatusEvent)
+            ]
+            self.assertEqual([event.active for event in seen_task_status], [True])
+
+            completed_snapshot = replace(running_snapshot, status="completed")
+            with patch.object(
+                runtime._subagent_manager,
+                "active_snapshots",
+                return_value=(completed_snapshot,),
+            ):
+                await runtime._publish_task_status_if_changed(reason="subagent_completed")
+
+            event = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertIsInstance(event, RouteTaskStatusEvent)
+            if not isinstance(event, RouteTaskStatusEvent):
+                self.fail("Expected task status event.")
+            self.assertFalse(event.active)
+            self.assertEqual(event.reason, "subagent_completed")
+
+            runtime.unsubscribe(subscriber_id)
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
     async def test_enqueue_user_message_supersedes_active_main_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(

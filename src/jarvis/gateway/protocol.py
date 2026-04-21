@@ -14,6 +14,7 @@ from .route_events import (
     RouteEvent,
     RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
+    RouteTaskStatusEvent,
     RouteToolCallEvent,
     RouteTurnStartedEvent,
     RouteTurnDoneEvent,
@@ -301,6 +302,14 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
             {
                 "notice_kind": event.notice_kind,
                 "text": event.text,
+            }
+        )
+        return payload
+    if isinstance(event, RouteTaskStatusEvent):
+        payload.update(
+            {
+                "active": event.active,
+                "reason": event.reason,
             }
         )
         return payload

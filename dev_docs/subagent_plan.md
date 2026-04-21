@@ -844,6 +844,7 @@ Per Telegram chat:
 - keep the current per-chat inbound message queue
 - continue serializing user messages per chat
 - process outbound route events continuously in the background
+- keep the Telegram typing indicator tied to route-level `task_status` activity, not only the currently active submitted user turn, so background subagent work and main-agent runtime follow-ups still show the task as running
 
 ### Immediate Telegram Messages Required
 

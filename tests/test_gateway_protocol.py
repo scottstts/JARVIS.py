@@ -5,8 +5,12 @@ from __future__ import annotations
 import unittest
 
 from jarvis.gateway.protocol import ProtocolError, build_route_event_payload, parse_client_event
-from jarvis.gateway.route_events import RouteAuthRequiredEvent
-from jarvis.ui.telegram.gateway_client import GatewayAuthRequiredEvent, _parse_route_event
+from jarvis.gateway.route_events import RouteAuthRequiredEvent, RouteTaskStatusEvent
+from jarvis.ui.telegram.gateway_client import (
+    GatewayAuthRequiredEvent,
+    GatewayTaskStatusEvent,
+    _parse_route_event,
+)
 
 
 class GatewayProtocolTests(unittest.TestCase):
@@ -129,3 +133,20 @@ class GatewayProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.login_id, "login_1")
         self.assertEqual(parsed.auth_url, "https://auth.example/login")
         self.assertEqual(parsed.message, "Open the browser login URL.")
+
+    def test_task_status_event_round_trips_through_gateway_payload(self) -> None:
+        payload = build_route_event_payload(
+            RouteTaskStatusEvent(
+                route_id="route_1",
+                agent_kind="main",
+                agent_name="Jarvis",
+                active=True,
+                reason="user_message_queued",
+            )
+        )
+
+        parsed = _parse_route_event(payload)
+
+        self.assertIsInstance(parsed, GatewayTaskStatusEvent)
+        self.assertTrue(parsed.active)
+        self.assertEqual(parsed.reason, "user_message_queued")
