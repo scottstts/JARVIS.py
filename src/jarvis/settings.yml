@@ -323,7 +323,7 @@ tools:
           label: "OpenAI Image Model"
           description: "OpenAI model used when generate_edit_image runs with provider openai."
           type: "text"
-          value: "gpt-image-1.5"
+          value: "gpt-image-2"
         gemini_model:
           label: "Gemini Image Model"
           description: "Gemini model used when generate_edit_image runs with provider gemini."
