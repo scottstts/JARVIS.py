@@ -12,7 +12,7 @@ providers:
           label: "Chat Model"
           description: "Default OpenAI chat model name."
           type: "text"
-          value: "gpt-5.4-2026-03-05"
+          value: "gpt-5.5"
         temperature:
           label: "Temperature"
           description: "Sampling temperature for OpenAI responses."
@@ -168,7 +168,7 @@ providers:
           description: "Optional default model override for Codex-backed actors."
           type: "text"
           nullable: true
-          value: "gpt-5.4"
+          value: "gpt-5.5"
         reasoning_effort:
           label: "Codex Reasoning Effort"
           description: "Reasoning effort passed to Codex turns."
@@ -390,7 +390,7 @@ memory:
           label: "Maintenance Model"
           description: "Model used for memory maintenance."
           type: "text"
-          value: "gpt-5.4-2026-03-05"
+          value: "gpt-5.5"
         max_output_tokens:
           label: "Maintenance Max Output Tokens"
           description: "Maximum output tokens for memory maintenance runs."
