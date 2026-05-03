@@ -7,6 +7,7 @@ import json
 import os
 import threading
 from collections.abc import AsyncIterator, Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import requests
@@ -46,6 +47,11 @@ from ..types import (
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 
+@dataclass(slots=True, frozen=True)
+class _OpenRouterStreamHeaders:
+    headers: dict[str, str]
+
+
 class OpenRouterProvider:
     """Provider implementation for OpenRouter OpenAI-compatible HTTP APIs."""
 
@@ -76,12 +82,16 @@ class OpenRouterProvider:
             raise LLMConfigurationError("request.model must be set before provider dispatch.")
 
         payload = self._build_chat_payload(request, stream=False)
-        data = await self._post_json(
+        data, response_headers = await self._post_json_with_headers(
             endpoint="/chat/completions",
             payload=payload,
             timeout_seconds=request.timeout_seconds,
         )
-        return self._normalize_chat_response(request=request, response_json=data)
+        return self._normalize_chat_response(
+            request=request,
+            response_json=data,
+            response_headers=response_headers,
+        )
 
     async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
         if request.model is None:
@@ -94,6 +104,7 @@ class OpenRouterProvider:
         response_id: str | None = None
         response_model = request.model
         raw_finish_reason = "unknown"
+        response_header_metadata: dict[str, Any] = {}
         saw_done_sentinel = False
         saw_terminal_choice = False
 
@@ -102,6 +113,11 @@ class OpenRouterProvider:
             payload=payload,
             timeout_seconds=request.timeout_seconds,
         ):
+            if isinstance(sse_payload, _OpenRouterStreamHeaders):
+                response_header_metadata = self._extract_response_header_metadata(
+                    sse_payload.headers
+                )
+                continue
             if sse_payload == "[DONE]":
                 saw_done_sentinel = True
                 break
@@ -158,7 +174,10 @@ class OpenRouterProvider:
             finish_reason=self._map_finish_reason(raw_finish_reason),
             usage=usage,
             response_id=response_id,
-            provider_metadata={"finish_reason_raw": raw_finish_reason},
+            provider_metadata={
+                "finish_reason_raw": raw_finish_reason,
+                **response_header_metadata,
+            },
         )
         yield DoneEvent(response=response)
 
@@ -320,6 +339,20 @@ class OpenRouterProvider:
         payload: dict[str, Any],
         timeout_seconds: float | None,
     ) -> dict[str, Any]:
+        data, _headers = await self._post_json_with_headers(
+            endpoint=endpoint,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+        )
+        return data
+
+    async def _post_json_with_headers(
+        self,
+        *,
+        endpoint: str,
+        payload: dict[str, Any],
+        timeout_seconds: float | None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         url, headers, timeout = self._build_request_context(
             endpoint=endpoint,
             timeout_seconds=timeout_seconds,
@@ -344,9 +377,10 @@ class OpenRouterProvider:
             self._raise_for_status(response)
 
         try:
-            return response.json()
+            data = response.json()
         except ValueError as exc:
             raise ProviderResponseError("OpenRouter returned non-JSON response.") from exc
+        return data, dict(response.headers)
 
     async def _stream_sse_payloads(
         self,
@@ -354,13 +388,15 @@ class OpenRouterProvider:
         endpoint: str,
         payload: dict[str, Any],
         timeout_seconds: float | None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | _OpenRouterStreamHeaders]:
         url, headers, timeout = self._build_request_context(
             endpoint=endpoint,
             timeout_seconds=timeout_seconds,
         )
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str | Exception | object] = asyncio.Queue()
+        queue: asyncio.Queue[str | _OpenRouterStreamHeaders | Exception | object] = (
+            asyncio.Queue()
+        )
         done_sentinel = object()
         stop_event = threading.Event()
         response_holder: dict[str, requests.Response | None] = {"response": None}
@@ -379,6 +415,10 @@ class OpenRouterProvider:
 
                 if response.status_code >= 400:
                     self._raise_for_status(response)
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    _OpenRouterStreamHeaders(dict(response.headers)),
+                )
 
                 for sse_payload in self._iter_sse_payloads(response):
                     if stop_event.is_set():
@@ -437,6 +477,7 @@ class OpenRouterProvider:
         headers: dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "X-OpenRouter-Cache": "true",
         }
         if self._settings.site_url:
             headers["HTTP-Referer"] = self._settings.site_url
@@ -487,7 +528,13 @@ class OpenRouterProvider:
             raise ProviderTemporaryError(message)
         raise ProviderBadRequestError(message)
 
-    def _normalize_chat_response(self, *, request: LLMRequest, response_json: dict[str, Any]) -> LLMResponse:
+    def _normalize_chat_response(
+        self,
+        *,
+        request: LLMRequest,
+        response_json: dict[str, Any],
+        response_headers: dict[str, str] | None = None,
+    ) -> LLMResponse:
         choices = response_json.get("choices", [])
         choice = choices[0] if choices else {}
         message = choice.get("message", {})
@@ -509,8 +556,39 @@ class OpenRouterProvider:
             finish_reason=self._map_finish_reason(finish_reason),
             usage=usage,
             response_id=response_json.get("id"),
-            provider_metadata={"finish_reason_raw": finish_reason},
+            provider_metadata={
+                "finish_reason_raw": finish_reason,
+                **self._extract_response_header_metadata(response_headers),
+            },
         )
+
+    def _extract_response_header_metadata(
+        self,
+        response_headers: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        if response_headers is None:
+            return {}
+
+        headers = {key.lower(): value for key, value in response_headers.items()}
+        metadata: dict[str, Any] = {}
+
+        cache_status = headers.get("x-openrouter-cache-status")
+        if cache_status:
+            metadata["openrouter_cache_status"] = str(cache_status).upper()
+
+        cache_age = _parse_header_int(headers.get("x-openrouter-cache-age"))
+        if cache_age is not None:
+            metadata["openrouter_cache_age_seconds"] = cache_age
+
+        cache_ttl = _parse_header_int(headers.get("x-openrouter-cache-ttl"))
+        if cache_ttl is not None:
+            metadata["openrouter_cache_ttl_seconds"] = cache_ttl
+
+        generation_id = headers.get("x-generation-id")
+        if generation_id:
+            metadata["openrouter_generation_id"] = str(generation_id)
+
+        return metadata
 
     def _extract_text(self, content: Any) -> str:
         if isinstance(content, str):
@@ -686,3 +764,12 @@ class OpenRouterProvider:
                 )
             )
         return parsed_calls
+
+
+def _parse_header_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None

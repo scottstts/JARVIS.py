@@ -171,3 +171,4 @@
 - Telegram now sends the non-persisted text `❌ Error occurred. Try again.` only when an active user turn ends on a gateway/runtime error; background route errors remain suppressed.
 - Main route runtime errors now append JSONL records to `/workspace/archive/error_logs/<session_id>.jsonl` with route/session/turn metadata plus full traceback text, and print only one Rich reminder line in the terminal; Telegram-side gateway-error suppression logs were removed to avoid duplicate noise.
 - Telegram typing now follows route `task_status` control events rather than only active submitted user turns, so it stays alive while the original task is parked on subagents or detached bash follow-ups.
+- OpenRouter response caching is default-on in the adapter via `X-OpenRouter-Cache: true`, separate from prompt caching, and chat cache status headers are preserved in `provider_metadata`.

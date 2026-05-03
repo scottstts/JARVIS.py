@@ -193,7 +193,12 @@ Includes:
 - validation
 - service lifecycle
 - provider implementations under `llm/providers/`
-- provider-local translation for cache/state quirks such as LM Studio `previous_response_id` reuse and Grok Responses replay via `x-grok-conv-id` plus persisted assistant `response.output` metadata
+- provider-local translation for cache/state quirks such as OpenRouter response-cache headers, LM Studio `previous_response_id` reuse, and Grok Responses replay via `x-grok-conv-id` plus persisted assistant `response.output` metadata
+
+Current OpenRouter note:
+
+- the OpenRouter adapter always sends `X-OpenRouter-Cache: true` on provider HTTP requests so OpenRouter can reuse identical response payloads independently of prompt caching
+- chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
 
 Current Grok note:
 

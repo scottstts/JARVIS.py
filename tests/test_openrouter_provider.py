@@ -28,10 +28,12 @@ class _FakeStreamingResponse:
         lines: list[str],
         status_code: int = 200,
         text: str = "",
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._lines = lines
         self.status_code = status_code
         self.text = text
+        self.headers = headers or {}
         self.closed = False
 
     def iter_lines(self, decode_unicode: bool = False):
@@ -40,6 +42,24 @@ class _FakeStreamingResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FakeJsonResponse:
+    def __init__(
+        self,
+        *,
+        data: dict[str, object],
+        status_code: int = 200,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self._data = data
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self) -> dict[str, object]:
+        return self._data
 
 
 class OpenRouterProviderStreamingTests(unittest.TestCase):
@@ -60,9 +80,59 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
 
         self.assertEqual(headers["Authorization"], "Bearer test-key")
         self.assertEqual(headers["HTTP-Referer"], "https://jarvis.example")
+        self.assertEqual(headers["X-OpenRouter-Cache"], "true")
         self.assertEqual(headers["X-OpenRouter-Title"], "Jarvis")
         self.assertEqual(headers["X-Title"], "Jarvis")
         self.assertEqual(timeout, 60.0)
+
+    def test_generate_sends_response_cache_header_and_surfaces_cache_metadata(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="openai/gpt-4o-mini",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+
+        captured_request: dict[str, object] = {}
+        response = _FakeJsonResponse(
+            data={
+                "id": "gen_123",
+                "model": "openai/gpt-4o-mini",
+                "choices": [
+                    {
+                        "message": {"content": "Hello"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            headers={
+                "X-OpenRouter-Cache-Status": "HIT",
+                "X-OpenRouter-Cache-Age": "12",
+                "X-OpenRouter-Cache-TTL": "300",
+                "X-Generation-Id": "gen_header_123",
+            },
+        )
+
+        def fake_post(*args, **kwargs):
+            captured_request.update(kwargs)
+            return response
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                side_effect=fake_post,
+            ):
+                result = asyncio.run(provider.generate(request))
+
+        headers = captured_request["headers"]
+        self.assertEqual(headers["X-OpenRouter-Cache"], "true")
+        self.assertEqual(result.text, "Hello")
+        self.assertEqual(result.provider_metadata["openrouter_cache_status"], "HIT")
+        self.assertEqual(result.provider_metadata["openrouter_cache_age_seconds"], 12)
+        self.assertEqual(result.provider_metadata["openrouter_cache_ttl_seconds"], 300)
+        self.assertEqual(result.provider_metadata["openrouter_generation_id"], "gen_header_123")
 
     def test_stream_generate_emits_text_usage_and_done_events(self) -> None:
         provider = OpenRouterProvider(
@@ -136,7 +206,13 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                 "",
                 "data: [DONE]",
                 "",
-            ]
+            ],
+            headers={
+                "X-OpenRouter-Cache-Status": "HIT",
+                "X-OpenRouter-Cache-Age": "12",
+                "X-OpenRouter-Cache-TTL": "300",
+                "X-Generation-Id": "gen_header_123",
+            },
         )
 
         def fake_post(*args, **kwargs):
@@ -149,6 +225,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
 
         self.assertTrue(captured_request["stream"])
         self.assertTrue(captured_request["json"]["stream"])
+        self.assertEqual(captured_request["headers"]["X-OpenRouter-Cache"], "true")
         self.assertEqual(
             [event.delta for event in events if isinstance(event, TextDeltaEvent)],
             ["Hel", "lo"],
@@ -164,6 +241,13 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(done.response.finish_reason, "stop")
         self.assertEqual(done.response.usage.total_tokens, 5)
         self.assertEqual(done.response.response_id, "gen_123")
+        self.assertEqual(done.response.provider_metadata["openrouter_cache_status"], "HIT")
+        self.assertEqual(done.response.provider_metadata["openrouter_cache_age_seconds"], 12)
+        self.assertEqual(done.response.provider_metadata["openrouter_cache_ttl_seconds"], 300)
+        self.assertEqual(
+            done.response.provider_metadata["openrouter_generation_id"],
+            "gen_header_123",
+        )
         self.assertTrue(response.closed)
 
     def test_stream_generate_assembles_streamed_tool_calls(self) -> None:
