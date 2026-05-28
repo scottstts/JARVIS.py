@@ -226,7 +226,7 @@ class OpenRouterProvider:
     def _build_chat_payload(self, request: LLMRequest, *, stream: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,
-            "messages": [self._to_openrouter_message(message) for message in request.messages],
+            "messages": self._to_openrouter_messages(request),
             "provider": {"sort": "throughput"},
             "stream": stream,
         }
@@ -244,6 +244,37 @@ class OpenRouterProvider:
             )
 
         return payload
+
+    def _to_openrouter_messages(self, request: LLMRequest) -> list[dict[str, Any]]:
+        if not _openrouter_model_uses_anthropic_system_rules(request.model):
+            return [self._to_openrouter_message(message) for message in request.messages]
+
+        system_parts: list[str] = []
+        out_messages: list[dict[str, Any]] = []
+        for message in request.messages:
+            if message.role == "system":
+                text = _join_text_parts(
+                    message.parts,
+                    unsupported_message=(
+                        "OpenRouter Anthropic-compatible system history only supports "
+                        "text parts."
+                    ),
+                )
+                if text:
+                    if _openrouter_system_message_is_global(message):
+                        system_parts.append(text)
+                    else:
+                        out_messages.append({"role": "user", "content": text})
+                continue
+
+            out_messages.append(self._to_openrouter_message(message))
+
+        if not system_parts:
+            return out_messages
+        return [
+            {"role": "system", "content": "\n\n".join(system_parts)},
+            *out_messages,
+        ]
 
     def _to_openrouter_message(self, message: LLMMessage) -> dict[str, Any]:
         role = message.role
@@ -773,3 +804,31 @@ def _parse_header_int(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _openrouter_model_uses_anthropic_system_rules(model: str | None) -> bool:
+    if model is None:
+        return False
+    normalized = model.lower()
+    return normalized.startswith("anthropic/") or "claude" in normalized
+
+
+def _openrouter_system_message_is_global(message: LLMMessage) -> bool:
+    metadata = message.metadata
+    if not metadata:
+        return True
+    return bool(
+        metadata.get("bootstrap_identity")
+        or metadata.get("memory_bootstrap")
+        or metadata.get("summary_seed")
+    )
+
+
+def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:
+    text_parts: list[str] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            text_parts.append(part.text)
+            continue
+        raise LLMConfigurationError(unsupported_message)
+    return "\n".join(text_parts).strip()
