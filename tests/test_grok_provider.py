@@ -209,7 +209,7 @@ class GrokProviderTests(unittest.TestCase):
         self.assertEqual(image_item["image_url"], image_url)
         self.assertEqual(image_item["detail"], "high")
 
-    def test_reasoning_models_request_encrypted_reasoning_and_disable_store(self) -> None:
+    def test_reasoning_models_request_encrypted_reasoning_and_enable_store(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
             default_timeout_seconds=60.0,
@@ -222,7 +222,7 @@ class GrokProviderTests(unittest.TestCase):
         kwargs = provider._build_response_create_kwargs(request, stream=False)
 
         self.assertEqual(kwargs["include"], ["reasoning.encrypted_content"])
-        self.assertFalse(kwargs["store"])
+        self.assertTrue(kwargs["store"])
 
     def test_non_reasoning_models_omit_encrypted_reasoning_include(self) -> None:
         provider = GrokProvider(
@@ -237,7 +237,32 @@ class GrokProviderTests(unittest.TestCase):
         kwargs = provider._build_response_create_kwargs(request, stream=False)
 
         self.assertNotIn("include", kwargs)
-        self.assertFalse(kwargs["store"])
+        self.assertTrue(kwargs["store"])
+
+    def test_stateful_continuation_uses_previous_response_id(self) -> None:
+        provider = GrokProvider(
+            settings=GrokProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="grok-4.20-0309-non-reasoning",
+            messages=(LLMMessage.text("user", "Second turn"),),
+            previous_response_id="resp_grok_123",
+        )
+
+        kwargs = provider._build_response_create_kwargs(request, stream=False)
+
+        self.assertEqual(kwargs["previous_response_id"], "resp_grok_123")
+        self.assertEqual(
+            kwargs["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Second turn"}],
+                }
+            ],
+        )
 
     def test_generate_uses_prompt_cache_header(self) -> None:
         provider = GrokProvider(

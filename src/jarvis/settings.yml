@@ -364,7 +364,7 @@ skills:
       label: "Bootstrap Skill Headers"
       description: "Show installed skill names and descriptions at session start."
       type: "boolean"
-      value: false
+      value: true
 
 memory:
   title: "Memory"

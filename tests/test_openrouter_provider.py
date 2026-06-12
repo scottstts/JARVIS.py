@@ -134,6 +134,41 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(result.provider_metadata["openrouter_cache_ttl_seconds"], 300)
         self.assertEqual(result.provider_metadata["openrouter_generation_id"], "gen_header_123")
 
+    def test_anthropic_model_payload_enables_prompt_cache_and_sticky_session(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="anthropic/claude-4.5-sonnet",
+            messages=(
+                LLMMessage.text("system", "System prompt"),
+                LLMMessage.text("user", "hello"),
+            ),
+            prompt_cache_key="session_123",
+        )
+
+        payload = provider._build_chat_payload(request)
+
+        self.assertEqual(payload["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(payload["session_id"], "session_123")
+
+    def test_non_anthropic_model_payload_omits_prompt_cache_control(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="openai/gpt-4o-mini",
+            messages=(LLMMessage.text("user", "hello"),),
+            prompt_cache_key="session_123",
+        )
+
+        payload = provider._build_chat_payload(request)
+
+        self.assertNotIn("cache_control", payload)
+        self.assertEqual(payload["session_id"], "session_123")
+
     def test_stream_generate_emits_text_usage_and_done_events(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),

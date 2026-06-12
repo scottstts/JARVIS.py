@@ -220,7 +220,7 @@ class GrokProvider:
                 for item in self._to_grok_input_items(message, model=request.model)
             ],
             "stream": stream,
-            "store": False,
+            "store": True,
             "parallel_tool_calls": request.parallel_tool_calls,
         }
 
@@ -230,6 +230,8 @@ class GrokProvider:
             kwargs["max_output_tokens"] = request.max_output_tokens
         if request.timeout_seconds is not None:
             kwargs["timeout"] = request.timeout_seconds
+        if request.previous_response_id is not None:
+            kwargs["previous_response_id"] = request.previous_response_id
 
         if _grok_model_uses_encrypted_reasoning(request.model):
             kwargs["include"] = ["reasoning.encrypted_content"]

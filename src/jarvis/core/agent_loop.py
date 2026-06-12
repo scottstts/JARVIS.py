@@ -6,6 +6,7 @@ import base64
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol, Sequence
@@ -20,6 +21,8 @@ from jarvis.llm import (
     LLMRequest,
     LLMResponse,
     LLMService,
+    ProviderContextStrategy,
+    ProviderSessionState,
     ProviderBadRequestError,
     TextPart,
     ToolCall,
@@ -27,6 +30,7 @@ from jarvis.llm import (
     ToolDefinition,
     ToolResultPart,
     UnsupportedCapabilityError,
+    strategy_for_provider,
 )
 from jarvis.memory import MemoryService, MemorySettings
 from jarvis.skills import (
@@ -668,6 +672,14 @@ class AgentLoop:
                 pending_records=pending_records,
                 record=assistant_record,
             )
+            session = (
+                self._persist_provider_session_state_from_response(
+                    session_id=session.session_id,
+                    response=response,
+                    assistant_record=assistant_record,
+                )
+                or session
+            )
             if self._stop_requested(turn_id):
                 return self._interrupt_turn(
                     session_id=session.session_id,
@@ -890,6 +902,7 @@ class AgentLoop:
                 extra_records=extra_records,
             )
         request, estimated_input_tokens = self._build_followup_request(
+            session_id=session_id,
             base_records=base_records,
             pending_records=pending_records,
             extra_records=extra_records,
@@ -997,6 +1010,7 @@ class AgentLoop:
     def _build_followup_request(
         self,
         *,
+        session_id: str,
         base_records: Sequence[ConversationRecord],
         pending_records: Sequence[ConversationRecord],
         allow_tools: bool = True,
@@ -1006,8 +1020,10 @@ class AgentLoop:
             pending_records
         )
 
-        request = self._build_request(
-            list(base_records) + list(pending_records) + list(extra_records),
+        request = self._build_contextual_request(
+            session_id=session_id,
+            base_records=base_records,
+            current_records=tuple(pending_records) + tuple(extra_records),
             activated_discoverable_tool_names=(
                 activated_discoverable_tool_names if allow_tools else ()
             ),
@@ -1041,6 +1057,7 @@ class AgentLoop:
         )
         staged_records = ((waiting_record,) if waiting_record is not None else ())
         request, estimated_input_tokens = self._build_followup_request(
+            session_id=session_id,
             base_records=base_records,
             pending_records=pending_records,
             allow_tools=False,
@@ -1125,6 +1142,148 @@ class AgentLoop:
             prompt_cache_key=records[0].session_id if records else None,
         )
 
+    def _build_contextual_request(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        current_records: Sequence[ConversationRecord],
+        activated_discoverable_tool_names: Sequence[str] = (),
+        allow_tools: bool = True,
+    ) -> LLMRequest:
+        provider = self._effective_llm_provider()
+        state = self._ensure_provider_session_state(
+            session_id=session_id,
+            provider=provider,
+        )
+        strategy = state.strategy if state is not None else strategy_for_provider(provider)
+        tools = (
+            self._compose_request_tools(activated_discoverable_tool_names)
+            if allow_tools
+            else ()
+        )
+        tool_choice = ToolChoice.auto() if allow_tools else ToolChoice.none()
+
+        request_records = tuple(base_records) + tuple(current_records)
+        prompt_cache_key = session_id if request_records else None
+        previous_response_id: str | None = None
+        conversation_id: str | None = None
+        cached_content_name: str | None = None
+        cached_content_model: str | None = None
+        cached_content_messages: tuple[LLMMessage, ...] = ()
+        cached_content_source_signature: str | None = None
+        cached_content_source_record_ids: tuple[str, ...] = ()
+        cached_content_media_ids: tuple[str, ...] = ()
+
+        if strategy == ProviderContextStrategy.PROVIDER_STATEFUL_CONTINUATION:
+            prompt_cache_key = None
+            if provider == "openai" and state is not None:
+                previous_response_id = state.openai.previous_response_id
+                conversation_id = state.openai.conversation_id
+                if previous_response_id or conversation_id:
+                    request_records = _records_after_response_record(
+                        current_records,
+                        state.openai.last_response_record_id,
+                    )
+            elif provider == "grok" and state is not None:
+                previous_response_id = state.grok.previous_response_id
+                if previous_response_id:
+                    request_records = _records_after_response_record(
+                        current_records,
+                        state.grok.last_response_record_id,
+                    )
+
+            if not request_records:
+                request_records = tuple(current_records) or tuple(base_records)
+
+        elif strategy == ProviderContextStrategy.PROVIDER_CACHED_CONTEXT and provider == "gemini":
+            prompt_cache_key = None
+            stable_records = tuple(base_records)
+            request_records = tuple(current_records) or tuple(base_records)
+            if stable_records:
+                cached_content_messages = _records_to_llm_messages(stable_records)
+                cached_content_source_record_ids = tuple(
+                    record.record_id
+                    for record in stable_records
+                    if record.kind == "message"
+                    and not bool(
+                        record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)
+                    )
+                )
+                cached_content_media_ids = _collect_message_media_ids(cached_content_messages)
+                cached_content_source_signature = _gemini_cache_source_signature(
+                    records=stable_records,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+                if (
+                    state is not None
+                    and _gemini_cache_is_usable(
+                        state,
+                        source_signature=cached_content_source_signature,
+                    )
+                ):
+                    cached_content_name = state.gemini.cached_content_name
+                    cached_content_model = state.gemini.model
+
+        messages = _records_to_llm_messages(request_records)
+        return LLMRequest(
+            messages=messages,
+            provider=provider,
+            tools=tools,
+            tool_choice=tool_choice,
+            prompt_cache_key=prompt_cache_key,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            cached_content_name=cached_content_name,
+            cached_content_model=cached_content_model,
+            cached_content_messages=cached_content_messages,
+            cached_content_source_signature=cached_content_source_signature,
+            cached_content_source_record_ids=cached_content_source_record_ids,
+            cached_content_media_ids=cached_content_media_ids,
+        )
+
+    def _effective_llm_provider(self) -> str | None:
+        if self._llm_provider:
+            return self._llm_provider
+        service_settings = getattr(self._llm_service, "settings", None)
+        if service_settings is None:
+            return None
+        default_provider = getattr(service_settings, "default_provider", None)
+        if not isinstance(default_provider, str):
+            return None
+        normalized = default_provider.strip().lower()
+        return normalized or None
+
+    def _ensure_provider_session_state(
+        self,
+        *,
+        session_id: str,
+        provider: str | None,
+    ) -> ProviderSessionState | None:
+        if provider is None:
+            return None
+        expected = ProviderSessionState.for_provider(provider)
+        if expected is None:
+            return None
+
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return expected
+        existing = ProviderSessionState.from_mapping(session.provider_session_state)
+        if (
+            existing is not None
+            and existing.provider == expected.provider
+            and existing.strategy == expected.strategy
+        ):
+            return existing
+
+        self._storage.update_session(
+            session_id,
+            provider_session_state=expected.to_dict(),
+        )
+        return expected
+
     def _build_tool_round_limit_recovery_request(
         self,
         *,
@@ -1154,8 +1313,10 @@ class AgentLoop:
                 turn_id=turn_id,
             ),
         )
-        request = self._build_request(
-            list(base_records) + pending_records,
+        request = self._build_contextual_request(
+            session_id=session_id,
+            base_records=base_records,
+            current_records=pending_records,
             allow_tools=False,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
@@ -1200,14 +1361,20 @@ class AgentLoop:
         )
         response = await self._llm_service.generate(request)
         normalized = self._normalize_tool_round_limit_recovery_response(response)
+        assistant_record = self._build_assistant_record(
+            session_id,
+            normalized,
+            turn_id=turn_id,
+        )
         self._append_turn_record(
             session_id=session_id,
             pending_records=pending_records,
-            record=self._build_assistant_record(
-                session_id,
-                normalized,
-                turn_id=turn_id,
-            ),
+            record=assistant_record,
+        )
+        self._persist_provider_session_state_from_response(
+            session_id=session_id,
+            response=normalized,
+            assistant_record=assistant_record,
         )
         return normalized, estimated_input_tokens
 
@@ -1250,14 +1417,20 @@ class AgentLoop:
             )
 
         normalized = self._normalize_tool_round_limit_recovery_response(streamed_response)
+        assistant_record = self._build_assistant_record(
+            session_id,
+            normalized,
+            turn_id=turn_id,
+        )
         self._append_turn_record(
             session_id=session_id,
             pending_records=pending_records,
-            record=self._build_assistant_record(
-                session_id,
-                normalized,
-                turn_id=turn_id,
-            ),
+            record=assistant_record,
+        )
+        self._persist_provider_session_state_from_response(
+            session_id=session_id,
+            response=normalized,
+            assistant_record=assistant_record,
         )
         if normalized.text:
             recovery_events.append(
@@ -1432,6 +1605,14 @@ class AgentLoop:
                     pending_records=pending_records,
                     record=final_initial_record,
                 )
+            session = (
+                self._persist_provider_session_state_from_response(
+                    session_id=session.session_id,
+                    response=initial_response,
+                    assistant_record=final_initial_record,
+                )
+                or session
+            )
             if initial_response.text:
                 yield AgentAssistantMessageEvent(
                     session_id=session.session_id,
@@ -1935,6 +2116,14 @@ class AgentLoop:
                         pending_records=pending_records,
                         record=final_followup_record,
                     )
+                session = (
+                    self._persist_provider_session_state_from_response(
+                        session_id=session.session_id,
+                        response=current_response,
+                        assistant_record=final_followup_record,
+                    )
+                    or session
+                )
                 if current_response.text:
                     yield AgentAssistantMessageEvent(
                         session_id=session.session_id,
@@ -2174,6 +2363,95 @@ class AgentLoop:
             last_estimated_input_tokens=estimated_input_tokens,
         )
 
+    def _persist_provider_session_state_from_response(
+        self,
+        *,
+        session_id: str,
+        response: LLMResponse,
+        assistant_record: ConversationRecord | None,
+    ) -> SessionMetadata | None:
+        provider = self._effective_llm_provider()
+        if provider is None:
+            return self._storage.get_session(session_id)
+        state = self._ensure_provider_session_state(
+            session_id=session_id,
+            provider=provider,
+        )
+        if state is None:
+            return self._storage.get_session(session_id)
+
+        response_record_id = assistant_record.record_id if assistant_record is not None else None
+        if provider == "openai":
+            state = replace(
+                state,
+                openai=replace(
+                    state.openai,
+                    conversation_id=(
+                        _metadata_str(response.provider_metadata, "conversation_id")
+                        or state.openai.conversation_id
+                    ),
+                    previous_response_id=response.response_id or state.openai.previous_response_id,
+                    last_response_record_id=response_record_id or state.openai.last_response_record_id,
+                ),
+            )
+        elif provider == "grok":
+            state = replace(
+                state,
+                grok=replace(
+                    state.grok,
+                    previous_response_id=response.response_id or state.grok.previous_response_id,
+                    last_response_record_id=response_record_id or state.grok.last_response_record_id,
+                ),
+            )
+        elif provider == "gemini":
+            state = replace(
+                state,
+                gemini=replace(
+                    state.gemini,
+                    cached_content_name=(
+                        _metadata_str(response.provider_metadata, "cached_content_name")
+                        or state.gemini.cached_content_name
+                    ),
+                    cache_expires_at=(
+                        _metadata_str(response.provider_metadata, "cached_content_expires_at")
+                        or state.gemini.cache_expires_at
+                    ),
+                    cached_media_ids=(
+                        _metadata_string_tuple(
+                            response.provider_metadata,
+                            "cached_content_media_ids",
+                        )
+                        if "cached_content_media_ids" in response.provider_metadata
+                        else state.gemini.cached_media_ids
+                    ),
+                    source_record_ids=(
+                        _metadata_string_tuple(
+                            response.provider_metadata,
+                            "cached_content_source_record_ids",
+                        )
+                        if "cached_content_source_record_ids" in response.provider_metadata
+                        else state.gemini.source_record_ids
+                    ),
+                    model=(
+                        _metadata_str(response.provider_metadata, "cached_content_model")
+                        or response.model
+                        or state.gemini.model
+                    ),
+                    source_signature=(
+                        _metadata_str(
+                            response.provider_metadata,
+                            "cached_content_source_signature",
+                        )
+                        or state.gemini.source_signature
+                    ),
+                ),
+            )
+
+        return self._storage.update_session(
+            session_id,
+            provider_session_state=state.to_dict(),
+        )
+
     def _compose_request_tools(
         self,
         activated_discoverable_tool_names: Sequence[str],
@@ -2205,7 +2483,12 @@ class AgentLoop:
                     content=user_text,
                 )
             )
-        return self._build_request(list(records) + turn_records, allow_tools=allow_tools)
+        return self._build_contextual_request(
+            session_id=session_id,
+            base_records=records,
+            current_records=turn_records,
+            allow_tools=allow_tools,
+        )
 
     def _build_turn_runtime_messages(
         self,
@@ -2516,14 +2799,23 @@ class AgentLoop:
                 did_compaction = True
                 followup_compaction_attempted = True
 
+            assistant_record = self._build_assistant_record(
+                current_session.session_id,
+                current_response,
+                turn_id=turn_id,
+            )
             self._append_turn_record(
                 session_id=current_session.session_id,
                 pending_records=pending_records,
-                record=self._build_assistant_record(
-                    current_session.session_id,
-                    current_response,
-                    turn_id=turn_id,
-                ),
+                record=assistant_record,
+            )
+            current_session = (
+                self._persist_provider_session_state_from_response(
+                    session_id=current_session.session_id,
+                    response=current_response,
+                    assistant_record=assistant_record,
+                )
+                or current_session
             )
             if pending_detached_job_ids:
                 current_response = replace(
@@ -2578,8 +2870,10 @@ class AgentLoop:
         activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
             rebound_pending_records
         )
-        request = self._build_request(
-            list(base_records) + rebound_pending_records,
+        request = self._build_contextual_request(
+            session_id=compacted.session_id,
+            base_records=base_records,
+            current_records=rebound_pending_records,
             activated_discoverable_tool_names=activated_discoverable_tool_names,
         )
         estimated_input_tokens = estimate_request_input_tokens(request)
@@ -2591,8 +2885,10 @@ class AgentLoop:
             activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
                 rebound_pending_records
             )
-            request = self._build_request(
-                list(base_records) + rebound_pending_records,
+            request = self._build_contextual_request(
+                session_id=compacted.session_id,
+                base_records=base_records,
+                current_records=rebound_pending_records,
                 activated_discoverable_tool_names=activated_discoverable_tool_names,
             )
             estimated_input_tokens = estimate_request_input_tokens(request)
@@ -3820,6 +4116,112 @@ def _records_to_llm_messages(
         _raise_unresolved_pending()
 
     return tuple(messages)
+
+
+def _records_after_response_record(
+    records: Sequence[ConversationRecord],
+    record_id: str | None,
+) -> tuple[ConversationRecord, ...]:
+    if record_id is None:
+        return tuple(records)
+    normalized = record_id.strip()
+    if not normalized:
+        return tuple(records)
+    for index, record in enumerate(records):
+        if record.record_id == normalized:
+            return tuple(records[index + 1:])
+    return tuple(records)
+
+
+def _gemini_cache_source_signature(
+    *,
+    records: Sequence[ConversationRecord],
+    tools: Sequence[ToolDefinition],
+    tool_choice: ToolChoice,
+) -> str:
+    payload = {
+        "records": [
+            {
+                "record_id": record.record_id,
+                "kind": record.kind,
+                "role": record.role,
+                "content": record.content,
+                "metadata": record.metadata,
+            }
+            for record in records
+            if record.kind == "message"
+            and not bool(record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False))
+        ],
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": dict(tool.input_schema),
+                "strict": tool.strict,
+            }
+            for tool in tools
+        ],
+        "tool_choice": {
+            "mode": tool_choice.mode.value,
+            "tool_name": tool_choice.tool_name,
+        },
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _gemini_cache_is_usable(
+    state: ProviderSessionState,
+    *,
+    source_signature: str | None,
+) -> bool:
+    gemini = state.gemini
+    if gemini.cached_content_name is None:
+        return False
+    if source_signature is None or gemini.source_signature != source_signature:
+        return False
+    if gemini.cache_expires_at is None:
+        return True
+    try:
+        expires_at = datetime.fromisoformat(gemini.cache_expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc)
+
+
+def _collect_message_media_ids(messages: Sequence[LLMMessage]) -> tuple[str, ...]:
+    media_ids: list[str] = []
+    for message in messages:
+        for part in message.parts:
+            if not isinstance(part, ImagePart):
+                continue
+            if part.file_id is not None:
+                media_ids.append(part.file_id)
+            elif part.image_url is not None and not part.image_url.startswith("data:"):
+                media_ids.append(part.image_url)
+    return tuple(media_ids)
+
+
+def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _metadata_string_tuple(metadata: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = metadata.get(key)
+    if not isinstance(value, (list, tuple)):
+        return ()
+    items: list[str] = []
+    for item in value:
+        normalized = str(item).strip()
+        if normalized:
+            items.append(normalized)
+    return tuple(items)
 
 
 def _record_to_llm_message(

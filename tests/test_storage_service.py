@@ -33,10 +33,25 @@ class SessionStorageTests(unittest.TestCase):
                 pending_reactive_compaction=True,
                 compaction_count=3,
                 last_input_tokens=123,
+                provider_session_state={
+                    "provider": "openai",
+                    "strategy": "provider_stateful_continuation",
+                    "openai": {"previousResponseId": "resp_1"},
+                },
             )
             self.assertTrue(updated.pending_reactive_compaction)
             self.assertEqual(updated.compaction_count, 3)
             self.assertEqual(updated.last_input_tokens, 123)
+            self.assertEqual(
+                updated.provider_session_state["openai"]["previousResponseId"],
+                "resp_1",
+            )
+
+            reloaded = storage.get_session(session.session_id)
+            self.assertEqual(
+                reloaded.provider_session_state["openai"]["previousResponseId"],  # type: ignore[union-attr]
+                "resp_1",
+            )
 
     def test_archive_marks_status_archived(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

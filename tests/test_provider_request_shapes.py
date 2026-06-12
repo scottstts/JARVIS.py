@@ -311,6 +311,85 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
             False,
         )
 
+    def test_cached_content_request_omits_disallowed_generate_config_fields(self) -> None:
+        provider = GeminiProvider(
+            settings=GeminiProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="gemini-3-flash-preview",
+            messages=(
+                LLMMessage.text("system", "Turn context"),
+                LLMMessage.text("user", "Hello"),
+            ),
+            cached_content_name="cachedContents/abc123",
+            cached_content_model="gemini-3-flash-preview",
+            tools=(
+                ToolDefinition(
+                    name="bash",
+                    description="Run bash.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+        )
+
+        contents, config = provider._build_generate_payload(request)
+
+        self.assertEqual(config["cached_content"], "cachedContents/abc123")
+        self.assertNotIn("system_instruction", config)
+        self.assertNotIn("tools", config)
+        self.assertNotIn("tool_config", config)
+        self.assertEqual(contents[0]["role"], "user")
+        self.assertEqual(contents[0]["parts"][0]["text"], "Turn context")
+        self.assertEqual(contents[1]["role"], "user")
+        self.assertEqual(contents[1]["parts"][0]["text"], "Hello")
+
+    def test_cached_content_create_config_contains_stable_context_and_tools(self) -> None:
+        provider = GeminiProvider(
+            settings=GeminiProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="gemini-3-flash-preview",
+            messages=(LLMMessage.text("user", "Hello"),),
+            cached_content_messages=(
+                LLMMessage.text("system", "Stable system"),
+                LLMMessage.text("user", "Prior user"),
+                LLMMessage.text("assistant", "Prior assistant"),
+            ),
+            tools=(
+                ToolDefinition(
+                    name="bash",
+                    description="Run bash.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+        )
+
+        contents, generate_config = provider._build_generate_payload(request)
+        cache_config = provider._build_cached_content_config(request)
+
+        self.assertEqual(contents[0]["role"], "user")
+        self.assertNotIn("tools", generate_config)
+        self.assertNotIn("system_instruction", generate_config)
+        self.assertEqual(cache_config["system_instruction"], "Stable system")
+        self.assertEqual(cache_config["contents"][0]["role"], "user")
+        self.assertEqual(cache_config["contents"][1]["role"], "model")
+        self.assertEqual(
+            cache_config["tools"][0]["function_declarations"][0]["name"],
+            "bash",
+        )
+
     def test_tool_roundtrip_uses_function_call_and_function_response_parts(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),

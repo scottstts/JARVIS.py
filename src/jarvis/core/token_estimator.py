@@ -29,6 +29,11 @@ def estimate_request_input_tokens(request: LLMRequest) -> int:
     payload = {
         "instructions": request.instructions,
         "messages": [_serialize_message(message) for message in request.messages],
+        "cached_content_name": request.cached_content_name,
+        "cached_content_messages": [
+            _serialize_message(message)
+            for message in request.cached_content_messages
+        ],
         "tools": [
             {
                 "name": tool.name,
@@ -47,7 +52,12 @@ def estimate_request_input_tokens(request: LLMRequest) -> int:
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     # Roughly 4 characters per token; used only for preflight heuristics.
     text_token_estimate = max(1, math.ceil(len(serialized) / 4))
-    image_token_estimate = sum(_estimate_message_image_tokens(message) for message in request.messages)
+    image_token_estimate = sum(
+        _estimate_message_image_tokens(message)
+        for message in (
+            tuple(request.messages) + tuple(request.cached_content_messages)
+        )
+    )
     return text_token_estimate + image_token_estimate
 
 

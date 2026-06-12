@@ -47,6 +47,34 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(content[1]["content"][0]["type"], "input_text")
         self.assertEqual(content[2]["content"][0]["type"], "output_text")
         self.assertEqual(content[3]["content"][0]["type"], "input_text")
+        self.assertTrue(kwargs["store"])
+
+    def test_stateful_continuation_uses_previous_response_and_conversation(self) -> None:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="gpt-5.2-2025-12-11",
+            messages=(LLMMessage.text("user", "Second turn"),),
+            previous_response_id="resp_123",
+            conversation_id="conv_456",
+        )
+
+        kwargs = provider._build_response_create_kwargs(request, stream=False)
+
+        self.assertEqual(kwargs["previous_response_id"], "resp_123")
+        self.assertEqual(kwargs["conversation"], "conv_456")
+        self.assertEqual(
+            kwargs["input"],
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Second turn"}],
+                }
+            ],
+        )
 
     def test_tool_roundtrip_uses_function_call_and_function_call_output_items(self) -> None:
         provider = OpenAIProvider(

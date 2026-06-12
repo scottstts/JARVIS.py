@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -230,6 +231,12 @@ class OpenRouterProvider:
             "provider": {"sort": "throughput"},
             "stream": stream,
         }
+        if request.prompt_cache_key:
+            session_id = _openrouter_session_id(request.prompt_cache_key)
+            if session_id is not None:
+                payload["session_id"] = session_id
+        if _openrouter_model_uses_anthropic_system_rules(request.model):
+            payload["cache_control"] = {"type": "ephemeral"}
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.max_output_tokens is not None:
@@ -811,6 +818,16 @@ def _openrouter_model_uses_anthropic_system_rules(model: str | None) -> bool:
         return False
     normalized = model.lower()
     return normalized.startswith("anthropic/") or "claude" in normalized
+
+
+def _openrouter_session_id(prompt_cache_key: str) -> str | None:
+    normalized = prompt_cache_key.strip()
+    if not normalized:
+        return None
+    if len(normalized) <= 256:
+        return normalized
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"jarvis-{digest}"
 
 
 def _openrouter_system_message_is_global(message: LLMMessage) -> bool:

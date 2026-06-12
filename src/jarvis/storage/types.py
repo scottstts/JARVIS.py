@@ -30,6 +30,7 @@ class SessionMetadata:
     last_output_tokens: int | None = None
     last_total_tokens: int | None = None
     last_estimated_input_tokens: int | None = None
+    provider_session_state: dict[str, Any] = field(default_factory=dict)
     backend_state: dict[str, Any] = field(default_factory=dict)
     turn_states: dict[str, TurnStatus] = field(default_factory=dict)
 
@@ -54,6 +55,7 @@ class SessionMetadata:
             "last_output_tokens": self.last_output_tokens,
             "last_total_tokens": self.last_total_tokens,
             "last_estimated_input_tokens": self.last_estimated_input_tokens,
+            "provider_session_state": dict(self.provider_session_state),
             "backend_state": dict(self.backend_state),
             "turn_states": dict(self.turn_states),
         }
@@ -82,6 +84,9 @@ class SessionMetadata:
             last_output_tokens=_optional_int(data.get("last_output_tokens")),
             last_total_tokens=_optional_int(data.get("last_total_tokens")),
             last_estimated_input_tokens=_optional_int(data.get("last_estimated_input_tokens")),
+            provider_session_state=_normalize_provider_session_state(
+                data.get("provider_session_state")
+            ),
             backend_state=_normalize_backend_state(data.get("backend_state")),
             turn_states=_normalize_turn_states(data.get("turn_states")),
         )
@@ -170,6 +175,12 @@ def _normalize_turn_states(value: Any) -> dict[str, TurnStatus]:
 
 
 def _normalize_backend_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return dict(value)
+
+
+def _normalize_provider_session_state(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return dict(value)

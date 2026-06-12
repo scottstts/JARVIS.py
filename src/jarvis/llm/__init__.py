@@ -25,6 +25,12 @@ from .errors import (
     UnsupportedCapabilityError,
 )
 from .protocols import LLMProvider, ProviderCapabilities
+from .provider_context import (
+    BUILTIN_PROVIDER_CONTEXT_STRATEGIES,
+    ProviderContextStrategy,
+    ProviderSessionState,
+    strategy_for_provider,
+)
 from .service import LLMService, ProviderRegistry
 from .types import (
     DoneEvent,
@@ -71,6 +77,9 @@ __all__ = [
     "GrokProviderSettings",
     "LMStudioProviderSettings",
     "OpenRouterProviderSettings",
+    "BUILTIN_PROVIDER_CONTEXT_STRATEGIES",
+    "ProviderContextStrategy",
+    "ProviderSessionState",
     "ProviderAuthenticationError",
     "ProviderBadRequestError",
     "ProviderCapabilities",
@@ -80,6 +89,7 @@ __all__ = [
     "ProviderResponseError",
     "ProviderTemporaryError",
     "ProviderTimeoutError",
+    "strategy_for_provider",
     "StreamProtocolError",
     "TextDeltaEvent",
     "TextPart",

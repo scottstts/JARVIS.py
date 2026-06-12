@@ -227,6 +227,14 @@ class LLMRequest:
     metadata: Mapping[str, str] | None = None
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
+    previous_response_id: str | None = None
+    conversation_id: str | None = None
+    cached_content_name: str | None = None
+    cached_content_model: str | None = None
+    cached_content_messages: Sequence[LLMMessage] = field(default_factory=tuple)
+    cached_content_source_signature: str | None = None
+    cached_content_source_record_ids: Sequence[str] = field(default_factory=tuple)
+    cached_content_media_ids: Sequence[str] = field(default_factory=tuple)
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:

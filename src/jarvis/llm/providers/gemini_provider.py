@@ -48,6 +48,7 @@ from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_
 
 _GEMINI_3_MODEL_PREFIX = "gemini-3"
 _GEMINI_25_MODEL_PREFIX = "gemini-2.5"
+_GEMINI_CACHED_CONTENT_TTL = "3600s"
 
 
 class GeminiProvider:
@@ -83,6 +84,11 @@ class GeminiProvider:
 
         client = await self._client_instance()
         contents, config = self._build_generate_payload(request)
+        cache_metadata = await self._ensure_cached_content(
+            client=client,
+            request=request,
+            config=config,
+        )
 
         try:
             response = await client.aio.models.generate_content(
@@ -93,7 +99,11 @@ class GeminiProvider:
         except Exception as exc:
             raise self._map_error(exc) from exc
 
-        return self._normalize_generate_response(request=request, response=response)
+        return self._normalize_generate_response(
+            request=request,
+            response=response,
+            cache_metadata=cache_metadata,
+        )
 
     async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
         response = await self.generate(request)
@@ -174,17 +184,128 @@ class GeminiProvider:
             return self._client
 
     def _build_generate_payload(self, request: LLMRequest) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        uses_cached_context = bool(
+            request.cached_content_name or request.cached_content_messages
+        )
+        contents, system_instruction = self._to_gemini_contents_and_system_instruction(
+            request.messages,
+            system_messages_as_content=uses_cached_context,
+        )
+
+        config: dict[str, Any] = {}
+        cached_content_name = self._usable_cached_content_name(request)
+        if cached_content_name is not None:
+            config["cached_content"] = cached_content_name
+        elif system_instruction:
+            config["system_instruction"] = system_instruction
+        if request.temperature is not None:
+            config["temperature"] = request.temperature
+        if request.max_output_tokens is not None:
+            config["max_output_tokens"] = request.max_output_tokens
+
+        thinking_config = self._to_gemini_thinking_config(model=request.model)
+        if thinking_config:
+            config["thinking_config"] = thinking_config
+
+        if request.tools and not uses_cached_context:
+            config["tools"] = self._to_gemini_tools(request.tools)
+            config["tool_config"] = self._to_gemini_tool_config(request.tool_choice)
+        elif not request.tools and request.tool_choice.mode not in {ToolChoiceMode.AUTO, ToolChoiceMode.NONE}:
+            raise LLMConfigurationError(
+                "Specific tool-choice mode requires non-empty request.tools."
+            )
+
+        return contents, config
+
+    async def _ensure_cached_content(
+        self,
+        *,
+        client: genai.Client,
+        request: LLMRequest,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing_name = config.get("cached_content")
+        if isinstance(existing_name, str) and existing_name.strip():
+            return {
+                "cached_content_name": existing_name.strip(),
+                "cached_content_model": request.cached_content_model,
+                "cached_content_source_signature": request.cached_content_source_signature,
+                "cached_content_source_record_ids": list(
+                    request.cached_content_source_record_ids
+                ),
+                "cached_content_media_ids": list(request.cached_content_media_ids),
+            }
+
+        if not request.cached_content_messages:
+            return {}
+
+        if request.model is None:
+            raise LLMConfigurationError("request.model must be set before creating Gemini cached content.")
+
+        cache_config = self._build_cached_content_config(request)
+        try:
+            cache = await client.aio.caches.create(
+                model=request.model,
+                config=cache_config,
+            )
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+
+        cache_name = _optional_str(getattr(cache, "name", None))
+        if cache_name is None:
+            raise ProviderResponseError("Gemini cached content creation returned no cache name.")
+
+        config["cached_content"] = cache_name
+        return {
+            "cached_content_name": cache_name,
+            "cached_content_model": _optional_str(getattr(cache, "model", None)) or request.model,
+            "cached_content_expires_at": _datetime_to_iso(getattr(cache, "expire_time", None)),
+            "cached_content_source_signature": request.cached_content_source_signature,
+            "cached_content_source_record_ids": list(request.cached_content_source_record_ids),
+            "cached_content_media_ids": list(request.cached_content_media_ids),
+        }
+
+    def _build_cached_content_config(self, request: LLMRequest) -> dict[str, Any]:
+        contents, system_instruction = self._to_gemini_contents_and_system_instruction(
+            request.cached_content_messages,
+            system_messages_as_content=False,
+        )
+        config: dict[str, Any] = {
+            "ttl": _GEMINI_CACHED_CONTENT_TTL,
+        }
+        if contents:
+            config["contents"] = contents
+        if system_instruction:
+            config["system_instruction"] = system_instruction
+        if request.tools:
+            config["tools"] = self._to_gemini_tools(request.tools)
+            config["tool_config"] = self._to_gemini_tool_config(request.tool_choice)
+        return config
+
+    def _to_gemini_contents_and_system_instruction(
+        self,
+        messages: Sequence[Any],
+        *,
+        system_messages_as_content: bool,
+    ) -> tuple[list[dict[str, Any]], str]:
         contents: list[dict[str, Any]] = []
         system_parts: list[str] = []
         pending_function_responses: list[dict[str, Any]] = []
 
-        for message in request.messages:
+        for message in messages:
             if message.role == "system":
                 text = _join_text_parts(
                     message.parts,
                     unsupported_message="Gemini system history only supports text parts.",
                 )
-                if text:
+                if not text:
+                    continue
+                if system_messages_as_content:
+                    if pending_function_responses:
+                        contents.append({"role": "user", "parts": pending_function_responses})
+                        pending_function_responses = []
+                    contents.append({"role": "user", "parts": [{"text": text}]})
+                else:
                     system_parts.append(text)
                 continue
 
@@ -207,36 +328,28 @@ class GeminiProvider:
         if pending_function_responses:
             contents.append({"role": "user", "parts": pending_function_responses})
 
-        config: dict[str, Any] = {}
-        system_instruction = "\n\n".join(system_parts).strip()
-        if system_instruction:
-            config["system_instruction"] = system_instruction
-        if request.temperature is not None:
-            config["temperature"] = request.temperature
-        if request.max_output_tokens is not None:
-            config["max_output_tokens"] = request.max_output_tokens
+        return contents, "\n\n".join(system_parts).strip()
 
-        thinking_config = self._to_gemini_thinking_config(model=request.model)
-        if thinking_config:
-            config["thinking_config"] = thinking_config
+    def _to_gemini_tools(self, tools: Sequence[ToolDefinition]) -> list[dict[str, Any]]:
+        declarations = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters_json_schema": dict(tool.input_schema),
+            }
+            for tool in tools
+        ]
+        return [{"function_declarations": declarations}]
 
-        if request.tools:
-            declarations = [
-                {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters_json_schema": dict(tool.input_schema),
-                }
-                for tool in request.tools
-            ]
-            config["tools"] = [{"function_declarations": declarations}]
-            config["tool_config"] = self._to_gemini_tool_config(request.tool_choice)
-        elif request.tool_choice.mode not in {ToolChoiceMode.AUTO, ToolChoiceMode.NONE}:
-            raise LLMConfigurationError(
-                "Specific tool-choice mode requires non-empty request.tools."
-            )
-
-        return contents, config
+    def _usable_cached_content_name(self, request: LLMRequest) -> str | None:
+        name = _optional_str(request.cached_content_name)
+        if name is None:
+            return None
+        cached_model = _optional_str(request.cached_content_model)
+        request_model = _optional_str(request.model)
+        if cached_model is not None and request_model is not None and cached_model != request_model:
+            return None
+        return name
 
     def _to_gemini_thinking_config(self, *, model: str) -> dict[str, Any] | None:
         thinking_level = self._settings.thinking_level
@@ -329,7 +442,13 @@ class GeminiProvider:
             )
         return parts
 
-    def _normalize_generate_response(self, *, request: LLMRequest, response: Any) -> LLMResponse:
+    def _normalize_generate_response(
+        self,
+        *,
+        request: LLMRequest,
+        response: Any,
+        cache_metadata: dict[str, Any] | None = None,
+    ) -> LLMResponse:
         tool_calls = self._extract_tool_calls(
             candidates=response.candidates or [],
             request_tools=request.tools,
@@ -382,6 +501,7 @@ class GeminiProvider:
             provider_metadata={
                 "model_version": getattr(response, "model_version", None),
                 "finish_reason": candidate_finish,
+                **dict(cache_metadata or {}),
             },
         )
 
@@ -509,3 +629,20 @@ def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:
             continue
         raise LLMConfigurationError(unsupported_message)
     return "\n".join(text_parts).strip()
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _datetime_to_iso(value: Any) -> str | None:
+    isoformat = getattr(value, "isoformat", None)
+    if not callable(isoformat):
+        return _optional_str(value)
+    try:
+        return _optional_str(isoformat())
+    except TypeError:
+        return _optional_str(value)

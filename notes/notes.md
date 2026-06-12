@@ -146,7 +146,7 @@
 - Telegram Bot API transport failures must preserve the sanitized `httpx` exception type/message in logs and must not be re-labeled as `gateway_unavailable` by the route worker.
 - OpenRouter app attribution depends on `HTTP-Referer` plus title headers, and Jarvis now keeps those defaults in local provider config instead of exposing them in `settings.yml`.
 - OpenRouter chat payloads now always send `provider.sort="throughput"` so routing prefers the highest-throughput backend instead of default load balancing.
-- Grok now uses xAI Responses with `store=false`, replays assistant-side `response.output` from transcript `provider_metadata` when available, and keeps `x-grok-conv-id` as the routing hint for stateless prompt-cache reuse.
+- Earlier Grok stateless-cache work used xAI Responses with `store=false`, replayed assistant-side `response.output` from transcript `provider_metadata`, and kept `x-grok-conv-id` as the routing hint for stateless prompt-cache reuse.
 - Codex keeps `codex` as a settings-level provider name but routes main and subagent actors through a separate host app-server backend, with host/container path translation and auth flow kept out of `src/jarvis/llm/`.
 - Codex is now backend-routed rather than provider-adapted: `RouteRuntime` and `SubagentManager` choose `CodexActorRuntime`, while direct `LLMService` use with provider `codex` fails fast by design.
 - Codex-backed subagents share the route-scoped Codex connection, and subagent disposal must call `loop.aclose()` so old `threadId` registrations do not linger in the coordinator.
@@ -172,3 +172,7 @@
 - Main route runtime errors now append JSONL records to `/workspace/archive/error_logs/<session_id>.jsonl` with route/session/turn metadata plus full traceback text, and print only one Rich reminder line in the terminal; Telegram-side gateway-error suppression logs were removed to avoid duplicate noise.
 - Telegram typing now follows route `task_status` control events rather than only active submitted user turns, so it stays alive while the original task is parked on subagents or detached bash follow-ups.
 - OpenRouter response caching is default-on in the adapter via `X-OpenRouter-Cache: true`, separate from prompt caching, and chat cache status headers are preserved in `provider_metadata`.
+- Provider context construction is now strategy-driven while transcript persistence remains unchanged: OpenAI/Grok use persisted provider continuation, Gemini uses cachedContent, and Anthropic/OpenRouter use local replay with prompt-cache best effort.
+- Grok native Responses now keeps provider-side state enabled and persists previousResponseId instead of relying on local replay plus x-grok-conv-id for context continuation.
+- Grok encrypted-reasoning replay was a workaround for the previous stateless Grok strategy; native Grok now relies on provider-managed Responses continuation, so Jarvis no longer needs to own/replay reasoning items to preserve cache locality.
+- OpenRouter Anthropic/Claude requests now send top-level `cache_control` plus `session_id`; previously Jarvis only enabled OpenRouter response caching, so Anthropic prompt-cache hits would not show up reliably in OpenRouter logs.

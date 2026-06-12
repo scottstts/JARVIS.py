@@ -307,6 +307,7 @@ class OpenAIProvider:
             ],
             "stream": stream,
             "parallel_tool_calls": request.parallel_tool_calls,
+            "store": True,
         }
 
         if request.instructions is not None:
@@ -321,6 +322,10 @@ class OpenAIProvider:
             kwargs["safety_identifier"] = request.safety_identifier
         if request.prompt_cache_key is not None:
             kwargs["prompt_cache_key"] = request.prompt_cache_key
+        if request.previous_response_id is not None:
+            kwargs["previous_response_id"] = request.previous_response_id
+        if request.conversation_id is not None:
+            kwargs["conversation"] = request.conversation_id
         if request.timeout_seconds is not None:
             kwargs["timeout"] = request.timeout_seconds
 
@@ -499,6 +504,9 @@ class OpenAIProvider:
             response_id=response.id,
             provider_metadata={
                 "status": response.status,
+                "conversation_id": _normalize_openai_conversation_id(
+                    getattr(response, "conversation", None)
+                ),
                 "incomplete_reason": _normalize_openai_incomplete_reason(
                     response.incomplete_details.reason
                     if response.incomplete_details is not None
@@ -638,6 +646,19 @@ def _normalize_openai_incomplete_reason(reason: Any) -> str | None:
     if normalized == "max_tokens":
         return "max_output_tokens"
     return normalized
+
+
+def _normalize_openai_conversation_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    raw_id = getattr(value, "id", None)
+    if raw_id is None:
+        return None
+    normalized = str(raw_id).strip()
+    return normalized or None
 
 
 def _build_openai_unexpected_stream_close_message(

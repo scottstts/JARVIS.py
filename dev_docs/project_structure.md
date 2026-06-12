@@ -76,7 +76,7 @@ If this document and the code ever disagree, treat the code as source of truth a
 - `README.md`
   - developer/operator quickstart
 - `dev_docs/`
-  - design docs, implementation plans, and subsystem docs
+  - post-implementation subsystem reference docs
 - `notes/notes.md`
   - concise running notes and lessons learned for future agents
 - `.codex/AGENTS.md`
@@ -193,25 +193,28 @@ Includes:
 - validation
 - service lifecycle
 - provider implementations under `llm/providers/`
-- provider-local translation for cache/state quirks such as OpenRouter response-cache headers, LM Studio `previous_response_id` reuse, and Grok Responses replay via `x-grok-conv-id` plus persisted assistant `response.output` metadata
+- provider-local translation for cache/state quirks such as OpenRouter response-cache headers, LM Studio `previous_response_id` reuse, and Grok Responses continuation via persisted `previous_response_id`
 
 Current OpenRouter note:
 
 - the OpenRouter adapter always sends `X-OpenRouter-Cache: true` on provider HTTP requests so OpenRouter can reuse identical response payloads independently of prompt caching
+- OpenRouter Claude/Anthropic requests also include top-level `cache_control: {"type": "ephemeral"}` so OpenRouter can enable Anthropic prompt caching
+- when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse
 - chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
 
 Current Grok note:
 
 - Grok now uses xAI Responses, not chat-completions
-- Jarvis still manually rebuilds turn context from unified transcript history
-- the Grok adapter sends `store=false` and uses `x-grok-conv-id` as the provider-side routing hint for better prompt-cache reuse
-- assistant transcript records may carry opaque Grok `response.output` items inside `provider_metadata`, and the Grok adapter may replay those items directly on later turns to preserve faithful stateless history for cache continuity
-- reasoning-capable Grok model families request encrypted reasoning content through the adapter so later stateless replay can include the opaque reasoning item when needed
+- native Grok uses provider-owned stateful continuation through persisted `previous_response_id`
+- the Grok adapter sends `store=true`, and follow-up turns send only the new input plus `previous_response_id`
+- Jarvis no longer manually rebuilds Grok provider context from unified transcript history for normal native Grok turns
+- transcript records remain the archive/debug/audit source, and assistant records may still carry opaque Grok `response.output` metadata for inspection
+- the older encrypted-reasoning replay path was only needed while Grok was treated as stateless; with xAI Responses continuation, reasoning history is provider-managed instead of Jarvis-owned
 
 Future note:
 
-- keep the transcript format unified and keep Grok-specific replay semantics inside the provider adapter
-- if xAI changes model-family naming or encrypted-reasoning behavior, update the Grok adapter heuristics there rather than leaking model-specific branching into the agent loop
+- keep the transcript format unified and keep Grok-specific request/metadata semantics inside the provider adapter
+- if xAI changes model-family naming or Responses continuation behavior, update the Grok adapter heuristics there rather than leaking model-specific branching into the agent loop
 
 ### `src/jarvis/memory/`
 
@@ -356,9 +359,9 @@ When adding a new runnable component:
 
 ### Add docs under `dev_docs/` when they are:
 
-- subsystem design docs
-- implementation plans
+- subsystem reference docs
 - architecture or layout documentation
+- durable maintenance notes for implemented behavior
 
 ### Add notes under `notes/notes.md` when they are:
 
