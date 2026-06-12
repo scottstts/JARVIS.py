@@ -198,8 +198,8 @@ Includes:
 Current OpenRouter note:
 
 - the OpenRouter adapter always sends `X-OpenRouter-Cache: true` on provider HTTP requests so OpenRouter can reuse identical response payloads independently of prompt caching
-- OpenRouter Claude/Anthropic requests also include top-level `cache_control: {"type": "ephemeral"}` so OpenRouter can enable Anthropic prompt caching
-- when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse
+- OpenRouter Claude/Anthropic requests also include top-level `cache_control: {"type": "ephemeral"}` so OpenRouter strictly routes them to Anthropic prompt caching instead of third-party Anthropic-compatible vendors
+- when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse, and it does not request provider throughput sorting because OpenRouter prioritizes sorting over sticky routing
 - chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
 
 Current Grok note:

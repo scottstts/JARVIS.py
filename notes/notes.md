@@ -145,7 +145,7 @@
 - Gateway broad `internal_error` fallbacks should always log the underlying exception stack, or provider/configuration failures become opaque from Telegram warnings alone.
 - Telegram Bot API transport failures must preserve the sanitized `httpx` exception type/message in logs and must not be re-labeled as `gateway_unavailable` by the route worker.
 - OpenRouter app attribution depends on `HTTP-Referer` plus title headers, and Jarvis now keeps those defaults in local provider config instead of exposing them in `settings.yml`.
-- OpenRouter chat payloads now always send `provider.sort="throughput"` so routing prefers the highest-throughput backend instead of default load balancing.
+- OpenRouter chat payloads must not send `provider.sort="throughput"` because OpenRouter prioritizes explicit provider sorting over `session_id` sticky routing, and Jarvis wants same-session prompt-cache locality.
 - Earlier Grok stateless-cache work used xAI Responses with `store=false`, replayed assistant-side `response.output` from transcript `provider_metadata`, and kept `x-grok-conv-id` as the routing hint for stateless prompt-cache reuse.
 - Codex keeps `codex` as a settings-level provider name but routes main and subagent actors through a separate host app-server backend, with host/container path translation and auth flow kept out of `src/jarvis/llm/`.
 - Codex is now backend-routed rather than provider-adapted: `RouteRuntime` and `SubagentManager` choose `CodexActorRuntime`, while direct `LLMService` use with provider `codex` fails fast by design.
@@ -175,4 +175,4 @@
 - Provider context construction is now strategy-driven while transcript persistence remains unchanged: OpenAI/Grok use persisted provider continuation, Gemini uses cachedContent, and Anthropic/OpenRouter use local replay with prompt-cache best effort.
 - Grok native Responses now keeps provider-side state enabled and persists previousResponseId instead of relying on local replay plus x-grok-conv-id for context continuation.
 - Grok encrypted-reasoning replay was a workaround for the previous stateless Grok strategy; native Grok now relies on provider-managed Responses continuation, so Jarvis no longer needs to own/replay reasoning items to preserve cache locality.
-- OpenRouter Anthropic/Claude requests now send top-level `cache_control` plus `session_id`; previously Jarvis only enabled OpenRouter response caching, so Anthropic prompt-cache hits would not show up reliably in OpenRouter logs.
+- OpenRouter Anthropic/Claude requests send top-level `cache_control: {"type":"ephemeral"}` plus `session_id`; ephemeral is OpenRouter/Anthropic's 5-minute prompt-cache mode and keeps same-session prompt-cache locality.

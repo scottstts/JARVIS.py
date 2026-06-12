@@ -228,7 +228,6 @@ class OpenRouterProvider:
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": self._to_openrouter_messages(request),
-            "provider": {"sort": "throughput"},
             "stream": stream,
         }
         if request.prompt_cache_key:

@@ -465,7 +465,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
 
 
 class OpenRouterProviderRequestShapeTests(unittest.TestCase):
-    def test_chat_payload_requests_throughput_sorted_provider_routing(self) -> None:
+    def test_chat_payload_uses_session_id_without_provider_sorting(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
             default_timeout_seconds=60.0,
@@ -473,10 +473,12 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
         request = LLMRequest(
             model="minimax/minimax-m2.5",
             messages=(LLMMessage.text("user", "Hello"),),
+            prompt_cache_key="asset-session-123",
         )
 
         payload = provider._build_chat_payload(request)
-        self.assertEqual(payload["provider"], {"sort": "throughput"})
+        self.assertEqual(payload["session_id"], "asset-session-123")
+        self.assertNotIn("provider", payload)
 
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
         provider = OpenRouterProvider(

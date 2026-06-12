@@ -152,6 +152,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
 
         self.assertEqual(payload["cache_control"], {"type": "ephemeral"})
         self.assertEqual(payload["session_id"], "session_123")
+        self.assertNotIn("provider", payload)
 
     def test_non_anthropic_model_payload_omits_prompt_cache_control(self) -> None:
         provider = OpenRouterProvider(
