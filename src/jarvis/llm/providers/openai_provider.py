@@ -41,6 +41,7 @@ from ..types import (
     DoneEvent,
     EmbeddingRequest,
     EmbeddingResponse,
+    FinishReason,
     ImagePart,
     LLMMessage,
     LLMRequest,
@@ -143,19 +144,27 @@ class OpenAIProvider:
                 if event_type in {"response.output_item.added", "response.output_item.done"}:
                     item = event.item
                     if getattr(item, "type", "") == "function_call":
-                        item_id = getattr(item, "id", None)
-                        if item_id:
-                            tool_name_by_item_id[item_id] = item.name
-                            call_id_by_item_id[item_id] = item.call_id
+                        item_id = _normalize_openai_string(getattr(item, "id", None))
+                        tool_name = _normalize_openai_string(getattr(item, "name", None))
+                        call_id = _normalize_openai_string(getattr(item, "call_id", None))
+                        if item_id is not None and tool_name is not None:
+                            tool_name_by_item_id[item_id] = tool_name
+                        if item_id is not None and call_id is not None:
+                            call_id_by_item_id[item_id] = call_id
                     continue
 
                 if event_type == "response.function_call_arguments.delta":
                     if event.delta:
                         saw_tool_delta = True
-                    call_id = call_id_by_item_id.get(event.item_id, event.item_id)
+                    item_id = _normalize_openai_string(getattr(event, "item_id", None))
+                    if item_id is None:
+                        raise StreamProtocolError(
+                            "OpenAI tool call argument delta missing item_id."
+                        )
+                    call_id = call_id_by_item_id.get(item_id, item_id)
                     yield ToolCallDeltaEvent(
                         call_id=call_id,
-                        tool_name=tool_name_by_item_id.get(event.item_id),
+                        tool_name=tool_name_by_item_id.get(item_id),
                         arguments_delta=event.delta,
                     )
                     continue
@@ -163,7 +172,12 @@ class OpenAIProvider:
                 if event_type == "response.function_call_arguments.done":
                     if event.arguments:
                         saw_tool_delta = True
-                    call_id = call_id_by_item_id.get(event.item_id, event.item_id)
+                    item_id = _normalize_openai_string(getattr(event, "item_id", None))
+                    if item_id is None:
+                        raise StreamProtocolError(
+                            "OpenAI tool call arguments done event missing item_id."
+                        )
+                    call_id = call_id_by_item_id.get(item_id, item_id)
                     yield ToolCallDeltaEvent(
                         call_id=call_id,
                         tool_name=event.name,
@@ -581,7 +595,12 @@ class OpenAIProvider:
             total_tokens=total_tokens,
         )
 
-    def _infer_finish_reason(self, *, response: Any, tool_calls: Sequence[ToolCall]) -> str:
+    def _infer_finish_reason(
+        self,
+        *,
+        response: Any,
+        tool_calls: Sequence[ToolCall],
+    ) -> FinishReason:
         status = getattr(response, "status", None)
         if status == "failed":
             return "error"
@@ -646,6 +665,13 @@ def _normalize_openai_incomplete_reason(reason: Any) -> str | None:
     if normalized == "max_tokens":
         return "max_output_tokens"
     return normalized
+
+
+def _normalize_openai_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _normalize_openai_conversation_id(value: Any) -> str | None:
