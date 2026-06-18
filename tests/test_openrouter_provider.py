@@ -8,12 +8,18 @@ import unittest
 from unittest.mock import patch
 
 from jarvis.llm.config import OpenRouterProviderSettings
-from jarvis.llm.errors import ProviderResponseError
+from jarvis.llm.errors import (
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderTemporaryError,
+    ProviderTimeoutError,
+)
 from jarvis.llm.providers.openrouter_provider import OpenRouterProvider
 from jarvis.llm.types import (
     DoneEvent,
     LLMMessage,
     LLMRequest,
+    StreamActivityEvent,
     TextDeltaEvent,
     ToolCallDeltaEvent,
     ToolDefinition,
@@ -133,6 +139,43 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(result.provider_metadata["openrouter_cache_age_seconds"], 12)
         self.assertEqual(result.provider_metadata["openrouter_cache_ttl_seconds"], 300)
         self.assertEqual(result.provider_metadata["openrouter_generation_id"], "gen_header_123")
+
+    def test_generate_maps_http_504_to_provider_timeout(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="z-ai/glm-5.2",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        response = _FakeJsonResponse(
+            data={
+                "error": {
+                    "code": 504,
+                    "message": "Upstream idle timeout exceeded",
+                    "metadata": {
+                        "error_type": "timeout",
+                        "provider_code": "upstream_idle_timeout",
+                        "provider_name": "Z.ai",
+                    },
+                }
+            },
+            status_code=504,
+            headers={"X-Generation-Id": "gen_header_504"},
+        )
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                return_value=response,
+            ):
+                with self.assertRaises(ProviderTimeoutError) as caught:
+                    asyncio.run(provider.generate(request))
+
+        self.assertEqual(caught.exception.metadata["generation_id"], "gen_header_504")
+        self.assertEqual(caught.exception.metadata["http_code"], 504)
+        self.assertEqual(caught.exception.metadata["error_type"], "timeout")
 
     def test_anthropic_model_payload_enables_prompt_cache_and_sticky_session(self) -> None:
         provider = OpenRouterProvider(
@@ -456,6 +499,158 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertIsInstance(events[-1], DoneEvent)
         done = events[-1]
         self.assertEqual(done.response.text, "bash — run commands")
+
+    def test_stream_generate_emits_internal_activity_for_reasoning_chunks(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="z-ai/glm-5.2",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        response = _FakeStreamingResponse(
+            lines=[
+                self._sse_chunk(
+                    {
+                        "id": "gen_reasoning",
+                        "model": "z-ai/glm-5.2",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.text",
+                                            "text": "private reasoning",
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ),
+                "",
+                self._sse_chunk(
+                    {
+                        "id": "gen_reasoning",
+                        "model": "z-ai/glm-5.2",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "Hello"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ),
+                "",
+                self._sse_chunk(
+                    {
+                        "id": "gen_reasoning",
+                        "model": "z-ai/glm-5.2",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                return_value=response,
+            ):
+                events = asyncio.run(self._collect_events(provider, request))
+
+        activity_events = [
+            event for event in events if isinstance(event, StreamActivityEvent)
+        ]
+        self.assertEqual(len(activity_events), 1)
+        self.assertEqual(activity_events[0].source, "reasoning")
+        self.assertNotIn("private reasoning", repr(events))
+        self.assertEqual(
+            [event.delta for event in events if isinstance(event, TextDeltaEvent)],
+            ["Hello"],
+        )
+
+    def test_stream_generate_maps_structured_retryable_errors(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="z-ai/glm-5.2",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        cases = (
+            ("timeout", 504, ProviderTimeoutError),
+            ("provider_unavailable", 502, ProviderTemporaryError),
+            ("provider_overloaded", 503, ProviderTemporaryError),
+            ("rate_limit_exceeded", 429, ProviderRateLimitError),
+        )
+
+        for error_type, http_code, expected_error_type in cases:
+            with self.subTest(error_type=error_type):
+                response = _FakeStreamingResponse(
+                    lines=[
+                        self._sse_chunk(
+                            {
+                                "id": f"gen_{error_type}",
+                                "provider": "Z.ai",
+                                "model": "z-ai/glm-5.2",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "error",
+                                    }
+                                ],
+                                "error": {
+                                    "code": http_code,
+                                    "message": f"{error_type} message",
+                                    "metadata": {
+                                        "error_type": error_type,
+                                        "provider_code": f"upstream_{error_type}",
+                                        "provider_name": "Z.ai",
+                                    },
+                                },
+                            }
+                        ),
+                        "",
+                    ],
+                    headers={"X-Generation-Id": f"header_{error_type}"},
+                )
+
+                with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+                    with patch(
+                        "jarvis.llm.providers.openrouter_provider.requests.post",
+                        return_value=response,
+                    ):
+                        with self.assertRaises(expected_error_type) as caught:
+                            asyncio.run(self._collect_events(provider, request))
+
+                self.assertIs(type(caught.exception), expected_error_type)
+                self.assertEqual(
+                    caught.exception.metadata,
+                    {
+                        "generation_id": f"header_{error_type}",
+                        "response_id": f"gen_{error_type}",
+                        "provider_name": "Z.ai",
+                        "http_code": http_code,
+                        "error_type": error_type,
+                        "upstream_provider_code": f"upstream_{error_type}",
+                    },
+                )
 
     def test_stream_generate_raises_on_stream_error_chunk(self) -> None:
         provider = OpenRouterProvider(

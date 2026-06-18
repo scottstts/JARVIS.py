@@ -30,6 +30,7 @@ jarvis = "jarvis.main:main"
 
 [dependency-groups]
 dev = [
+    "basedpyright>=1.39.7",
     "pytest>=8.4.2",
     "ruff>=0.15.7",
 ]
@@ -39,6 +40,12 @@ source-exclude = [".DS_Store"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.basedpyright]
+include = ["src/jarvis"]
+exclude = ["vendor"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
 
 [tool.ruff]
 target-version = "py312"

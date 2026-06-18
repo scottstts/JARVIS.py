@@ -381,6 +381,7 @@ class LLMSettings:
     default_provider: str = ""
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings.from_env)
     request_timeout_seconds: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
+    generation_timeout_seconds: float | None = None
     retry_attempts: int = _DEFAULT_LLM_RETRY_ATTEMPTS
     retry_backoff_seconds: float = _DEFAULT_LLM_RETRY_BACKOFF_SECONDS
     openai: OpenAIProviderSettings = field(default_factory=OpenAIProviderSettings.from_env)
@@ -401,6 +402,13 @@ class LLMSettings:
             raise LLMConfigurationError("JARVIS_LLM_RETRY_ATTEMPTS must be >= 0.")
         if self.retry_backoff_seconds < 0:
             raise LLMConfigurationError("JARVIS_LLM_RETRY_BACKOFF_SECONDS must be >= 0.")
+        if (
+            self.generation_timeout_seconds is not None
+            and self.generation_timeout_seconds <= 0
+        ):
+            raise LLMConfigurationError(
+                "JARVIS_LLM_GENERATION_TIMEOUT_SECONDS must be > 0."
+            )
 
     @classmethod
     def from_env(cls) -> "LLMSettings":
@@ -413,6 +421,9 @@ class LLMSettings:
             request_timeout_seconds=_parse_float_env(
                 "JARVIS_LLM_TIMEOUT_SECONDS",
                 _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+            ),
+            generation_timeout_seconds=_parse_optional_float_env(
+                "JARVIS_LLM_GENERATION_TIMEOUT_SECONDS",
             ),
             retry_attempts=_parse_int_env(
                 "JARVIS_LLM_RETRY_ATTEMPTS",

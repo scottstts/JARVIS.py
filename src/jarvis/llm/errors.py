@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 
 class LLMError(Exception):
     """Base class for all LLM service errors."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.metadata = dict(metadata or {})
 
 
 class LLMConfigurationError(LLMError):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -289,6 +289,7 @@ class RouteRuntime:
         published_client_message_id: str | None,
         parsed_command_kind: str | None,
         exc: Exception,
+        error_code: str = "internal_error",
     ) -> Path:
         error_log_path = self._runtime_error_log_path(session_id=session_id)
         error_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,7 +307,7 @@ class RouteRuntime:
                 f"Route {self._route_id} main turn failed while processing "
                 f"client_message_id={request.client_message_id}."
             ),
-            "error_code": "internal_error",
+            "error_code": error_code,
             "session_id": session_id,
             "turn_id": turn_id,
             "request_turn_kind": "user" if request.user_initiated else "runtime",
@@ -321,6 +322,7 @@ class RouteRuntime:
             "exception_type": type(exc).__name__,
             "exception_module": type(exc).__module__,
             "exception_message": str(exc),
+            "exception_metadata": _exception_metadata(exc),
             "traceback": traceback_text,
         }
         with error_log_path.open("a", encoding="utf-8") as handle:
@@ -676,7 +678,20 @@ class RouteRuntime:
                         message=str(exc),
                     )
                 )
-            except ProviderTimeoutError:
+            except ProviderTimeoutError as exc:
+                error_log_path = self._write_runtime_error_log(
+                    request=request,
+                    session_id=self._main_loop.active_session_id() or request.force_session_id,
+                    turn_id=self._main_loop.active_turn_id(),
+                    published_turn_kind="user" if request.user_initiated else "runtime",
+                    published_client_message_id=request.client_message_id,
+                    parsed_command_kind=(
+                        parsed_command.kind if parsed_command is not None else None
+                    ),
+                    exc=exc,
+                    error_code="provider_timeout",
+                )
+                self._print_runtime_error_notice(error_log_path=error_log_path)
                 await self.publish_event(
                     RouteErrorEvent(
                         route_id=self._route_id,
@@ -1488,6 +1503,13 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _exception_metadata(exc: Exception) -> dict[str, Any]:
+    metadata = getattr(exc, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return {}
+    return json.loads(json.dumps(dict(metadata), ensure_ascii=False, default=str))
 
 
 def _tool_result_for_payload(

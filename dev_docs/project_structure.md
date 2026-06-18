@@ -201,6 +201,10 @@ Current OpenRouter note:
 - OpenRouter Claude/Anthropic requests also include top-level `cache_control: {"type": "ephemeral"}` so OpenRouter strictly routes them to Anthropic prompt caching instead of third-party Anthropic-compatible vendors
 - when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse, and it does not request provider throughput sorting because OpenRouter prioritizes sorting over sticky routing
 - chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
+- OpenRouter SSE errors preserve generation, response, endpoint, HTTP, typed-error, and upstream-code metadata; timeout/504, unavailable/502, overloaded/503, and rate-limit/429 failures map to retryable normalized exceptions
+- reasoning-only SSE chunks become internal stream-activity events: they refresh explicit stream-idle timing but are consumed by `LLMService`, never shown to users, and do not prevent a safe retry before text or tool-call output
+- `JARVIS_LLM_TIMEOUT_SECONDS` remains the provider transport/read-idle timeout, while optional `JARVIS_LLM_GENERATION_TIMEOUT_SECONDS` is a separate end-to-end deadline for each generation attempt
+- streaming retries are allowed only before a non-empty text delta or any tool-call delta has been exposed; once visible output begins, failures propagate without replaying the request
 
 Current Grok note:
 

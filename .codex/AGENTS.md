@@ -86,6 +86,7 @@ Then run normally:
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run jarvis"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run pytest"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run ruff check ."
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run basedpyright"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run <...>"
 ```
 
@@ -99,6 +100,8 @@ The project is strict container-first:
 ## Dev Rules and Preferences
 
 - Use ruff for python lint checking at the end of each turn
+- Use basedpyright for static type checking at the end of each code-edit turn
+- Existing basedpyright debt is tracked in `.basedpyright/baseline.json`; do not run `basedpyright --writebaseline` to accept new diagnostics unless the user explicitly approves it
 - Use pytest for testing
 - When you find containers are not running, try `docker compose start` instead of `docker compose up -d --build`. Do NOT rebuilt container just to start it, unless rebuilding is needed
 - When asked to make a plan or proposal, NEVER give a "simple v1 followed by further v2". Always plan for long term, plan for ultimate form, NOT in incremental phases

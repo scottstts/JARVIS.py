@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import AsyncIterator, Iterable, TypeVar
+from typing import TypeVar
 
 from .config import LLMSettings
 from .errors import (
@@ -23,6 +23,9 @@ from .types import (
     LLMRequest,
     LLMResponse,
     LLMStreamEvent,
+    StreamActivityEvent,
+    TextDeltaEvent,
+    ToolCallDeltaEvent,
 )
 
 T = TypeVar("T")
@@ -114,8 +117,10 @@ class LLMService:
 
         async def attempt() -> LLMResponse:
             return await self._run_with_optional_timeout(
-                resolved.timeout_seconds,
+                resolved.generation_timeout_seconds,
                 provider.generate(resolved),
+                timeout_message="Generation timed out.",
+                timeout_kind="generation_deadline",
             )
 
         return await self._run_with_retries(attempt)
@@ -130,22 +135,30 @@ class LLMService:
 
         attempts = max(1, self.settings.retry_attempts + 1)
         for attempt_index in range(attempts):
-            emitted_any = False
+            exposed_output = False
             try:
                 stream = provider.stream_generate(resolved)
                 iterator = (
-                    self._iter_with_per_event_timeout(stream, resolved.timeout_seconds)
-                    if resolved.timeout_seconds is not None
+                    self._iter_with_generation_timeout(
+                        stream,
+                        timeout_seconds=resolved.generation_timeout_seconds,
+                    )
+                    if resolved.generation_timeout_seconds is not None
                     else stream
                 )
                 async for event in iterator:
-                    emitted_any = True
+                    if isinstance(event, StreamActivityEvent):
+                        continue
+                    if isinstance(event, TextDeltaEvent):
+                        exposed_output = exposed_output or bool(event.delta)
+                    elif isinstance(event, ToolCallDeltaEvent):
+                        exposed_output = True
                     yield event
                 return
             except Exception as exc:
                 should_retry = (
                     attempt_index < attempts - 1
-                    and not emitted_any
+                    and not exposed_output
                     and is_retryable_error(exc)
                 )
                 if not should_retry:
@@ -197,42 +210,76 @@ class LLMService:
         self,
         timeout_seconds: float | None,
         awaitable: Awaitable[T],
+        *,
+        timeout_message: str = "Request timed out.",
+        timeout_kind: str = "request_deadline",
     ) -> T:
         if timeout_seconds is None:
             return await awaitable
         try:
             return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
-            raise ProviderTimeoutError("Request timed out.") from exc
+            raise ProviderTimeoutError(
+                timeout_message,
+                metadata={
+                    "timeout_kind": timeout_kind,
+                    "timeout_seconds": timeout_seconds,
+                },
+            ) from exc
 
-    async def _iter_with_per_event_timeout(
+    async def _iter_with_generation_timeout(
         self,
         stream: AsyncIterator[LLMStreamEvent],
-        timeout_seconds: float | None,
+        *,
+        timeout_seconds: float,
     ) -> AsyncIterator[LLMStreamEvent]:
-        if timeout_seconds is None:
-            async for event in stream:
-                yield event
-            return
-
+        loop = asyncio.get_running_loop()
+        generation_deadline = loop.time() + timeout_seconds
         iterator = stream.__aiter__()
         while True:
+            generation_remaining = generation_deadline - loop.time()
+            if generation_remaining <= 0:
+                await self._close_async_iterator(iterator)
+                raise ProviderTimeoutError(
+                    "Generation timed out.",
+                    metadata={
+                        "timeout_kind": "generation_deadline",
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+
             try:
-                event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_seconds)
+                event = await asyncio.wait_for(
+                    iterator.__anext__(),
+                    timeout=generation_remaining,
+                )
             except StopAsyncIteration:
                 return
             except asyncio.TimeoutError as exc:
-                aclose = getattr(iterator, "aclose", None)
-                if callable(aclose):
-                    await aclose()
-                raise ProviderTimeoutError("Request timed out.") from exc
+                await self._close_async_iterator(iterator)
+                raise ProviderTimeoutError(
+                    "Generation timed out.",
+                    metadata={
+                        "timeout_kind": "generation_deadline",
+                        "timeout_seconds": timeout_seconds,
+                    },
+                ) from exc
             yield event
+
+    async def _close_async_iterator(self, iterator: AsyncIterator[LLMStreamEvent]) -> None:
+        if isinstance(iterator, AsyncGenerator):
+            await iterator.aclose()
 
     def _resolve_generate_request(self, request: LLMRequest) -> LLMRequest:
         provider = request.provider or self.settings.default_provider
         model: str | None = request.model
         temperature: float | None = request.temperature
         max_output_tokens: int | None = request.max_output_tokens
+        generation_timeout_seconds = (
+            request.generation_timeout_seconds
+            if request.generation_timeout_seconds is not None
+            else self.settings.generation_timeout_seconds
+        )
 
         if provider == "openai":
             model = model or self.settings.openai.chat_model
@@ -310,6 +357,7 @@ class LLMService:
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            generation_timeout_seconds=generation_timeout_seconds,
         )
 
     def _resolve_embedding_request(self, request: EmbeddingRequest) -> EmbeddingRequest:

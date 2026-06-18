@@ -18,7 +18,7 @@ from jarvis.core import (
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
-from jarvis.llm import TextPart
+from jarvis.llm import ProviderTimeoutError, TextPart
 from jarvis.core.compaction import CompactionOutcome, CompactionReplacementItem
 from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
 from jarvis.gateway.route_events import (
@@ -631,6 +631,76 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("RuntimeError: boom", entry["traceback"])
             self.assertIn("Traceback (most recent call last):", entry["traceback"])
             self.assertIn("logged_at", entry)
+
+            runtime.unsubscribe(subscriber_id)
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_provider_timeout_preserves_structured_metadata_in_error_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            session_id_holder: dict[str, str] = {}
+            provider_metadata = {
+                "generation_id": "gen_header_123",
+                "response_id": "gen_body_123",
+                "provider_name": "Z.ai",
+                "http_code": 504,
+                "error_type": "timeout",
+                "upstream_provider_code": "upstream_idle_timeout",
+            }
+
+            async def _stream_user_input(_user_text: str):
+                session_id = await runtime._main_loop.prepare_session()
+                session_id_holder["session_id"] = session_id
+                raise ProviderTimeoutError(
+                    "Upstream idle timeout exceeded",
+                    metadata=provider_metadata,
+                )
+                yield  # pragma: no cover
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+
+            with patch.object(runtime, "_print_runtime_error_notice") as print_notice:
+                await runtime._user_message_queue.put(
+                    _RouteTurnRequest(
+                        user_text="hello",
+                        client_message_id="msg_1",
+                        parse_commands=True,
+                        user_initiated=True,
+                    )
+                )
+                runtime._queue_wakeup.set()
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            event = await asyncio.wait_for(queue.get(), timeout=1)
+            self.assertIsInstance(event, RouteErrorEvent)
+            if not isinstance(event, RouteErrorEvent):
+                self.fail("Expected provider timeout to publish a route error event.")
+            self.assertEqual(event.code, "provider_timeout")
+
+            session_id = session_id_holder["session_id"]
+            error_log_path = (
+                runtime._core_settings.transcript_archive_dir.parent
+                / "error_logs"
+                / f"{session_id}.jsonl"
+            )
+            self.assertEqual(
+                print_notice.call_args.kwargs["error_log_path"],
+                error_log_path,
+            )
+            entry = json.loads(error_log_path.read_text(encoding="utf-8"))
+            self.assertEqual(entry["error_code"], "provider_timeout")
+            self.assertEqual(entry["exception_type"], "ProviderTimeoutError")
+            self.assertEqual(entry["exception_metadata"], provider_metadata)
 
             runtime.unsubscribe(subscriber_id)
             worker = runtime._message_worker

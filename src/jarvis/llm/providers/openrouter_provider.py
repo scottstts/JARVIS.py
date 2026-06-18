@@ -29,12 +29,14 @@ from ..types import (
     DoneEvent,
     EmbeddingRequest,
     EmbeddingResponse,
+    FinishReason,
     ImagePart,
     LLMMessage,
     LLMRequest,
     LLMResponse,
     LLMStreamEvent,
     LLMUsage,
+    StreamActivityEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -51,6 +53,11 @@ from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_
 @dataclass(slots=True, frozen=True)
 class _OpenRouterStreamHeaders:
     headers: dict[str, str]
+
+
+@dataclass(slots=True, frozen=True)
+class _OpenRouterStreamDone:
+    pass
 
 
 class OpenRouterProvider:
@@ -129,7 +136,12 @@ class OpenRouterProvider:
 
             error = chunk.get("error")
             if error is not None:
-                raise ProviderResponseError(self._extract_stream_error_message(error))
+                raise self._map_stream_error(
+                    error=error,
+                    chunk=chunk,
+                    response_id=response_id,
+                    response_header_metadata=response_header_metadata,
+                )
 
             chunk_usage = self._normalize_usage(chunk.get("usage"))
             if chunk_usage is not None:
@@ -143,6 +155,9 @@ class OpenRouterProvider:
                     continue
 
                 delta = choice.get("delta") or {}
+                if self._has_reasoning_activity(delta):
+                    yield StreamActivityEvent(source="reasoning")
+
                 text_delta = self._extract_stream_text(delta.get("content"))
                 if text_delta:
                     accumulated_text.append(text_delta)
@@ -431,10 +446,10 @@ class OpenRouterProvider:
             timeout_seconds=timeout_seconds,
         )
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str | _OpenRouterStreamHeaders | Exception | object] = (
-            asyncio.Queue()
-        )
-        done_sentinel = object()
+        queue: asyncio.Queue[
+            str | _OpenRouterStreamHeaders | Exception | _OpenRouterStreamDone
+        ] = asyncio.Queue()
+        done_sentinel = _OpenRouterStreamDone()
         stop_event = threading.Event()
         response_holder: dict[str, requests.Response | None] = {"response": None}
 
@@ -486,7 +501,7 @@ class OpenRouterProvider:
         try:
             while True:
                 item = await queue.get()
-                if item is done_sentinel:
+                if isinstance(item, _OpenRouterStreamDone):
                     return
                 if isinstance(item, Exception):
                     raise item
@@ -556,14 +571,24 @@ class OpenRouterProvider:
 
     def _raise_for_status(self, response: requests.Response) -> None:
         status = response.status_code
-        message = response.text
+        error = self._extract_http_error(response)
+        message = self._extract_stream_error_message(error) if error is not None else response.text
+        metadata = self._build_error_metadata(
+            error=error,
+            provider_name=None,
+            response_id=None,
+            response_headers=dict(response.headers),
+            fallback_http_code=status,
+        )
         if status == 429:
-            raise ProviderRateLimitError(message)
+            raise ProviderRateLimitError(message, metadata=metadata)
         if status in {401, 403}:
-            raise ProviderAuthenticationError(message)
+            raise ProviderAuthenticationError(message, metadata=metadata)
+        if status == 504:
+            raise ProviderTimeoutError(message, metadata=metadata)
         if status >= 500:
-            raise ProviderTemporaryError(message)
-        raise ProviderBadRequestError(message)
+            raise ProviderTemporaryError(message, metadata=metadata)
+        raise ProviderBadRequestError(message, metadata=metadata)
 
     def _normalize_chat_response(
         self,
@@ -720,14 +745,15 @@ class OpenRouterProvider:
             total_tokens=usage_obj.get("total_tokens"),
         )
 
-    def _map_finish_reason(self, finish_reason: str | None) -> str:
-        return {
+    def _map_finish_reason(self, finish_reason: str | None) -> FinishReason:
+        mapped_reasons: dict[str, FinishReason] = {
             "stop": "stop",
             "tool_calls": "tool_calls",
             "length": "length",
             "content_filter": "content_filter",
             "error": "error",
-        }.get(finish_reason or "unknown", "unknown")
+        }
+        return mapped_reasons.get(finish_reason or "unknown", "unknown")
 
     def _decode_stream_chunk(self, sse_payload: str) -> dict[str, Any]:
         try:
@@ -749,6 +775,90 @@ class OpenRouterProvider:
             if code is not None:
                 return f"OpenRouter streaming error ({code})."
         return "OpenRouter streaming response failed."
+
+    def _map_stream_error(
+        self,
+        *,
+        error: Any,
+        chunk: dict[str, Any],
+        response_id: str | None,
+        response_header_metadata: dict[str, Any],
+    ) -> Exception:
+        metadata = self._build_error_metadata(
+            error=error,
+            provider_name=_optional_string(chunk.get("provider")),
+            response_id=response_id,
+            response_headers=response_header_metadata,
+        )
+        message = self._extract_stream_error_message(error)
+        error_type = metadata.get("error_type")
+        http_code = metadata.get("http_code")
+        if error_type == "timeout" or http_code == 504:
+            return ProviderTimeoutError(message, metadata=metadata)
+        if error_type in {"provider_unavailable", "provider_overloaded"} or http_code in {
+            502,
+            503,
+        }:
+            return ProviderTemporaryError(message, metadata=metadata)
+        if error_type == "rate_limit_exceeded" or http_code == 429:
+            return ProviderRateLimitError(message, metadata=metadata)
+        return ProviderResponseError(message, metadata=metadata)
+
+    def _build_error_metadata(
+        self,
+        *,
+        error: Any,
+        provider_name: str | None,
+        response_id: str | None,
+        response_headers: dict[str, Any] | None,
+        fallback_http_code: int | None = None,
+    ) -> dict[str, Any]:
+        error_obj = error if isinstance(error, dict) else {}
+        error_metadata = error_obj.get("metadata")
+        metadata_obj = error_metadata if isinstance(error_metadata, dict) else {}
+        normalized_headers = {
+            str(key).lower(): value
+            for key, value in (response_headers or {}).items()
+        }
+        generation_id = (
+            normalized_headers.get("openrouter_generation_id")
+            or normalized_headers.get("x-generation-id")
+            or response_id
+        )
+        return {
+            "generation_id": _optional_string(generation_id),
+            "response_id": response_id,
+            "provider_name": (
+                provider_name
+                or _optional_string(metadata_obj.get("provider_name"))
+            ),
+            "http_code": (
+                _parse_error_code(error_obj.get("code"))
+                or fallback_http_code
+            ),
+            "error_type": _optional_string(metadata_obj.get("error_type")),
+            "upstream_provider_code": _optional_string(
+                metadata_obj.get("provider_code")
+            ),
+        }
+
+    def _extract_http_error(self, response: requests.Response) -> Any:
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload.get("error")
+
+    def _has_reasoning_activity(self, delta: Any) -> bool:
+        if not isinstance(delta, dict):
+            return False
+        for key in ("reasoning", "reasoning_content", "reasoning_details"):
+            value = delta.get(key)
+            if value not in (None, "", (), [], {}, False):
+                return True
+        return False
 
     def _map_request_exception(self, exc: Exception) -> Exception:
         if isinstance(
@@ -810,6 +920,26 @@ def _parse_header_int(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _parse_error_code(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _openrouter_model_uses_anthropic_system_rules(model: str | None) -> bool:

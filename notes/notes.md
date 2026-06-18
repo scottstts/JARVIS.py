@@ -176,3 +176,6 @@
 - Grok native Responses now keeps provider-side state enabled and persists previousResponseId instead of relying on local replay plus x-grok-conv-id for context continuation.
 - Grok encrypted-reasoning replay was a workaround for the previous stateless Grok strategy; native Grok now relies on provider-managed Responses continuation, so Jarvis no longer needs to own/replay reasoning items to preserve cache locality.
 - OpenRouter Anthropic/Claude requests send top-level `cache_control: {"type":"ephemeral"}` plus `session_id`; ephemeral is OpenRouter/Anthropic's 5-minute prompt-cache mode and keeps same-session prompt-cache locality.
+- OpenRouter structured stream failures now retain endpoint/error metadata and map timeout/504, unavailable/502, overloaded/503, and rate-limit/429 to retryable exceptions, but retries remain forbidden after text or tool-call output is exposed.
+- Reasoning-only OpenRouter chunks are private stream activity, and transport idle timeout is now distinct from the optional `JARVIS_LLM_GENERATION_TIMEOUT_SECONDS` total generation deadline.
+- Basedpyright runs in standard mode against `src/jarvis`; existing typing debt is committed in `.basedpyright/baseline.json`, while new diagnostics must be fixed rather than added to the baseline without explicit approval.
