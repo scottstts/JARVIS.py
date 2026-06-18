@@ -94,6 +94,12 @@ docker compose exec jarvis_runtime bash -lc "cd /repo && uv run pytest"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run ruff check ."
 ```
 
+Tests that make real AI provider API calls are skipped by default. Run them explicitly with:
+
+```bash
+docker compose exec jarvis_runtime bash -lc "cd /repo && uv run pytest --run-live-api"
+```
+
 ### Build & Run App
 
 To build and install the packaged artifact into `jarvis_runtime`, run this on host:

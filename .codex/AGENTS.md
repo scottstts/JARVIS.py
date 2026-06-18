@@ -90,6 +90,8 @@ docker compose exec jarvis_runtime bash -lc "cd /repo && uv run basedpyright"
 docker compose exec jarvis_runtime bash -lc "cd /repo && uv run <...>"
 ```
 
+Note: some tests contain real AI provider API calls. By default running pytest will skip those tests. run pytest with flag `--run-live-api` will include them. ALWAYS run pytest without flag to skip them unless told otherwise
+
 The project is strict container-first:
 
 - do not create or use a host-side `.venv`

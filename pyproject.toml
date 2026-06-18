@@ -40,6 +40,9 @@ source-exclude = [".DS_Store"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live_api: tests that make real API calls to external AI providers",
+]
 
 [tool.basedpyright]
 include = ["src/jarvis"]
