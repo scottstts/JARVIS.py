@@ -371,6 +371,7 @@ class TelegramGatewayBridge:
         self._output_pause_state_by_chat: dict[int, _ChatOutputPauseState] = {}
         self._typing_indicator_by_chat: dict[int, _ChatTypingIndicatorState] = {}
         self._task_status_active_by_chat: dict[int, bool] = {}
+        self._pending_stop_completion_by_chat: set[int] = set()
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -632,6 +633,13 @@ class TelegramGatewayBridge:
                 pass
             self._update_chat_idle_state(message.chat_id)
             raise
+        if submitted_turn.show_new_session_notice:
+            await self._send_html_message(
+                chat_id=message.chat_id,
+                html_text=_format_local_system_notice(
+                    "Prepare to start a new session."
+                ),
+            )
         return completion
 
     async def _handle_route_event(
@@ -720,6 +728,7 @@ class TelegramGatewayBridge:
     ) -> None:
         output_paused = self._chat_output_paused(chat_id)
         if isinstance(event, GatewayErrorEvent):
+            await self._send_stop_completion_if_pending(chat_id)
             if not output_paused:
                 self._task_status_active_by_chat.pop(chat_id, None)
                 self._stop_typing_indicator(chat_id)
@@ -824,6 +833,7 @@ class TelegramGatewayBridge:
                 active_turn.delivered_any_segment = True
             return
         if isinstance(event, GatewayTurnDoneEvent):
+            await self._send_stop_completion_if_pending(chat_id)
             if (
                 not output_paused
                 and not event.interrupted
@@ -851,6 +861,15 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 client_message_id=active_turn.client_message_id,
             )
+
+    async def _send_stop_completion_if_pending(self, chat_id: int) -> None:
+        if chat_id not in self._pending_stop_completion_by_chat:
+            return
+        self._pending_stop_completion_by_chat.discard(chat_id)
+        await self._send_html_message(
+            chat_id=chat_id,
+            html_text=_format_local_system_notice("Session stopped."),
+        )
 
     async def _activate_submitted_turn(
         self,
@@ -1440,10 +1459,11 @@ class TelegramGatewayBridge:
             return
 
         if stop_requested:
+            self._pending_stop_completion_by_chat.add(message.chat_id)
             await self._send_html_message(
                 chat_id=message.chat_id,
                 html_text=_format_local_system_notice(
-                    "Stop requested. I will stop after the current step."
+                    "Prepare to stop the session."
                 ),
             )
             self._pause_chat_output(message.chat_id)

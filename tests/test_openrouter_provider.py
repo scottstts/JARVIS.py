@@ -9,17 +9,14 @@ from unittest.mock import patch
 
 from jarvis.llm.config import OpenRouterProviderSettings
 from jarvis.llm.errors import (
-    ProviderRateLimitError,
     ProviderResponseError,
     ProviderTemporaryError,
-    ProviderTimeoutError,
 )
 from jarvis.llm.providers.openrouter_provider import OpenRouterProvider
 from jarvis.llm.types import (
     DoneEvent,
     LLMMessage,
     LLMRequest,
-    StreamActivityEvent,
     TextDeltaEvent,
     ToolCallDeltaEvent,
     ToolDefinition,
@@ -140,7 +137,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(result.provider_metadata["openrouter_cache_ttl_seconds"], 300)
         self.assertEqual(result.provider_metadata["openrouter_generation_id"], "gen_header_123")
 
-    def test_generate_maps_http_504_to_provider_timeout(self) -> None:
+    def test_generate_preserves_http_504_metadata(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
             default_timeout_seconds=60.0,
@@ -170,7 +167,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                 "jarvis.llm.providers.openrouter_provider.requests.post",
                 return_value=response,
             ):
-                with self.assertRaises(ProviderTimeoutError) as caught:
+                with self.assertRaises(ProviderTemporaryError) as caught:
                     asyncio.run(provider.generate(request))
 
         self.assertEqual(caught.exception.metadata["generation_id"], "gen_header_504")
@@ -500,7 +497,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         done = events[-1]
         self.assertEqual(done.response.text, "bash — run commands")
 
-    def test_stream_generate_emits_internal_activity_for_reasoning_chunks(self) -> None:
+    def test_stream_generate_ignores_private_reasoning_chunks(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
             default_timeout_seconds=60.0,
@@ -572,18 +569,13 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             ):
                 events = asyncio.run(self._collect_events(provider, request))
 
-        activity_events = [
-            event for event in events if isinstance(event, StreamActivityEvent)
-        ]
-        self.assertEqual(len(activity_events), 1)
-        self.assertEqual(activity_events[0].source, "reasoning")
         self.assertNotIn("private reasoning", repr(events))
         self.assertEqual(
             [event.delta for event in events if isinstance(event, TextDeltaEvent)],
             ["Hello"],
         )
 
-    def test_stream_generate_maps_structured_retryable_errors(self) -> None:
+    def test_stream_generate_preserves_structured_error_metadata(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
             default_timeout_seconds=60.0,
@@ -593,13 +585,13 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             messages=(LLMMessage.text("user", "hello"),),
         )
         cases = (
-            ("timeout", 504, ProviderTimeoutError),
-            ("provider_unavailable", 502, ProviderTemporaryError),
-            ("provider_overloaded", 503, ProviderTemporaryError),
-            ("rate_limit_exceeded", 429, ProviderRateLimitError),
+            ("timeout", 504),
+            ("provider_unavailable", 502),
+            ("provider_overloaded", 503),
+            ("rate_limit_exceeded", 429),
         )
 
-        for error_type, http_code, expected_error_type in cases:
+        for error_type, http_code in cases:
             with self.subTest(error_type=error_type):
                 response = _FakeStreamingResponse(
                     lines=[
@@ -636,10 +628,10 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                         "jarvis.llm.providers.openrouter_provider.requests.post",
                         return_value=response,
                     ):
-                        with self.assertRaises(expected_error_type) as caught:
+                        with self.assertRaises(ProviderResponseError) as caught:
                             asyncio.run(self._collect_events(provider, request))
 
-                self.assertIs(type(caught.exception), expected_error_type)
+                self.assertIs(type(caught.exception), ProviderResponseError)
                 self.assertEqual(
                     caught.exception.metadata,
                     {

@@ -200,14 +200,6 @@ class UsageDeltaEvent:
 
 
 @dataclass(slots=True, frozen=True)
-class StreamActivityEvent:
-    """Internal stream progress that must not be exposed as assistant output."""
-
-    source: str
-    type: Literal["stream_activity"] = "stream_activity"
-
-
-@dataclass(slots=True, frozen=True)
 class DoneEvent:
     response: LLMResponse
     type: Literal["done"] = "done"
@@ -217,7 +209,6 @@ LLMStreamEvent: TypeAlias = (
     TextDeltaEvent
     | ToolCallDeltaEvent
     | UsageDeltaEvent
-    | StreamActivityEvent
     | DoneEvent
 )
 
@@ -245,18 +236,12 @@ class LLMRequest:
     cached_content_source_record_ids: Sequence[str] = field(default_factory=tuple)
     cached_content_media_ids: Sequence[str] = field(default_factory=tuple)
     timeout_seconds: float | None = None
-    generation_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.messages:
             raise ValueError("LLMRequest.messages cannot be empty.")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("LLMRequest.timeout_seconds must be > 0.")
-        if (
-            self.generation_timeout_seconds is not None
-            and self.generation_timeout_seconds <= 0
-        ):
-            raise ValueError("LLMRequest.generation_timeout_seconds must be > 0.")
 
 
 @dataclass(slots=True, frozen=True)

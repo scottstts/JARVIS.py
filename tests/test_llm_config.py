@@ -66,35 +66,34 @@ class OpenRouterConfigTests(unittest.TestCase):
 
 
 class LLMSettingsTests(unittest.TestCase):
-    def test_generation_timeout_is_optional_and_read_from_env(self) -> None:
+    def test_request_timeout_defaults_to_five_minutes(self) -> None:
         with patch.dict(
             os.environ,
             {
                 "JARVIS_LLM_DEFAULT_PROVIDER": "openai",
                 "JARVIS_EMBEDDING_PROVIDER": "openai",
                 "JARVIS_EMBEDDING_MODEL": "text-embedding-test",
-                "JARVIS_LLM_GENERATION_TIMEOUT_SECONDS": "300",
             },
             clear=True,
         ):
             settings = LLMSettings.from_env()
 
-        self.assertEqual(settings.request_timeout_seconds, 60.0)
-        self.assertEqual(settings.generation_timeout_seconds, 300.0)
+        self.assertEqual(settings.request_timeout_seconds, 300.0)
 
-    def test_generation_timeout_must_be_positive(self) -> None:
-        with self.assertRaisesRegex(
-            LLMConfigurationError,
-            "JARVIS_LLM_GENERATION_TIMEOUT_SECONDS must be > 0",
+    def test_request_timeout_reads_env_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "JARVIS_LLM_DEFAULT_PROVIDER": "openai",
+                "JARVIS_EMBEDDING_PROVIDER": "openai",
+                "JARVIS_EMBEDDING_MODEL": "text-embedding-test",
+                "JARVIS_LLM_TIMEOUT_SECONDS": "120",
+            },
+            clear=True,
         ):
-            LLMSettings(
-                default_provider="openai",
-                generation_timeout_seconds=0,
-                embedding=EmbeddingSettings(
-                    provider="openai",
-                    model="text-embedding-test",
-                ),
-            )
+            settings = LLMSettings.from_env()
+
+        self.assertEqual(settings.request_timeout_seconds, 120.0)
 
 
 class GrokConfigTests(unittest.TestCase):

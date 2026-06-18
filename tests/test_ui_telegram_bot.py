@@ -1652,11 +1652,14 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.stop_calls, ["tg_777"])
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["⚙️ <b>System:</b> Stop requested. I will stop after the current step."],
+            [
+                "⚙️ <b>System:</b> Prepare to stop the session.",
+                "⚙️ <b>System:</b> Session stopped.",
+            ],
         )
         self.assertEqual(
             [message.parse_mode for message in telegram.sent_messages],
-            ["HTML"],
+            ["HTML", "HTML"],
         )
 
     async def test_dispatch_message_submits_second_message_immediately_while_first_turn_is_active(
@@ -1849,7 +1852,62 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.stop_requested)
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["⚙️ <b>System:</b> Stop requested. I will stop after the current step."],
+            [
+                "⚙️ <b>System:</b> Prepare to stop the session.",
+                "⚙️ <b>System:</b> Session stopped.",
+            ],
+        )
+
+    async def test_stop_command_reports_completion_when_active_turn_ends_with_error(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_PersistentFakeGatewayClient(session),
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="first"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=2, chat_id=777, chat_type="private", text="/stop"),
+        )
+        await session.emit(
+            GatewayErrorEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                code="provider_timeout",
+                message="provider timed out",
+            )
+        )
+
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "⚙️ <b>System:</b> Prepare to stop the session.",
+                "⚙️ <b>System:</b> Session stopped.",
+            ],
         )
 
     async def test_stop_command_resumes_output_only_after_next_user_turn_event(self) -> None:
@@ -1953,7 +2011,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "⚙️ <b>System:</b> Stop requested. I will stop after the current step.",
+                "⚙️ <b>System:</b> Prepare to stop the session.",
+                "⚙️ <b>System:</b> Session stopped.",
                 "handled second",
             ],
         )
@@ -2035,7 +2094,9 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "⚙️ <b>System:</b> Stop requested. I will stop after the current step.",
+                "⚙️ <b>System:</b> Prepare to stop the session.",
+                "⚙️ <b>System:</b> Prepare to start a new session.",
+                "⚙️ <b>System:</b> Session stopped.",
                 "⚙️ <b>System:</b> Started a new session.",
             ],
         )
@@ -2150,11 +2211,14 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["⚙️ <b>System:</b> Started a new session."],
+            [
+                "⚙️ <b>System:</b> Prepare to start a new session.",
+                "⚙️ <b>System:</b> Started a new session.",
+            ],
         )
         self.assertEqual(
             [message.parse_mode for message in telegram.sent_messages],
-            ["HTML"],
+            ["HTML", "HTML"],
         )
 
     async def test_new_command_with_body_keeps_notice_and_response_separate(self) -> None:
@@ -2221,6 +2285,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
+                "⚙️ <b>System:</b> Prepare to start a new session.",
                 "⚙️ <b>System:</b> Started a new session.",
                 "continuing in the new session",
             ],
@@ -2588,17 +2653,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_route_event_worker_logs_telegram_delivery_errors_without_relabeling_them(
         self,
     ) -> None:
-        telegram = _FakeTelegramClient(
-            message_errors=[
-                TelegramAPIError(
-                    code="telegram_http_error",
-                    message=(
-                        "Telegram request failed for method 'sendMessage': "
-                        "ReadTimeout: timed out"
-                    ),
-                )
-            ]
-        )
+        telegram = _FakeTelegramClient()
         session = _PersistentFakeRouteSession()
         bridge = TelegramGatewayBridge(
             settings=_settings(),
@@ -2610,6 +2665,15 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="/new"),
         )
         client_message_id = session.sent_messages[0][1]
+        telegram._message_errors.append(
+            TelegramAPIError(
+                code="telegram_http_error",
+                message=(
+                    "Telegram request failed for method 'sendMessage': "
+                    "ReadTimeout: timed out"
+                ),
+            )
+        )
 
         with self.assertLogs("ui.telegram.bot", level="ERROR") as captured_logs:
             await session.emit(
@@ -2625,7 +2689,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             )
             await bridge.wait_for_chat_idle(777)
 
-        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["⚙️ <b>System:</b> Prepare to start a new session."],
+        )
         self.assertNotIn(777, bridge._active_turn_by_chat)
         self.assertNotIn(777, bridge._submitted_turns_by_chat)
         self.assertTrue(

@@ -36,7 +36,6 @@ from ..types import (
     LLMResponse,
     LLMStreamEvent,
     LLMUsage,
-    StreamActivityEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -155,9 +154,6 @@ class OpenRouterProvider:
                     continue
 
                 delta = choice.get("delta") or {}
-                if self._has_reasoning_activity(delta):
-                    yield StreamActivityEvent(source="reasoning")
-
                 text_delta = self._extract_stream_text(delta.get("content"))
                 if text_delta:
                     accumulated_text.append(text_delta)
@@ -584,8 +580,6 @@ class OpenRouterProvider:
             raise ProviderRateLimitError(message, metadata=metadata)
         if status in {401, 403}:
             raise ProviderAuthenticationError(message, metadata=metadata)
-        if status == 504:
-            raise ProviderTimeoutError(message, metadata=metadata)
         if status >= 500:
             raise ProviderTemporaryError(message, metadata=metadata)
         raise ProviderBadRequestError(message, metadata=metadata)
@@ -791,17 +785,6 @@ class OpenRouterProvider:
             response_headers=response_header_metadata,
         )
         message = self._extract_stream_error_message(error)
-        error_type = metadata.get("error_type")
-        http_code = metadata.get("http_code")
-        if error_type == "timeout" or http_code == 504:
-            return ProviderTimeoutError(message, metadata=metadata)
-        if error_type in {"provider_unavailable", "provider_overloaded"} or http_code in {
-            502,
-            503,
-        }:
-            return ProviderTemporaryError(message, metadata=metadata)
-        if error_type == "rate_limit_exceeded" or http_code == 429:
-            return ProviderRateLimitError(message, metadata=metadata)
         return ProviderResponseError(message, metadata=metadata)
 
     def _build_error_metadata(
@@ -850,15 +833,6 @@ class OpenRouterProvider:
         if not isinstance(payload, dict):
             return None
         return payload.get("error")
-
-    def _has_reasoning_activity(self, delta: Any) -> bool:
-        if not isinstance(delta, dict):
-            return False
-        for key in ("reasoning", "reasoning_content", "reasoning_details"):
-            value = delta.get(key)
-            if value not in (None, "", (), [], {}, False):
-                return True
-        return False
 
     def _map_request_exception(self, exc: Exception) -> Exception:
         if isinstance(
