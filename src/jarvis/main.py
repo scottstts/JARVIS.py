@@ -8,14 +8,14 @@ from dataclasses import replace
 
 import uvicorn
 
-from jarvis.codex_backend import CodexBackendSettings
 from jarvis.core import CoreSettings
 from jarvis.gateway import GatewaySettings, create_app
-from jarvis.llm import LLMSettings
 from jarvis.logging_setup import configure_application_logging, get_application_logger
-from jarvis.memory import MemorySettings
+from jarvis.runtime_provider_configuration import (
+    RuntimeProviderConfiguration,
+    load_runtime_provider_configuration,
+)
 from jarvis.runtime_env import load_docker_secrets_if_present
-from jarvis.subagent.settings import SubagentSettings
 from jarvis.ui.telegram import UISettings, run_telegram_ui
 
 LOGGER = get_application_logger(__name__)
@@ -32,7 +32,10 @@ async def run_system(
         ui_settings or UISettings.from_env(),
         resolved_gateway_settings,
     )
-    _log_runtime_provider_configuration(core_settings=resolved_core_settings)
+    provider_configuration = load_runtime_provider_configuration(
+        core_settings=resolved_core_settings,
+    )
+    _log_runtime_provider_configuration(provider_configuration)
 
     app = create_app(
         gateway_settings=resolved_gateway_settings,
@@ -62,7 +65,10 @@ async def run_system(
             resolved_ui_settings.gateway_ws_base_url,
         )
         ui_task = asyncio.create_task(
-            run_telegram_ui(resolved_ui_settings),
+            run_telegram_ui(
+                resolved_ui_settings,
+                provider_configuration=provider_configuration,
+            ),
             name="jarvis-ui",
         )
 
@@ -143,10 +149,9 @@ def _gateway_ws_base_url(gateway_settings: GatewaySettings) -> str:
     return f"ws://{host}:{gateway_settings.port}{websocket_path}"
 
 
-def _log_runtime_provider_configuration(*, core_settings: CoreSettings) -> None:
-    provider_configuration = _load_runtime_provider_configuration(
-        core_settings=core_settings,
-    )
+def _log_runtime_provider_configuration(
+    provider_configuration: RuntimeProviderConfiguration,
+) -> None:
     from rich.console import Console
     from rich.table import Table
 
@@ -155,88 +160,10 @@ def _log_runtime_provider_configuration(*, core_settings: CoreSettings) -> None:
     table.add_column("Provider", style="green")
     table.add_column("Model", style="yellow")
 
-    table.add_row("Main Agent", *provider_configuration["main_llm"])
-    table.add_row("Subagent", *provider_configuration["subagent_llm"])
-    table.add_row("Compaction", *provider_configuration["compaction_llm"])
-    table.add_row("Memory Maintenance", *provider_configuration["memory_maintenance_llm"])
-    table.add_row("Embedding", *provider_configuration["embedding"])
+    for target in provider_configuration:
+        table.add_row(target.role, target.provider, target.model)
 
     Console().print(table)
-
-
-def _load_runtime_provider_configuration(*, core_settings: CoreSettings) -> dict[str, tuple[str, str]]:
-    llm_settings = LLMSettings.from_env()
-    memory_settings = MemorySettings.from_workspace_dir(core_settings.workspace_dir)
-    subagent_settings = SubagentSettings.from_workspace_dir(
-        core_settings.workspace_dir,
-        transcript_archive_root=core_settings.transcript_archive_dir,
-    )
-    return _resolve_runtime_provider_configuration(
-        core_settings=core_settings,
-        llm_settings=llm_settings,
-        memory_settings=memory_settings,
-        subagent_settings=subagent_settings,
-    )
-
-
-def _resolve_runtime_provider_configuration(
-    *,
-    core_settings: CoreSettings,
-    llm_settings: LLMSettings,
-    memory_settings: MemorySettings,
-    subagent_settings: SubagentSettings,
-) -> dict[str, tuple[str, str]]:
-    main_provider = llm_settings.default_provider
-    subagent_provider = subagent_settings.provider or main_provider
-    compaction_provider = core_settings.compaction.provider
-    return {
-        "main_llm": _format_provider_target(
-            provider=main_provider,
-            model=_chat_model_for_provider(llm_settings=llm_settings, provider=main_provider),
-        ),
-        "subagent_llm": _format_provider_target(
-            provider=subagent_provider,
-            model=_chat_model_for_provider(llm_settings=llm_settings, provider=subagent_provider),
-        ),
-        "compaction_llm": _format_provider_target(
-            provider=compaction_provider,
-            model=_chat_model_for_provider(
-                llm_settings=llm_settings,
-                provider=compaction_provider,
-            ),
-        ),
-        "memory_maintenance_llm": _format_provider_target(
-            provider=memory_settings.maintenance_provider,
-            model=memory_settings.maintenance_model,
-        ),
-        "embedding": _format_provider_target(
-            provider=llm_settings.embedding.provider,
-            model=llm_settings.embedding.model,
-        ),
-    }
-
-
-def _chat_model_for_provider(*, llm_settings: LLMSettings, provider: str) -> str:
-    if provider == "codex":
-        codex_settings = CodexBackendSettings.from_env()
-        return codex_settings.model or "(server default)"
-    if provider == "openai":
-        return llm_settings.openai.chat_model or "(unconfigured)"
-    if provider == "anthropic":
-        return llm_settings.anthropic.chat_model or "(unconfigured)"
-    if provider == "gemini":
-        return llm_settings.gemini.chat_model or "(unconfigured)"
-    if provider == "grok":
-        return llm_settings.grok.chat_model or "(unconfigured)"
-    if provider == "openrouter":
-        return llm_settings.openrouter.chat_model or "(unconfigured)"
-    if provider == "lmstudio":
-        return "(provider-selected)"
-    return "(unknown)"
-
-
-def _format_provider_target(*, provider: str, model: str) -> tuple[str, str]:
-    return (provider, model)
 
 
 if __name__ == "__main__":

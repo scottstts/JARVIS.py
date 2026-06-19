@@ -12,6 +12,7 @@ from typing import Any
 from types import SimpleNamespace
 
 from jarvis.ui.telegram.api import DraftMessage, TelegramAPIError, TelegramRemoteFile
+from jarvis.runtime_provider_configuration import RuntimeProviderTarget
 from jarvis.ui.telegram.bot import (
     IncomingTelegramApprovalCallback,
     IncomingTelegramFile,
@@ -412,6 +413,73 @@ def _settings(**overrides: object) -> UISettings:
 
 
 class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_models_command_is_transient_and_bypasses_gateway(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+            provider_configuration=(
+                RuntimeProviderTarget("Main Agent", "openrouter", "z-ai/glm-5.2"),
+                RuntimeProviderTarget(
+                    "Subagent",
+                    "gemini",
+                    "gemini-flash-latest",
+                ),
+                RuntimeProviderTarget(
+                    "Compaction",
+                    "gemini",
+                    "gemini-flash-latest",
+                ),
+                RuntimeProviderTarget(
+                    "Memory Maintenance",
+                    "gemini",
+                    "gemini-flash-latest",
+                ),
+                RuntimeProviderTarget(
+                    "Embedding",
+                    "gemini",
+                    "text-embedding-3-small",
+                ),
+            ),
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=777,
+                chat_type="private",
+                text="/models",
+            ),
+        )
+
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(gateway.stop_calls, [])
+        self.assertEqual(len(telegram.sent_messages), 1)
+        self.assertEqual(telegram.sent_messages[0].parse_mode, "HTML")
+        self.assertEqual(
+            telegram.sent_messages[0].text,
+            (
+                "🤖 <b>LLM Provider Configuration</b>\n\n"
+                "<b>Main Agent</b>\n"
+                "Provider: <code>openrouter</code>\n"
+                "Model: <code>z-ai/glm-5.2</code>\n\n"
+                "<b>Subagent</b>\n"
+                "Provider: <code>gemini</code>\n"
+                "Model: <code>gemini-flash-latest</code>\n\n"
+                "<b>Compaction</b>\n"
+                "Provider: <code>gemini</code>\n"
+                "Model: <code>gemini-flash-latest</code>\n\n"
+                "<b>Memory Maintenance</b>\n"
+                "Provider: <code>gemini</code>\n"
+                "Model: <code>gemini-flash-latest</code>\n\n"
+                "<b>Embedding</b>\n"
+                "Provider: <code>gemini</code>\n"
+                "Model: <code>text-embedding-3-small</code>"
+            ),
+        )
+
     async def test_poll_once_processes_private_text_update(self) -> None:
         updates = [
             {

@@ -20,6 +20,10 @@ from jarvis.llm import (
     OpenAIProviderSettings,
 )
 from jarvis.memory import MemorySettings
+from jarvis.runtime_provider_configuration import (
+    RuntimeProviderTarget,
+    resolve_runtime_provider_configuration,
+)
 from jarvis.subagent.settings import SubagentSettings
 from jarvis.ui.telegram import UISettings
 
@@ -77,7 +81,20 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_system_binds_ui_to_local_gateway_and_shuts_server_down(self) -> None:
         fake_server: _FakeServer | None = None
         captured_ui_settings: list[UISettings] = []
+        captured_provider_configurations: list[tuple[RuntimeProviderTarget, ...]] = []
+        logged_provider_configurations: list[tuple[RuntimeProviderTarget, ...]] = []
         captured_app_args: list[GatewaySettings] = []
+        provider_configuration = (
+            RuntimeProviderTarget("Main Agent", "openrouter", "z-ai/glm-5.2"),
+            RuntimeProviderTarget("Subagent", "gemini", "gemini-flash-latest"),
+            RuntimeProviderTarget("Compaction", "gemini", "gemini-flash-latest"),
+            RuntimeProviderTarget(
+                "Memory Maintenance",
+                "gemini",
+                "gemini-flash-latest",
+            ),
+            RuntimeProviderTarget("Embedding", "gemini", "text-embedding-3-small"),
+        )
 
         def fake_create_app(*, gateway_settings: GatewaySettings, **_: object) -> object:
             captured_app_args.append(gateway_settings)
@@ -91,8 +108,13 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             fake_server = _FakeServer(config)
             return fake_server
 
-        async def fake_run_telegram_ui(settings: UISettings) -> None:
+        async def fake_run_telegram_ui(
+            settings: UISettings,
+            *,
+            provider_configuration: tuple[RuntimeProviderTarget, ...],
+        ) -> None:
             captured_ui_settings.append(settings)
+            captured_provider_configurations.append(provider_configuration)
 
         gateway_settings = GatewaySettings(
             host="0.0.0.0",
@@ -110,10 +132,20 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(jarvis_main.uvicorn, "Config", side_effect=fake_config):
                 with patch.object(jarvis_main.uvicorn, "Server", side_effect=fake_server_factory):
                     with patch.object(jarvis_main, "run_telegram_ui", side_effect=fake_run_telegram_ui):
-                        await jarvis_main.run_system(
-                            gateway_settings=gateway_settings,
-                            ui_settings=ui_settings,
-                        )
+                        with patch.object(
+                            jarvis_main,
+                            "load_runtime_provider_configuration",
+                            return_value=provider_configuration,
+                        ):
+                            with patch.object(
+                                jarvis_main,
+                                "_log_runtime_provider_configuration",
+                                side_effect=logged_provider_configurations.append,
+                            ):
+                                await jarvis_main.run_system(
+                                    gateway_settings=gateway_settings,
+                                    ui_settings=ui_settings,
+                                )
 
         self.assertIsNotNone(fake_server)
         if fake_server is None:
@@ -125,12 +157,14 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             captured_ui_settings[0].gateway_ws_base_url,
             "ws://127.0.0.1:8181/ws",
         )
+        self.assertEqual(captured_provider_configurations, [provider_configuration])
+        self.assertEqual(logged_provider_configurations, [provider_configuration])
         self.assertFalse(fake_server.config["access_log"])
         self.assertEqual(fake_server.config["host"], "0.0.0.0")
         self.assertEqual(fake_server.config["port"], 8181)
 
     def test_resolve_runtime_provider_configuration_falls_back_to_main_for_subagent(self) -> None:
-        provider_configuration = jarvis_main._resolve_runtime_provider_configuration(
+        provider_configuration = resolve_runtime_provider_configuration(
             core_settings=CoreSettings(
                 context_policy=ContextPolicySettings(context_window_tokens=100_000),
                 compaction=CompactionSettings(provider="openai"),
@@ -175,42 +209,41 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             provider_configuration,
-            {
-                "main_llm": ("openai", "gpt-5.4"),
-                "subagent_llm": ("openai", "gpt-5.4"),
-                "compaction_llm": ("openai", "gpt-5.4"),
-                "memory_maintenance_llm": ("anthropic", "claude-maintenance"),
-                "embedding": ("openai", "text-embedding-3-small"),
-            },
+            (
+                RuntimeProviderTarget("Main Agent", "openai", "gpt-5.4"),
+                RuntimeProviderTarget("Subagent", "openai", "gpt-5.4"),
+                RuntimeProviderTarget("Compaction", "openai", "gpt-5.4"),
+                RuntimeProviderTarget(
+                    "Memory Maintenance",
+                    "anthropic",
+                    "claude-maintenance",
+                ),
+                RuntimeProviderTarget(
+                    "Embedding",
+                    "openai",
+                    "text-embedding-3-small",
+                ),
+            ),
         )
 
     def test_log_runtime_provider_configuration_logs_effective_providers(self) -> None:
-        core_settings = CoreSettings(
-            context_policy=ContextPolicySettings(context_window_tokens=100_000),
-            compaction=CompactionSettings(provider="openai"),
-            workspace_dir=Path("/tmp/workspace"),
-            transcript_archive_dir=Path("/tmp/workspace/archive/transcripts"),
-            identities_dir=Path("/tmp/workspace/identities"),
-            turn_timezone="Europe/Dublin",
-        )
-
         import io
         from contextlib import redirect_stdout
 
         out = io.StringIO()
-        with patch.object(
-            jarvis_main,
-            "_load_runtime_provider_configuration",
-            return_value={
-                "main_llm": ("openai", "gpt-5.4"),
-                "subagent_llm": ("gemini", "gemini-3.1-pro"),
-                "compaction_llm": ("anthropic", "claude-3.7-sonnet"),
-                "memory_maintenance_llm": ("anthropic", "claude-maintenance"),
-                "embedding": ("openai", "text-embedding-3-small"),
-            },
-        ):
-            with redirect_stdout(out):
-                jarvis_main._log_runtime_provider_configuration(core_settings=core_settings)
+        provider_configuration = (
+            RuntimeProviderTarget("Main Agent", "openai", "gpt-5.4"),
+            RuntimeProviderTarget("Subagent", "gemini", "gemini-3.1-pro"),
+            RuntimeProviderTarget("Compaction", "anthropic", "claude-3.7-sonnet"),
+            RuntimeProviderTarget(
+                "Memory Maintenance",
+                "anthropic",
+                "claude-maintenance",
+            ),
+            RuntimeProviderTarget("Embedding", "openai", "text-embedding-3-small"),
+        )
+        with redirect_stdout(out):
+            jarvis_main._log_runtime_provider_configuration(provider_configuration)
 
         output = out.getvalue()
         self.assertIn("LLM Provider Configuration", output)
@@ -236,7 +269,12 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         def fake_server_factory(config: object) -> _FakeServer:
             return _FakeServer(config, startup_error=startup_error)
 
-        async def fake_run_telegram_ui(_settings: UISettings) -> None:
+        async def fake_run_telegram_ui(
+            _settings: UISettings,
+            *,
+            provider_configuration: tuple[RuntimeProviderTarget, ...],
+        ) -> None:
+            _ = provider_configuration
             self.fail("Telegram UI should not start when gateway startup fails.")
 
         with patch.object(jarvis_main, "create_app", return_value=object()):

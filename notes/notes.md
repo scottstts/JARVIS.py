@@ -171,6 +171,7 @@
 - Telegram now sends the non-persisted text `❌ Error occurred. Try again.` only when an active user turn ends on a gateway/runtime error; background route errors remain suppressed.
 - Main route runtime errors now append JSONL records to `/workspace/archive/error_logs/<session_id>.jsonl` with route/session/turn metadata plus full traceback text, and print only one Rich reminder line in the terminal; Telegram-side gateway-error suppression logs were removed to avoid duplicate noise.
 - Telegram typing now follows route `task_status` control events rather than only active submitted user turns, so it stays alive while the original task is parked on subagents or detached bash follow-ups.
+- Telegram `/models` renders the immutable startup provider/model snapshot locally in the bridge and never enters the gateway, transcript, persistence, or agent context.
 - OpenRouter response caching is default-on in the adapter via `X-OpenRouter-Cache: true`, separate from prompt caching, and chat cache status headers are preserved in `provider_metadata`.
 - Provider context construction is now strategy-driven while transcript persistence remains unchanged: OpenAI/Grok use persisted provider continuation, Gemini uses cachedContent, and Anthropic/OpenRouter use local replay with prompt-cache best effort.
 - Grok native Responses now keeps provider-side state enabled and persists previousResponseId instead of relying on local replay plus x-grok-conv-id for context continuation.

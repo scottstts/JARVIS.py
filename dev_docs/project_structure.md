@@ -112,6 +112,7 @@ src/jarvis/
 ├── settings.py
 ├── settings.yml
 ├── runtime_env.py
+├── runtime_provider_configuration.py
 ├── logging_setup.py
 ├── workspace_paths.py
 ├── core/
@@ -143,6 +144,8 @@ src/jarvis/
   - internal runtime defaults live in subsystem-local config modules instead of here
 - `runtime_env.py`
   - Docker secret loading and runtime environment bootstrap
+- `runtime_provider_configuration.py`
+  - resolves the effective startup provider/model targets shared by terminal and UI status rendering
 - `logging_setup.py`
   - application logging configuration
 - `workspace_paths.py`

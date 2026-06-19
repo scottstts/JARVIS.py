@@ -36,6 +36,7 @@ In telegram BotFather, add commands:
 new - start a new session
 stop - pause Jarvis
 compact - compact current session
+models - show active LLM providers and models
 ```
 
 ### Use Codex Backend

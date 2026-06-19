@@ -161,6 +161,8 @@ Interrupted `turn_done` events include `interruption_reason`.
 
 Telegram inbound handling submits user messages immediately over the persistent route session. It does not wait for the current turn to finish before forwarding the next user message.
 
+`/models` is handled entirely by the Telegram bridge from the immutable provider configuration snapshot resolved at process startup. It does not create a gateway route, agent turn, transcript record, or provider request.
+
 For each chat, the bridge maintains:
 
 - one persistent route session

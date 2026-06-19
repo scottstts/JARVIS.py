@@ -18,6 +18,10 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from jarvis.logging_setup import get_application_logger
+from jarvis.runtime_provider_configuration import (
+    RuntimeProviderConfiguration,
+    load_runtime_provider_configuration,
+)
 from .api import (
     DraftMessage,
     TelegramAPIError,
@@ -345,6 +349,7 @@ class TelegramGatewayBridge:
         settings: UISettings | None = None,
         telegram_client: TelegramClientLike | None = None,
         gateway_client: GatewayClientLike | None = None,
+        provider_configuration: RuntimeProviderConfiguration = (),
     ) -> None:
         self._settings = settings or UISettings.from_env()
         self._telegram = telegram_client or TelegramBotAPIClient(
@@ -355,6 +360,7 @@ class TelegramGatewayBridge:
             websocket_base_url=self._settings.gateway_ws_base_url,
             connect_timeout_seconds=self._settings.gateway_connect_timeout_seconds,
         )
+        self._provider_configuration = provider_configuration
         self._next_draft_ids: dict[int, int] = {}
         self._draft_retry_until_by_chat: dict[int, float] = {}
         self._draft_min_interval_by_chat: dict[int, float] = {}
@@ -485,10 +491,9 @@ class TelegramGatewayBridge:
         ):
             LOGGER.warning("Ignoring unauthorized Telegram private message.")
             return
-        if message.file_attachment is None and _is_stop_command_text(message.text):
-            await self._handle_stop_command(message)
-            return
         try:
+            if await self._handle_ui_command(message):
+                return
             await self._submit_message(message)
         except GatewayBridgeError:
             LOGGER.exception(
@@ -1239,10 +1244,9 @@ class TelegramGatewayBridge:
         ):
             LOGGER.warning("Ignoring unauthorized Telegram private message.")
             return
-        if message.file_attachment is None and _is_stop_command_text(message.text):
-            await self._handle_stop_command(message)
-            return
         try:
+            if await self._handle_ui_command(message):
+                return
             completion = await self._submit_message(message)
             if completion is None:
                 return
@@ -1468,6 +1472,23 @@ class TelegramGatewayBridge:
             )
             self._pause_chat_output(message.chat_id)
         return
+
+    async def _handle_ui_command(self, message: IncomingTelegramMessage) -> bool:
+        if message.file_attachment is not None:
+            return False
+        if _is_models_command_text(message.text):
+            if not self._provider_configuration:
+                LOGGER.error("Runtime provider configuration is unavailable for /models.")
+                return True
+            await self._send_html_message(
+                chat_id=message.chat_id,
+                html_text=_format_provider_configuration(self._provider_configuration),
+            )
+            return True
+        if _is_stop_command_text(message.text):
+            await self._handle_stop_command(message)
+            return True
+        return False
 
     def _pause_chat_output(self, chat_id: int) -> None:
         state = self._output_pause_state_by_chat.get(chat_id)
@@ -2044,6 +2065,13 @@ def _is_new_command_text(text: str) -> bool:
     return stripped.split(maxsplit=1)[0] == "/new"
 
 
+def _is_models_command_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return stripped.split(maxsplit=1)[0] == "/models"
+
+
 def _extract_file_attachment(message: dict[str, Any]) -> IncomingTelegramFile | None:
     document = message.get("document")
     if isinstance(document, dict):
@@ -2416,6 +2444,23 @@ def _format_tool_usage_notice(agent_name: str, tool_name: str) -> str:
     return f"🔧 <b>{normalized_agent}</b> used <b>{normalized_name}</b> tool."
 
 
+def _format_provider_configuration(
+    provider_configuration: RuntimeProviderConfiguration,
+) -> str:
+    sections = ["🤖 <b>LLM Provider Configuration</b>"]
+    for target in provider_configuration:
+        sections.append(
+            "\n".join(
+                (
+                    f"<b>{html.escape(target.role)}</b>",
+                    f"Provider: <code>{html.escape(target.provider)}</code>",
+                    f"Model: <code>{html.escape(target.model)}</code>",
+                )
+            )
+        )
+    return "\n\n".join(sections)
+
+
 def _is_stop_command_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -2555,8 +2600,22 @@ async def send_telegram_file(
     }
 
 
-async def run_telegram_ui(settings: UISettings | None = None) -> None:
-    bridge = TelegramGatewayBridge(settings=settings)
+async def run_telegram_ui(
+    settings: UISettings | None = None,
+    *,
+    provider_configuration: RuntimeProviderConfiguration | None = None,
+) -> None:
+    resolved_provider_configuration = provider_configuration
+    if resolved_provider_configuration is None:
+        from jarvis.core.config import CoreSettings
+
+        resolved_provider_configuration = load_runtime_provider_configuration(
+            core_settings=CoreSettings.from_env(),
+        )
+    bridge = TelegramGatewayBridge(
+        settings=settings,
+        provider_configuration=resolved_provider_configuration,
+    )
     cleanup_task = asyncio.create_task(
         _maintain_temp_dir(bridge._settings.telegram_temp_dir),
         name="jarvis-telegram-temp-maintenance",
