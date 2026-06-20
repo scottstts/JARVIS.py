@@ -59,6 +59,20 @@ class _FakeClient:
 
 
 class GrokProviderTests(unittest.TestCase):
+    def test_build_response_create_kwargs_includes_reasoning_effort(self) -> None:
+        provider = GrokProvider(
+            settings=GrokProviderSettings(reasoning_effort="high"),
+            default_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="grok-4.3",
+            messages=(LLMMessage.text("user", "Hello"),),
+        )
+
+        kwargs = provider._build_response_create_kwargs(request, stream=False)
+
+        self.assertEqual(kwargs["reasoning"], {"effort": "high"})
+
     def test_build_response_create_kwargs_preserves_system_messages_in_order(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),

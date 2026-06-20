@@ -349,10 +349,14 @@ JARVIS_CODEX_REASONING_EFFORT: Final[str | None] = _optional_string(
 JARVIS_GROK_CHAT_MODEL: Final = _string("providers.grok.chat_model")
 JARVIS_GROK_TEMPERATURE: Final = _float("providers.grok.temperature")
 JARVIS_GROK_MAX_OUTPUT_TOKENS: Final = _integer("providers.grok.max_output_tokens")
+JARVIS_GROK_REASONING_EFFORT: Final = _string("providers.grok.reasoning_effort")
 
 # OpenRouter provider defaults.
 JARVIS_OPENROUTER_CHAT_MODEL: Final = _string("providers.openrouter.chat_model")
 JARVIS_OPENROUTER_TEMPERATURE: Final = _float("providers.openrouter.temperature")
 JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS: Final = _integer(
     "providers.openrouter.max_output_tokens"
+)
+JARVIS_OPENROUTER_REASONING_EFFORT: Final = _string(
+    "providers.openrouter.reasoning_effort"
 )

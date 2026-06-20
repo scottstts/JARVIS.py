@@ -302,6 +302,7 @@ class OpenRouterProviderSettings:
     chat_model: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
+    reasoning_effort: str | None = None
     site_url: str | None = None
     app_name: str | None = None
 
@@ -326,6 +327,11 @@ class OpenRouterProviderSettings:
                 "JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS",
                 app_settings.JARVIS_OPENROUTER_MAX_OUTPUT_TOKENS,
             ),
+            reasoning_effort=_optional_choice_setting(
+                "JARVIS_OPENROUTER_REASONING_EFFORT",
+                app_settings.JARVIS_OPENROUTER_REASONING_EFFORT,
+                {"none", "minimal", "low", "medium", "high", "xhigh"},
+            ),
             site_url=_optional_env("OPENROUTER_SITE_URL") or _DEFAULT_OPENROUTER_SITE_URL,
             app_name=_optional_env("OPENROUTER_APP_NAME") or _DEFAULT_OPENROUTER_APP_NAME,
         )
@@ -338,6 +344,7 @@ class GrokProviderSettings:
     chat_model: str | None = None
     temperature: float | None = None
     max_output_tokens: int | None = None
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
@@ -359,6 +366,11 @@ class GrokProviderSettings:
             max_output_tokens=_parse_optional_int_env(
                 "JARVIS_GROK_MAX_OUTPUT_TOKENS",
                 app_settings.JARVIS_GROK_MAX_OUTPUT_TOKENS,
+            ),
+            reasoning_effort=_optional_choice_setting(
+                "JARVIS_GROK_REASONING_EFFORT",
+                app_settings.JARVIS_GROK_REASONING_EFFORT,
+                {"none", "low", "medium", "high"},
             ),
         )
 

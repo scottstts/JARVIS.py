@@ -64,6 +64,16 @@ class OpenRouterConfigTests(unittest.TestCase):
         self.assertEqual(settings.site_url, "https://jarvis.example")
         self.assertEqual(settings.app_name, "Jarvis Dev")
 
+    def test_openrouter_settings_reads_reasoning_effort_override(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"JARVIS_OPENROUTER_REASONING_EFFORT": "xhigh"},
+            clear=True,
+        ):
+            settings = OpenRouterProviderSettings.from_env()
+
+        self.assertEqual(settings.reasoning_effort, "xhigh")
+
 
 class LLMSettingsTests(unittest.TestCase):
     def test_request_timeout_defaults_to_five_minutes(self) -> None:
@@ -105,7 +115,8 @@ class GrokConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(settings.default_provider, "grok")
-        self.assertEqual(settings.grok.chat_model, "grok-4.20-0309-non-reasoning")
+        self.assertEqual(settings.grok.chat_model, "grok-4.3")
+        self.assertEqual(settings.grok.reasoning_effort, "high")
 
     def test_grok_settings_reads_model_override(self) -> None:
         with patch.dict(
@@ -114,6 +125,7 @@ class GrokConfigTests(unittest.TestCase):
                 "JARVIS_GROK_CHAT_MODEL": "grok-test-model",
                 "JARVIS_GROK_TEMPERATURE": "0.2",
                 "JARVIS_GROK_MAX_OUTPUT_TOKENS": "2048",
+                "JARVIS_GROK_REASONING_EFFORT": "medium",
             },
             clear=True,
         ):
@@ -122,3 +134,4 @@ class GrokConfigTests(unittest.TestCase):
         self.assertEqual(settings.chat_model, "grok-test-model")
         self.assertEqual(settings.temperature, 0.2)
         self.assertEqual(settings.max_output_tokens, 2048)
+        self.assertEqual(settings.reasoning_effort, "medium")

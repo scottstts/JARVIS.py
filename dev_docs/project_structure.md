@@ -202,6 +202,7 @@ Current OpenRouter note:
 
 - the OpenRouter adapter always sends `X-OpenRouter-Cache: true` on provider HTTP requests so OpenRouter can reuse identical response payloads independently of prompt caching
 - OpenRouter Claude/Anthropic requests also include top-level `cache_control: {"type": "ephemeral"}` so OpenRouter strictly routes them to Anthropic prompt caching instead of third-party Anthropic-compatible vendors
+- configured OpenRouter reasoning effort is sent through the normalized `reasoning.effort` field; accepted effort levels remain model-specific
 - when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse, and it does not request provider throughput sorting because OpenRouter prioritizes sorting over sticky routing
 - chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
 - OpenRouter SSE errors preserve generation, response, endpoint, HTTP, typed-error, and upstream-code metadata in runtime logs, but structured upstream stream failures propagate immediately so the user can retry explicitly
@@ -211,6 +212,7 @@ Current OpenRouter note:
 Current Grok note:
 
 - Grok now uses xAI Responses, not chat-completions
+- configured Grok reasoning effort is sent as Responses `reasoning.effort`
 - native Grok uses provider-owned stateful continuation through persisted `previous_response_id`
 - the Grok adapter sends `store=true`, and follow-up turns send only the new input plus `previous_response_id`
 - Jarvis no longer manually rebuilds Grok provider context from unified transcript history for normal native Grok turns

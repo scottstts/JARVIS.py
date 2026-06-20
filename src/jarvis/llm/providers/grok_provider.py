@@ -228,6 +228,8 @@ class GrokProvider:
             kwargs["temperature"] = request.temperature
         if request.max_output_tokens is not None:
             kwargs["max_output_tokens"] = request.max_output_tokens
+        if self._settings.reasoning_effort is not None:
+            kwargs["reasoning"] = {"effort": self._settings.reasoning_effort}
         if request.timeout_seconds is not None:
             kwargs["timeout"] = request.timeout_seconds
         if request.previous_response_id is not None:

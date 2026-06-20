@@ -251,6 +251,8 @@ class OpenRouterProvider:
             payload["temperature"] = request.temperature
         if request.max_output_tokens is not None:
             payload["max_tokens"] = request.max_output_tokens
+        if self._settings.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self._settings.reasoning_effort}
 
         if request.tools:
             payload["tools"] = [self._to_openrouter_tool(tool) for tool in request.tools]

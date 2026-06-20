@@ -396,7 +396,11 @@ class GetSkillsToolTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp)
             _write_skill(workspace_dir, "slides", description="Create decks.")
-            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+            with patch.dict(
+                "os.environ",
+                {"JARVIS_SKILLS_BOOTSTRAP_HEADERS": "true"},
+            ):
+                registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
             tool = registry.require("get_skills")
 
             self.assertEqual(
@@ -405,16 +409,20 @@ class GetSkillsToolTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotIn("query", tool.definition.input_schema["properties"])
 
-            runtime = ToolRuntime(registry=registry)
-            result = await runtime.execute(
-                tool_call=ToolCall(
-                    call_id="call_get_skills_search",
-                    name="get_skills",
-                    arguments={"mode": "search", "query": "slides"},
-                    raw_arguments='{"mode":"search","query":"slides"}',
-                ),
-                context=ToolExecutionContext(workspace_dir=workspace_dir),
-            )
+            with patch.dict(
+                "os.environ",
+                {"JARVIS_SKILLS_BOOTSTRAP_HEADERS": "true"},
+            ):
+                runtime = ToolRuntime(registry=registry)
+                result = await runtime.execute(
+                    tool_call=ToolCall(
+                        call_id="call_get_skills_search",
+                        name="get_skills",
+                        arguments={"mode": "search", "query": "slides"},
+                        raw_arguments='{"mode":"search","query":"slides"}',
+                    ),
+                    context=ToolExecutionContext(workspace_dir=workspace_dir),
+                )
 
             self.assertFalse(result.ok)
             self.assertIn("not available", result.content)
@@ -501,13 +509,16 @@ class SkillBootstrapTests(unittest.IsolatedAsyncioTestCase):
             _write_skill(settings.workspace_dir, "slides", description="Create decks.")
             storage = SessionStorage(settings.transcript_archive_dir)
             llm_service = _FakeLLMService()
-            loop = AgentLoop(
-                llm_service=llm_service,
-                settings=settings,
-                storage=storage,
-            )
-
-            result = await loop.handle_user_input("hello")
+            with patch.dict(
+                "os.environ",
+                {"JARVIS_SKILLS_BOOTSTRAP_HEADERS": "true"},
+            ):
+                loop = AgentLoop(
+                    llm_service=llm_service,
+                    settings=settings,
+                    storage=storage,
+                )
+                result = await loop.handle_user_input("hello")
 
             records = storage.load_records(result.session_id)
             skill_records = [

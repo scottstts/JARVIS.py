@@ -55,8 +55,10 @@ class SettingsModuleTests(unittest.TestCase):
                 module = importlib.reload(app_settings)
 
         self.assertEqual(module.SETTINGS_SOURCE_PATH, _PACKAGED_TEMPLATE_PATH.resolve())
-        self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "openai")
-        self.assertTrue(module.JARVIS_SKILLS_BOOTSTRAP_HEADERS)
+        self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "openrouter")
+        self.assertFalse(module.JARVIS_SKILLS_BOOTSTRAP_HEADERS)
+        self.assertEqual(module.JARVIS_GROK_REASONING_EFFORT, "high")
+        self.assertEqual(module.JARVIS_OPENROUTER_REASONING_EFFORT, "high")
         self.assertEqual(module.JARVIS_TOOL_GENERATE_EDIT_IMAGE_OPENAI_MODEL, "gpt-image-2")
         self.assertEqual(
             module.JARVIS_TOOL_GENERATE_EDIT_IMAGE_GEMINI_MODEL,

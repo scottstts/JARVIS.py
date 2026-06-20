@@ -126,7 +126,7 @@ providers:
           label: "Chat Model"
           description: "Default Gemini chat model name."
           type: "text"
-          value: "gemini-3.1-pro-preview"
+          value: "gemini-flash-latest"
         temperature:
           label: "Temperature"
           description: "Sampling temperature for Gemini requests."
@@ -150,7 +150,7 @@ providers:
             - "low"
             - "medium"
             - "high"
-          value: "medium"
+          value: "high"
         thinking_budget:
           label: "Thinking Budget"
           description: "Optional Gemini thinking budget."
@@ -190,7 +190,7 @@ providers:
           label: "Chat Model"
           description: "Default Grok chat model name."
           type: "text"
-          value: "grok-4.20-0309-non-reasoning"
+          value: "grok-4.3"
         temperature:
           label: "Temperature"
           description: "Sampling temperature for Grok requests."
@@ -205,6 +205,16 @@ providers:
           min: 1
           step: 100
           value: 32000
+        reasoning_effort:
+          label: "Reasoning Effort"
+          description: "Reasoning effort passed to the xAI Responses API."
+          type: "select"
+          options:
+            - "none"
+            - "low"
+            - "medium"
+            - "high"
+          value: "high"
     openrouter:
       title: "OpenRouter"
       description: "Default model and generation settings for OpenRouter."
@@ -213,7 +223,7 @@ providers:
           label: "Chat Model"
           description: "Default OpenRouter chat model name."
           type: "text"
-          value: "moonshotai/kimi-k2.6"
+          value: "z-ai/glm-5.2"
         temperature:
           label: "Temperature"
           description: "Sampling temperature for OpenRouter requests."
@@ -228,6 +238,18 @@ providers:
           min: 1
           step: 100
           value: 32000
+        reasoning_effort:
+          label: "Reasoning Effort"
+          description: "OpenRouter reasoning effort; supported levels vary by model."
+          type: "select"
+          options:
+            - "none"
+            - "minimal"
+            - "low"
+            - "medium"
+            - "high"
+            - "xhigh"
+          value: "high"
 
 main_agent_provider:
   label: "Main Agent Provider"
@@ -241,7 +263,7 @@ main_agent_provider:
     - "grok"
     - "openrouter"
     - "lmstudio"
-  value: "openai"
+  value: "openrouter"
 
 subagent_provider:
   label: "Subagent Provider"
@@ -270,7 +292,7 @@ embedding:
         - "openai"
         - "gemini"
         - "openrouter"
-      value: "openai"
+      value: "gemini"
     model:
       label: "Embedding Model"
       description: "Embedding model name used across the app."
@@ -364,7 +386,7 @@ skills:
       label: "Bootstrap Skill Headers"
       description: "Show installed skill names and descriptions at session start."
       type: "boolean"
-      value: true
+      value: false
 
 memory:
   title: "Memory"
