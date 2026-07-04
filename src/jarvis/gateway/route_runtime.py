@@ -339,13 +339,9 @@ class RouteRuntime:
         Console(stderr=True).print(text, highlight=False)
 
     def request_stop(self) -> bool:
-        main_stop_requested = self._main_loop.request_stop(reason="user_stop")
-        affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
-        pending_bash_jobs = self._bash_job_supervisor.pending_jobs()
-        stop_requested = (
-            main_stop_requested
-            or bool(affected_subagents)
-            or bool(pending_bash_jobs)
+        stop_requested, affected_subagents, pending_bash_jobs = self._request_route_stop(
+            main_reason="user_stop",
+            subagent_stop_reason="user_stop",
         )
         if stop_requested and not self._main_resume_requires_user_message:
             self._main_resume_requires_user_message = True
@@ -358,14 +354,44 @@ class RouteRuntime:
         return stop_requested
 
     def _request_user_message_supersede(self) -> None:
-        _ = self._main_loop.request_stop(reason="superseded_by_user_message")
-        self._subagent_manager.request_stop_all_for_superseded_user_message()
-        self._invalidate_stale_internal_followups()
+        self._request_route_stop(
+            main_reason="superseded_by_user_message",
+            subagent_stop_reason="superseded_by_user_message",
+        )
 
     def _request_new_session_supersede(self) -> None:
-        _ = self._main_loop.request_stop(reason="superseded_by_user_message")
-        self._subagent_manager.request_stop_all_for_user_stop()
+        self._request_route_stop(
+            main_reason="superseded_by_user_message",
+            subagent_stop_reason="user_stop",
+        )
+
+    def _request_route_stop(
+        self,
+        *,
+        main_reason: str,
+        subagent_stop_reason: str,
+    ) -> tuple[bool, tuple[SubagentSnapshot, ...], tuple[object, ...]]:
+        if main_reason == "superseded_by_user_message":
+            main_stop_requested = self._main_loop.request_stop(
+                reason="superseded_by_user_message"
+            )
+        else:
+            main_stop_requested = self._main_loop.request_stop(reason="user_stop")
+
+        if subagent_stop_reason == "superseded_by_user_message":
+            affected_subagents = (
+                self._subagent_manager.request_stop_all_for_superseded_user_message()
+            )
+        else:
+            affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
+
+        pending_bash_jobs = self._bash_job_supervisor.pending_jobs()
         self._invalidate_stale_internal_followups()
+        return (
+            main_stop_requested or bool(affected_subagents) or bool(pending_bash_jobs),
+            affected_subagents,
+            tuple(pending_bash_jobs),
+        )
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._approval_registry.resolve(approval_id, approved)

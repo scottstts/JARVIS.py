@@ -192,7 +192,7 @@ Route-scoped supervision owns detached bash monitoring outside the model loop. A
 
 Progress pacing combines immediate signal-driven updates with fallback heartbeats. Notices are batched and deduplicated by owner so multiple job updates coalesce into one revival.
 
-Route-level `/stop` suppresses detached-bash auto-followups until the next user message, but it does not cancel already-running bash executions.
+Route-level `/stop` preempts foreground tool awaits. Foreground bash gets best-effort process-group/job cancellation when its active await is cancelled. Already-detached bash jobs are different: `/stop` suppresses their auto-followups until the next user message, but it does not cancel those jobs.
 
 ## Implemented Basic Tools
 

@@ -18,7 +18,7 @@ from jarvis.core import (
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
-from jarvis.llm import ProviderTimeoutError, TextPart
+from jarvis.llm import DoneEvent, LLMResponse, LLMUsage, ProviderTimeoutError, TextPart
 from jarvis.core.compaction import CompactionOutcome, CompactionReplacementItem
 from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
 from jarvis.gateway.route_events import (
@@ -27,6 +27,7 @@ from jarvis.gateway.route_events import (
     RouteLocalNoticeEvent,
     RouteSystemNoticeEvent,
     RouteTaskStatusEvent,
+    RouteTurnDoneEvent,
 )
 from jarvis.gateway.route_runtime import (
     CompositeMainBootstrapLoader,
@@ -40,6 +41,35 @@ from jarvis.subagent.types import SubagentSnapshot
 from tests.helpers import build_core_settings
 from jarvis.tools import ToolSettings
 from jarvis.tools.basic.bash.jobs import BashJobRecord, claim_job_owner, create_background_job
+
+
+def _build_llm_response(text: str) -> LLMResponse:
+    return LLMResponse(
+        provider="fake",
+        model="fake-chat",
+        text=text,
+        tool_calls=[],
+        finish_reason="stop",
+        usage=LLMUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+    )
+
+
+class _BlockedRouteStreamingLLMService:
+    def __init__(self) -> None:
+        self.stream_started = asyncio.Event()
+        self.stream_closed = asyncio.Event()
+        self.release_stream = asyncio.Event()
+
+    async def generate(self, _request):
+        return _build_llm_response("unexpected")
+
+    async def stream_generate(self, _request):
+        self.stream_started.set()
+        try:
+            await self.release_stream.wait()
+        finally:
+            self.stream_closed.set()
+        yield DoneEvent(response=_build_llm_response("late"))
 
 
 class _TrackingLoop:
@@ -504,6 +534,45 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 worker.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await worker
+
+    async def test_new_command_preempts_blocked_active_turn_then_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_service = _BlockedRouteStreamingLLMService()
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=llm_service,  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            worker: asyncio.Task[None] | None = None
+            try:
+                await runtime.enqueue_user_message("hello", client_message_id="msg_1")
+                await asyncio.wait_for(llm_service.stream_started.wait(), timeout=1.0)
+
+                await runtime.enqueue_user_message("/new", client_message_id="msg_new")
+                await asyncio.wait_for(llm_service.stream_closed.wait(), timeout=1.0)
+
+                done_events: list[RouteTurnDoneEvent] = []
+                deadline = asyncio.get_running_loop().time() + 1.0
+                while len(done_events) < 2:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        self.fail("Timed out waiting for interrupted turn and /new completion.")
+                    event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    if isinstance(event, RouteTurnDoneEvent):
+                        done_events.append(event)
+
+                self.assertTrue(done_events[0].interrupted)
+                self.assertEqual(done_events[0].client_message_id, "msg_1")
+                self.assertEqual(done_events[1].command, "/new")
+                self.assertEqual(done_events[1].client_message_id, "msg_new")
+            finally:
+                runtime.unsubscribe(subscriber_id)
+                worker = runtime._message_worker
+                if worker is not None:
+                    worker.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await worker
 
     async def test_new_command_reset_failure_is_unbound_from_client_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

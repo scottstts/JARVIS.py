@@ -3,13 +3,15 @@
 from __future__ import annotations
 import asyncio
 import base64
+from collections.abc import Awaitable as RuntimeAwaitable
+import contextlib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol, Sequence, TypeVar
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -123,6 +125,8 @@ LOGGER = get_application_logger(__name__)
 
 AgentKind = Literal["main", "subagent"]
 InterruptionReason = Literal["user_stop", "superseded_by_user_message"]
+T = TypeVar("T")
+_STOP_PREEMPTION_CLEANUP_SECONDS = 1.0
 
 
 class BootstrapMessageLoader(Protocol):
@@ -255,6 +259,10 @@ class _RequestedInterruption:
     reason: InterruptionReason
 
 
+class _TurnStopRequested(Exception):
+    """Internal control-flow signal raised when a turn stop preempts an await."""
+
+
 @dataclass(slots=True, frozen=True)
 class _ToolExecutionOutcome:
     approval_rejected: bool = False
@@ -262,6 +270,7 @@ class _ToolExecutionOutcome:
     pending_detached_job_ids: frozenset[str] = frozenset()
     pending_subagent_ids: frozenset[str] = frozenset()
     deferred_tool_successes: tuple["_DeferredToolSuccess", ...] = ()
+    unexecuted_tool_names: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -347,6 +356,7 @@ class AgentLoop:
         self._pending_approval_future: asyncio.Future[bool] | None = None
         self._pending_approval_id: str | None = None
         self._pending_approval_turn_id: str | None = None
+        self._turn_stop_event: asyncio.Event | None = None
 
     @property
     def agent_kind(self) -> AgentKind:
@@ -501,6 +511,9 @@ class AgentLoop:
             turn_id=active_turn_id,
             reason=reason,
         )
+        stop_event = self._turn_stop_event
+        if stop_event is not None:
+            stop_event.set()
         return True
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
@@ -755,6 +768,14 @@ class AgentLoop:
                 compaction_performed=did_compaction,
                 approval_rejected=approval_rejected,
             )
+        except _TurnStopRequested:
+            return self._interrupt_turn(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                command=command_override,
+                compaction_performed=did_compaction,
+                response_text="",
+            )
         except Exception:
             self._fail_turn_after_runtime_error(
                 session_id=session.session_id,
@@ -778,14 +799,29 @@ class AgentLoop:
         deferred_tool_successes: list[_DeferredToolSuccess] = []
         current_pending_detached_job_ids = set(pending_detached_job_ids)
         current_pending_subagent_ids = set(pending_subagent_ids)
-        for tool_call in current_response.tool_calls:
+        tool_calls = tuple(current_response.tool_calls)
+        for tool_index, tool_call in enumerate(tool_calls):
             tool_context = replace(
                 self._tool_context,
                 session_id=session_id,
                 turn_id=turn_id,
             )
             while True:
-                tool_result = await self._tool_executor(tool_call, tool_context)
+                try:
+                    tool_result = await self._await_with_stop(
+                        self._tool_executor(tool_call, tool_context),
+                        turn_id=turn_id,
+                        operation=f"tool_{tool_call.name}",
+                    )
+                except _TurnStopRequested:
+                    pending_records.extend(ephemeral_image_records)
+                    return _ToolExecutionOutcome(
+                        interrupted=True,
+                        pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+                        pending_subagent_ids=frozenset(current_pending_subagent_ids),
+                        deferred_tool_successes=tuple(deferred_tool_successes),
+                        unexecuted_tool_names=tuple(call.name for call in tool_calls[tool_index:]),
+                    )
                 pending_approval = self._build_pending_approval(
                     tool_result=tool_result,
                     tool_name=tool_call.name,
@@ -850,10 +886,12 @@ class AgentLoop:
                     approval=pending_approval,
                 )
                 if approved is None:
+                    pending_records.extend(ephemeral_image_records)
                     return _ToolExecutionOutcome(
                         interrupted=True,
                         pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
                         pending_subagent_ids=frozenset(current_pending_subagent_ids),
+                        deferred_tool_successes=tuple(deferred_tool_successes),
                     )
                 self._append_turn_record(
                     session_id=session_id,
@@ -1359,7 +1397,11 @@ class AgentLoop:
             unexecuted_tool_names=unexecuted_tool_names,
             turn_id=turn_id,
         )
-        response = await self._llm_service.generate(request)
+        response = await self._await_with_stop(
+            self._llm_service.generate(request),
+            turn_id=turn_id,
+            operation="llm_generate",
+        )
         normalized = self._normalize_tool_round_limit_recovery_response(response)
         assistant_record = self._build_assistant_record(
             session_id,
@@ -1398,7 +1440,7 @@ class AgentLoop:
         )
         streamed_response: LLMResponse | None = None
         recovery_events: list[AgentTurnStreamEvent] = []
-        async for event in self._llm_service.stream_generate(request):
+        async for event in self._stream_generate_with_stop(request, turn_id=turn_id):
             if event.type == "text_delta":
                 if event.delta:
                     recovery_events.append(
@@ -1494,6 +1536,9 @@ class AgentLoop:
             turn_id=turn_id,
         )
 
+        interrupted_response_text = ""
+        interrupted_stream_fragment_text = ""
+        interrupted_unexecuted_tool_names: tuple[str, ...] = ()
         try:
             overflow_compacted = False
             overflow_retry_attempted = False
@@ -1508,11 +1553,13 @@ class AgentLoop:
                 noticed_initial_tool_call_ids = set()
                 streamed_initial_text = ""
                 try:
-                    async for event in self._llm_service.stream_generate(request):
+                    async for event in self._stream_generate_with_stop(request, turn_id=turn_id):
                         if event.type == "text_delta":
                             emitted_any = True
                             if event.delta:
                                 streamed_initial_text += event.delta
+                                interrupted_response_text = streamed_initial_text
+                                interrupted_stream_fragment_text = streamed_initial_text
                                 yield AgentTextDeltaEvent(
                                     session_id=session.session_id,
                                     delta=event.delta,
@@ -1524,6 +1571,10 @@ class AgentLoop:
                             call_id = event.call_id.strip()
                             if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
                                 noticed_initial_tool_call_ids.add(call_id)
+                                interrupted_unexecuted_tool_names = (
+                                    *interrupted_unexecuted_tool_names,
+                                    tool_name,
+                                )
                                 yield AgentToolCallEvent(
                                     session_id=session.session_id,
                                     tool_names=(tool_name,),
@@ -1567,6 +1618,11 @@ class AgentLoop:
                             "Streaming generation completed without a final done event."
                         )
                     initial_response = streamed_response
+                    interrupted_response_text = initial_response.text
+                    interrupted_unexecuted_tool_names = tuple(
+                        call.name for call in initial_response.tool_calls
+                    )
+                    interrupted_stream_fragment_text = ""
                     break
                 except ProviderBadRequestError as exc:
                     if overflow_retry_attempted or emitted_any or not _is_context_overflow_error(exc):
@@ -1652,6 +1708,10 @@ class AgentLoop:
 
             base_records = self._storage.load_records(session.session_id)
             current_response = initial_response
+            interrupted_response_text = current_response.text
+            interrupted_unexecuted_tool_names = tuple(
+                call.name for call in current_response.tool_calls
+            )
             tool_rounds = 0
             turn_approval_rejected = False
             pending_detached_job_ids = _collect_pending_detached_job_ids(turn_runtime_messages)
@@ -1696,6 +1756,10 @@ class AgentLoop:
                     for recovery_event in recovery_events:
                         yield recovery_event
                     current_response = final_response
+                    interrupted_response_text = current_response.text
+                    interrupted_unexecuted_tool_names = tuple(
+                        call.name for call in current_response.tool_calls
+                    )
                     break
 
                 followup_compaction_attempted = False
@@ -1707,14 +1771,49 @@ class AgentLoop:
                     approval_rejected = False
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
                     current_pending_subagent_ids = set(pending_subagent_ids)
-                    for tool_call in current_response.tool_calls:
+                    tool_calls = tuple(current_response.tool_calls)
+                    for tool_index, tool_call in enumerate(tool_calls):
                         tool_context = replace(
                             self._tool_context,
                             session_id=session.session_id,
                             turn_id=turn_id,
                         )
                         while True:
-                            tool_result = await self._tool_executor(tool_call, tool_context)
+                            try:
+                                tool_result = await self._await_with_stop(
+                                    self._tool_executor(tool_call, tool_context),
+                                    turn_id=turn_id,
+                                    operation=f"tool_{tool_call.name}",
+                                )
+                            except _TurnStopRequested:
+                                pending_records.extend(ephemeral_image_records)
+                                deferred_tool_successes = tuple(staged_image_tool_successes)
+                                if deferred_tool_successes:
+                                    self._commit_deferred_tool_successes(
+                                        session_id=session.session_id,
+                                        pending_records=pending_records,
+                                        deferred_tool_successes=deferred_tool_successes,
+                                    )
+                                interrupted = self._interrupt_turn(
+                                    session_id=session.session_id,
+                                    turn_id=turn_id,
+                                    command=command_override,
+                                    compaction_performed=did_compaction,
+                                    response_text=current_response.text,
+                                    unexecuted_tool_names=tuple(
+                                        call.name for call in tool_calls[tool_index:]
+                                    ),
+                                )
+                                yield AgentTurnDoneEvent(
+                                    session_id=interrupted.session_id,
+                                    response_text=interrupted.response_text,
+                                    turn_id=turn_id,
+                                    command=interrupted.command,
+                                    compaction_performed=interrupted.compaction_performed,
+                                    interrupted=True,
+                                    interruption_reason=interrupted.interruption_reason,
+                                )
+                                return
                             pending_approval = self._build_pending_approval(
                                 tool_result=tool_result,
                                 tool_name=tool_call.name,
@@ -1784,6 +1883,14 @@ class AgentLoop:
                                 approval=pending_approval,
                             )
                             if approved is None:
+                                pending_records.extend(ephemeral_image_records)
+                                deferred_tool_successes = tuple(staged_image_tool_successes)
+                                if deferred_tool_successes:
+                                    self._commit_deferred_tool_successes(
+                                        session_id=session.session_id,
+                                        pending_records=pending_records,
+                                        deferred_tool_successes=deferred_tool_successes,
+                                    )
                                 interrupted = self._interrupt_turn(
                                     session_id=session.session_id,
                                     turn_id=turn_id,
@@ -1876,6 +1983,7 @@ class AgentLoop:
                             interruption_reason=interrupted.interruption_reason,
                         )
                         return
+                    interrupted_unexecuted_tool_names = ()
                     (
                         request,
                         final_estimated_input_tokens,
@@ -1889,6 +1997,25 @@ class AgentLoop:
                         turn_id=turn_id,
                         extra_records=self._deferred_tool_success_records(deferred_tool_successes),
                     )
+                except _TurnStopRequested:
+                    interrupted = self._interrupt_turn(
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                        command=command_override,
+                        compaction_performed=did_compaction,
+                        response_text=current_response.text,
+                        unexecuted_tool_names=tuple(call.name for call in current_response.tool_calls),
+                    )
+                    yield AgentTurnDoneEvent(
+                        session_id=interrupted.session_id,
+                        response_text=interrupted.response_text,
+                        turn_id=turn_id,
+                        command=interrupted.command,
+                        compaction_performed=interrupted.compaction_performed,
+                        interrupted=True,
+                        interruption_reason=interrupted.interruption_reason,
+                    )
+                    return
                 except ContextBudgetError:
                     if deferred_tool_successes:
                         self._commit_deferred_tool_successes(
@@ -1920,7 +2047,7 @@ class AgentLoop:
                     streamed_followup_text = ""
                     deferred_committed = False
                     try:
-                        async for event in self._llm_service.stream_generate(request):
+                        async for event in self._stream_generate_with_stop(request, turn_id=turn_id):
                             if not deferred_committed:
                                 if deferred_tool_successes:
                                     self._commit_deferred_tool_successes(
@@ -1941,6 +2068,8 @@ class AgentLoop:
                                 emitted_any = True
                                 if event.delta:
                                     streamed_followup_text += event.delta
+                                    interrupted_response_text = streamed_followup_text
+                                    interrupted_stream_fragment_text = streamed_followup_text
                                     yield AgentTextDeltaEvent(
                                         session_id=session.session_id,
                                         delta=event.delta,
@@ -1952,6 +2081,10 @@ class AgentLoop:
                                 call_id = event.call_id.strip()
                                 if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
                                     noticed_followup_tool_call_ids.add(call_id)
+                                    interrupted_unexecuted_tool_names = (
+                                        *interrupted_unexecuted_tool_names,
+                                        tool_name,
+                                    )
                                     yield AgentToolCallEvent(
                                         session_id=session.session_id,
                                         tool_names=(tool_name,),
@@ -2005,6 +2138,51 @@ class AgentLoop:
                                 )
                                 staged_followup_records = ()
                         break
+                    except _TurnStopRequested:
+                        if deferred_tool_successes:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
+                            deferred_tool_successes = ()
+                        if staged_followup_records:
+                            self._commit_staged_followup_records(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                records=staged_followup_records,
+                            )
+                            staged_followup_records = ()
+                        if interrupted_stream_fragment_text:
+                            partial_record = self._build_streamed_assistant_text_record(
+                                session_id=session.session_id,
+                                text=interrupted_stream_fragment_text,
+                                turn_id=turn_id,
+                            )
+                            if partial_record is not None:
+                                self._append_turn_record(
+                                    session_id=session.session_id,
+                                    pending_records=pending_records,
+                                    record=partial_record,
+                                )
+                        interrupted = self._interrupt_turn(
+                            session_id=session.session_id,
+                            turn_id=turn_id,
+                            command=command_override,
+                            compaction_performed=did_compaction,
+                            response_text=interrupted_response_text or current_response.text,
+                            unexecuted_tool_names=interrupted_unexecuted_tool_names,
+                        )
+                        yield AgentTurnDoneEvent(
+                            session_id=interrupted.session_id,
+                            response_text=interrupted.response_text,
+                            turn_id=turn_id,
+                            command=interrupted.command,
+                            compaction_performed=interrupted.compaction_performed,
+                            interrupted=True,
+                            interruption_reason=interrupted.interruption_reason,
+                        )
+                        return
                     except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
                         if (
                             not deferred_tool_successes
@@ -2105,6 +2283,11 @@ class AgentLoop:
                     )
 
                 current_response = streamed_response
+                interrupted_response_text = current_response.text
+                interrupted_unexecuted_tool_names = tuple(
+                    call.name for call in current_response.tool_calls
+                )
+                interrupted_stream_fragment_text = ""
                 final_followup_record = self._build_final_stream_assistant_record(
                     session_id=session.session_id,
                     response=current_response,
@@ -2199,6 +2382,36 @@ class AgentLoop:
                 command=command_override,
                 compaction_performed=did_compaction,
                 approval_rejected=turn_approval_rejected,
+            )
+        except _TurnStopRequested:
+            if interrupted_stream_fragment_text:
+                partial_record = self._build_streamed_assistant_text_record(
+                    session_id=session.session_id,
+                    text=interrupted_stream_fragment_text,
+                    turn_id=turn_id,
+                )
+                if partial_record is not None:
+                    self._append_turn_record(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        record=partial_record,
+                    )
+            interrupted = self._interrupt_turn(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                command=command_override,
+                compaction_performed=did_compaction,
+                response_text=interrupted_response_text,
+                unexecuted_tool_names=interrupted_unexecuted_tool_names,
+            )
+            yield AgentTurnDoneEvent(
+                session_id=interrupted.session_id,
+                response_text=interrupted.response_text,
+                turn_id=turn_id,
+                command=interrupted.command,
+                compaction_performed=interrupted.compaction_performed,
+                interrupted=True,
+                interruption_reason=interrupted.interruption_reason,
             )
         except Exception:
             self._fail_turn_after_runtime_error(
@@ -2307,7 +2520,11 @@ class AgentLoop:
         turn_id: str,
     ) -> tuple[SessionMetadata, LLMResponse, bool, int, list[ConversationRecord]]:
         try:
-            response = await self._llm_service.generate(request)
+            response = await self._await_with_stop(
+                self._llm_service.generate(request),
+                turn_id=turn_id,
+                operation="llm_generate",
+            )
             return session, response, False, estimated_input_tokens, pending_records
         except ProviderBadRequestError as exc:
             if not _is_context_overflow_error(exc):
@@ -2325,7 +2542,11 @@ class AgentLoop:
             reason="overflow",
             turn_id=turn_id,
         )
-        response = await self._llm_service.generate(retry_request)
+        response = await self._await_with_stop(
+            self._llm_service.generate(retry_request),
+            turn_id=turn_id,
+            operation="llm_generate",
+        )
         return compacted, response, True, retry_estimate, rebound_pending_records
 
     def _pending_interruption_notice_text(
@@ -2568,21 +2789,33 @@ class AgentLoop:
                 )
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
-                current_response, current_estimated_input_tokens = (
-                    await self._recover_from_tool_round_limit(
-                        session_id=current_session.session_id,
-                        base_records=current_base_records,
-                        pending_records=pending_records,
-                        attempted_round=tool_rounds,
-                        unexecuted_tool_names=tuple(
-                            call.name for call in current_response.tool_calls
-                        ),
-                        turn_id=turn_id,
+                try:
+                    current_response, current_estimated_input_tokens = (
+                        await self._recover_from_tool_round_limit(
+                            session_id=current_session.session_id,
+                            base_records=current_base_records,
+                            pending_records=pending_records,
+                            attempted_round=tool_rounds,
+                            unexecuted_tool_names=tuple(
+                                call.name for call in current_response.tool_calls
+                            ),
+                            turn_id=turn_id,
+                        )
                     )
-                )
+                except _TurnStopRequested:
+                    return (
+                        current_session,
+                        current_response,
+                        current_estimated_input_tokens,
+                        did_compaction,
+                        True,
+                        approval_rejected,
+                        (),
+                    )
                 break
 
             followup_compaction_attempted = False
+            deferred_tool_successes: tuple[_DeferredToolSuccess, ...] = ()
             staged_followup_records: tuple[ConversationRecord, ...] = ()
             try:
                 tool_execution_outcome = await self._execute_tool_calls(
@@ -2610,7 +2843,7 @@ class AgentLoop:
                         did_compaction,
                         True,
                         approval_rejected,
-                        (),
+                        tool_execution_outcome.unexecuted_tool_names,
                     )
                 if tool_execution_outcome.approval_rejected:
                     if deferred_tool_successes:
@@ -2667,6 +2900,16 @@ class AgentLoop:
                     turn_id=turn_id,
                     extra_records=self._deferred_tool_success_records(deferred_tool_successes),
                 )
+            except _TurnStopRequested:
+                return (
+                    current_session,
+                    current_response,
+                    current_estimated_input_tokens,
+                    did_compaction,
+                    True,
+                    approval_rejected,
+                    tuple(call.name for call in current_response.tool_calls),
+                )
             except ContextBudgetError:
                 if deferred_tool_successes:
                     self._commit_deferred_tool_successes(
@@ -2693,7 +2936,11 @@ class AgentLoop:
 
             while True:
                 try:
-                    current_response = await self._llm_service.generate(request)
+                    current_response = await self._await_with_stop(
+                        self._llm_service.generate(request),
+                        turn_id=turn_id,
+                        operation="llm_generate",
+                    )
                     if deferred_tool_successes:
                         self._commit_deferred_tool_successes(
                             session_id=current_session.session_id,
@@ -2709,6 +2956,30 @@ class AgentLoop:
                         )
                         staged_followup_records = ()
                     break
+                except _TurnStopRequested:
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
+                        deferred_tool_successes = ()
+                    if staged_followup_records:
+                        self._commit_staged_followup_records(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            records=staged_followup_records,
+                        )
+                        staged_followup_records = ()
+                    return (
+                        current_session,
+                        current_response,
+                        current_estimated_input_tokens,
+                        did_compaction,
+                        True,
+                        approval_rejected,
+                        (),
+                    )
                 except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
                     if (
                         not deferred_tool_successes
@@ -2851,7 +3122,6 @@ class AgentLoop:
         if compacted is None:
             raise ContextBudgetError(_FOLLOWUP_COMPACTION_FAILED_TEXT)
 
-        stop_requested = self._stop_requested(turn_id)
         self._storage.set_turn_status(
             session.session_id,
             turn_id=turn_id,
@@ -2900,8 +3170,6 @@ class AgentLoop:
                 continue
             self._storage.append_record(compacted.session_id, record)
         self._active_turn_id = turn_id
-        if stop_requested:
-            self._stop_requested_turn_id = turn_id
         return (
             compacted,
             list(base_records),
@@ -3610,6 +3878,7 @@ class AgentLoop:
         )
         self._active_turn_id = turn_id
         self._requested_interruption = None
+        self._turn_stop_event = asyncio.Event()
 
     def _finish_turn(
         self,
@@ -3625,6 +3894,7 @@ class AgentLoop:
         )
         if self._active_turn_id == turn_id:
             self._active_turn_id = None
+            self._turn_stop_event = None
         requested = self._requested_interruption
         if requested is not None and requested.turn_id == turn_id:
             self._requested_interruption = None
@@ -3638,9 +3908,129 @@ class AgentLoop:
             return None
         return requested.reason
 
+    async def _await_with_stop(
+        self,
+        awaitable: Awaitable[T],
+        *,
+        turn_id: str,
+        operation: str,
+    ) -> T:
+        if self._stop_requested(turn_id):
+            _close_unstarted_awaitable(awaitable)
+            raise _TurnStopRequested
+
+        stop_event = self._turn_stop_event
+        if stop_event is None:
+            return await awaitable
+
+        task = asyncio.ensure_future(awaitable)
+        stop_task = asyncio.create_task(
+            stop_event.wait(),
+            name=f"jarvis-turn-stop-wait-{operation}-{turn_id}",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done and self._stop_requested(turn_id):
+                task.cancel()
+                await self._drain_preempted_task(task, operation=operation)
+                raise _TurnStopRequested
+
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+            return task.result()
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+
+    async def _stream_generate_with_stop(
+        self,
+        request: LLMRequest,
+        *,
+        turn_id: str,
+    ) -> AsyncIterator[Any]:
+        if self._stop_requested(turn_id):
+            raise _TurnStopRequested
+
+        stop_event = self._turn_stop_event
+        stream = self._llm_service.stream_generate(request)
+        iterator = stream.__aiter__()
+        if stop_event is None:
+            async for event in iterator:
+                yield event
+            return
+
+        while True:
+            next_task = asyncio.ensure_future(iterator.__anext__())
+            stop_task = asyncio.create_task(
+                stop_event.wait(),
+                name=f"jarvis-turn-stop-wait-llm-stream-{turn_id}",
+            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {next_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done and self._stop_requested(turn_id):
+                    next_task.cancel()
+                    await self._drain_preempted_task(
+                        next_task,
+                        operation="llm_stream",
+                    )
+                    if next_task.done():
+                        await self._close_preempted_stream(iterator)
+                    raise _TurnStopRequested
+
+                stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_task
+                try:
+                    yield next_task.result()
+                except StopAsyncIteration:
+                    return
+            finally:
+                if not stop_task.done():
+                    stop_task.cancel()
+
+    async def _drain_preempted_task(
+        self,
+        task: asyncio.Future[Any],
+        *,
+        operation: str,
+    ) -> None:
+        try:
+            await asyncio.wait_for(task, timeout=_STOP_PREEMPTION_CLEANUP_SECONDS)
+        except asyncio.CancelledError:
+            return
+        except asyncio.TimeoutError:
+            LOGGER.warning(
+                "Timed out waiting for preempted %s task to acknowledge cancellation.",
+                operation,
+            )
+        except Exception:
+            LOGGER.debug(
+                "Preempted %s task ended with an exception during stop cleanup.",
+                operation,
+                exc_info=True,
+            )
+
+    async def _close_preempted_stream(self, iterator: AsyncIterator[Any]) -> None:
+        aclose = getattr(iterator, "aclose", None)
+        if not callable(aclose):
+            return
+        close_awaitable = aclose()
+        if not isinstance(close_awaitable, RuntimeAwaitable):
+            return
+        close_task = asyncio.ensure_future(close_awaitable)
+        await self._drain_preempted_task(close_task, operation="llm_stream_close")
+
     def _clear_turn_control(self, turn_id: str) -> None:
         if self._active_turn_id == turn_id:
             self._active_turn_id = None
+            self._turn_stop_event = None
         requested = self._requested_interruption
         if requested is not None and requested.turn_id == turn_id:
             self._requested_interruption = None
@@ -4519,6 +4909,13 @@ def _copy_record_with_content(
         kind=record.kind,
         metadata=metadata,
     )
+
+
+def _close_unstarted_awaitable(awaitable: Awaitable[Any]) -> None:
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
+
 
 def _completed_after_interrupt_metadata(
     reason: InterruptionReason | None,

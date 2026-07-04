@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import time
@@ -152,6 +153,11 @@ class DirectBashToolExecutor:
                 process.communicate(),
                 timeout=timeout_seconds,
             )
+        except asyncio.CancelledError:
+            _kill_process_group(process.pid)
+            with contextlib.suppress(Exception):
+                await process.communicate()
+            raise
         except asyncio.TimeoutError:
             timed_out = True
             _kill_process_group(process.pid)
@@ -239,6 +245,11 @@ class DirectBashToolExecutor:
 
         try:
             await asyncio.wait_for(process.wait(), timeout=soft_timeout_seconds)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BashJobError):
+                _, record = load_job(context.workspace_dir, job.job_id)
+                cancel_job(job, record)
+            raise
         except asyncio.TimeoutError:
             duration_seconds = perf_counter() - started_at
             _, record = load_job(context.workspace_dir, job.job_id)

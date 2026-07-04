@@ -40,7 +40,7 @@ class RouteRuntimeLike(Protocol):
         """Return active main session id for this route."""
 
     def request_stop(self) -> bool:
-        """Request cooperative stop for the active main turn, if any."""
+        """Request stop for active route work, if any."""
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         """Resolve one pending approval request for the active route."""

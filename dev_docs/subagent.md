@@ -221,7 +221,7 @@ Approval requests include the acting agent name. Rejected subagent approvals pau
 
 ## User Stop And Supersede
 
-`/stop` asks the main loop and active subagents to stop cooperatively. It does not hard-cancel already-running tools.
+`/stop` asks the main loop and active subagents to stop through the same route stop path. Active provider/tool awaits are preempted and foreground bash gets best-effort cancellation; already-detached bash jobs are not cancelled by plain `/stop`.
 
 When a newer user message supersedes active work, active subagents tied to that task are asked to stop with reason `superseded_by_user_message`. Completed child tool results remain in child archives and main-session progress notes can point Jarvis back to child state when useful.
 

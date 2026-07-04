@@ -1510,6 +1510,27 @@ class _BlockingToolExecutor:
         )
 
 
+class _ImmediateToolExecutor:
+    def __init__(
+        self,
+        *,
+        name: str = "slow_tool",
+        content: str = "slow tool finished",
+    ) -> None:
+        self._name = name
+        self._content = content
+
+    async def __call__(self, *, call_id: str, arguments: dict[str, object], context) -> ToolExecutionResult:
+        _ = arguments, context
+        return ToolExecutionResult(
+            call_id=call_id,
+            name=self._name,
+            ok=True,
+            content=self._content,
+            metadata={"source": "test"},
+        )
+
+
 class _FakeStopDuringToolLLMService:
     def __init__(
         self,
@@ -1545,6 +1566,46 @@ class _FakeStopDuringToolLLMService:
                 finish_reason="tool_calls",
             )
         )
+
+
+class _BlockedFollowupAfterToolLLMService:
+    def __init__(self) -> None:
+        self.stream_calls = 0
+        self.followup_started = asyncio.Event()
+        self.followup_closed = asyncio.Event()
+        self.release_followup = asyncio.Event()
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        raise AssertionError("Non-streaming generate is not expected in this test.")
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        if self.stream_calls == 1:
+            names = [tool.name for tool in request.tools]
+            if names != ["slow_tool"]:
+                raise AssertionError(f"Expected only slow_tool to be registered, got {names}.")
+            yield DoneEvent(
+                response=_build_response(
+                    "Using the slow tool.",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="slow_tool_1",
+                            name="slow_tool",
+                            arguments={},
+                            raw_arguments="{}",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        self.followup_started.set()
+        try:
+            await self.release_followup.wait()
+        finally:
+            self.followup_closed.set()
+        yield DoneEvent(response=_build_response("followup should be stopped"))
 
 
 class _LargeOutputToolExecutor:
@@ -1628,7 +1689,7 @@ class _FakeCompactionProviderSplitLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
-class _InterruptedToolProposalContinuationLLMService:
+class _PreemptedBeforeToolProposalContinuationLLMService:
     def __init__(self) -> None:
         self.stream_started = asyncio.Event()
         self.release_stream = asyncio.Event()
@@ -1642,8 +1703,8 @@ class _InterruptedToolProposalContinuationLLMService:
             if message.role == "assistant"
             for part in message.parts
         ):
-            raise AssertionError("Dangling interrupted bash tool calls should be normalized before prompt build.")
-        if not any(
+            raise AssertionError("Preempted streams should not replay undelivered bash tool calls.")
+        if any(
             isinstance(part, TextPart)
             and "bash" in part.text
             and "Treat them as not run." in part.text
@@ -1651,7 +1712,7 @@ class _InterruptedToolProposalContinuationLLMService:
             if message.role == "system"
             for part in message.parts
         ):
-            raise AssertionError("Expected a normalization note for the unexecuted interrupted tool call.")
+            raise AssertionError("No unexecuted-tool notice should be invented before a tool call is observed.")
         return _build_response("continued")
 
     async def stream_generate(self, request: LLMRequest):
@@ -1676,28 +1737,37 @@ class _InterruptedToolProposalContinuationLLMService:
         )
 
 
-class _InterruptedCompletedToolContinuationLLMService:
+class _InterruptedPreemptedToolContinuationLLMService:
     def __init__(self) -> None:
         self.stream_calls = 0
         self.generate_requests: list[LLMRequest] = []
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_requests.append(request)
-        if not any(
+        if any(
             isinstance(part, ToolCall) and part.name == "slow_tool"
             for message in request.messages
             if message.role == "assistant"
             for part in message.parts
         ):
-            raise AssertionError("Expected the interrupted turn's completed slow_tool call to remain in context.")
-        if not any(
+            raise AssertionError("Preempted tool calls should be stripped from replayed assistant context.")
+        if any(
             isinstance(part, ToolResultPart) and part.content == "slow tool finished"
             for message in request.messages
             if message.role == "tool"
             for part in message.parts
         ):
-            raise AssertionError("Expected the interrupted turn's completed tool result to remain in context.")
-        return _build_response("continued after tool")
+            raise AssertionError("A tool result released after stop should not be recorded as completed.")
+        if not any(
+            isinstance(part, TextPart)
+            and "slow_tool" in part.text
+            and "Treat them as not run." in part.text
+            for message in request.messages
+            if message.role == "system"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected a normalization note for the preempted slow_tool call.")
+        return _build_response("continued after preempted tool")
 
     async def stream_generate(self, request: LLMRequest):
         self.stream_calls += 1
@@ -1789,9 +1859,27 @@ class _StopMidToolCallStreamingLLMService:
         self.tool_call_started = asyncio.Event()
         self.release_stream = asyncio.Event()
         self.stream_closed = asyncio.Event()
+        self.generate_requests: list[LLMRequest] = []
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
-        raise AssertionError("Non-streaming generate is not expected in this test.")
+        self.generate_requests.append(request)
+        if any(
+            isinstance(part, ToolCall) and part.name == "bash"
+            for message in request.messages
+            if message.role == "assistant"
+            for part in message.parts
+        ):
+            raise AssertionError("Dangling interrupted bash tool calls should be normalized before prompt build.")
+        if not any(
+            isinstance(part, TextPart)
+            and "bash" in part.text
+            and "Treat them as not run." in part.text
+            for message in request.messages
+            if message.role == "system"
+            for part in message.parts
+        ):
+            raise AssertionError("Expected a normalization note for the unexecuted interrupted tool call.")
+        return _build_response("continued")
 
     async def stream_generate(self, request: LLMRequest):
         try:
@@ -2360,7 +2448,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected the mixed response text to still be finalized.")
             self.assertEqual(first_message.text, "Working on it.")
 
-    async def test_stream_user_input_interrupts_after_current_tool_batch_finishes(self) -> None:
+    async def test_stream_user_input_preempts_current_tool_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -2408,13 +2496,67 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             all_records = storage.load_records(done.session_id, include_all_turns=True)
             message_records = [record for record in all_records if record.kind == "message"]
-            self.assertEqual(message_records[-4].role, "user")
-            self.assertEqual(message_records[-3].role, "assistant")
-            self.assertEqual(message_records[-2].role, "tool")
-            self.assertEqual(message_records[-1].role, "system")
-            self.assertEqual(message_records[-2].content, "slow tool finished")
-            self.assertTrue(
-                message_records[-2].metadata.get("completed_after_interrupt_request")
+            self.assertEqual(
+                [record.role for record in message_records[-4:]],
+                ["user", "assistant", "system", "system"],
+            )
+            self.assertTrue(message_records[-2].metadata.get("unexecuted_tool_call_notice"))
+            self.assertIn("slow_tool", message_records[-2].content)
+            self.assertIn("Treat them as not run.", message_records[-2].content)
+            self.assertFalse(any(record.role == "tool" for record in message_records))
+
+    async def test_stream_user_input_stop_during_followup_keeps_completed_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="slow_tool",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="slow_tool",
+                            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                            description="Slow test tool.",
+                        ),
+                        executor=_ImmediateToolExecutor(),
+                    )
+                ]
+            )
+            llm_service = _BlockedFollowupAfterToolLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("Use the slow tool.")]
+
+            task = asyncio.create_task(_collect_events())
+            await asyncio.wait_for(llm_service.followup_started.wait(), timeout=1.0)
+
+            self.assertTrue(loop.request_stop())
+            events = await asyncio.wait_for(task, timeout=1.0)
+            await asyncio.wait_for(llm_service.followup_closed.wait(), timeout=1.0)
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+            self.assertEqual(done.response_text, "Using the slow tool.")
+
+            all_records = storage.load_records(done.session_id, include_all_turns=True)
+            tool_records = [record for record in all_records if record.role == "tool"]
+            self.assertEqual(len(tool_records), 1)
+            self.assertEqual(tool_records[0].content, "slow tool finished")
+            self.assertFalse(
+                any(record.metadata.get("unexecuted_tool_call_notice") for record in all_records)
             )
 
     async def test_stream_user_input_persists_text_when_stop_interrupts_mid_tool_call_stream(self) -> None:
@@ -2466,11 +2608,15 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Treat them as not run.", message_records[-2].content)
             self.assertFalse(any(record.role == "tool" for record in message_records))
 
-    async def test_next_turn_normalizes_unexecuted_interrupted_tool_calls(self) -> None:
+            result = await loop.handle_user_input("continue")
+            self.assertEqual(result.response_text, "continued")
+            self.assertEqual(len(llm_service.generate_requests), 1)
+
+    async def test_next_turn_after_preempted_stream_before_tool_done_has_no_unexecuted_notice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
-            llm_service = _InterruptedToolProposalContinuationLLMService()
+            llm_service = _PreemptedBeforeToolProposalContinuationLLMService()
             loop = AgentLoop(
                 llm_service=llm_service,
                 settings=settings,
@@ -2496,7 +2642,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.response_text, "continued")
             self.assertEqual(len(llm_service.generate_requests), 1)
 
-    async def test_next_turn_keeps_completed_tool_results_from_interrupted_turns(self) -> None:
+    async def test_next_turn_marks_preempted_tool_results_unexecuted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -2515,7 +2661,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     )
                 ]
             )
-            llm_service = _InterruptedCompletedToolContinuationLLMService()
+            llm_service = _InterruptedPreemptedToolContinuationLLMService()
             loop = AgentLoop(
                 llm_service=llm_service,
                 settings=settings,
@@ -2542,8 +2688,17 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
             self.assertTrue(done.interrupted)
 
+            all_records = storage.load_records(done.session_id, include_all_turns=True)
+            tool_records = [record for record in all_records if record.role == "tool"]
+            self.assertEqual(tool_records, [])
+            unexecuted_notices = [
+                record for record in all_records if record.metadata.get("unexecuted_tool_call_notice")
+            ]
+            self.assertEqual(len(unexecuted_notices), 1)
+            self.assertIn("slow_tool", unexecuted_notices[0].content)
+
             result = await loop.handle_user_input("continue")
-            self.assertEqual(result.response_text, "continued after tool")
+            self.assertEqual(result.response_text, "continued after preempted tool")
             self.assertEqual(len(llm_service.generate_requests), 1)
 
     async def test_handle_user_input_recovers_orphaned_in_progress_turns(self) -> None:
@@ -2737,7 +2892,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 failed_turn_records[-1].metadata.get("orphaned_turn_recovery")
             )
 
-    async def test_stream_user_input_stops_after_large_tool_batch_without_compacting(self) -> None:
+    async def test_stream_user_input_preempts_large_tool_batch_without_compacting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -2806,8 +2961,13 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             all_records = storage.load_records(done.session_id, include_all_turns=True)
             tool_records = [record for record in all_records if record.role == "tool"]
-            self.assertEqual(len(tool_records), 1)
-            self.assertEqual(tool_records[0].content, large_output)
+            self.assertEqual(tool_records, [])
+            unexecuted_notices = [
+                record for record in all_records if record.metadata.get("unexecuted_tool_call_notice")
+            ]
+            self.assertEqual(len(unexecuted_notices), 1)
+            self.assertIn("large_tool", unexecuted_notices[0].content)
+            self.assertIn("Treat them as not run.", unexecuted_notices[0].content)
 
     async def test_handle_user_input_auto_compacts_when_followup_provider_overflows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -179,5 +179,6 @@
 - Grok encrypted-reasoning replay was a workaround for the previous stateless Grok strategy; native Grok now relies on provider-managed Responses continuation, so Jarvis no longer needs to own/replay reasoning items to preserve cache locality.
 - OpenRouter Anthropic/Claude requests send top-level `cache_control: {"type":"ephemeral"}` plus `session_id`; ephemeral is OpenRouter/Anthropic's 5-minute prompt-cache mode and keeps same-session prompt-cache locality.
 - OpenRouter structured stream failures retain endpoint/error metadata for logs but fail immediately as provider-response errors; explicit user retry is preferred over automatic streamed-failure recovery.
+- `/stop`, superseding user messages, and `/new` now share the route stop path and preempt active provider/tool awaits through an AgentLoop turn stop signal; completed results and interrupted stream fragments are persisted, but in-flight tool results are not fabricated and detached bash jobs keep their explicit background semantics.
 - LLM provider and normalized stream-event timeout use the single `JARVIS_LLM_TIMEOUT_SECONDS` setting, now defaulting to 300 seconds.
 - Basedpyright runs in standard mode against `src/jarvis`; existing typing debt is committed in `.basedpyright/baseline.json`, while new diagnostics must be fixed rather than added to the baseline without explicit approval.

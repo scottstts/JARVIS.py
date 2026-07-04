@@ -107,6 +107,24 @@ class _InterruptibleStreamingLLMService:
         yield DoneEvent(response=_build_response("stream-reply"))
 
 
+class _BlockedFirstTokenStreamingLLMService:
+    def __init__(self) -> None:
+        self.stream_started = asyncio.Event()
+        self.stream_closed = asyncio.Event()
+        self.release_stream = asyncio.Event()
+
+    async def generate(self, _request):
+        return _build_response("unexpected")
+
+    async def stream_generate(self, _request):
+        self.stream_started.set()
+        try:
+            await self.release_stream.wait()
+        finally:
+            self.stream_closed.set()
+        yield DoneEvent(response=_build_response("late-reply"))
+
+
 class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_user_input_emits_delta_and_done_and_persists_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,14 +288,14 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
             self.assertTrue(done.interrupted)
-            self.assertEqual(done.response_text, "stream-reply")
+            self.assertEqual(done.response_text, "stream-")
 
             visible_records = storage.load_records(done.session_id)
             visible_message_records = [record for record in visible_records if record.kind == "message"]
             self.assertEqual(visible_message_records[-3].role, "user")
             self.assertEqual(visible_message_records[-3].content, "hello")
             self.assertEqual(visible_message_records[-2].role, "assistant")
-            self.assertEqual(visible_message_records[-2].content, "stream-reply")
+            self.assertEqual(visible_message_records[-2].content, "stream-")
             self.assertEqual(visible_message_records[-1].role, "system")
 
             all_records = storage.load_records(done.session_id, include_all_turns=True)
@@ -293,6 +311,42 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             session = storage.get_session(done.session_id)
             self.assertIsNotNone(session)
             self.assertTrue(session.pending_interruption_notice)  # type: ignore[union-attr]
+
+    async def test_stream_user_input_stop_preempts_stream_before_first_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _BlockedFirstTokenStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            async def _collect_events():
+                return [event async for event in loop.stream_user_input("hello")]
+
+            task = asyncio.create_task(_collect_events())
+            await asyncio.wait_for(llm_service.stream_started.wait(), timeout=1.0)
+
+            self.assertTrue(loop.request_stop())
+            events = await asyncio.wait_for(task, timeout=1.0)
+            await asyncio.wait_for(llm_service.stream_closed.wait(), timeout=1.0)
+
+            done = events[-1]
+            if not isinstance(done, AgentTurnDoneEvent):
+                self.fail("Expected final stream event to be AgentTurnDoneEvent.")
+            self.assertTrue(done.interrupted)
+            self.assertEqual(done.response_text, "")
+
+            all_records = storage.load_records(done.session_id, include_all_turns=True)
+            self.assertTrue(
+                any(
+                    record.role == "system"
+                    and record.content == "The user interrupted this turn before it completed."
+                    for record in all_records
+                )
+            )
 
     async def test_next_turn_includes_previous_task_interruption_notice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,7 +383,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any(
                     message.role == "assistant"
-                    and any(isinstance(part, TextPart) and part.text == "stream-reply" for part in message.parts)
+                    and any(isinstance(part, TextPart) and part.text == "stream-" for part in message.parts)
                     for message in request.messages
                 )
             )

@@ -83,7 +83,7 @@ Prompt-visible records persisted during follow-up rounds include:
 - orchestrator waiting notices
 - explicit unexecuted-tool-call normalization notices
 
-Streaming completions persist one canonical assistant record. Stream checkpoints are not canonical history.
+Completed streaming turns persist one canonical assistant record. Interrupted streams can persist a partial assistant-text checkpoint with interruption metadata so later replay reflects text that was already shown before the stop.
 
 ## Tool-Call Normalization
 
@@ -113,25 +113,27 @@ Same-process runtime failures use the same normalization immediately for the act
 
 ## User Message Interruption
 
-Route-level user message interruption is cooperative.
+Route-level user message interruption is preemptive at active await boundaries.
 
 When a new user message arrives while a main turn is active:
 
 1. the new user message is accepted immediately as a normal queued user turn
-2. `RouteRuntime` requests cooperative interruption of the active work with reason `superseded_by_user_message`
+2. `RouteRuntime` requests interruption of the active work with reason `superseded_by_user_message`
 3. active subagents tied to the superseded task are also asked to stop
-4. the active turn runs until its next interruption checkpoint
-5. completed tool results remain persisted and replayable
+4. active provider streams, provider requests, and tool awaits race against the turn stop signal
+5. completed tool results remain persisted and replayable; in-flight tool results are not fabricated
 6. the interrupted turn emits `turn_done(interrupted=true, interruption_reason="superseded_by_user_message")`
 7. the queued user turn begins automatically
 
 Multiple mid-turn user messages remain distinct turns and run FIFO.
 
-Explicit `/stop` is separate. `/stop` means stop and pause until the next user action. A newer user message means supersede the active task and continue automatically into the newer request.
+Explicit `/stop` is separate. `/stop` means stop and pause until the next user action. A newer user message means supersede the active task and continue automatically into the newer request. `/new` uses the same route stop request path as `/stop`, then resets subagents and starts the fresh session request.
 
 Queued user turns outrank internal runtime follow-ups. Runtime follow-ups from superseded work are discarded or delayed so they cannot consume the next main-model turn ahead of user input.
 
 Chronology stays truthful. Tool results completed by the superseded turn remain in the older turn. Priority is expressed through persisted interruption and priority notes, not by rewriting history.
+
+Detached bash jobs are intentionally distinct from in-turn awaits. `/stop` suppresses their automatic follow-ups but does not cancel already-detached jobs; foreground bash execution is best-effort cancelled when the active tool await is preempted.
 
 ## Turn Identity And Gateway Events
 
