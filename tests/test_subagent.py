@@ -65,6 +65,8 @@ class _FakeSubagentLoop:
         self.closed = False
         self.stop_requests = 0
         self.stop_reasons: list[str] = []
+        self.hard_stop_requests = 0
+        self.hard_stop_reasons: list[str] = []
         self.system_notes: list[tuple[str, str | None, dict[str, object] | None]] = []
 
     async def prepare_session(self, *, start_reason: str) -> str:
@@ -97,6 +99,11 @@ class _FakeSubagentLoop:
     def request_stop(self, *, reason: str = "user_stop") -> bool:
         self.stop_requests += 1
         self.stop_reasons.append(reason)
+        return True
+
+    def request_hard_stop(self, *, reason: str = "new_session") -> bool:
+        self.hard_stop_requests += 1
+        self.hard_stop_reasons.append(reason)
         return True
 
     async def aclose(self) -> None:
@@ -728,8 +735,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result["disposed_count"], 3)
             self.assertEqual(result["cancelled_job_ids"], [])
-            self.assertEqual(running_loop.stop_reasons, ["user_stop"])
+            self.assertEqual(running_loop.stop_reasons, [])
+            self.assertEqual(running_loop.hard_stop_reasons, ["new_session"])
             self.assertEqual(completed_loop.stop_requests, 0)
+            self.assertEqual(completed_loop.hard_stop_requests, 0)
             self.assertEqual(manager._subagents["sub_running"].status, "disposed")
             self.assertEqual(manager._subagents["sub_completed"].status, "disposed")
 

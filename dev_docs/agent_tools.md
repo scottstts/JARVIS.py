@@ -194,6 +194,8 @@ Progress pacing combines immediate signal-driven updates with fallback heartbeat
 
 Route-level `/stop` preempts foreground tool awaits. Foreground bash gets best-effort process-group/job cancellation when its active await is cancelled. Already-detached bash jobs are different: `/stop` suppresses their auto-followups until the next user message, but it does not cancel those jobs.
 
+`/new` is destructive: it closes the route follow-up gate immediately, cancels every detached job still owned by the route through the configured bash runtime, marks terminal notice state as finalized, clears retained notices, and only then creates the fresh main session. Old job metadata and logs remain as archive artifacts, but the supervisor cannot recover them into a later turn.
+
 ## Implemented Basic Tools
 
 ### `bash`

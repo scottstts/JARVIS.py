@@ -55,7 +55,7 @@ from jarvis.tools.basic.bash.jobs import (
     mark_job_terminal_notice_dispatched,
 )
 
-from .bash_job_supervisor import BashJobNotice, BashJobSupervisor
+from .bash_job_supervisor import BashJobNotice, BashJobResetResult, BashJobSupervisor
 from .route_events import (
     RouteApprovalRequestEvent,
     RouteAssistantDeltaEvent,
@@ -185,6 +185,7 @@ class RouteRuntime:
         self._message_worker: asyncio.Task[None] | None = None
         self._active_turn_request: _RouteTurnRequest | None = None
         self._main_resume_requires_user_message = False
+        self._new_session_boundary_pending = False
         self._internal_followup_generation = 0
         self._pending_main_bash_notices: dict[str, BashJobNotice] = {}
         self._main_bash_runtime_turn_queued = False
@@ -359,11 +360,11 @@ class RouteRuntime:
             subagent_stop_reason="superseded_by_user_message",
         )
 
-    def _request_new_session_supersede(self) -> None:
-        self._request_route_stop(
-            main_reason="superseded_by_user_message",
-            subagent_stop_reason="user_stop",
-        )
+    def _request_new_session_hard_reset(self) -> None:
+        self._new_session_boundary_pending = True
+        self._main_loop.request_hard_stop(reason="new_session")
+        self._subagent_manager.request_hard_stop_all_for_new_session()
+        self._invalidate_stale_internal_followups()
 
     def _request_route_stop(
         self,
@@ -404,6 +405,8 @@ class RouteRuntime:
     ) -> None:
         self._bash_job_supervisor.ensure_running()
         command = parse_user_command(user_text)
+        if command.kind == "new":
+            self._request_new_session_hard_reset()
         await self._user_message_queue.put(
             _RouteTurnRequest(
                 user_text=user_text,
@@ -414,9 +417,7 @@ class RouteRuntime:
         )
         self._queue_wakeup.set()
         await self._publish_task_status_if_changed(reason="user_message_queued")
-        if command.kind == "new":
-            self._request_new_session_supersede()
-        else:
+        if command.kind != "new":
             self._request_user_message_supersede()
         self._ensure_message_worker()
 
@@ -577,6 +578,8 @@ class RouteRuntime:
     async def _maybe_schedule_deferred_internal_followups(self) -> None:
         if self._subagent_reset_in_progress:
             return
+        if self._new_session_boundary_pending:
+            return
         if self._main_resume_requires_user_message:
             return
         if not self._user_message_queue.empty():
@@ -623,14 +626,18 @@ class RouteRuntime:
                 else None
             )
             emitted_main_turn_event = False
+            is_new_command = parsed_command is not None and parsed_command.kind == "new"
             try:
                 if request.user_initiated:
-                    if self._main_resume_requires_user_message:
+                    if is_new_command:
+                        self._main_resume_requires_user_message = True
+                    elif (
+                        parsed_command is None
+                        or parsed_command.kind == "message"
+                    ) and self._main_resume_requires_user_message:
                         self._main_resume_requires_user_message = False
                 else:
-                    if self._main_resume_requires_user_message:
-                        continue
-                    if request.internal_generation != self._internal_followup_generation:
+                    if self._internal_request_is_blocked(request):
                         continue
                 if request.runtime_turn_kind == _MAIN_BASH_PROGRESS_RUNTIME_KIND:
                     self._main_bash_runtime_turn_queued = False
@@ -640,12 +647,16 @@ class RouteRuntime:
                     if runtime_message is None:
                         continue
                     force_session_id, system_message, notices = runtime_message
+                    if self._internal_request_is_blocked(request):
+                        continue
                     published = await self._publish_main_system_message(
                         session_id=force_session_id,
                         message=system_message,
                         notices=notices,
                     )
                     if not published:
+                        continue
+                    if self._internal_request_is_blocked(request):
                         continue
                     event_stream = self._main_loop.stream_runtime_turn(
                         force_session_id=force_session_id,
@@ -659,12 +670,16 @@ class RouteRuntime:
                     if runtime_message is None:
                         continue
                     force_session_id, system_message, notices = runtime_message
+                    if self._internal_request_is_blocked(request):
+                        continue
                     published = await self._publish_main_subagent_system_message(
                         session_id=force_session_id,
                         message=system_message,
                         notices=notices,
                     )
                     if not published:
+                        continue
+                    if self._internal_request_is_blocked(request):
                         continue
                     event_stream = self._main_loop.stream_runtime_turn(
                         force_session_id=force_session_id,
@@ -673,8 +688,9 @@ class RouteRuntime:
                 elif request.parse_commands:
                     if request.user_text is None:
                         continue
-                    if parsed_command is not None and parsed_command.kind == "new":
+                    if is_new_command:
                         await self._prepare_new_session_request()
+                        self._new_session_boundary_pending = False
                     event_stream = self._main_loop.stream_user_input(request.user_text)
                 elif request.user_text is None:
                     event_stream = self._main_loop.stream_runtime_turn(
@@ -787,6 +803,9 @@ class RouteRuntime:
                     )
                 )
             finally:
+                if is_new_command and self._new_session_boundary_pending:
+                    self._new_session_boundary_pending = False
+                    self._main_resume_requires_user_message = True
                 self._active_turn_request = None
                 source_queue.task_done()
                 await self._maybe_schedule_deferred_internal_followups()
@@ -801,7 +820,7 @@ class RouteRuntime:
             return
         if event.notice_kind not in _SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS:
             return
-        if self._main_resume_requires_user_message:
+        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return
         await self._enqueue_main_subagent_followup(event)
 
@@ -1093,7 +1112,19 @@ class RouteRuntime:
         )
 
     def _internal_followups_allowed(self) -> bool:
-        return not self._main_resume_requires_user_message
+        return not (
+            self._main_resume_requires_user_message
+            or self._new_session_boundary_pending
+            or self._subagent_reset_in_progress
+        )
+
+    def _internal_request_is_blocked(self, request: _RouteTurnRequest) -> bool:
+        return (
+            request.user_initiated
+            or self._main_resume_requires_user_message
+            or self._new_session_boundary_pending
+            or request.internal_generation != self._internal_followup_generation
+        )
 
     def _main_loop_has_active_turn(self) -> bool:
         return self._main_loop.has_active_turn()
@@ -1107,7 +1138,7 @@ class RouteRuntime:
     ) -> None:
         if not notices:
             return
-        if self._main_resume_requires_user_message:
+        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return
         self._merge_main_bash_notices(notices)
         if self._main_bash_runtime_turn_queued:
@@ -1132,7 +1163,7 @@ class RouteRuntime:
     ) -> None:
         if self._subagent_reset_in_progress:
             return
-        if self._main_resume_requires_user_message:
+        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return
         await self._subagent_manager.enqueue_bash_job_followup(notices)
 
@@ -1142,7 +1173,7 @@ class RouteRuntime:
     ) -> None:
         if self._subagent_reset_in_progress:
             return
-        if self._main_resume_requires_user_message:
+        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return
         self._merge_main_subagent_notice(notice)
         if self._main_subagent_runtime_turn_queued:
@@ -1167,14 +1198,72 @@ class RouteRuntime:
             self._pending_main_bash_notices[notice.job_id] = notice
 
     async def _prepare_new_session_request(self) -> None:
+        previous_session_id = self._main_loop.active_session_id()
         self._subagent_reset_in_progress = True
         self._invalidate_stale_internal_followups()
+        self._clear_pending_main_bash_notices()
         self._clear_pending_main_subagent_notices()
+        bash_reset = BashJobResetResult()
+        subagent_reset: dict[str, Any] = {}
         try:
-            await self._subagent_manager.reset_for_new_session()
+            subagent_reset = await self._subagent_manager.reset_for_new_session(
+                cancel_owned_bash_jobs=False,
+            )
+            bash_reset = await self._bash_job_supervisor.terminate_route_jobs_for_new_session()
+            self._append_new_session_reset_note(
+                previous_session_id=previous_session_id,
+                bash_reset=bash_reset,
+                subagent_reset=subagent_reset,
+            )
         finally:
             self._subagent_reset_in_progress = False
-        self._clear_pending_main_subagent_notices()
+            self._clear_pending_main_bash_notices()
+            self._clear_pending_main_subagent_notices()
+
+    def _append_new_session_reset_note(
+        self,
+        *,
+        previous_session_id: str | None,
+        bash_reset: BashJobResetResult,
+        subagent_reset: Mapping[str, Any],
+    ) -> None:
+        if previous_session_id is None:
+            return
+        disposed_subagent_ids = tuple(
+            str(value)
+            for value in subagent_reset.get("disposed_subagent_ids", ())
+            if str(value).strip()
+        )
+        finalized_job_ids = bash_reset.finalized_job_ids
+        cancellation_requested_job_ids = bash_reset.cancellation_requested_job_ids
+        lines = [
+            "The user issued /new. Jarvis hard-stopped work owned by this route before creating "
+            "the replacement session.",
+            "No queued or automatic follow-up from this session may resume in the replacement "
+            "session.",
+            f"Disposed subagents: {', '.join(disposed_subagent_ids) or 'none'}.",
+            f"Finalized detached bash jobs: {', '.join(finalized_job_ids) or 'none'}.",
+            (
+                "Cancellation requested for detached bash jobs: "
+                f"{', '.join(cancellation_requested_job_ids) or 'none'}."
+            ),
+        ]
+        appended = self._main_loop.append_system_note(
+            "\n".join(lines),
+            session_id=previous_session_id,
+            metadata={
+                "new_session_hard_reset": True,
+                "disposed_subagent_ids": list(disposed_subagent_ids),
+                "finalized_bash_job_ids": list(finalized_job_ids),
+                "cancellation_requested_bash_job_ids": list(
+                    cancellation_requested_job_ids
+                ),
+            },
+        )
+        if not appended:
+            raise RuntimeError(
+                "Could not persist the /new hard-reset trace to the previous session."
+            )
 
     def _clear_pending_main_bash_notices(self) -> None:
         self._pending_main_bash_notices.clear()

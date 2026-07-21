@@ -156,7 +156,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-1].role, "assistant")
             self.assertEqual(message_records[-1].content, "stream-reply")
 
-    async def test_stream_new_with_body_marks_command(self) -> None:
+    async def test_stream_new_archives_previous_session_without_running_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -166,13 +166,18 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
                 storage=storage,
             )
 
-            events = [event async for event in loop.stream_user_input("/new continue")]
-            self.assertEqual(events[-2].type, "assistant_message")
+            old_session_id = await loop.prepare_session()
+            events = [event async for event in loop.stream_user_input("/new")]
+            self.assertEqual([event.type for event in events], ["assistant_message", "done"])
             self.assertIsInstance(events[-1], AgentTurnDoneEvent)
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
             self.assertEqual(done.command, "/new")
+            self.assertNotEqual(done.session_id, old_session_id)
+            old_session = storage.get_session(old_session_id)
+            self.assertIsNotNone(old_session)
+            self.assertEqual(old_session.status, "archived")  # type: ignore[union-attr]
 
     async def test_handle_user_input_persists_turn_datetime_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

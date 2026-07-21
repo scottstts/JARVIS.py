@@ -13,10 +13,10 @@ class ParseUserCommandTests(unittest.TestCase):
         self.assertEqual(parsed.kind, "message")
         self.assertEqual(parsed.body, "hello there")
 
-    def test_new_command_parses_optional_body(self) -> None:
+    def test_new_command_is_control_only_and_discards_trailing_text(self) -> None:
         parsed = parse_user_command("/new continue this task")
         self.assertEqual(parsed.kind, "new")
-        self.assertEqual(parsed.body, "continue this task")
+        self.assertEqual(parsed.body, "")
 
     def test_compact_command_parses_empty_and_non_empty_body(self) -> None:
         empty = parse_user_command("/compact")

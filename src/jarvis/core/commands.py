@@ -24,7 +24,7 @@ def parse_user_command(raw_text: str) -> ParsedCommand:
     argument = parts[1].strip() if len(parts) > 1 else ""
 
     if keyword == "/new":
-        return ParsedCommand(kind="new", body=argument)
+        return ParsedCommand(kind="new", body="")
     if keyword == "/compact":
         return ParsedCommand(kind="compact", body=argument)
     return ParsedCommand(kind="message", body=raw_text)

@@ -267,6 +267,13 @@ class SubagentManager:
                 affected.append(runtime.snapshot())
         return tuple(affected)
 
+    def request_hard_stop_all_for_new_session(self) -> tuple[SubagentSnapshot, ...]:
+        affected: list[SubagentSnapshot] = []
+        for runtime in self._non_disposed_runtimes():
+            if self._request_runtime_stop(runtime, pause_reason="new_session"):
+                affected.append(runtime.snapshot())
+        return tuple(affected)
+
     async def stop(self, *, agent: str, reason: str | None = None) -> dict[str, Any]:
         runtime = self._require_runtime(agent)
         if not self._request_runtime_stop(runtime, pause_reason="main_stop"):
@@ -328,8 +335,12 @@ class SubagentManager:
             raise ValueError("Cannot dispose a running subagent. Stop it first.")
         return await self._dispose_runtime(runtime, public_notice=True)
 
-    async def reset_for_new_session(self) -> dict[str, Any]:
-        self.request_stop_all_for_user_stop()
+    async def reset_for_new_session(
+        self,
+        *,
+        cancel_owned_bash_jobs: bool = True,
+    ) -> dict[str, Any]:
+        self.request_hard_stop_all_for_new_session()
         for runtime in tuple(self._non_disposed_runtimes()):
             await self._wait_for_turn_settle(runtime)
 
@@ -340,7 +351,8 @@ class SubagentManager:
         for runtime in tuple(self._subagents.values()):
             if runtime.status == "disposed":
                 continue
-            cancelled_job_ids.extend(self._cancel_owned_bash_jobs(runtime.subagent_id))
+            if cancel_owned_bash_jobs:
+                cancelled_job_ids.extend(self._cancel_owned_bash_jobs(runtime.subagent_id))
             runtime.pending_background_job_ids.clear()
             self._pending_bash_job_notices.pop(runtime.subagent_id, None)
             payload = await self._dispose_runtime(runtime, public_notice=False)
@@ -350,7 +362,8 @@ class SubagentManager:
         for entry in self._catalog.list_entries():
             if entry.status == "disposed" or entry.subagent_id in live_subagent_ids:
                 continue
-            cancelled_job_ids.extend(self._cancel_owned_bash_jobs(entry.subagent_id))
+            if cancel_owned_bash_jobs:
+                cancelled_job_ids.extend(self._cancel_owned_bash_jobs(entry.subagent_id))
             self._pending_bash_job_notices.pop(entry.subagent_id, None)
             disposed_at = _utc_now_iso()
             self._catalog.update_entry(
@@ -1320,6 +1333,8 @@ class SubagentManager:
                 continue
             if record.owner_subagent_id != subagent_id:
                 continue
+            if record.terminal_notice_dispatched_at is not None:
+                continue
             try:
                 status = job_status(paths, record)
                 if str(status["status"]) == "running":
@@ -1436,12 +1451,20 @@ class SubagentManager:
     ) -> bool:
         if runtime.status in {"paused", "completed", "waiting_background", "failed", "disposed"}:
             return False
+        if runtime.pending_pause_reason == pause_reason:
+            return False
         interruption_reason: str
         if pause_reason == "superseded_by_user_message":
             interruption_reason = "superseded_by_user_message"
+        elif pause_reason == "new_session":
+            interruption_reason = "new_session"
         else:
             interruption_reason = "user_stop"
-        if not runtime.loop.request_stop(reason=interruption_reason):
+        if pause_reason == "new_session":
+            stop_requested = runtime.loop.request_hard_stop(reason=interruption_reason)
+        else:
+            stop_requested = runtime.loop.request_stop(reason=interruption_reason)
+        if not stop_requested:
             return False
         runtime.pending_pause_reason = pause_reason
         return True

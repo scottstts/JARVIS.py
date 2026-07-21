@@ -170,6 +170,7 @@ Key responsibilities:
 - session routing
 - route event publication
 - detached bash-job observation
+- separate cooperative `/stop` and destructive `/new` lifecycle paths; `/new` hard-resets route work, archives the old session trace, and leaves the replacement session idle
 - route-scoped runtime error capture, with full tracebacks persisted as JSONL entries under `/workspace/archive/error_logs/<session_id>.jsonl` and only a short Rich terminal reminder emitted inline
 
 ### `src/jarvis/identities/`

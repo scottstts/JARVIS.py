@@ -354,6 +354,27 @@ class CodexActorRuntime:
             )
         return True
 
+    def request_hard_stop(
+        self,
+        *,
+        reason: InterruptionReason = "new_session",
+    ) -> bool:
+        active_turn_id = self._active_turn_id
+        turn = self._current_turn
+        if active_turn_id is None or turn is None:
+            return False
+        self._requested_interruption = reason
+        pending_approval = self._pending_approval_future
+        if pending_approval is not None and not pending_approval.done():
+            pending_approval.cancel()
+        provider_turn_id = turn.provider_turn_id
+        if provider_turn_id is not None:
+            turn.provider_interrupt_task = self._request_provider_turn_interrupt(
+                provider_turn_id=provider_turn_id,
+                reason=reason,
+            )
+        return True
+
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         normalized = approval_id.strip()
         pending_future = self._pending_approval_future
@@ -559,15 +580,8 @@ class CodexActorRuntime:
         self,
         command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
+        _ = command
         session = await self._start_fresh_session(start_reason="user_new")
-        if command.body:
-            async for event in self._stream_message_turn(
-                user_text=command.body,
-                force_session_id=session.session_id,
-                command_override="/new",
-            ):
-                yield event
-            return
         yield AgentAssistantMessageEvent(
             session_id=session.session_id,
             text="Started a new session.",

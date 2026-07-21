@@ -130,8 +130,15 @@ _PREVIOUS_TASK_SUPERSEDED_TEXT = (
     "A newer user message superseded the previous task. Handle the current user message "
     "first. Use completed results from the older task only if they are directly relevant."
 )
+_PREVIOUS_SESSION_RESET_TEXT = (
+    "The user started a new session and terminated the previous task. Treat all partial output "
+    "from the previous session as archived history, not work to resume."
+)
 _TURN_INTERRUPTED_RECORD_TEXT = "The user interrupted this turn before it completed."
 _TURN_SUPERSEDED_RECORD_TEXT = "A newer user message superseded this turn before it completed."
+_TURN_NEW_SESSION_RECORD_TEXT = (
+    "The user started a new session and terminated this turn before it completed."
+)
 _TURN_ORPHANED_RECOVERY_RECORD_TEXT = (
     "This turn ended unexpectedly before it completed. Treat any partial assistant output "
     "above as incomplete."
@@ -146,7 +153,7 @@ _ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT = (
 LOGGER = get_application_logger(__name__)
 
 AgentKind = Literal["main", "subagent"]
-InterruptionReason = Literal["user_stop", "superseded_by_user_message"]
+InterruptionReason = Literal["user_stop", "superseded_by_user_message", "new_session"]
 T = TypeVar("T")
 _STOP_PREEMPTION_CLEANUP_SECONDS = 1.0
 
@@ -540,6 +547,27 @@ class AgentLoop:
             stop_event.set()
         return True
 
+    def request_hard_stop(
+        self,
+        *,
+        reason: InterruptionReason = "new_session",
+    ) -> bool:
+        """Immediately preempt the active turn for a destructive session reset."""
+        active_turn_id = self._active_turn_id
+        if active_turn_id is None:
+            return False
+        self._requested_interruption = _RequestedInterruption(
+            turn_id=active_turn_id,
+            reason=reason,
+        )
+        pending_approval = self._pending_approval_future
+        if pending_approval is not None and not pending_approval.done():
+            pending_approval.cancel()
+        stop_event = self._turn_stop_event
+        if stop_event is not None:
+            stop_event.set()
+        return True
+
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         normalized = approval_id.strip()
         if not normalized:
@@ -553,17 +581,9 @@ class AgentLoop:
         return True
 
     async def _handle_new_command(self, command: ParsedCommand) -> AgentTurnResult:
+        _ = command
         await self._ensure_memory_runtime_ready()
-        previous_session_id = self.active_session_id()
-        session = await self._start_session(start_reason="user_new")
-        if previous_session_id is not None and previous_session_id != session.session_id:
-            self._cleanup_grok_provider_media(previous_session_id)
-        if command.body:
-            return await self._handle_message_turn(
-                command.body,
-                force_session_id=session.session_id,
-                command_override="/new",
-            )
+        session = await self._start_user_new_session()
         return AgentTurnResult(
             session_id=session.session_id,
             response_text="Started a new session.",
@@ -595,20 +615,9 @@ class AgentLoop:
         self,
         command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
+        _ = command
         await self._ensure_memory_runtime_ready()
-        previous_session_id = self.active_session_id()
-        session = await self._start_session(start_reason="user_new")
-        if previous_session_id is not None and previous_session_id != session.session_id:
-            self._cleanup_grok_provider_media(previous_session_id)
-        if command.body:
-            async for event in self._stream_message_turn(
-                command.body,
-                force_session_id=session.session_id,
-                command_override="/new",
-            ):
-                yield event
-            return
-
+        session = await self._start_user_new_session()
         yield AgentAssistantMessageEvent(
             session_id=session.session_id,
             text="Started a new session.",
@@ -2629,6 +2638,8 @@ class AgentLoop:
         reason = (session.pending_interruption_notice_reason or "").strip()
         if reason == "superseded_by_user_message":
             return _PREVIOUS_TASK_SUPERSEDED_TEXT
+        if reason == "new_session":
+            return _PREVIOUS_SESSION_RESET_TEXT
         return _PREVIOUS_TASK_INTERRUPTED_TEXT
 
     def _persist_successful_turn(
@@ -3290,6 +3301,14 @@ class AgentLoop:
             return active
         return await self._start_session(start_reason="initial")
 
+    async def _start_user_new_session(self) -> SessionMetadata:
+        previous_session_id = self.active_session_id()
+        session = await self._start_session(start_reason="user_new")
+        if previous_session_id is not None and previous_session_id != session.session_id:
+            self._storage.archive_session(previous_session_id)
+            self._cleanup_grok_provider_media(previous_session_id)
+        return session
+
     async def _start_session(
         self,
         *,
@@ -3703,6 +3722,8 @@ class AgentLoop:
         interruption_reason: InterruptionReason = "user_stop"
         if text == _PREVIOUS_TASK_SUPERSEDED_TEXT:
             interruption_reason = "superseded_by_user_message"
+        elif text == _PREVIOUS_SESSION_RESET_TEXT:
+            interruption_reason = "new_session"
         return self._build_message_record(
             session_id=session_id,
             role="system",
@@ -3713,6 +3734,7 @@ class AgentLoop:
                 "prioritize_current_user_message": (
                     interruption_reason == "superseded_by_user_message"
                 ),
+                "new_session_boundary": interruption_reason == "new_session",
             },
             turn_id=turn_id,
         )
@@ -4457,6 +4479,9 @@ class AgentLoop:
         if interruption_reason == "superseded_by_user_message":
             interrupted_status = "superseded"
             interrupted_record_text = _TURN_SUPERSEDED_RECORD_TEXT
+        elif interruption_reason == "new_session":
+            interrupted_status = "interrupted"
+            interrupted_record_text = _TURN_NEW_SESSION_RECORD_TEXT
         else:
             interrupted_status = "interrupted"
             interrupted_record_text = _TURN_INTERRUPTED_RECORD_TEXT
@@ -4476,6 +4501,7 @@ class AgentLoop:
             metadata={
                 "interrupted_by_user": interruption_reason == "user_stop",
                 "superseded_by_user_message": (interruption_reason == "superseded_by_user_message"),
+                "new_session_boundary": interruption_reason == "new_session",
                 "interruption_reason": interruption_reason,
             },
             turn_id=turn_id,
@@ -5376,6 +5402,7 @@ def _completed_after_interrupt_metadata(
         "completed_after_interrupt_request": True,
         "interruption_reason": reason,
         "superseded_turn_output": reason == "superseded_by_user_message",
+        "new_session_boundary": reason == "new_session",
     }
 
 

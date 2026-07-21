@@ -194,7 +194,7 @@ Behavior:
 
 - new Jarvis session -> new Codex thread
 - resumed Jarvis session -> `thread/resume` with stored `thread_id`
-- `/new` -> archive current session and start a fresh Codex thread
+- `/new` -> hard-interrupt the current Codex turn with reason `new_session`, archive the old Jarvis session and reset trace, unregister its thread mapping, and create an idle fresh session whose first later user message starts a new Codex thread
 - `/compact` -> archive the current session, persist structured replacement-history items into a fresh session, and mark the next Codex turn to seed that new thread exactly once with the compacted handover history
 
 Jarvis still does not rebuild Codex continuity by replaying the full old transcript into a new thread.
@@ -290,6 +290,8 @@ This is how Codex-backed actors rejoin the same orchestration model used by norm
 - the current turn ends cleanly
 - `RouteRuntime` regains control
 - later bash/subagent notices can enqueue new runtime follow-up turns
+
+The last point applies within one live session. A `/new` hard boundary invalidates those queued turns, terminates detached jobs, disposes subagents, and prevents any old-session orchestrator notice from resuming the new Codex session.
 
 For main-agent subagent completion/finalize notices, the orchestrator progress message now includes the latest persisted subagent assistant report when available.
 That lets Codex finalize against the child’s actual reported result instead of reopening the child with `subagent_monitor` or `subagent_step_in` just to recover the already-persisted output.

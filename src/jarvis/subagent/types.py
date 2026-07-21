@@ -17,6 +17,7 @@ SubagentStatus = Literal[
 SubagentPauseReason = Literal[
     "main_stop",
     "superseded_by_user_message",
+    "new_session",
     "approval_rejected",
     "gateway_disconnect_recovery",
 ]
@@ -95,6 +96,7 @@ class SubagentCatalogEntry:
             in {
                 "main_stop",
                 "superseded_by_user_message",
+                "new_session",
                 "approval_rejected",
                 "gateway_disconnect_recovery",
             }

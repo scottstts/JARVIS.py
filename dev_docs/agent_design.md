@@ -143,13 +143,15 @@ When a new user message arrives while a main turn is active:
 
 Multiple mid-turn user messages remain distinct turns and run FIFO.
 
-Explicit `/stop` is separate. `/stop` means stop and pause until the next user action. A newer user message means supersede the active task and continue automatically into the newer request. `/new` uses the same route stop request path as `/stop`, then resets subagents and starts the fresh session request.
+Explicit `/stop` is separate. `/stop` cooperatively stops active agent work, suppresses automatic follow-ups, and pauses until the next user message. Already-detached bash jobs keep running. A newer user message means supersede the active task and continue automatically into the newer request.
+
+`/new` is a control-only hard session boundary and does not reuse `/stop` semantics. As soon as the command is accepted, `RouteRuntime` closes the internal-follow-up gate, hard-preempts active main and subagent turns with reason `new_session`, and invalidates queued runtime continuations. Before the replacement session is created, the runtime terminates and finalizes all route-owned detached bash jobs, disposes every old subagent, clears retained bash/subagent notices, and persists a hard-reset trace in the old main transcript. The old main session is archived, provider/thread continuity is severed, and the fresh session remains idle. Only a later ordinary user message can start its agent loop.
 
 Queued user turns outrank internal runtime follow-ups. Runtime follow-ups from superseded work are discarded or delayed so they cannot consume the next main-model turn ahead of user input.
 
 Chronology stays truthful. Tool results completed by the superseded turn remain in the older turn. Priority is expressed through persisted interruption and priority notes, not by rewriting history.
 
-Detached bash jobs are intentionally distinct from in-turn awaits. `/stop` suppresses their automatic follow-ups but does not cancel already-detached jobs; foreground bash execution is best-effort cancelled when the active tool await is preempted.
+Detached bash jobs are intentionally distinct from in-turn awaits. `/stop` suppresses their automatic follow-ups but does not cancel already-detached jobs; foreground bash execution is best-effort cancelled when the active tool await is preempted. `/new` terminates and finalizes detached jobs because none of their work may cross the hard session boundary.
 
 ## Turn Identity And Gateway Events
 
@@ -317,4 +319,5 @@ When changing the agent loop:
 - persist continuation/cache handles in provider session state
 - preserve truthful transcript chronology
 - keep `/stop` and superseding-user-message semantics separate
+- keep `/new` on its distinct hard-reset path and never let the command itself open the runtime-follow-up gate
 - ensure subagent prompt-visible behavior follows the same shared-loop persistence rules

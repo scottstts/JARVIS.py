@@ -225,6 +225,8 @@ Approval requests include the acting agent name. Rejected subagent approvals pau
 
 When a newer user message supersedes active work, active subagents tied to that task are asked to stop with reason `superseded_by_user_message`. Completed child tool results remain in child archives and main-session progress notes can point Jarvis back to child state when useful.
 
+`/new` does not use either cooperative path. It hard-preempts active child turns with reason `new_session`, waits for their persisted turn state to settle, terminates route-owned detached jobs, archives and disposes every remaining child, and clears pending child notices before the replacement main session is created.
+
 ## Codex-Backed Subagents
 
 Subagents can use provider `codex`. Codex-backed subagents share the Codex route connection with the main actor when applicable and use `CodexActorRuntime` with subagent identity, subagent bootstrap, filtered tools, and memory disabled.

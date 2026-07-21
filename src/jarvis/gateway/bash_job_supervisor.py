@@ -65,6 +65,14 @@ class BashJobNotice:
     skill_import_notice: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class BashJobResetResult:
+    """Detached-job state finalized by a hard new-session boundary."""
+
+    finalized_job_ids: tuple[str, ...] = ()
+    cancellation_requested_job_ids: tuple[str, ...] = ()
+
+
 class BashJobSupervisor:
     """Observes route-owned detached bash jobs and dispatches owner follow-ups."""
 
@@ -90,6 +98,7 @@ class BashJobSupervisor:
         self._tracked_job_ids: set[str] = set()
         self._loop_task: asyncio.Task[None] | None = None
         self._wake_event = asyncio.Event()
+        self._job_operation_lock = asyncio.Lock()
 
     def ensure_running(self) -> None:
         if self._loop_task is not None and not self._loop_task.done():
@@ -116,6 +125,70 @@ class BashJobSupervisor:
                 continue
             records.append(record)
         return tuple(records)
+
+    async def terminate_route_jobs_for_new_session(self) -> BashJobResetResult:
+        """Terminate and finalize every detached job still owned by this route."""
+        finalized_job_ids: list[str] = []
+        cancellation_requested_job_ids: list[str] = []
+        async with self._job_operation_lock:
+            candidates = sorted(
+                (
+                    record
+                    for _paths, record in list_jobs(self._workspace_dir)
+                    if record.owner_route_id == self._route_id
+                    and record.terminal_notice_dispatched_at is None
+                ),
+                key=lambda record: record.job_id,
+            )
+            for record in candidates:
+                status_result = await self._execute_internal_bash(
+                    record=record,
+                    arguments={"mode": "status", "job_id": record.job_id},
+                )
+                if not status_result.ok:
+                    raise RuntimeError(
+                        "Failed to inspect detached bash job during /new hard reset: "
+                        f"{record.job_id}: {status_result.content}"
+                    )
+                status = str(status_result.metadata.get("status", "")).strip()
+                exit_code = _optional_int(status_result.metadata.get("exit_code"))
+                if status == "running":
+                    cancellation_requested_job_ids.append(record.job_id)
+                    cancel_result = await self._execute_internal_bash(
+                        record=record,
+                        arguments={"mode": "cancel", "job_id": record.job_id},
+                    )
+                    if not cancel_result.ok:
+                        raise RuntimeError(
+                            "Failed to cancel detached bash job during /new hard reset: "
+                            f"{record.job_id}: {cancel_result.content}"
+                        )
+                    status = str(cancel_result.metadata.get("status", "")).strip()
+                    exit_code = _optional_int(cancel_result.metadata.get("exit_code"))
+                if status == "running" or not status:
+                    raise RuntimeError(
+                        f"Detached bash job {record.job_id} survived /new hard reset."
+                    )
+                try:
+                    mark_job_terminal_notice_dispatched(
+                        workspace_dir=self._workspace_dir,
+                        job_id=record.job_id,
+                        notice_kind=_notice_kind_for_status(
+                            status=status,
+                            exit_code=exit_code,
+                        ),
+                    )
+                except BashJobError as exc:
+                    raise RuntimeError(
+                        "Failed to finalize detached bash job archive state during /new: "
+                        f"{record.job_id}: {exc}"
+                    ) from exc
+                self._tracked_job_ids.discard(record.job_id)
+                finalized_job_ids.append(record.job_id)
+        return BashJobResetResult(
+            finalized_job_ids=tuple(finalized_job_ids),
+            cancellation_requested_job_ids=tuple(cancellation_requested_job_ids),
+        )
 
     async def observe_tool_result(
         self,
@@ -211,20 +284,21 @@ class BashJobSupervisor:
 
     async def _run_loop(self) -> None:
         while True:
-            self._recover_tracked_jobs()
             main_notices: list[BashJobNotice] = []
             subagent_notices: dict[str, list[BashJobNotice]] = {}
-            for job_id in tuple(self._tracked_job_ids):
-                notice = await self._collect_due_notice(job_id)
-                if notice is None:
-                    continue
-                if (
-                    notice.owner_agent_kind == "subagent"
-                    and notice.owner_subagent_id is not None
-                ):
-                    subagent_notices.setdefault(notice.owner_subagent_id, []).append(notice)
-                else:
-                    main_notices.append(notice)
+            async with self._job_operation_lock:
+                self._recover_tracked_jobs()
+                for job_id in tuple(self._tracked_job_ids):
+                    notice = await self._collect_due_notice(job_id)
+                    if notice is None:
+                        continue
+                    if (
+                        notice.owner_agent_kind == "subagent"
+                        and notice.owner_subagent_id is not None
+                    ):
+                        subagent_notices.setdefault(notice.owner_subagent_id, []).append(notice)
+                    else:
+                        main_notices.append(notice)
 
             if main_notices:
                 await self._dispatch_main_notices(tuple(main_notices))

@@ -85,6 +85,14 @@ class ActorRuntime(Protocol):
         """Request cooperative interruption for the active turn, if any."""
         ...
 
+    def request_hard_stop(
+        self,
+        *,
+        reason: InterruptionReason = "new_session",
+    ) -> bool:
+        """Immediately preempt the active turn for a destructive session reset."""
+        ...
+
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         """Resolve a pending Jarvis approval request."""
         ...

@@ -20,7 +20,11 @@ from jarvis.core import (
 )
 from jarvis.llm import DoneEvent, LLMResponse, LLMUsage, ProviderTimeoutError, TextPart
 from jarvis.core.compaction import CompactionOutcome, CompactionReplacementItem
-from jarvis.gateway.bash_job_supervisor import BashJobNotice, _classify_notice_kind
+from jarvis.gateway.bash_job_supervisor import (
+    BashJobNotice,
+    BashJobResetResult,
+    _classify_notice_kind,
+)
 from jarvis.gateway.route_events import (
     RouteAssistantMessageEvent,
     RouteErrorEvent,
@@ -39,8 +43,13 @@ from jarvis.gateway.route_runtime import (
 from jarvis.gateway.session_router import SessionRouter, validate_route_id
 from jarvis.subagent.types import SubagentSnapshot
 from tests.helpers import build_core_settings
-from jarvis.tools import ToolSettings
-from jarvis.tools.basic.bash.jobs import BashJobRecord, claim_job_owner, create_background_job
+from jarvis.tools import ToolExecutionResult, ToolSettings
+from jarvis.tools.basic.bash.jobs import (
+    BashJobRecord,
+    claim_job_owner,
+    create_background_job,
+    load_job,
+)
 
 
 def _build_llm_response(text: str) -> LLMResponse:
@@ -419,7 +428,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued.client_message_id, "msg_2")
             self.assertFalse(runtime._main_resume_requires_user_message)
 
-    async def test_enqueue_new_user_message_uses_user_stop_subagent_path(self) -> None:
+    async def test_enqueue_new_user_message_uses_distinct_hard_reset_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
                 route_id="route_1",
@@ -427,29 +436,61 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
 
-            with patch.object(runtime._main_loop, "request_stop", return_value=True) as request_stop:
+            with patch.object(
+                runtime._main_loop,
+                "request_hard_stop",
+                return_value=True,
+            ) as request_hard_stop:
                 with patch.object(
                     runtime._subagent_manager,
-                    "request_stop_all_for_user_stop",
+                    "request_hard_stop_all_for_new_session",
                     return_value=(),
-                ) as stop_for_new:
+                ) as hard_stop_for_new:
+                    with patch.object(runtime._main_loop, "request_stop") as request_stop:
+                        await runtime.enqueue_user_message(
+                            "/new",
+                            client_message_id="msg_new",
+                        )
+
+            request_hard_stop.assert_called_once_with(reason="new_session")
+            hard_stop_for_new.assert_called_once_with()
+            request_stop.assert_not_called()
+            queued = runtime._user_message_queue.get_nowait()
+            self.assertEqual(queued.user_text, "/new")
+            self.assertEqual(queued.client_message_id, "msg_new")
+            self.assertTrue(queued.parse_commands)
+            self.assertTrue(runtime._new_session_boundary_pending)
+
+    async def test_enqueue_new_does_not_use_cooperative_or_supersede_subagent_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+
+            with patch.object(runtime._main_loop, "request_hard_stop", return_value=False):
+                with patch.object(
+                    runtime._subagent_manager,
+                    "request_hard_stop_all_for_new_session",
+                    return_value=(),
+                ):
                     with patch.object(
                         runtime._subagent_manager,
                         "request_stop_all_for_superseded_user_message",
                         return_value=(),
                     ) as stop_superseded:
-                        await runtime.enqueue_user_message(
-                            "/new continue here",
-                            client_message_id="msg_new",
-                        )
+                        with patch.object(
+                            runtime._subagent_manager,
+                            "request_stop_all_for_user_stop",
+                            return_value=(),
+                        ) as stop_cooperative:
+                            await runtime.enqueue_user_message("/new")
 
-            request_stop.assert_called_once_with(reason="superseded_by_user_message")
-            stop_for_new.assert_called_once_with()
             stop_superseded.assert_not_called()
-            queued = runtime._user_message_queue.get_nowait()
-            self.assertEqual(queued.user_text, "/new continue here")
-            self.assertEqual(queued.client_message_id, "msg_new")
-            self.assertTrue(queued.parse_commands)
+            stop_cooperative.assert_not_called()
 
     async def test_enqueue_user_message_supersedes_background_subagent_work_when_main_idle(
         self,
@@ -492,7 +533,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             )
             observed: list[object] = []
 
-            async def _reset() -> dict[str, object]:
+            async def _reset(*, cancel_owned_bash_jobs: bool) -> dict[str, object]:
+                self.assertFalse(cancel_owned_bash_jobs)
                 observed.append("reset")
                 return {
                     "disposed_subagent_ids": [],
@@ -517,7 +559,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await runtime._user_message_queue.put(
                     _RouteTurnRequest(
-                        user_text="/new continue here",
+                        user_text="/new",
                         client_message_id="msg_new",
                         parse_commands=True,
                         user_initiated=True,
@@ -527,7 +569,98 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 runtime._ensure_message_worker()
                 await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
 
-            self.assertEqual(observed, ["reset", ("user", "/new continue here")])
+            self.assertEqual(observed, ["reset", ("user", "/new")])
+
+            worker = runtime._message_worker
+            if worker is not None:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+
+    async def test_bare_new_keeps_runtime_followups_paused_and_drops_old_bash_notices(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            observed: list[tuple[str, str]] = []
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_completed",
+                owner_route_id="route_1",
+                owner_session_id="old_session",
+                owner_turn_id="old_turn",
+                owner_agent_kind="main",
+                owner_agent_name="Jarvis",
+                owner_subagent_id=None,
+                status="finished",
+                command="echo old work",
+                started_at="2026-07-21T10:00:00Z",
+                last_update_at="2026-07-21T10:00:01Z",
+                finished_at="2026-07-21T10:00:01Z",
+                cancelled_at=None,
+                exit_code=0,
+                stdout="old work\n",
+                stderr="",
+                stdout_bytes_seen=9,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint="old work",
+            )
+            runtime._pending_main_bash_notices[notice.job_id] = notice
+            runtime._main_resume_requires_user_message = True
+
+            async def _reset(*, cancel_owned_bash_jobs: bool) -> dict[str, object]:
+                self.assertFalse(cancel_owned_bash_jobs)
+                return {
+                    "disposed_subagent_ids": [],
+                    "cancelled_job_ids": [],
+                    "disposed_count": 0,
+                    "cancelled_job_count": 0,
+                }
+
+            async def _stream_user_input(user_text: str):
+                observed.append(("user", user_text))
+                yield AgentTurnDoneEvent(
+                    session_id="new_session",
+                    response_text="Started a new session.",
+                    command="/new",
+                )
+
+            async def _stream_runtime_turn(*, force_session_id=None, pre_turn_messages=()):
+                _ = pre_turn_messages
+                observed.append(("runtime", force_session_id or "new_session"))
+                yield AgentTurnDoneEvent(
+                    session_id=force_session_id or "new_session",
+                    response_text="unexpected runtime continuation",
+                )
+
+            runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
+            runtime._main_loop.stream_runtime_turn = _stream_runtime_turn  # type: ignore[method-assign]
+
+            with patch.object(runtime._subagent_manager, "reset_for_new_session", side_effect=_reset):
+                await runtime._user_message_queue.put(
+                    _RouteTurnRequest(
+                        user_text="/new",
+                        client_message_id="msg_new",
+                        parse_commands=True,
+                        user_initiated=True,
+                    )
+                )
+                runtime._new_session_boundary_pending = True
+                runtime._queue_wakeup.set()
+                runtime._ensure_message_worker()
+                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+                await asyncio.wait_for(runtime._message_queue.join(), timeout=1)
+
+            self.assertEqual(observed, [("user", "/new")])
+            self.assertTrue(runtime._main_resume_requires_user_message)
+            self.assertFalse(runtime._new_session_boundary_pending)
+            self.assertEqual(runtime._pending_main_bash_notices, {})
 
             worker = runtime._message_worker
             if worker is not None:
@@ -563,6 +696,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                         done_events.append(event)
 
                 self.assertTrue(done_events[0].interrupted)
+                self.assertEqual(done_events[0].interruption_reason, "new_session")
                 self.assertEqual(done_events[0].client_message_id, "msg_1")
                 self.assertEqual(done_events[1].command, "/new")
                 self.assertEqual(done_events[1].client_message_id, "msg_new")
@@ -1335,6 +1469,123 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(stop_notes), 1)
             self.assertIn("detached bash jobs", stop_notes[0].content)
             self.assertIn(job.job_id, stop_notes[0].content)
+
+    async def test_new_session_hard_reset_terminates_and_finalizes_route_bash_jobs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            tool_settings = ToolSettings.from_workspace_dir(runtime._core_settings.workspace_dir)
+            job = create_background_job(
+                workspace_dir=tool_settings.workspace_dir,
+                bash_executable="/bin/bash",
+                command="sleep 30",
+                cwd="/workspace",
+                log_max_bytes=tool_settings.bash_job_log_max_bytes,
+                total_storage_budget_bytes=tool_settings.bash_job_total_storage_budget_bytes,
+                retention_seconds=tool_settings.bash_job_retention_seconds,
+            )
+            claim_job_owner(
+                workspace_dir=tool_settings.workspace_dir,
+                job_id=job.job_id,
+                route_id="route_1",
+                session_id=session_id,
+                turn_id="turn_1",
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+            observed_modes: list[str] = []
+
+            async def _execute_internal_bash(*, record, arguments):
+                _ = record
+                mode = str(arguments["mode"])
+                observed_modes.append(mode)
+                status = "running" if mode == "status" else "cancelled"
+                return ToolExecutionResult(
+                    call_id=f"reset_{mode}",
+                    name="bash",
+                    ok=True,
+                    content=f"status={status}",
+                    metadata={
+                        "mode": mode,
+                        "job_id": job.job_id,
+                        "status": status,
+                        "exit_code": None,
+                    },
+                )
+
+            with patch.object(
+                runtime._bash_job_supervisor,
+                "_execute_internal_bash",
+                side_effect=_execute_internal_bash,
+            ):
+                result = (
+                    await runtime._bash_job_supervisor.terminate_route_jobs_for_new_session()
+                )
+
+            self.assertEqual(observed_modes, ["status", "cancel"])
+            self.assertEqual(result.finalized_job_ids, (job.job_id,))
+            self.assertEqual(result.cancellation_requested_job_ids, (job.job_id,))
+            _, archived_job = load_job(tool_settings.workspace_dir, job.job_id)
+            self.assertEqual(archived_job.terminal_notice_kind, "bash_job_cancelled")
+            self.assertIsNotNone(archived_job.terminal_notice_dispatched_at)
+
+    async def test_new_session_hard_reset_persists_old_session_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            previous_session_id = await runtime._main_loop.prepare_session()
+            bash_reset = BashJobResetResult(
+                finalized_job_ids=("job_1", "job_2"),
+                cancellation_requested_job_ids=("job_1",),
+            )
+            subagent_reset = {
+                "disposed_subagent_ids": ["sub_1"],
+                "cancelled_job_ids": [],
+                "disposed_count": 1,
+                "cancelled_job_count": 0,
+            }
+
+            with patch.object(
+                runtime._bash_job_supervisor,
+                "terminate_route_jobs_for_new_session",
+                return_value=bash_reset,
+            ):
+                with patch.object(
+                    runtime._subagent_manager,
+                    "reset_for_new_session",
+                    return_value=subagent_reset,
+                ) as reset_subagents:
+                    await runtime._prepare_new_session_request()
+
+            reset_subagents.assert_awaited_once_with(cancel_owned_bash_jobs=False)
+
+            records = runtime._main_loop._storage.load_records(previous_session_id)
+            reset_records = [
+                record
+                for record in records
+                if record.metadata.get("new_session_hard_reset") is True
+            ]
+            self.assertEqual(len(reset_records), 1)
+            reset_record = reset_records[0]
+            self.assertIn("No queued or automatic follow-up", reset_record.content)
+            self.assertEqual(reset_record.metadata["disposed_subagent_ids"], ["sub_1"])
+            self.assertEqual(
+                reset_record.metadata["finalized_bash_job_ids"],
+                ["job_1", "job_2"],
+            )
+            self.assertEqual(
+                reset_record.metadata["cancellation_requested_bash_job_ids"],
+                ["job_1"],
+            )
 
     async def test_detached_bash_notice_enqueues_internal_main_followup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
