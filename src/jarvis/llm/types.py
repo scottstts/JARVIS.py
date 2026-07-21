@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Literal, Mapping, Sequence, TypeAlias
+from typing import Any, Callable, Literal, Mapping, Sequence, TypeAlias
 
 LLMRole: TypeAlias = Literal["system", "user", "assistant", "tool"]
 ImageDetail: TypeAlias = Literal["low", "high", "auto", "original"]
@@ -17,6 +17,7 @@ FinishReason: TypeAlias = Literal[
     "error",
     "unknown",
 ]
+ResponseStorageMode: TypeAlias = Literal["durable", "ephemeral"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -78,6 +79,22 @@ class ImagePart:
 
 
 @dataclass(slots=True, frozen=True)
+class LocalImagePart:
+    """Deferred local image reference materialized only by a supporting provider."""
+
+    path: str
+    media_type: str
+    detail: ImageDetail = "auto"
+    type: Literal["local_image"] = "local_image"
+
+    def __post_init__(self) -> None:
+        if not self.path.strip():
+            raise ValueError("LocalImagePart.path cannot be empty.")
+        if not self.media_type.strip():
+            raise ValueError("LocalImagePart.media_type cannot be empty.")
+
+
+@dataclass(slots=True, frozen=True)
 class ToolCall:
     call_id: str
     name: str
@@ -95,7 +112,7 @@ class ToolResultPart:
     type: Literal["tool_result"] = "tool_result"
 
 
-MessagePart: TypeAlias = TextPart | ImagePart | ToolCall | ToolResultPart
+MessagePart: TypeAlias = TextPart | ImagePart | LocalImagePart | ToolCall | ToolResultPart
 
 
 @dataclass(slots=True, frozen=True)
@@ -180,6 +197,38 @@ class LLMResponse:
 
 
 @dataclass(slots=True, frozen=True)
+class StatefulContinuation:
+    """Provider-owned continuation state plus a bounded reconnect fallback."""
+
+    session_key: str
+    storage_mode: ResponseStorageMode = "durable"
+    durable_response_id: str | None = None
+    recovery_messages: Sequence[LLMMessage] = field(default_factory=tuple)
+    recovery_message_loader: Callable[[], Sequence[LLMMessage]] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.session_key.strip():
+            raise ValueError("StatefulContinuation.session_key cannot be empty.")
+        if self.recovery_messages and self.recovery_message_loader is not None:
+            raise ValueError(
+                "StatefulContinuation accepts recovery_messages or recovery_message_loader, "
+                "not both."
+            )
+        if self.generation < 0:
+            raise ValueError("StatefulContinuation.generation must be >= 0.")
+
+    def materialize_recovery_messages(self) -> tuple[LLMMessage, ...]:
+        if self.recovery_message_loader is None:
+            return tuple(self.recovery_messages)
+        return tuple(self.recovery_message_loader())
+
+
+@dataclass(slots=True, frozen=True)
 class TextDeltaEvent:
     delta: str
     type: Literal["text_delta"] = "text_delta"
@@ -243,6 +292,7 @@ class LLMRequest:
     safety_identifier: str | None = None
     prompt_cache_key: str | None = None
     previous_response_id: str | None = None
+    stateful_continuation: StatefulContinuation | None = None
     conversation_id: str | None = None
     cached_content_name: str | None = None
     cached_content_model: str | None = None

@@ -9,11 +9,24 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Protocol, Sequence, TypeVar
+import shutil
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Literal,
+    Protocol,
+    Sequence,
+    TypeVar,
+)
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+
+from PIL import Image, ImageOps
 
 from jarvis.logging_setup import get_application_logger
 from jarvis.llm import (
@@ -23,9 +36,11 @@ from jarvis.llm import (
     LLMRequest,
     LLMResponse,
     LLMService,
+    LocalImagePart,
     ProviderContextStrategy,
     ProviderSessionState,
     ProviderBadRequestError,
+    StatefulContinuation,
     TextPart,
     ToolCall,
     ToolChoice,
@@ -43,7 +58,13 @@ from jarvis.skills import (
     render_skill_search_guidance,
 )
 from jarvis.storage import ConversationRecord, SessionMetadata, SessionStorage
-from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
+from jarvis.tools import (
+    ToolExecutionContext,
+    ToolExecutionResult,
+    ToolRegistry,
+    ToolRuntime,
+    ToolSettings,
+)
 
 from .commands import ParsedCommand, parse_user_command
 from .compaction import (
@@ -75,6 +96,11 @@ _IMAGE_ATTACHMENT_ERROR_HINTS = (
 _TRANSCRIPT_ONLY_RECORD_METADATA_KEY = "transcript_only"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
 _EPHEMERAL_IMAGE_INPUT_METADATA_KEY = "ephemeral_image_input"
+_GROK_RECOVERY_IMAGE_METADATA_KEY = "grok_recovery_image"
+_GROK_PROVIDER_MEDIA_DIR_NAME = "provider_media"
+_GROK_IMAGE_TRANSCODE_MIN_BYTES = 512 * 1024
+_GROK_IMAGE_MAX_EDGE_PIXELS = 1_600
+_GROK_IMAGE_JPEG_QUALITY = 82
 _TURN_CONTEXT_METADATA_KEY = "turn_context"
 _TURN_ID_METADATA_KEY = "turn_id"
 _INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
@@ -104,12 +130,8 @@ _PREVIOUS_TASK_SUPERSEDED_TEXT = (
     "A newer user message superseded the previous task. Handle the current user message "
     "first. Use completed results from the older task only if they are directly relevant."
 )
-_TURN_INTERRUPTED_RECORD_TEXT = (
-    "The user interrupted this turn before it completed."
-)
-_TURN_SUPERSEDED_RECORD_TEXT = (
-    "A newer user message superseded this turn before it completed."
-)
+_TURN_INTERRUPTED_RECORD_TEXT = "The user interrupted this turn before it completed."
+_TURN_SUPERSEDED_RECORD_TEXT = "A newer user message superseded this turn before it completed."
 _TURN_ORPHANED_RECOVERY_RECORD_TEXT = (
     "This turn ended unexpectedly before it completed. Treat any partial assistant output "
     "above as incomplete."
@@ -307,9 +329,7 @@ class AgentLoop:
         self._identity = identity or AgentIdentity(kind="main", name="Jarvis")
         self._memory_mode = memory_mode or AgentMemoryMode()
         self._llm_provider = (
-            normalized
-            if (normalized := (llm_provider or "").strip().lower())
-            else None
+            normalized if (normalized := (llm_provider or "").strip().lower()) else None
         )
         self._identity_loader = bootstrap_loader or IdentityBootstrapLoader(self._settings)
         self._runtime_messages_provider = runtime_messages_provider
@@ -319,7 +339,9 @@ class AgentLoop:
             provider=self._settings.compaction.provider,
         )
         memory_settings = MemorySettings.from_workspace_dir(self._settings.workspace_dir)
-        memory_llm_service = self._llm_service if isinstance(self._llm_service, LLMService) else None
+        memory_llm_service = (
+            self._llm_service if isinstance(self._llm_service, LLMService) else None
+        )
         if memory_llm_service is None or not self._memory_mode.reflection:
             memory_settings = replace(memory_settings, enable_reflection=False)
         self._memory_service = MemoryService(
@@ -330,7 +352,9 @@ class AgentLoop:
         self._skills_settings = SkillsSettings.from_workspace_dir(self._settings.workspace_dir)
         self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
-        self._tool_definitions_provider = tool_definitions_provider or self._default_tool_definitions
+        self._tool_definitions_provider = (
+            tool_definitions_provider or self._default_tool_definitions
+        )
         self._tool_executor = tool_executor or self._default_execute_tool_call
         self._local_notice_callback = local_notice_callback
         self._tool_context = ToolExecutionContext(
@@ -530,7 +554,10 @@ class AgentLoop:
 
     async def _handle_new_command(self, command: ParsedCommand) -> AgentTurnResult:
         await self._ensure_memory_runtime_ready()
+        previous_session_id = self.active_session_id()
         session = await self._start_session(start_reason="user_new")
+        if previous_session_id is not None and previous_session_id != session.session_id:
+            self._cleanup_grok_provider_media(previous_session_id)
         if command.body:
             return await self._handle_message_turn(
                 command.body,
@@ -569,7 +596,10 @@ class AgentLoop:
         command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         await self._ensure_memory_runtime_ready()
+        previous_session_id = self.active_session_id()
         session = await self._start_session(start_reason="user_new")
+        if previous_session_id is not None and previous_session_id != session.session_id:
+            self._cleanup_grok_provider_media(previous_session_id)
         if command.body:
             async for event in self._stream_message_turn(
                 command.body,
@@ -748,7 +778,8 @@ class AgentLoop:
             refreshed = self._storage.get_session(session.session_id)
             threshold_observed = (
                 final_response.usage.input_tokens
-                if final_response.usage is not None and final_response.usage.input_tokens is not None
+                if final_response.usage is not None
+                and final_response.usage.input_tokens is not None
                 else final_estimated_input_tokens
             )
             should_enqueue_reactive = (
@@ -1028,8 +1059,10 @@ class AgentLoop:
         metadata.pop("image_attachment", None)
         metadata["error"] = reason
 
-        title = "View image failed" if tool_result.name == "view_image" else (
-            f"{tool_result.name.replace('_', ' ').capitalize()} failed"
+        title = (
+            "View image failed"
+            if tool_result.name == "view_image"
+            else (f"{tool_result.name.replace('_', ' ').capitalize()} failed")
         )
         lines = [title]
         raw_path = str(metadata.get("path", "")).strip()
@@ -1093,7 +1126,7 @@ class AgentLoop:
             pending_subagent_ids=pending_subagent_ids,
             turn_id=turn_id,
         )
-        staged_records = ((waiting_record,) if waiting_record is not None else ())
+        staged_records = (waiting_record,) if waiting_record is not None else ()
         request, estimated_input_tokens = self._build_followup_request(
             session_id=session_id,
             base_records=base_records,
@@ -1196,15 +1229,14 @@ class AgentLoop:
         )
         strategy = state.strategy if state is not None else strategy_for_provider(provider)
         tools = (
-            self._compose_request_tools(activated_discoverable_tool_names)
-            if allow_tools
-            else ()
+            self._compose_request_tools(activated_discoverable_tool_names) if allow_tools else ()
         )
         tool_choice = ToolChoice.auto() if allow_tools else ToolChoice.none()
 
         request_records = tuple(base_records) + tuple(current_records)
         prompt_cache_key = session_id if request_records else None
         previous_response_id: str | None = None
+        stateful_continuation: StatefulContinuation | None = None
         conversation_id: str | None = None
         cached_content_name: str | None = None
         cached_content_model: str | None = None
@@ -1224,12 +1256,38 @@ class AgentLoop:
                         state.openai.last_response_record_id,
                     )
             elif provider == "grok" and state is not None:
+                prompt_cache_key = session_id
                 previous_response_id = state.grok.previous_response_id
                 if previous_response_id:
                     request_records = _records_after_response_record(
-                        current_records,
+                        request_records,
                         state.grok.last_response_record_id,
                     )
+
+                storage_mode = state.grok.storage_mode
+                if _records_have_image_inputs(request_records):
+                    storage_mode = "ephemeral"
+                recovery_message_loader: Callable[[], Sequence[LLMMessage]] | None = None
+                if storage_mode == "ephemeral":
+                    recovery_records = _records_between_response_records(
+                        tuple(base_records) + tuple(current_records),
+                        after_record_id=state.grok.durable_response_record_id,
+                        through_record_id=state.grok.last_response_record_id,
+                    )
+
+                    def _load_grok_recovery_messages(
+                        records: tuple[ConversationRecord, ...] = recovery_records,
+                    ) -> tuple[LLMMessage, ...]:
+                        return _records_to_grok_recovery_messages(records)
+
+                    recovery_message_loader = _load_grok_recovery_messages
+                stateful_continuation = StatefulContinuation(
+                    session_key=session_id,
+                    storage_mode=storage_mode,
+                    durable_response_id=state.grok.durable_response_id,
+                    recovery_message_loader=recovery_message_loader,
+                    generation=state.grok.websocket_generation,
+                )
 
             if not request_records:
                 request_records = tuple(current_records) or tuple(base_records)
@@ -1244,9 +1302,7 @@ class AgentLoop:
                     record.record_id
                     for record in stable_records
                     if record.kind == "message"
-                    and not bool(
-                        record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)
-                    )
+                    and not bool(record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False))
                 )
                 cached_content_media_ids = _collect_message_media_ids(cached_content_messages)
                 cached_content_source_signature = _gemini_cache_source_signature(
@@ -1254,12 +1310,9 @@ class AgentLoop:
                     tools=tools,
                     tool_choice=tool_choice,
                 )
-                if (
-                    state is not None
-                    and _gemini_cache_is_usable(
-                        state,
-                        source_signature=cached_content_source_signature,
-                    )
+                if state is not None and _gemini_cache_is_usable(
+                    state,
+                    source_signature=cached_content_source_signature,
                 ):
                     cached_content_name = state.gemini.cached_content_name
                     cached_content_model = state.gemini.model
@@ -1272,6 +1325,7 @@ class AgentLoop:
             tool_choice=tool_choice,
             prompt_cache_key=prompt_cache_key,
             previous_response_id=previous_response_id,
+            stateful_continuation=stateful_continuation,
             conversation_id=conversation_id,
             cached_content_name=cached_content_name,
             cached_content_model=cached_content_model,
@@ -1569,7 +1623,11 @@ class AgentLoop:
                             emitted_any = True
                             tool_name = str(event.tool_name or "").strip()
                             call_id = event.call_id.strip()
-                            if tool_name and call_id and call_id not in noticed_initial_tool_call_ids:
+                            if (
+                                tool_name
+                                and call_id
+                                and call_id not in noticed_initial_tool_call_ids
+                            ):
                                 noticed_initial_tool_call_ids.add(call_id)
                                 interrupted_unexecuted_tool_names = (
                                     *interrupted_unexecuted_tool_names,
@@ -1625,7 +1683,11 @@ class AgentLoop:
                     interrupted_stream_fragment_text = ""
                     break
                 except ProviderBadRequestError as exc:
-                    if overflow_retry_attempted or emitted_any or not _is_context_overflow_error(exc):
+                    if (
+                        overflow_retry_attempted
+                        or emitted_any
+                        or not _is_context_overflow_error(exc)
+                    ):
                         raise
 
                 (
@@ -1724,7 +1786,9 @@ class AgentLoop:
                         command=command_override,
                         compaction_performed=did_compaction,
                         response_text=current_response.text,
-                        unexecuted_tool_names=tuple(call.name for call in current_response.tool_calls),
+                        unexecuted_tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
                     )
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
@@ -2004,7 +2068,9 @@ class AgentLoop:
                         command=command_override,
                         compaction_performed=did_compaction,
                         response_text=current_response.text,
-                        unexecuted_tool_names=tuple(call.name for call in current_response.tool_calls),
+                        unexecuted_tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
                     )
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
@@ -2047,7 +2113,9 @@ class AgentLoop:
                     streamed_followup_text = ""
                     deferred_committed = False
                     try:
-                        async for event in self._stream_generate_with_stop(request, turn_id=turn_id):
+                        async for event in self._stream_generate_with_stop(
+                            request, turn_id=turn_id
+                        ):
                             if not deferred_committed:
                                 if deferred_tool_successes:
                                     self._commit_deferred_tool_successes(
@@ -2079,7 +2147,11 @@ class AgentLoop:
                                 emitted_any = True
                                 tool_name = str(event.tool_name or "").strip()
                                 call_id = event.call_id.strip()
-                                if tool_name and call_id and call_id not in noticed_followup_tool_call_ids:
+                                if (
+                                    tool_name
+                                    and call_id
+                                    and call_id not in noticed_followup_tool_call_ids
+                                ):
                                     noticed_followup_tool_call_ids.add(call_id)
                                     interrupted_unexecuted_tool_names = (
                                         *interrupted_unexecuted_tool_names,
@@ -2184,9 +2256,8 @@ class AgentLoop:
                         )
                         return
                     except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
-                        if (
-                            not deferred_tool_successes
-                            or not _is_image_attachment_request_error(exc)
+                        if not deferred_tool_successes or not _is_image_attachment_request_error(
+                            exc
                         ):
                             raise
                         self._persist_failed_deferred_tool_successes(
@@ -2237,10 +2308,7 @@ class AgentLoop:
                                 turn_id=turn_id,
                             )
                             continue
-                        if (
-                            not _is_context_overflow_error(exc)
-                            or emitted_any
-                        ):
+                        if not _is_context_overflow_error(exc) or emitted_any:
                             raise
                         if deferred_tool_successes:
                             self._commit_deferred_tool_successes(
@@ -2331,7 +2399,9 @@ class AgentLoop:
                         command=command_override,
                         compaction_performed=did_compaction,
                         response_text=current_response.text,
-                        unexecuted_tool_names=tuple(call.name for call in current_response.tool_calls),
+                        unexecuted_tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
                     )
                     yield AgentTurnDoneEvent(
                         session_id=interrupted.session_id,
@@ -2363,7 +2433,8 @@ class AgentLoop:
             refreshed = self._storage.get_session(session.session_id)
             threshold_observed = (
                 final_response.usage.input_tokens
-                if final_response.usage is not None and final_response.usage.input_tokens is not None
+                if final_response.usage is not None
+                and final_response.usage.input_tokens is not None
                 else final_estimated_input_tokens
             )
             should_enqueue_reactive = (
@@ -2612,16 +2683,51 @@ class AgentLoop:
                         or state.openai.conversation_id
                     ),
                     previous_response_id=response.response_id or state.openai.previous_response_id,
-                    last_response_record_id=response_record_id or state.openai.last_response_record_id,
+                    last_response_record_id=response_record_id
+                    or state.openai.last_response_record_id,
                 ),
             )
         elif provider == "grok":
+            storage_mode = _metadata_str(
+                response.provider_metadata,
+                "response_storage_mode",
+            )
+            if storage_mode not in {"durable", "ephemeral"}:
+                storage_mode = state.grok.storage_mode
+            resolved_storage_mode: Literal["durable", "ephemeral"] = (
+                "ephemeral" if storage_mode == "ephemeral" else "durable"
+            )
+            durable_response_id = _metadata_str(
+                response.provider_metadata,
+                "durable_response_id",
+            )
+            websocket_generation = _metadata_int(
+                response.provider_metadata,
+                "websocket_generation",
+            )
+            if resolved_storage_mode == "durable":
+                durable_response_id = response.response_id or durable_response_id
+                durable_response_record_id = (
+                    response_record_id or state.grok.durable_response_record_id
+                )
+            else:
+                durable_response_id = durable_response_id or state.grok.durable_response_id
+                durable_response_record_id = state.grok.durable_response_record_id
             state = replace(
                 state,
                 grok=replace(
                     state.grok,
                     previous_response_id=response.response_id or state.grok.previous_response_id,
-                    last_response_record_id=response_record_id or state.grok.last_response_record_id,
+                    last_response_record_id=response_record_id
+                    or state.grok.last_response_record_id,
+                    durable_response_id=durable_response_id,
+                    durable_response_record_id=durable_response_record_id,
+                    storage_mode=resolved_storage_mode,
+                    websocket_generation=(
+                        websocket_generation
+                        if websocket_generation is not None
+                        else state.grok.websocket_generation
+                    ),
                 ),
             )
         elif provider == "gemini":
@@ -2790,17 +2896,18 @@ class AgentLoop:
             tool_rounds += 1
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                 try:
-                    current_response, current_estimated_input_tokens = (
-                        await self._recover_from_tool_round_limit(
-                            session_id=current_session.session_id,
-                            base_records=current_base_records,
-                            pending_records=pending_records,
-                            attempted_round=tool_rounds,
-                            unexecuted_tool_names=tuple(
-                                call.name for call in current_response.tool_calls
-                            ),
-                            turn_id=turn_id,
-                        )
+                    (
+                        current_response,
+                        current_estimated_input_tokens,
+                    ) = await self._recover_from_tool_round_limit(
+                        session_id=current_session.session_id,
+                        base_records=current_base_records,
+                        pending_records=pending_records,
+                        attempted_round=tool_rounds,
+                        unexecuted_tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
+                        turn_id=turn_id,
                     )
                 except _TurnStopRequested:
                     return (
@@ -2981,10 +3088,7 @@ class AgentLoop:
                         (),
                     )
                 except (LLMConfigurationError, UnsupportedCapabilityError) as exc:
-                    if (
-                        not deferred_tool_successes
-                        or not _is_image_attachment_request_error(exc)
-                    ):
+                    if not deferred_tool_successes or not _is_image_attachment_request_error(exc):
                         raise
                     self._persist_failed_deferred_tool_successes(
                         session_id=current_session.session_id,
@@ -3008,10 +3112,7 @@ class AgentLoop:
                     )
                     continue
                 except ProviderBadRequestError as exc:
-                    if (
-                        deferred_tool_successes
-                        and _is_image_attachment_request_error(exc)
-                    ):
+                    if deferred_tool_successes and _is_image_attachment_request_error(exc):
                         self._persist_failed_deferred_tool_successes(
                             session_id=current_session.session_id,
                             pending_records=pending_records,
@@ -3050,9 +3151,7 @@ class AgentLoop:
                         )
                         staged_followup_records = ()
                     if followup_compaction_attempted:
-                        raise ContextBudgetError(
-                            _FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT
-                        ) from exc
+                        raise ContextBudgetError(_FOLLOWUP_RETRY_PROVIDER_OVERFLOW_TEXT) from exc
 
                 (
                     current_session,
@@ -3113,7 +3212,13 @@ class AgentLoop:
         pending_records: Sequence[ConversationRecord],
         reason: str,
         turn_id: str,
-    ) -> tuple[SessionMetadata, list[ConversationRecord], list[ConversationRecord], LLMRequest, int]:
+    ) -> tuple[
+        SessionMetadata,
+        list[ConversationRecord],
+        list[ConversationRecord],
+        LLMRequest,
+        int,
+    ]:
         compacted = await self._compact_session(
             session,
             reason=reason,
@@ -3169,6 +3274,7 @@ class AgentLoop:
             if _record_is_ephemeral_image_input(record):
                 continue
             self._storage.append_record(compacted.session_id, record)
+        self._cleanup_grok_provider_media(session.session_id)
         self._active_turn_id = turn_id
         return (
             compacted,
@@ -3199,10 +3305,13 @@ class AgentLoop:
 
         bootstrap_messages = self._identity_loader.load_bootstrap_messages()
         for message in bootstrap_messages:
+            first_part = message.parts[0]
+            if not isinstance(first_part, TextPart):
+                raise RuntimeError("Identity bootstrap messages must contain text parts.")
             self._append_message(
                 session_id=session.session_id,
                 role=message.role,
-                content=message.parts[0].text,
+                content=first_part.text,
                 metadata={"bootstrap_identity": True},
             )
         tool_bootstrap = self._serialize_basic_tool_bootstrap()
@@ -3222,9 +3331,10 @@ class AgentLoop:
 
         if self._memory_mode.bootstrap:
             try:
-                core_memory_bootstrap, ongoing_memory_bootstrap = (
-                    await self._memory_service.render_bootstrap_messages()
-                )
+                (
+                    core_memory_bootstrap,
+                    ongoing_memory_bootstrap,
+                ) = await self._memory_service.render_bootstrap_messages()
             except Exception:
                 LOGGER.exception("Memory bootstrap rendering failed.")
                 core_memory_bootstrap, ongoing_memory_bootstrap = "", ""
@@ -3266,11 +3376,7 @@ class AgentLoop:
         user_instruction: str | None = None,
         excluded_turn_ids: tuple[str, ...] = (),
     ) -> SessionMetadata | None:
-        excluded_turn_id_set = {
-            turn_id.strip()
-            for turn_id in excluded_turn_ids
-            if turn_id.strip()
-        }
+        excluded_turn_id_set = {turn_id.strip() for turn_id in excluded_turn_ids if turn_id.strip()}
         records = self._storage.load_records(
             session.session_id,
             include_all_turns=True,
@@ -3341,11 +3447,28 @@ class AgentLoop:
             pending_interruption_notice=session.pending_interruption_notice,
             pending_interruption_notice_reason=session.pending_interruption_notice_reason,
         )
+        if not excluded_turn_id_set:
+            self._cleanup_grok_provider_media(session.session_id)
         await self._emit_local_notice(
             notice_kind="compaction_completed",
             text="Context compacted into a new session.",
         )
         return self._storage.get_session(next_session.session_id) or next_session
+
+    def _cleanup_grok_provider_media(self, session_id: str) -> None:
+        media_dir = (
+            self._settings.transcript_archive_dir / _GROK_PROVIDER_MEDIA_DIR_NAME / session_id
+        )
+        try:
+            shutil.rmtree(media_dir)
+        except FileNotFoundError:
+            return
+        except OSError:
+            LOGGER.warning(
+                "Failed to clean Grok provider media for session %s.",
+                session_id,
+                exc_info=True,
+            )
 
     async def _emit_local_notice(self, *, notice_kind: str, text: str) -> None:
         if self._identity.kind != "main":
@@ -3686,6 +3809,48 @@ class AgentLoop:
             media_type = str(attachment.get("media_type", "")).strip()
             detail = str(attachment.get("detail", "auto")).strip() or "auto"
             if path and media_type:
+                recovery_metadata: dict[str, Any] | None = None
+                if self._effective_llm_provider() == "grok":
+                    try:
+                        source_bytes = Path(path).read_bytes()
+                    except OSError:
+                        source_bytes = b""
+                    source_sha256 = (
+                        hashlib.sha256(source_bytes).hexdigest() if source_bytes else None
+                    )
+                    if source_sha256 is not None and self._grok_image_hash_is_live(
+                        session_id=session_id,
+                        source_sha256=source_sha256,
+                    ):
+                        return [
+                            self._build_message_record(
+                                session_id=session_id,
+                                role="user",
+                                content=(
+                                    "The requested workspace image is unchanged and is "
+                                    "already present in the live Grok context. Reuse the "
+                                    f"existing image for path: {path}"
+                                ),
+                                metadata={
+                                    _EPHEMERAL_IMAGE_INPUT_METADATA_KEY: True,
+                                    "source_tool": result.name,
+                                    "deduplicated_image_sha256": source_sha256,
+                                },
+                                turn_id=turn_id,
+                            )
+                        ]
+                    prepared = self._prepare_grok_image_attachment(
+                        session_id=session_id,
+                        path=path,
+                        media_type=media_type,
+                        detail=detail,
+                        source_bytes=source_bytes or None,
+                        source_sha256=source_sha256,
+                    )
+                    if prepared is not None:
+                        path = str(prepared["path"])
+                        media_type = str(prepared["media_type"])
+                        recovery_metadata = prepared
                 content = (
                     "Attached image from a local workspace file requested via view_image.\n"
                     f"path: {path}\n"
@@ -3708,8 +3873,125 @@ class AgentLoop:
                         turn_id=turn_id,
                     )
                 )
+                if recovery_metadata is not None:
+                    records.append(
+                        ConversationRecord(
+                            record_id=uuid4().hex,
+                            session_id=session_id,
+                            created_at=_utc_now_iso(),
+                            role="user",
+                            content=content,
+                            kind="provider_context",
+                            metadata={
+                                _TRANSCRIPT_ONLY_RECORD_METADATA_KEY: True,
+                                _GROK_RECOVERY_IMAGE_METADATA_KEY: True,
+                                _IMAGE_INPUT_METADATA_KEY: {
+                                    "path": path,
+                                    "media_type": media_type,
+                                    "detail": detail,
+                                },
+                                "source_tool": result.name,
+                                "source_path": recovery_metadata["source_path"],
+                                "source_sha256": recovery_metadata["source_sha256"],
+                                "content_sha256": recovery_metadata["content_sha256"],
+                                "source_bytes": recovery_metadata["source_bytes"],
+                                "content_bytes": recovery_metadata["content_bytes"],
+                                "transcoded": recovery_metadata["transcoded"],
+                                _TURN_ID_METADATA_KEY: turn_id,
+                            },
+                        )
+                    )
 
         return records
+
+    def _prepare_grok_image_attachment(
+        self,
+        *,
+        session_id: str,
+        path: str,
+        media_type: str,
+        detail: str,
+        source_bytes: bytes | None = None,
+        source_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
+        source_path = Path(path)
+        if source_bytes is None:
+            try:
+                source_bytes = source_path.read_bytes()
+            except OSError:
+                return None
+        if not source_bytes:
+            return None
+
+        source_sha256 = source_sha256 or hashlib.sha256(source_bytes).hexdigest()
+        content_bytes = source_bytes
+        content_media_type = media_type
+        transcoded = False
+        if len(
+            source_bytes
+        ) >= _GROK_IMAGE_TRANSCODE_MIN_BYTES and _should_transcode_grok_tool_image(
+            source_path, media_type=media_type
+        ):
+            optimized = _transcode_grok_tool_image(source_bytes)
+            if optimized is not None and len(optimized) < len(source_bytes):
+                content_bytes = optimized
+                content_media_type = "image/jpeg"
+                transcoded = True
+
+        content_sha256 = hashlib.sha256(content_bytes).hexdigest()
+        suffix = _image_media_type_suffix(content_media_type)
+        snapshot_dir = (
+            self._settings.transcript_archive_dir / _GROK_PROVIDER_MEDIA_DIR_NAME / session_id
+        )
+        snapshot_path = snapshot_dir / f"{content_sha256}{suffix}"
+        try:
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            if not snapshot_path.exists():
+                temporary_path = snapshot_dir / f".{snapshot_path.name}.{uuid4().hex}.tmp"
+                temporary_path.write_bytes(content_bytes)
+                temporary_path.replace(snapshot_path)
+        except OSError:
+            snapshot_path = source_path
+            content_bytes = source_bytes
+            content_media_type = media_type
+            content_sha256 = source_sha256
+            transcoded = False
+
+        return {
+            "path": str(snapshot_path),
+            "media_type": content_media_type,
+            "detail": detail,
+            "source_path": str(source_path),
+            "source_sha256": source_sha256,
+            "content_sha256": content_sha256,
+            "source_bytes": len(source_bytes),
+            "content_bytes": len(content_bytes),
+            "transcoded": transcoded,
+        }
+
+    def _grok_image_hash_is_live(
+        self,
+        *,
+        session_id: str,
+        source_sha256: str,
+    ) -> bool:
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return False
+        state = ProviderSessionState.from_mapping(session.provider_session_state)
+        if state is None or state.provider != "grok" or state.grok.storage_mode != "ephemeral":
+            return False
+        live_tail_records = _records_between_response_records(
+            self._storage.load_records(session_id, include_all_turns=True),
+            after_record_id=state.grok.durable_response_record_id,
+            through_record_id=state.grok.last_response_record_id,
+        )
+        for record in live_tail_records:
+            if record.kind != "provider_context":
+                continue
+            if record.metadata.get("source_sha256") == source_sha256:
+                return True
+        return False
 
     def _build_unexecuted_tool_call_note_record(
         self,
@@ -3813,11 +4095,15 @@ class AgentLoop:
         turn_id: str,
         turn_records: Sequence[ConversationRecord] | None = None,
     ) -> None:
-        records = list(turn_records) if turn_records is not None else [
-            record
-            for record in self._storage.load_records(session_id, include_all_turns=True)
-            if str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip() == turn_id
-        ]
+        records = (
+            list(turn_records)
+            if turn_records is not None
+            else [
+                record
+                for record in self._storage.load_records(session_id, include_all_turns=True)
+                if str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip() == turn_id
+            ]
+        )
         if not records:
             self._storage.set_turn_status(
                 session_id,
@@ -3839,8 +4125,7 @@ class AgentLoop:
                 )
 
         if not any(
-            record.metadata.get(_ORPHANED_TURN_RECOVERY_METADATA_KEY, False)
-            for record in records
+            record.metadata.get(_ORPHANED_TURN_RECOVERY_METADATA_KEY, False) for record in records
         ):
             self._storage.append_record(
                 session_id,
@@ -4056,15 +4341,9 @@ class AgentLoop:
             kind=str(approval.get("kind", "approval")).strip() or "approval",
             summary=str(approval.get("summary", "")).strip(),
             details=str(approval.get("details", "")).strip(),
-            command=(
-                str(approval["command"])
-                if approval.get("command") is not None
-                else None
-            ),
+            command=(str(approval["command"]) if approval.get("command") is not None else None),
             tool_name=(
-                str(approval["tool_name"])
-                if approval.get("tool_name") is not None
-                else None
+                str(approval["tool_name"]) if approval.get("tool_name") is not None else None
             ),
             inspection_url=(
                 str(approval["inspection_url"])
@@ -4141,9 +4420,7 @@ class AgentLoop:
                 if self._stop_requested(turn_id):
                     return None
                 try:
-                    return bool(
-                        await asyncio.wait_for(asyncio.shield(future), timeout=0.2)
-                    )
+                    return bool(await asyncio.wait_for(asyncio.shield(future), timeout=0.2))
                 except asyncio.TimeoutError:
                     continue
         finally:
@@ -4198,9 +4475,7 @@ class AgentLoop:
             content=interrupted_record_text,
             metadata={
                 "interrupted_by_user": interruption_reason == "user_stop",
-                "superseded_by_user_message": (
-                    interruption_reason == "superseded_by_user_message"
-                ),
+                "superseded_by_user_message": (interruption_reason == "superseded_by_user_message"),
                 "interruption_reason": interruption_reason,
             },
             turn_id=turn_id,
@@ -4231,7 +4506,7 @@ class AgentLoop:
         session_id: str,
         record: ConversationRecord,
     ) -> ConversationRecord:
-        return ConversationRecord(
+        cloned = ConversationRecord(
             record_id=uuid4().hex,
             session_id=session_id,
             created_at=_utc_now_iso(),
@@ -4240,6 +4515,37 @@ class AgentLoop:
             kind=record.kind,
             metadata=deepcopy(record.metadata),
         )
+        attachment = cloned.metadata.get(_IMAGE_INPUT_METADATA_KEY)
+        if not isinstance(attachment, dict):
+            return cloned
+        raw_path = str(attachment.get("path", "")).strip()
+        if not raw_path:
+            return cloned
+        source_path = Path(raw_path)
+        source_media_root = (
+            self._settings.transcript_archive_dir
+            / _GROK_PROVIDER_MEDIA_DIR_NAME
+            / record.session_id
+        )
+        try:
+            source_path.relative_to(source_media_root)
+        except ValueError:
+            return cloned
+        if not source_path.is_file():
+            return cloned
+
+        destination_dir = (
+            self._settings.transcript_archive_dir / _GROK_PROVIDER_MEDIA_DIR_NAME / session_id
+        )
+        destination_path = destination_dir / source_path.name
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            if not destination_path.exists():
+                shutil.copyfile(source_path, destination_path)
+        except OSError:
+            return cloned
+        attachment["path"] = str(destination_path)
+        return cloned
 
     def _clone_carry_forward_record_for_session(
         self,
@@ -4345,7 +4651,9 @@ def _turn_requires_no_tools(
 ) -> bool:
     if user_text is not None:
         return False
-    return any(bool(message.metadata.get("force_no_tools_this_turn")) for message in runtime_messages)
+    return any(
+        bool(message.metadata.get("force_no_tools_this_turn")) for message in runtime_messages
+    )
 
 
 def _update_pending_detached_job_ids(
@@ -4360,12 +4668,9 @@ def _update_pending_detached_job_ids(
     status = str(
         tool_result.metadata.get("status") or tool_result.metadata.get("state") or ""
     ).strip()
-    if (
-        status == "running"
-        and (
-            str(tool_result.metadata.get("mode", "")).strip() == "background"
-            or bool(tool_result.metadata.get("promoted_to_background"))
-        )
+    if status == "running" and (
+        str(tool_result.metadata.get("mode", "")).strip() == "background"
+        or bool(tool_result.metadata.get("promoted_to_background"))
     ):
         pending_job_ids.add(job_id)
         return
@@ -4384,7 +4689,11 @@ def _update_pending_subagent_ids(
         return
     action = str(tool_result.metadata.get("subagent_action", "")).strip()
     status = str(tool_result.metadata.get("status", "")).strip()
-    if action in {"invoke", "step_in"} and status in {"running", "waiting_background", "awaiting_approval"}:
+    if action in {"invoke", "step_in"} and status in {
+        "running",
+        "waiting_background",
+        "awaiting_approval",
+    }:
         pending_subagent_ids.add(subagent_id)
         return
     if status in {"paused", "completed", "failed", "disposed"}:
@@ -4414,6 +4723,9 @@ def _is_image_attachment_request_error(exc: Exception) -> bool:
 
 def _records_to_llm_messages(
     records: Sequence[ConversationRecord],
+    *,
+    defer_local_images: bool = False,
+    allow_terminal_pending_tool_calls: bool = False,
 ) -> tuple[LLMMessage, ...]:
     # Replayable transcript records are the source of truth for rebuilding
     # LLMRequest.messages. Non-image prompt-visible records must persist.
@@ -4434,6 +4746,7 @@ def _records_to_llm_messages(
         llm_message = _record_to_llm_message(
             record,
             include_tool_calls=include_tool_calls,
+            defer_local_images=defer_local_images,
         )
         if llm_message is not None:
             messages.append(llm_message)
@@ -4472,7 +4785,9 @@ def _records_to_llm_messages(
                 pending_assistant = record
                 pending_tool_records = []
                 pending_call_ids = {call_id for call_id, _name in call_specs}
-                pending_tool_names = tuple(_ordered_unique_names(name for _call_id, name in call_specs))
+                pending_tool_names = tuple(
+                    _ordered_unique_names(name for _call_id, name in call_specs)
+                )
                 continue
 
             _append_record(record)
@@ -4503,7 +4818,11 @@ def _records_to_llm_messages(
         _append_record(record)
 
     if pending_assistant is not None:
-        _raise_unresolved_pending()
+        if not allow_terminal_pending_tool_calls:
+            _raise_unresolved_pending()
+        _append_record(pending_assistant, include_tool_calls=True)
+        for tool_record in pending_tool_records:
+            _append_record(tool_record)
 
     return tuple(messages)
 
@@ -4519,8 +4838,67 @@ def _records_after_response_record(
         return tuple(records)
     for index, record in enumerate(records):
         if record.record_id == normalized:
-            return tuple(records[index + 1:])
+            return tuple(records[index + 1 :])
     return tuple(records)
+
+
+def _records_between_response_records(
+    records: Sequence[ConversationRecord],
+    *,
+    after_record_id: str | None,
+    through_record_id: str | None,
+) -> tuple[ConversationRecord, ...]:
+    if through_record_id is None or not through_record_id.strip():
+        return ()
+
+    start_index = 0
+    if after_record_id is not None and after_record_id.strip():
+        for index, record in enumerate(records):
+            if record.record_id == after_record_id:
+                start_index = index + 1
+                break
+
+    for index in range(start_index, len(records)):
+        if records[index].record_id == through_record_id:
+            return tuple(records[start_index : index + 1])
+    return ()
+
+
+def _records_have_image_inputs(records: Sequence[ConversationRecord]) -> bool:
+    return any(
+        isinstance(record.metadata.get(_IMAGE_INPUT_METADATA_KEY), dict) for record in records
+    )
+
+
+def _records_to_grok_recovery_messages(
+    records: Sequence[ConversationRecord],
+) -> tuple[LLMMessage, ...]:
+    replay_records: list[ConversationRecord] = []
+    for record in records:
+        if record.kind != "provider_context":
+            replay_records.append(record)
+            continue
+        if not bool(record.metadata.get(_GROK_RECOVERY_IMAGE_METADATA_KEY, False)):
+            continue
+        metadata = deepcopy(record.metadata)
+        metadata.pop(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, None)
+        metadata.pop(_GROK_RECOVERY_IMAGE_METADATA_KEY, None)
+        replay_records.append(
+            ConversationRecord(
+                record_id=record.record_id,
+                session_id=record.session_id,
+                created_at=record.created_at,
+                role=record.role,
+                content=record.content,
+                kind="message",
+                metadata=metadata,
+            )
+        )
+    return _records_to_llm_messages(
+        replay_records,
+        defer_local_images=True,
+        allow_terminal_pending_tool_calls=True,
+    )
 
 
 def _gemini_cache_source_signature(
@@ -4602,6 +4980,13 @@ def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
     return normalized or None
 
 
+def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
+    value = metadata.get(key)
+    if not isinstance(value, int):
+        return None
+    return value
+
+
 def _metadata_string_tuple(metadata: dict[str, Any], key: str) -> tuple[str, ...]:
     value = metadata.get(key)
     if not isinstance(value, (list, tuple)):
@@ -4618,13 +5003,14 @@ def _record_to_llm_message(
     record: ConversationRecord,
     *,
     include_tool_calls: bool = True,
+    defer_local_images: bool = False,
 ) -> LLMMessage | None:
     if bool(record.metadata.get(_TRANSCRIPT_ONLY_RECORD_METADATA_KEY, False)):
         return None
 
     if record.role in {"system", "user"}:
-        parts: list[ImagePart | TextPart] = []
-        image_part = _record_image_part(record)
+        parts: list[ImagePart | LocalImagePart | TextPart] = []
+        image_part = _record_image_part(record, defer_local=defer_local_images)
         if image_part is not None:
             parts.append(image_part)
         if record.content:
@@ -4712,7 +5098,9 @@ def _assistant_tool_call_specs(
     return tuple(specs)
 
 
-def _ordered_unique_names(names: Sequence[str] | list[str] | tuple[str, ...] | Any) -> tuple[str, ...]:
+def _ordered_unique_names(
+    names: Sequence[str] | list[str] | tuple[str, ...] | Any,
+) -> tuple[str, ...]:
     ordered: list[str] = []
     seen: set[str] = set()
     for raw_name in names:
@@ -4760,7 +5148,11 @@ def _pending_tool_notice_names(
     return tuple(names)
 
 
-def _record_image_part(record: ConversationRecord) -> ImagePart | None:
+def _record_image_part(
+    record: ConversationRecord,
+    *,
+    defer_local: bool = False,
+) -> ImagePart | LocalImagePart | None:
     attachment = record.metadata.get(_IMAGE_INPUT_METADATA_KEY)
     if not isinstance(attachment, dict):
         return None
@@ -4773,6 +5165,13 @@ def _record_image_part(record: ConversationRecord) -> ImagePart | None:
     if raw_detail not in {"low", "high", "auto", "original"}:
         raw_detail = "auto"
 
+    if defer_local:
+        return LocalImagePart(
+            path=raw_path,
+            media_type=media_type,
+            detail=raw_detail,  # type: ignore[arg-type]
+        )
+
     try:
         data = Path(raw_path).read_bytes()
     except OSError:
@@ -4783,6 +5182,57 @@ def _record_image_part(record: ConversationRecord) -> ImagePart | None:
         data_base64=base64.b64encode(data).decode("ascii"),
         detail=raw_detail,  # type: ignore[arg-type]
     )
+
+
+def _transcode_grok_tool_image(source_bytes: bytes) -> bytes | None:
+    try:
+        with Image.open(BytesIO(source_bytes)) as source:
+            image = ImageOps.exif_transpose(source)
+            if max(image.size) > _GROK_IMAGE_MAX_EDGE_PIXELS:
+                image.thumbnail(
+                    (_GROK_IMAGE_MAX_EDGE_PIXELS, _GROK_IMAGE_MAX_EDGE_PIXELS),
+                    Image.Resampling.LANCZOS,
+                )
+            if image.mode in {"RGBA", "LA"}:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            output = BytesIO()
+            image.save(
+                output,
+                format="JPEG",
+                quality=_GROK_IMAGE_JPEG_QUALITY,
+                optimize=True,
+            )
+            return output.getvalue()
+    except (OSError, ValueError):
+        return None
+
+
+def _should_transcode_grok_tool_image(path: Path, *, media_type: str) -> bool:
+    if media_type != "image/png":
+        return False
+    screenshot_markers = {
+        "captures",
+        "renders",
+        "screenshots",
+        "shots",
+    }
+    normalized_parts = {part.lower() for part in path.parts}
+    normalized_name = path.stem.lower()
+    return bool(normalized_parts & screenshot_markers) or "screenshot" in normalized_name
+
+
+def _image_media_type_suffix(media_type: str) -> str:
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }.get(media_type, ".bin")
 
 
 def _carry_forward_soft_limit(record: ConversationRecord) -> int | None:
@@ -4967,9 +5417,7 @@ def _collect_unexecuted_tool_call_names(
             if pending_call_ids:
                 _flush_pending()
             pending_call_ids = {call_id for call_id, _name in call_specs}
-            pending_tool_names = tuple(
-                _ordered_unique_names(name for _call_id, name in call_specs)
-            )
+            pending_tool_names = tuple(_ordered_unique_names(name for _call_id, name in call_specs))
             continue
 
         if not pending_call_ids:

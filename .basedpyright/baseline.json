@@ -310,30 +310,6 @@
                 }
             },
             {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 19,
-                    "endColumn": 42,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 23,
-                    "endColumn": 46,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 28,
-                    "endColumn": 51,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportArgumentType",
                 "range": {
                     "startColumn": 49,
@@ -350,14 +326,6 @@
                 }
             },
             {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 24,
-                    "endColumn": 47,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportArgumentType",
                 "range": {
                     "startColumn": 53,
@@ -370,38 +338,6 @@
                 "range": {
                     "startColumn": 49,
                     "endColumn": 69,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 23,
-                    "endColumn": 46,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 41,
-                    "endColumn": 45,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 41,
-                    "endColumn": 45,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 41,
-                    "endColumn": 45,
                     "lineCount": 1
                 }
             },
@@ -648,32 +584,6 @@
                 "range": {
                     "startColumn": 23,
                     "endColumn": 44,
-                    "lineCount": 1
-                }
-            }
-        ],
-        "./src/jarvis/llm/providers/grok_provider.py": [
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 32,
-                    "endColumn": 39,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 32,
-                    "endColumn": 39,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 26,
-                    "endColumn": 93,
                     "lineCount": 1
                 }
             }

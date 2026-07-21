@@ -216,15 +216,26 @@ Current Grok note:
 
 - Grok now uses xAI Responses, not chat-completions
 - configured Grok reasoning effort is sent as Responses `reasoning.effort`
-- native Grok uses provider-owned stateful continuation through persisted `previous_response_id`
-- the Grok adapter sends `store=true`, and follow-up turns send only the new input plus `previous_response_id`
-- Jarvis no longer manually rebuilds Grok provider context from unified transcript history for normal native Grok turns
+- native Grok uses provider-owned stateful continuation through persisted response ids; normal turns send only the new input plus `previous_response_id`
+- xAI durable Responses storage (`store=true`) is distinct from its prompt/KV cache: durable storage is what makes a response id rehydratable on a later connection, while prompt caching only accelerates repeated token prefixes
+- ordinary text-only Grok turns remain on HTTP Responses with `store=true`; the adapter sends the stable Jarvis session id as the Responses-body `prompt_cache_key`
+- image-bearing turns proactively latch that Jarvis session into an ephemeral Grok mode and use a per-session Responses WebSocket with `store=false`, because xAI explicitly warns that storing image request/response history may fail
+- once latched, later turns continue incrementally on the same WebSocket from its live response id instead of toggling back to durable storage or rebuilding context locally
+- Grok session metadata keeps the live response/record id, last durable response/record anchor, storage mode, and WebSocket generation
+- after a socket expiry, disconnect, or process restart, the adapter lazily assembles the bounded ephemeral tail, hydrates the last durable response id, and uses a `generate=false` warmup before sending the current delta; the normal live-socket path neither assembles nor sends that tail
+- a recovery tail may validly end with assistant tool calls whose results begin the current delta; this narrow recovery-only case is supported without weakening normal transcript replay validation
+- recovery-only image records persist path/hash metadata as `kind=provider_context`, never raw bytes or base64; their compressed snapshots are materialized lazily only during reconnect and are cleaned when the Jarvis session is replaced or compacted
+- large PNGs that are clearly tool-produced screenshots (`shots`, `renders`, `screenshots`, or `captures`) may be bounded and transcoded to JPEG; arbitrary JPEG/WebP inputs and unmarked PNGs are preserved, and unchanged screenshots already in the live chain are replaced by a small reuse notice
+- the exact xAI `Response is too large to store` failure is classified in the Grok adapter and retried once over `store=false`; matching partial text is suppressed by content prefix and already-announced tool deltas are not emitted twice, while tool execution still waits for the retried response's terminal `DoneEvent`
+- Jarvis compaction/new-session boundaries deliberately start a fresh durable Grok chain and release the old recovery media
+- Jarvis does not use a public URL or Files upload as the primary workaround, so local workspace images do not need to be exposed externally
+- Jarvis no longer manually rebuilds Grok provider context from unified transcript history for normal native Grok turns; local tail reconstruction is a reconnect-only fallback after the durable anchor
 - transcript records remain the archive/debug/audit source, and assistant records may still carry opaque Grok `response.output` metadata for inspection
 - the older encrypted-reasoning replay path was only needed while Grok was treated as stateless; with xAI Responses continuation, reasoning history is provider-managed instead of Jarvis-owned
 
 Future note:
 
-- keep the transcript format unified and keep Grok-specific request/metadata semantics inside the provider adapter
+- keep WebSocket/storage/error behavior Grok-specific; only the generic stateful-continuation descriptor, deferred local-image part, and `provider_context` archive seam are shared infrastructure
 - if xAI changes model-family naming or Responses continuation behavior, update the Grok adapter heuristics there rather than leaking model-specific branching into the agent loop
 
 ### `src/jarvis/memory/`

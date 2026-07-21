@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-RecordKind = Literal["message", "compaction"]
+RecordKind = Literal["message", "compaction", "provider_context"]
 RecordRole = Literal["system", "user", "assistant", "tool"]
 SessionStatus = Literal["active", "archived"]
 TurnStatus = Literal["in_progress", "completed", "interrupted", "superseded"]
@@ -125,7 +125,13 @@ class ConversationRecord:
             role = "assistant"
 
         raw_kind = str(data.get("kind", "message"))
-        kind: RecordKind = "compaction" if raw_kind == "compaction" else "message"
+        kind: RecordKind
+        if raw_kind == "compaction":
+            kind = "compaction"
+        elif raw_kind == "provider_context":
+            kind = "provider_context"
+        else:
+            kind = "message"
 
         metadata = data.get("metadata", {})
         if not isinstance(metadata, dict):

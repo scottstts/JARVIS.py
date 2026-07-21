@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 class ProviderContextStrategy(StrEnum):
@@ -50,20 +50,57 @@ class OpenAIProviderSessionState:
 class GrokProviderSessionState:
     previous_response_id: str | None = None
     last_response_record_id: str | None = None
+    durable_response_id: str | None = None
+    durable_response_record_id: str | None = None
+    storage_mode: Literal["durable", "ephemeral"] = "durable"
+    websocket_generation: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "previousResponseId": self.previous_response_id,
             "lastResponseRecordId": self.last_response_record_id,
+            "durableResponseId": self.durable_response_id,
+            "durableResponseRecordId": self.durable_response_record_id,
+            "storageMode": self.storage_mode,
+            "websocketGeneration": self.websocket_generation,
         }
 
     @classmethod
     def from_mapping(cls, value: Any) -> "GrokProviderSessionState":
         if not isinstance(value, Mapping):
             return cls()
+        previous_response_id = _optional_str(value.get("previousResponseId"))
+        last_response_record_id = _optional_str(value.get("lastResponseRecordId"))
+        raw_storage_mode = _optional_str(value.get("storageMode"))
+        storage_mode: Literal["durable", "ephemeral"] = (
+            "ephemeral" if raw_storage_mode == "ephemeral" else "durable"
+        )
+        raw_generation = value.get("websocketGeneration", 0)
+        websocket_generation = raw_generation if isinstance(raw_generation, int) else 0
+        is_legacy_state = not any(
+            key in value
+            for key in (
+                "durableResponseId",
+                "durableResponseRecordId",
+                "storageMode",
+                "websocketGeneration",
+            )
+        )
         return cls(
-            previous_response_id=_optional_str(value.get("previousResponseId")),
-            last_response_record_id=_optional_str(value.get("lastResponseRecordId")),
+            previous_response_id=previous_response_id,
+            last_response_record_id=last_response_record_id,
+            durable_response_id=(
+                previous_response_id
+                if is_legacy_state
+                else _optional_str(value.get("durableResponseId"))
+            ),
+            durable_response_record_id=(
+                last_response_record_id
+                if is_legacy_state
+                else _optional_str(value.get("durableResponseRecordId"))
+            ),
+            storage_mode=storage_mode,
+            websocket_generation=max(0, websocket_generation),
         )
 
 

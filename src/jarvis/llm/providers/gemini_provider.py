@@ -8,7 +8,7 @@ import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from google import genai
@@ -102,7 +102,7 @@ class GeminiProvider:
         try:
             response = await client.aio.models.generate_content(
                 model=request.model,
-                contents=contents,
+                contents=cast(Any, contents),
                 config=config or None,
             )
         except Exception as exc:
@@ -143,7 +143,7 @@ class GeminiProvider:
         try:
             stream = await client.aio.models.generate_content_stream(
                 model=request.model,
-                contents=contents,
+                contents=cast(Any, contents),
                 config=config or None,
             )
             async for chunk in stream:

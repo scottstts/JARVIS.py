@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from dataclasses import dataclass, replace
 import inspect
 import json
 import os
+from pathlib import Path
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
+
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from openai import (
     APIConnectionError,
@@ -41,13 +46,16 @@ from ..types import (
     DoneEvent,
     EmbeddingRequest,
     EmbeddingResponse,
+    FinishReason,
     ImagePart,
     LLMMessage,
     LLMRequest,
     LLMResponse,
     LLMUsage,
+    LocalImagePart,
     ProviderActivityEvent,
     ProviderStreamEvent,
+    StatefulContinuation,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -60,6 +68,29 @@ from ..types import (
 )
 from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
+
+_GROK_WEBSOCKET_MAX_AGE_SECONDS = 23 * 60
+_GROK_WEBSOCKET_POOL_LIMIT = 32
+_RESPONSE_STORAGE_OVERFLOW_HINT = "response is too large to store"
+
+
+class GrokResponseStorageOverflowError(ProviderResponseError):
+    """xAI could generate the response but refused its durable representation."""
+
+
+class GrokWebSocketContinuationError(ProviderResponseError):
+    """The requested xAI in-memory continuation is unavailable on this socket."""
+
+
+@dataclass(slots=True)
+class _GrokWebSocketSession:
+    session_key: str
+    websocket: Any
+    lock: asyncio.Lock
+    opened_at: float
+    last_used_at: float
+    generation: int
+    live_response_id: str | None = None
 
 
 class GrokProvider:
@@ -79,6 +110,8 @@ class GrokProvider:
         )
         self._client: AsyncOpenAI | None = None
         self._client_lock = asyncio.Lock()
+        self._websocket_sessions: dict[str, _GrokWebSocketSession] = {}
+        self._websocket_sessions_lock = asyncio.Lock()
 
     @property
     def name(self) -> str:
@@ -94,96 +127,502 @@ class GrokProvider:
         )
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
-        kwargs = self._build_response_create_kwargs(request, stream=False)
-        client = await self._client_for_request(request)
+        if _request_contains_image(request) and not _request_uses_ephemeral_storage(request):
+            request = _request_with_ephemeral_fallback(request)
+        if _request_uses_ephemeral_storage(request):
+            return await self._generate_ephemeral(request)
+
+        kwargs = self._build_response_create_kwargs(request, stream=False, store=True)
+        client = await self._client_instance()
         try:
             response = await client.responses.create(**kwargs)
         except Exception as exc:
-            raise self._map_error(exc) from exc
+            mapped = self._map_error(exc)
+            if isinstance(mapped, GrokResponseStorageOverflowError):
+                return await self._generate_ephemeral(_request_with_ephemeral_fallback(request))
+            raise mapped from exc
         return self._normalize_response(request=request, response=response)
 
     async def stream_generate(
         self,
         request: LLMRequest,
     ) -> AsyncIterator[ProviderStreamEvent]:
-        kwargs = self._build_response_create_kwargs(request, stream=True)
-        client = await self._client_for_request(request)
+        if _request_contains_image(request) and not _request_uses_ephemeral_storage(request):
+            request = _request_with_ephemeral_fallback(request)
+        if _request_uses_ephemeral_storage(request):
+            async for event in self._stream_ephemeral_with_reconnect(request):
+                yield event
+            return
 
+        kwargs = self._build_response_create_kwargs(request, stream=True, store=True)
+        client = await self._client_instance()
+        emitted_deltas: list[TextDeltaEvent | ToolCallDeltaEvent] = []
+
+        try:
+            stream = await client.responses.create(**kwargs)
+            async for event in self._normalize_provider_stream(request=request, stream=stream):
+                if isinstance(event, (TextDeltaEvent, ToolCallDeltaEvent)):
+                    emitted_deltas.append(event)
+                yield event
+        except Exception as exc:
+            mapped = self._map_error(exc)
+            if not isinstance(mapped, GrokResponseStorageOverflowError):
+                raise mapped from exc
+
+            fallback = _request_with_ephemeral_fallback(request)
+            async for event in self._suppress_replayed_deltas(
+                self._stream_ephemeral_with_reconnect(fallback),
+                emitted_deltas,
+            ):
+                yield event
+
+    async def _generate_ephemeral(self, request: LLMRequest) -> LLMResponse:
+        response: LLMResponse | None = None
+        async for event in self._stream_ephemeral_with_reconnect(request):
+            if isinstance(event, DoneEvent):
+                response = event.response
+        if response is None:
+            raise StreamProtocolError("Grok WebSocket closed without a completed response.")
+        return response
+
+    async def _stream_ephemeral_with_reconnect(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        emitted_deltas: list[TextDeltaEvent | ToolCallDeltaEvent] = []
+        for attempt in range(2):
+            try:
+                stream = self._stream_ephemeral_once(
+                    request,
+                    force_reconnect=attempt > 0,
+                )
+                if attempt == 0:
+                    async for event in stream:
+                        if isinstance(event, (TextDeltaEvent, ToolCallDeltaEvent)):
+                            emitted_deltas.append(event)
+                        yield event
+                else:
+                    async for event in self._suppress_replayed_deltas(
+                        stream,
+                        emitted_deltas,
+                    ):
+                        yield event
+                return
+            except Exception as exc:
+                mapped = self._map_error(exc)
+                if attempt > 0 or not _is_reconnectable_websocket_error(mapped):
+                    raise mapped from exc
+                continuation = request.stateful_continuation
+                if continuation is not None:
+                    await self._drop_websocket_session(continuation.session_key)
+
+        raise StreamProtocolError("Grok WebSocket reconnect loop exited unexpectedly.")
+
+    async def _stream_ephemeral_once(
+        self,
+        request: LLMRequest,
+        *,
+        force_reconnect: bool,
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        continuation = request.stateful_continuation
+        if continuation is None:
+            raise LLMConfigurationError(
+                "Grok ephemeral continuation requires stateful_continuation."
+            )
+        if force_reconnect:
+            await self._drop_websocket_session(continuation.session_key)
+        session = await self._websocket_session(continuation)
+
+        completed = False
+        try:
+            async with session.lock:
+                previous_response_id = await self._prepare_websocket_continuation(
+                    session=session,
+                    request=request,
+                )
+                payload = self._build_websocket_payload(
+                    request=request,
+                    messages=request.messages,
+                    previous_response_id=previous_response_id,
+                    generate=True,
+                )
+                raw_stream = self._websocket_response_events(session, payload)
+                async for event in self._normalize_provider_stream(
+                    request=request,
+                    stream=raw_stream,
+                ):
+                    if isinstance(event, DoneEvent):
+                        session.live_response_id = event.response.response_id
+                        session.last_used_at = asyncio.get_running_loop().time()
+                        completed = True
+                    yield event
+        finally:
+            if not completed:
+                await self._drop_websocket_session(
+                    continuation.session_key,
+                    expected=session,
+                )
+
+    async def _prepare_websocket_continuation(
+        self,
+        *,
+        session: _GrokWebSocketSession,
+        request: LLMRequest,
+    ) -> str | None:
+        continuation = request.stateful_continuation
+        if continuation is None:
+            raise LLMConfigurationError("Missing Grok stateful continuation metadata.")
+
+        requested_response_id = request.previous_response_id
+        if session.live_response_id == requested_response_id:
+            return requested_response_id
+
+        durable_response_id = continuation.durable_response_id
+        if requested_response_id == durable_response_id:
+            session.live_response_id = durable_response_id
+            return durable_response_id
+
+        recovery_messages = continuation.materialize_recovery_messages()
+        if not recovery_messages:
+            raise GrokWebSocketContinuationError(
+                "Grok live continuation is unavailable and no recovery tail was supplied.",
+                metadata={
+                    "code": "missing_recovery_tail",
+                    "requested_response_id": requested_response_id,
+                    "durable_response_id": durable_response_id,
+                },
+            )
+
+        warmup_payload = self._build_websocket_payload(
+            request=request,
+            messages=recovery_messages,
+            previous_response_id=durable_response_id,
+            generate=False,
+        )
+        warmup_response_id: str | None = None
+        async for raw_event in self._websocket_response_events(session, warmup_payload):
+            event_type = str(_field(raw_event, "type", ""))
+            if event_type == "error":
+                raise self._stream_error_from_event(raw_event)
+            if event_type == "response.failed":
+                raise self._stream_error_from_failed_response(_field(raw_event, "response"))
+            if event_type in {"response.completed", "response.incomplete"}:
+                response = _field(raw_event, "response")
+                warmup_response_id = _normalize_optional_string(_field(response, "id"))
+
+        if warmup_response_id is None:
+            raise StreamProtocolError(
+                "Grok WebSocket recovery warmup completed without a response id."
+            )
+        session.live_response_id = warmup_response_id
+        return warmup_response_id
+
+    async def _websocket_session(
+        self,
+        continuation: StatefulContinuation,
+    ) -> _GrokWebSocketSession:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        stale_sessions: list[_GrokWebSocketSession] = []
+        async with self._websocket_sessions_lock:
+            session = self._websocket_sessions.get(continuation.session_key)
+            if (
+                session is not None
+                and not session.lock.locked()
+                and now - session.opened_at >= _GROK_WEBSOCKET_MAX_AGE_SECONDS
+            ):
+                self._websocket_sessions.pop(continuation.session_key, None)
+                stale_sessions.append(session)
+                session = None
+
+            if session is None:
+                session = await self._open_websocket_session(continuation)
+                self._websocket_sessions[continuation.session_key] = session
+
+            if len(self._websocket_sessions) > _GROK_WEBSOCKET_POOL_LIMIT:
+                candidates = [
+                    candidate
+                    for candidate in self._websocket_sessions.values()
+                    if candidate is not session and not candidate.lock.locked()
+                ]
+                if candidates:
+                    oldest = min(candidates, key=lambda candidate: candidate.last_used_at)
+                    self._websocket_sessions.pop(oldest.session_key, None)
+                    stale_sessions.append(oldest)
+
+        for stale in stale_sessions:
+            await self._close_websocket_session(stale)
+        return session
+
+    async def _open_websocket_session(
+        self,
+        continuation: StatefulContinuation,
+    ) -> _GrokWebSocketSession:
+        api_key = self._api_key()
+        websocket = await connect(
+            self._websocket_url(),
+            additional_headers={"Authorization": f"Bearer {api_key}"},
+            open_timeout=self._transport_timeouts.connect_seconds,
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+        now = asyncio.get_running_loop().time()
+        return _GrokWebSocketSession(
+            session_key=continuation.session_key,
+            websocket=websocket,
+            lock=asyncio.Lock(),
+            opened_at=now,
+            last_used_at=now,
+            generation=continuation.generation + 1,
+        )
+
+    async def _drop_websocket_session(
+        self,
+        session_key: str,
+        *,
+        expected: _GrokWebSocketSession | None = None,
+    ) -> None:
+        async with self._websocket_sessions_lock:
+            session = self._websocket_sessions.get(session_key)
+            if session is None or (expected is not None and session is not expected):
+                return
+            self._websocket_sessions.pop(session_key, None)
+        await self._close_websocket_session(session)
+
+    async def _close_websocket_session(self, session: _GrokWebSocketSession) -> None:
+        close = getattr(session.websocket, "close", None)
+        if not callable(close):
+            return
+        try:
+            maybe = close()
+            if inspect.isawaitable(maybe):
+                await maybe
+        except Exception:
+            return
+
+    async def _websocket_response_events(
+        self,
+        session: _GrokWebSocketSession,
+        payload: dict[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        await session.websocket.send(json.dumps(payload, separators=(",", ":")))
+        while True:
+            try:
+                raw_event = await asyncio.wait_for(
+                    session.websocket.recv(),
+                    timeout=self._transport_timeouts.read_seconds,
+                )
+            except TimeoutError as exc:
+                raise ProviderTimeoutError(
+                    "Grok WebSocket read timed out.",
+                    metadata={
+                        "timeout_kind": "websocket_read",
+                        "read_timeout_seconds": self._transport_timeouts.read_seconds,
+                    },
+                ) from exc
+            if isinstance(raw_event, bytes):
+                raw_event = raw_event.decode("utf-8")
+            try:
+                event = json.loads(raw_event)
+            except (TypeError, ValueError) as exc:
+                raise StreamProtocolError("Grok WebSocket returned invalid JSON.") from exc
+            if not isinstance(event, dict):
+                raise StreamProtocolError("Grok WebSocket returned a non-object event.")
+            yield event
+            if event.get("type") in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "error",
+            }:
+                return
+
+    def _build_websocket_payload(
+        self,
+        *,
+        request: LLMRequest,
+        messages: Sequence[LLMMessage],
+        previous_response_id: str | None,
+        generate: bool,
+    ) -> dict[str, Any]:
+        payload_request = replace(
+            request,
+            messages=messages,
+            previous_response_id=previous_response_id,
+        )
+        payload = self._build_response_create_kwargs(
+            payload_request,
+            stream=False,
+            store=False,
+        )
+        payload.pop("stream", None)
+        payload["type"] = "response.create"
+        if not generate:
+            payload["generate"] = False
+        return payload
+
+    async def _suppress_replayed_deltas(
+        self,
+        stream: AsyncIterator[ProviderStreamEvent],
+        emitted_deltas: Sequence[TextDeltaEvent | ToolCallDeltaEvent],
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        emitted_text_deltas = [
+            event for event in emitted_deltas if isinstance(event, TextDeltaEvent)
+        ]
+        suppress_tool_deltas = any(
+            isinstance(event, ToolCallDeltaEvent) for event in emitted_deltas
+        )
+        replay_index = 0
+        replay_offset = 0
+        async for event in stream:
+            if isinstance(event, ToolCallDeltaEvent) and suppress_tool_deltas:
+                # Tool execution is driven by DoneEvent.response, not stream deltas.
+                # A retried response receives fresh call ids, so suppress every retry
+                # delta after the first attempt already announced the tool name.
+                continue
+            if isinstance(event, TextDeltaEvent):
+                remaining = _stream_delta_text(event)
+                while remaining and replay_index < len(emitted_text_deltas):
+                    expected = emitted_text_deltas[replay_index]
+                    if not _same_stream_delta_channel(event, expected):
+                        raise StreamProtocolError(
+                            "Grok store=false retry diverged from the partial durable stream."
+                        )
+                    expected_remaining = _stream_delta_text(expected)[replay_offset:]
+                    if expected_remaining.startswith(remaining):
+                        replay_offset += len(remaining)
+                        remaining = ""
+                        if replay_offset == len(_stream_delta_text(expected)):
+                            replay_index += 1
+                            replay_offset = 0
+                        break
+                    if remaining.startswith(expected_remaining):
+                        remaining = remaining[len(expected_remaining) :]
+                        replay_index += 1
+                        replay_offset = 0
+                        continue
+                    raise StreamProtocolError(
+                        "Grok store=false retry diverged from the partial durable stream."
+                    )
+                if replay_index < len(emitted_text_deltas) or not remaining:
+                    continue
+                event = _replace_stream_delta_text(event, remaining)
+            if replay_index < len(emitted_text_deltas) and isinstance(
+                event, (UsageDeltaEvent, DoneEvent)
+            ):
+                raise StreamProtocolError(
+                    "Grok store=false retry ended before replaying the partial durable stream."
+                )
+            yield event
+
+    async def _normalize_provider_stream(
+        self,
+        *,
+        request: LLMRequest,
+        stream: AsyncIterator[Any],
+    ) -> AsyncIterator[ProviderStreamEvent]:
         tool_name_by_item_id: dict[str, str] = {}
         call_id_by_item_id: dict[str, str] = {}
         saw_completion = False
 
-        try:
-            stream = await client.responses.create(**kwargs)
-            async for event in stream:
-                event_type = getattr(event, "type", "")
+        async for event in stream:
+            event_type = str(_field(event, "type", ""))
 
-                if event_type == "response.output_text.delta":
-                    yield TextDeltaEvent(delta=event.delta)
-                    continue
+            if event_type == "response.output_text.delta":
+                yield TextDeltaEvent(delta=str(_field(event, "delta", "")))
+                continue
 
-                if event_type in {"response.output_item.added", "response.output_item.done"}:
-                    item = event.item
-                    if getattr(item, "type", "") == "function_call":
-                        item_id = getattr(item, "id", None)
-                        if item_id:
-                            tool_name_by_item_id[item_id] = item.name
-                            call_id_by_item_id[item_id] = item.call_id
-                    yield _grok_activity_event(event_type, event)
-                    continue
+            if event_type in {
+                "response.output_item.added",
+                "response.output_item.done",
+            }:
+                item = _field(event, "item")
+                if _field(item, "type") == "function_call":
+                    item_id = _normalize_optional_string(_field(item, "id"))
+                    if item_id:
+                        tool_name_by_item_id[item_id] = str(_field(item, "name", ""))
+                        call_id_by_item_id[item_id] = str(_field(item, "call_id", item_id))
+                yield _grok_activity_event(event_type, event)
+                continue
 
-                if event_type == "response.function_call_arguments.delta":
-                    call_id = call_id_by_item_id.get(event.item_id, event.item_id)
-                    yield ToolCallDeltaEvent(
-                        call_id=call_id,
-                        tool_name=tool_name_by_item_id.get(event.item_id),
-                        arguments_delta=event.delta,
-                    )
-                    continue
+            if event_type == "response.function_call_arguments.delta":
+                item_id = str(_field(event, "item_id", ""))
+                call_id = call_id_by_item_id.get(item_id, item_id)
+                yield ToolCallDeltaEvent(
+                    call_id=call_id,
+                    tool_name=tool_name_by_item_id.get(item_id),
+                    arguments_delta=str(_field(event, "delta", "")),
+                )
+                continue
 
-                if event_type == "response.function_call_arguments.done":
-                    call_id = call_id_by_item_id.get(event.item_id, event.item_id)
-                    yield ToolCallDeltaEvent(
-                        call_id=call_id,
-                        tool_name=event.name,
-                        arguments_delta=event.arguments,
-                    )
-                    continue
+            if event_type == "response.function_call_arguments.done":
+                item_id = str(_field(event, "item_id", ""))
+                call_id = call_id_by_item_id.get(item_id, item_id)
+                yield ToolCallDeltaEvent(
+                    call_id=call_id,
+                    tool_name=str(_field(event, "name", "")) or None,
+                    arguments_delta=str(_field(event, "arguments", "")),
+                )
+                continue
 
-                if event_type in {"response.completed", "response.incomplete"}:
-                    normalized = self._normalize_response(
-                        request=request,
-                        response=event.response,
-                    )
-                    if normalized.usage is not None:
-                        yield UsageDeltaEvent(usage=normalized.usage)
-                    yield DoneEvent(response=normalized)
-                    saw_completion = True
-                    continue
+            if event_type in {"response.completed", "response.incomplete"}:
+                normalized = self._normalize_response(
+                    request=request,
+                    response=_field(event, "response"),
+                )
+                if normalized.usage is not None:
+                    yield UsageDeltaEvent(usage=normalized.usage)
+                yield DoneEvent(response=normalized)
+                saw_completion = True
+                continue
 
-                if event_type == "response.failed":
-                    yield _grok_activity_event(event_type, event)
-                    raise ProviderResponseError(
-                        self._extract_stream_failed_message(getattr(event, "response", None))
-                    )
+            if event_type == "response.failed":
+                yield _grok_activity_event(event_type, event)
+                raise self._stream_error_from_failed_response(_field(event, "response"))
 
-                if event_type == "error":
-                    yield _grok_activity_event(event_type, event)
-                    raise ProviderResponseError(event.message)
+            if event_type == "error":
+                yield _grok_activity_event(event_type, event)
+                raise self._stream_error_from_event(event)
 
-                yield _grok_activity_event(event_type or "unknown", event)
-        except Exception as exc:
-            if isinstance(exc, (ProviderResponseError, StreamProtocolError)):
-                raise
-            raise self._map_error(exc) from exc
+            yield _grok_activity_event(event_type or "unknown", event)
 
         if not saw_completion:
             raise StreamProtocolError("Grok stream closed without a response.completed event.")
+
+    def _stream_error_from_failed_response(self, response: Any) -> ProviderResponseError:
+        message = self._extract_stream_failed_message(response)
+        error = _field(response, "error")
+        return _grok_response_error(
+            message,
+            status=_extract_optional_int(response, "status"),
+            code=_normalize_optional_string(_field(error, "code")),
+            param=_normalize_optional_string(_field(error, "param")),
+        )
+
+    def _stream_error_from_event(self, event: Any) -> ProviderResponseError:
+        error = _field(event, "error")
+        message = _normalize_optional_string(_field(error, "message"))
+        if message is None:
+            message = _normalize_optional_string(_field(event, "message"))
+        return _grok_response_error(
+            message or "Grok streaming response failed.",
+            status=_extract_optional_int(event, "status"),
+            code=_normalize_optional_string(_field(error, "code")),
+            param=_normalize_optional_string(_field(error, "param")),
+        )
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         raise UnsupportedCapabilityError("Provider 'grok' does not support embeddings.")
 
     async def aclose(self) -> None:
+        async with self._websocket_sessions_lock:
+            websocket_sessions = tuple(self._websocket_sessions.values())
+            self._websocket_sessions.clear()
+        await asyncio.gather(
+            *(self._close_websocket_session(session) for session in websocket_sessions),
+            return_exceptions=True,
+        )
         async with self._client_lock:
             client = self._client
             self._client = None
@@ -204,25 +643,37 @@ class GrokProvider:
             if self._client is not None:
                 return self._client
 
-            api_key = self._settings.api_key or os.getenv("XAI_API_KEY")
-            if not api_key:
-                raise LLMConfigurationError("XAI_API_KEY is required for the Grok provider.")
-
             self._client = AsyncOpenAI(
-                api_key=api_key,
+                api_key=self._api_key(),
                 base_url=self._settings.base_url.rstrip("/"),
                 timeout=self._transport_timeouts.as_httpx(),
                 max_retries=0,
             )
             return self._client
 
-    async def _client_for_request(self, request: LLMRequest) -> AsyncOpenAI:
-        client = await self._client_instance()
-        if request.prompt_cache_key is None:
-            return client
-        return client.with_options(default_headers={"x-grok-conv-id": request.prompt_cache_key})
+    def _api_key(self) -> str:
+        api_key = self._settings.api_key or os.getenv("XAI_API_KEY")
+        if not api_key:
+            raise LLMConfigurationError("XAI_API_KEY is required for the Grok provider.")
+        return api_key
 
-    def _build_response_create_kwargs(self, request: LLMRequest, *, stream: bool) -> dict[str, Any]:
+    def _websocket_url(self) -> str:
+        base_url = self._settings.base_url.rstrip("/")
+        if base_url.startswith("https://"):
+            base_url = "wss://" + base_url.removeprefix("https://")
+        elif base_url.startswith("http://"):
+            base_url = "ws://" + base_url.removeprefix("http://")
+        if base_url.endswith("/responses"):
+            return base_url
+        return f"{base_url}/responses"
+
+    def _build_response_create_kwargs(
+        self,
+        request: LLMRequest,
+        *,
+        stream: bool,
+        store: bool | None = None,
+    ) -> dict[str, Any]:
         if request.model is None:
             raise LLMConfigurationError("request.model must be set before provider dispatch.")
 
@@ -234,7 +685,7 @@ class GrokProvider:
                 for item in self._to_grok_input_items(message, model=request.model)
             ],
             "stream": stream,
-            "store": True,
+            "store": (store if store is not None else not _request_uses_ephemeral_storage(request)),
             "parallel_tool_calls": request.parallel_tool_calls,
         }
 
@@ -246,6 +697,8 @@ class GrokProvider:
             kwargs["reasoning"] = {"effort": self._settings.reasoning_effort}
         if request.previous_response_id is not None:
             kwargs["previous_response_id"] = request.previous_response_id
+        if request.prompt_cache_key is not None:
+            kwargs["prompt_cache_key"] = request.prompt_cache_key
 
         if _grok_model_uses_encrypted_reasoning(request.model):
             kwargs["include"] = ["reasoning.encrypted_content"]
@@ -291,13 +744,33 @@ class GrokProvider:
                         "Grok provider does not support assistant image history items."
                     )
                 if part.file_id is not None:
-                    raise LLMConfigurationError(
-                        "Grok provider supports image_url, not file_id."
-                    )
+                    raise LLMConfigurationError("Grok provider supports image_url, not file_id.")
                 content.append(
                     {
                         "type": "input_image",
                         "image_url": part.image_url,
+                        "detail": _normalize_grok_image_detail(part.detail),
+                    }
+                )
+            elif isinstance(part, LocalImagePart):
+                if message.role == "assistant":
+                    raise LLMConfigurationError(
+                        "Grok provider does not support assistant image history items."
+                    )
+                try:
+                    image_bytes = Path(part.path).read_bytes()
+                except OSError as exc:
+                    raise LLMConfigurationError(
+                        f"Grok recovery image is unavailable: {part.path}"
+                    ) from exc
+                content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": ImagePart.from_bytes(
+                            media_type=part.media_type,
+                            data=image_bytes,
+                            detail=part.detail,
+                        ).image_url,
                         "detail": _normalize_grok_image_detail(part.detail),
                     }
                 )
@@ -385,23 +858,43 @@ class GrokProvider:
         return {"type": "function", "function": {"name": tool_choice.tool_name}}
 
     def _normalize_response(self, *, request: LLMRequest, response: Any) -> LLMResponse:
-        response_output = _serialize_response_output_items(getattr(response, "output", []))
+        response_output = _serialize_response_output_items(_field(response, "output", []))
         tool_calls = self._extract_tool_calls(
             response_output=response_output,
             request_tools=request.tools,
         )
-        usage = self._normalize_usage(getattr(response, "usage", None))
+        usage_obj = _field(response, "usage")
+        usage = self._normalize_usage(usage_obj)
+        continuation = request.stateful_continuation
+        storage_mode = continuation.storage_mode if continuation is not None else "durable"
+        response_id = _normalize_optional_string(_field(response, "id"))
+        durable_response_id = (
+            response_id
+            if storage_mode == "durable"
+            else continuation.durable_response_id
+            if continuation is not None
+            else None
+        )
 
         provider_metadata: dict[str, Any] = {
-            "status": getattr(response, "status", None),
+            "status": _field(response, "status"),
             "incomplete_reason": _normalize_optional_string(
-                getattr(getattr(response, "incomplete_details", None), "reason", None)
+                _field(_field(response, "incomplete_details"), "reason")
             ),
             "response_output": response_output,
+            "response_storage_mode": storage_mode,
+            "durable_response_id": durable_response_id,
         }
+        if continuation is not None and storage_mode == "ephemeral":
+            websocket_session = self._websocket_sessions.get(continuation.session_key)
+            provider_metadata["websocket_generation"] = (
+                websocket_session.generation
+                if websocket_session is not None
+                else continuation.generation
+            )
 
         input_tokens_details = _serialize_optional_mapping(
-            getattr(getattr(response, "usage", None), "input_tokens_details", None)
+            _field(usage_obj, "input_tokens_details")
         )
         if input_tokens_details is not None:
             provider_metadata["input_tokens_details"] = input_tokens_details
@@ -410,7 +903,7 @@ class GrokProvider:
                 provider_metadata["cached_tokens"] = cached_tokens
 
         output_tokens_details = _serialize_optional_mapping(
-            getattr(getattr(response, "usage", None), "output_tokens_details", None)
+            _field(usage_obj, "output_tokens_details")
         )
         if output_tokens_details is not None:
             provider_metadata["output_tokens_details"] = output_tokens_details
@@ -420,12 +913,12 @@ class GrokProvider:
 
         return LLMResponse(
             provider=self.name,
-            model=getattr(response, "model", None) or request.model or "",
+            model=_field(response, "model") or request.model or "",
             text=self._extract_response_text(response=response, response_output=response_output),
             tool_calls=tool_calls,
             finish_reason=self._infer_finish_reason(response=response, tool_calls=tool_calls),
             usage=usage,
-            response_id=getattr(response, "id", None),
+            response_id=response_id,
             provider_metadata=provider_metadata,
         )
 
@@ -435,7 +928,7 @@ class GrokProvider:
         response: Any,
         response_output: Sequence[dict[str, Any]],
     ) -> str:
-        output_text = getattr(response, "output_text", None)
+        output_text = _field(response, "output_text")
         if isinstance(output_text, str):
             return output_text
 
@@ -457,12 +950,12 @@ class GrokProvider:
         return "".join(text_parts)
 
     def _extract_stream_failed_message(self, response: Any) -> str:
-        error = getattr(response, "error", None)
+        error = _field(response, "error")
         if error is None:
             return "Grok streaming response failed."
         if isinstance(error, str) and error:
             return error
-        message = getattr(error, "message", None)
+        message = _field(error, "message")
         if isinstance(message, str) and message:
             return message
         if isinstance(error, dict):
@@ -518,12 +1011,14 @@ class GrokProvider:
             total_tokens=total_tokens,
         )
 
-    def _infer_finish_reason(self, *, response: Any, tool_calls: Sequence[ToolCall]) -> str:
-        status = getattr(response, "status", None)
+    def _infer_finish_reason(
+        self, *, response: Any, tool_calls: Sequence[ToolCall]
+    ) -> FinishReason:
+        status = _field(response, "status")
         if status == "failed":
             return "error"
         if status == "incomplete":
-            reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
+            reason = _field(_field(response, "incomplete_details"), "reason")
             if reason == "max_output_tokens":
                 return "length"
             if reason == "content_filter":
@@ -535,6 +1030,13 @@ class GrokProvider:
         return "unknown"
 
     def _map_error(self, error: Exception) -> Exception:
+        if isinstance(error, ConnectionClosed):
+            return ProviderTemporaryError(
+                str(error),
+                metadata={"transport": "websocket"},
+            )
+        if _is_response_storage_overflow_message(str(error)):
+            return _grok_response_error(str(error))
         if isinstance(error, (ProviderResponseError, StreamProtocolError)):
             return error
         if isinstance(error, (AuthenticationError, PermissionDeniedError)):
@@ -567,10 +1069,10 @@ class GrokProvider:
 
 
 def _grok_activity_event(event_type: str, event: Any) -> ProviderActivityEvent:
-    response = getattr(event, "response", None)
-    response_id = _normalize_optional_string(getattr(response, "id", None))
+    response = _field(event, "response")
+    response_id = _normalize_optional_string(_field(response, "id"))
     if response_id is None:
-        response_id = _normalize_optional_string(getattr(event, "response_id", None))
+        response_id = _normalize_optional_string(_field(event, "response_id"))
     return ProviderActivityEvent(
         provider_event_type=event_type,
         response_id=response_id,
@@ -582,8 +1084,117 @@ def _normalize_grok_image_detail(detail: str) -> str:
         return "high"
     if detail in {"auto", "low", "high"}:
         return detail
-    raise LLMConfigurationError(
-        f"Grok provider does not support image detail '{detail}'."
+    raise LLMConfigurationError(f"Grok provider does not support image detail '{detail}'.")
+
+
+def _request_uses_ephemeral_storage(request: LLMRequest) -> bool:
+    continuation = request.stateful_continuation
+    return continuation is not None and continuation.storage_mode == "ephemeral"
+
+
+def _request_contains_image(request: LLMRequest) -> bool:
+    return any(
+        isinstance(part, (ImagePart, LocalImagePart))
+        for message in request.messages
+        for part in message.parts
+    )
+
+
+def _request_with_ephemeral_fallback(request: LLMRequest) -> LLMRequest:
+    continuation = request.stateful_continuation
+    if continuation is None:
+        session_key = request.prompt_cache_key or f"grok-request-{id(request)}"
+        continuation = StatefulContinuation(
+            session_key=session_key,
+            storage_mode="ephemeral",
+            durable_response_id=request.previous_response_id,
+        )
+    else:
+        continuation = replace(
+            continuation,
+            storage_mode="ephemeral",
+            durable_response_id=(continuation.durable_response_id or request.previous_response_id),
+        )
+    return replace(request, stateful_continuation=continuation)
+
+
+def _grok_response_error(
+    message: str,
+    *,
+    status: int | None = None,
+    code: str | None = None,
+    param: str | None = None,
+) -> ProviderResponseError:
+    metadata: dict[str, Any] = {
+        "status": status,
+        "code": code,
+        "param": param,
+    }
+    if _is_response_storage_overflow_message(message):
+        metadata.update(
+            {
+                "code": code or "response_storage_too_large",
+                "retryable_with_store_false": True,
+            }
+        )
+        return GrokResponseStorageOverflowError(message, metadata=metadata)
+    if code in {
+        "previous_response_not_found",
+        "websocket_connection_limit_reached",
+    }:
+        return GrokWebSocketContinuationError(message, metadata=metadata)
+    return ProviderResponseError(message, metadata=metadata)
+
+
+def _is_response_storage_overflow_message(message: str) -> bool:
+    normalized = message.strip().lower()
+    return _RESPONSE_STORAGE_OVERFLOW_HINT in normalized and "store" in normalized
+
+
+def _is_reconnectable_websocket_error(error: Exception) -> bool:
+    return isinstance(
+        error,
+        (
+            GrokWebSocketContinuationError,
+            ProviderTemporaryError,
+            ProviderTimeoutError,
+        ),
+    )
+
+
+def _field(source: Any, field_name: str, default: Any = None) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(field_name, default)
+    return getattr(source, field_name, default)
+
+
+def _stream_delta_text(event: TextDeltaEvent | ToolCallDeltaEvent) -> str:
+    if isinstance(event, TextDeltaEvent):
+        return event.delta
+    return event.arguments_delta
+
+
+def _same_stream_delta_channel(
+    left: TextDeltaEvent | ToolCallDeltaEvent,
+    right: TextDeltaEvent | ToolCallDeltaEvent,
+) -> bool:
+    if isinstance(left, TextDeltaEvent) or isinstance(right, TextDeltaEvent):
+        return isinstance(left, TextDeltaEvent) and isinstance(right, TextDeltaEvent)
+    return left.call_id == right.call_id and (
+        left.tool_name is None or right.tool_name is None or left.tool_name == right.tool_name
+    )
+
+
+def _replace_stream_delta_text(
+    event: TextDeltaEvent | ToolCallDeltaEvent,
+    delta: str,
+) -> TextDeltaEvent | ToolCallDeltaEvent:
+    if isinstance(event, TextDeltaEvent):
+        return TextDeltaEvent(delta=delta)
+    return ToolCallDeltaEvent(
+        call_id=event.call_id,
+        tool_name=event.tool_name,
+        arguments_delta=delta,
     )
 
 
@@ -635,10 +1246,7 @@ def _serialize_json_compatible(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, Mapping):
-        return {
-            str(key): _serialize_json_compatible(item)
-            for key, item in value.items()
-        }
+        return {str(key): _serialize_json_compatible(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_serialize_json_compatible(item) for item in value]
 
@@ -656,9 +1264,7 @@ def _serialize_json_compatible(value: Any) -> Any:
 
     if hasattr(value, "__dict__"):
         public_attributes = {
-            key: item
-            for key, item in vars(value).items()
-            if not key.startswith("_")
+            key: item for key, item in vars(value).items() if not key.startswith("_")
         }
         if public_attributes:
             return _serialize_json_compatible(public_attributes)

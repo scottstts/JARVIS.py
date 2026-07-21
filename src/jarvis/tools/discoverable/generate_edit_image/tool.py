@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from google import genai
@@ -387,7 +387,7 @@ class GenerateEditImageToolExecutor:
         try:
             response = client.models.generate_content(
                 model=self.gemini_model,
-                contents=contents,
+                contents=cast(Any, contents),
                 config=config,
             )
         except Exception as exc:
