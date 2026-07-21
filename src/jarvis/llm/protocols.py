@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .types import EmbeddingRequest, EmbeddingResponse, LLMRequest, LLMResponse, LLMStreamEvent
+from .types import EmbeddingRequest, EmbeddingResponse, LLMRequest, LLMResponse, ProviderStreamEvent
 
 
 @dataclass(slots=True, frozen=True)
@@ -33,7 +33,7 @@ class LLMProvider(Protocol):
         """One-shot generation API."""
         ...
 
-    def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+    def stream_generate(self, request: LLMRequest) -> AsyncIterator[ProviderStreamEvent]:
         """Streaming generation API."""
         ...
 

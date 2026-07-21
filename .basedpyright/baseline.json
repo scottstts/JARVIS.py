@@ -650,14 +650,6 @@
                     "endColumn": 44,
                     "lineCount": 1
                 }
-            },
-            {
-                "code": "reportOptionalMemberAccess",
-                "range": {
-                    "startColumn": 35,
-                    "endColumn": 40,
-                    "lineCount": 1
-                }
             }
         ],
         "./src/jarvis/llm/providers/grok_provider.py": [
@@ -687,14 +679,6 @@
             }
         ],
         "./src/jarvis/llm/providers/lmstudio_provider.py": [
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 22,
-                    "endColumn": 26,
-                    "lineCount": 1
-                }
-            },
             {
                 "code": "reportArgumentType",
                 "range": {

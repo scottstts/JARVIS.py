@@ -205,12 +205,27 @@ class DoneEvent:
     type: Literal["done"] = "done"
 
 
+@dataclass(slots=True, frozen=True)
+class ProviderActivityEvent:
+    """Provider transport activity consumed by LLMService and never persisted."""
+
+    provider_event_type: str
+    response_id: str | None = None
+    type: Literal["provider_activity"] = "provider_activity"
+
+    def __post_init__(self) -> None:
+        if not self.provider_event_type.strip():
+            raise ValueError("ProviderActivityEvent.provider_event_type cannot be empty.")
+
+
 LLMStreamEvent: TypeAlias = (
     TextDeltaEvent
     | ToolCallDeltaEvent
     | UsageDeltaEvent
     | DoneEvent
 )
+
+ProviderStreamEvent: TypeAlias = LLMStreamEvent | ProviderActivityEvent
 
 
 @dataclass(slots=True, frozen=True)
@@ -235,13 +250,13 @@ class LLMRequest:
     cached_content_source_signature: str | None = None
     cached_content_source_record_ids: Sequence[str] = field(default_factory=tuple)
     cached_content_media_ids: Sequence[str] = field(default_factory=tuple)
-    timeout_seconds: float | None = None
+    deadline_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.messages:
             raise ValueError("LLMRequest.messages cannot be empty.")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("LLMRequest.timeout_seconds must be > 0.")
+        if self.deadline_seconds is not None and self.deadline_seconds <= 0:
+            raise ValueError("LLMRequest.deadline_seconds must be > 0.")
 
 
 @dataclass(slots=True, frozen=True)
@@ -251,7 +266,11 @@ class EmbeddingRequest:
     model: str | None = None
     dimensions: int | None = None
     user: str | None = None
-    timeout_seconds: float | None = None
+    deadline_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.deadline_seconds is not None and self.deadline_seconds <= 0:
+            raise ValueError("EmbeddingRequest.deadline_seconds must be > 0.")
 
 
 @dataclass(slots=True, frozen=True)

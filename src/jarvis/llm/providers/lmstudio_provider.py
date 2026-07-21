@@ -35,8 +35,9 @@ from ..types import (
     LLMMessage,
     LLMRequest,
     LLMResponse,
-    LLMStreamEvent,
     LLMUsage,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -47,6 +48,7 @@ from ..types import (
     ToolResultPart,
     UsageDeltaEvent,
 )
+from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 _HOST_DOCKER_INTERNAL = "host.docker.internal"
@@ -66,6 +68,16 @@ class _ResolvedResponseRequest:
     payload: dict[str, Any]
 
 
+@dataclass(slots=True, frozen=True)
+class _LMStudioStreamHeaders:
+    pass
+
+
+@dataclass(slots=True, frozen=True)
+class _LMStudioStreamDone:
+    pass
+
+
 class LMStudioProvider:
     """Provider implementation for a locally running LM Studio server."""
 
@@ -73,10 +85,14 @@ class LMStudioProvider:
         self,
         *,
         settings: LMStudioProviderSettings,
-        default_timeout_seconds: float,
+        read_timeout_seconds: float,
+        connect_timeout_seconds: float = 30.0,
     ) -> None:
         self._settings = settings
-        self._default_timeout_seconds = default_timeout_seconds
+        self._transport_timeouts = ProviderTransportTimeouts(
+            connect_seconds=connect_timeout_seconds,
+            read_seconds=read_timeout_seconds,
+        )
         self._stateful_response_ids: OrderedDict[tuple[str, tuple[str, ...]], str] = OrderedDict()
         self._stateful_response_ids_lock = threading.Lock()
 
@@ -100,7 +116,10 @@ class LMStudioProvider:
         self._remember_stateful_response(resolved=resolved, response=response)
         return response
 
-    async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream_generate(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
         resolved = await self._resolve_response_request(request, stream=True)
         attempt_resolved = resolved
         retried_without_previous_response_id = False
@@ -114,19 +133,37 @@ class LMStudioProvider:
                 async for sse_payload in self._stream_sse_payloads(
                     endpoint="/responses",
                     payload=attempt_resolved.payload,
-                    timeout_seconds=attempt_resolved.request.timeout_seconds,
                 ):
+                    emitted_any = True
+                    if isinstance(sse_payload, _LMStudioStreamHeaders):
+                        yield ProviderActivityEvent(
+                            provider_event_type="http.response_headers"
+                        )
+                        continue
                     if sse_payload == "[DONE]":
+                        if not saw_completion:
+                            yield ProviderActivityEvent(provider_event_type="sse.done")
                         continue
 
-                    emitted_any = True
                     event = self._decode_stream_event(sse_payload)
                     event_type = str(event.get("type", ""))
+                    event_response = event.get("response")
+                    response_id = (
+                        str(event_response.get("id"))
+                        if isinstance(event_response, dict)
+                        and event_response.get("id") is not None
+                        else None
+                    )
 
                     if event_type == "response.output_text.delta":
                         delta = event.get("delta")
                         if isinstance(delta, str) and delta:
                             yield TextDeltaEvent(delta=delta)
+                        else:
+                            yield ProviderActivityEvent(
+                                provider_event_type=event_type,
+                                response_id=response_id,
+                            )
                         continue
 
                     if event_type in {"response.output_item.added", "response.output_item.done"}:
@@ -140,6 +177,10 @@ class LMStudioProvider:
                                     tool_name_by_item_id[item_id] = name
                                 if isinstance(call_id, str) and call_id:
                                     call_id_by_item_id[item_id] = call_id
+                        yield ProviderActivityEvent(
+                            provider_event_type=event_type,
+                            response_id=response_id,
+                        )
                         continue
 
                     if event_type == "response.function_call_arguments.delta":
@@ -148,6 +189,10 @@ class LMStudioProvider:
                             event.get("delta")
                         )
                         if not item_id or arguments_delta is None:
+                            yield ProviderActivityEvent(
+                                provider_event_type=event_type,
+                                response_id=response_id,
+                            )
                             continue
                         yield ToolCallDeltaEvent(
                             call_id=call_id_by_item_id.get(item_id, item_id),
@@ -162,6 +207,10 @@ class LMStudioProvider:
                             event.get("arguments")
                         )
                         if not item_id or arguments_text is None:
+                            yield ProviderActivityEvent(
+                                provider_event_type=event_type,
+                                response_id=response_id,
+                            )
                             continue
                         tool_name = event.get("name")
                         yield ToolCallDeltaEvent(
@@ -196,12 +245,25 @@ class LMStudioProvider:
                         continue
 
                     if event_type == "response.failed":
+                        yield ProviderActivityEvent(
+                            provider_event_type=event_type,
+                            response_id=response_id,
+                        )
                         raise ProviderResponseError(self._extract_response_failed_message(event))
 
                     if event_type == "error":
+                        yield ProviderActivityEvent(
+                            provider_event_type=event_type,
+                            response_id=response_id,
+                        )
                         raise ProviderResponseError(
                             self._extract_stream_error_message(event.get("error"))
                         )
+
+                    yield ProviderActivityEvent(
+                        provider_event_type=event_type or "unknown",
+                        response_id=response_id,
+                    )
 
                 if not saw_completion:
                     raise StreamProtocolError(
@@ -278,7 +340,6 @@ class LMStudioProvider:
                 return await self._post_json(
                     endpoint="/responses",
                     payload=attempt_resolved.payload,
-                    timeout_seconds=attempt_resolved.request.timeout_seconds,
                 )
             except ProviderBadRequestError as exc:
                 if (
@@ -323,10 +384,7 @@ class LMStudioProvider:
         return replace(request, model=model)
 
     async def _select_loaded_chat_model(self, request: LLMRequest) -> str:
-        models_payload = await self._get_json(
-            endpoint="/models",
-            timeout_seconds=request.timeout_seconds,
-        )
+        models_payload = await self._get_json(endpoint="/models")
         models = models_payload.get("models")
         if not isinstance(models, list):
             raise ProviderResponseError("LM Studio returned an invalid model listing.")
@@ -561,12 +619,10 @@ class LMStudioProvider:
         self,
         *,
         endpoint: str,
-        timeout_seconds: float | None,
     ) -> dict[str, Any]:
         url, headers, timeout = self._build_request_context(
             endpoint=endpoint,
             api_prefix="/api/v1",
-            timeout_seconds=timeout_seconds,
         )
         try:
             response = await asyncio.to_thread(
@@ -576,7 +632,13 @@ class LMStudioProvider:
                 timeout=timeout,
             )
         except requests.Timeout as exc:
-            raise ProviderTimeoutError(str(exc)) from exc
+            raise ProviderTimeoutError(
+                str(exc),
+                metadata=transport_timeout_metadata(
+                    exc,
+                    timeouts=self._transport_timeouts,
+                ),
+            ) from exc
         except requests.ConnectionError as exc:
             raise ProviderTemporaryError(str(exc)) from exc
         except requests.RequestException as exc:
@@ -598,12 +660,10 @@ class LMStudioProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
-        timeout_seconds: float | None,
     ) -> dict[str, Any]:
         url, headers, timeout = self._build_request_context(
             endpoint=endpoint,
             api_prefix="/v1",
-            timeout_seconds=timeout_seconds,
         )
 
         try:
@@ -615,7 +675,13 @@ class LMStudioProvider:
                 timeout=timeout,
             )
         except requests.Timeout as exc:
-            raise ProviderTimeoutError(str(exc)) from exc
+            raise ProviderTimeoutError(
+                str(exc),
+                metadata=transport_timeout_metadata(
+                    exc,
+                    timeouts=self._transport_timeouts,
+                ),
+            ) from exc
         except requests.ConnectionError as exc:
             raise ProviderTemporaryError(str(exc)) from exc
         except requests.RequestException as exc:
@@ -637,16 +703,16 @@ class LMStudioProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
-        timeout_seconds: float | None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | _LMStudioStreamHeaders]:
         url, headers, timeout = self._build_request_context(
             endpoint=endpoint,
             api_prefix="/v1",
-            timeout_seconds=timeout_seconds,
         )
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str | Exception | object] = asyncio.Queue()
-        done_sentinel = object()
+        queue: asyncio.Queue[
+            str | _LMStudioStreamHeaders | Exception | _LMStudioStreamDone
+        ] = asyncio.Queue()
+        done_sentinel = _LMStudioStreamDone()
         stop_event = threading.Event()
         response_holder: dict[str, requests.Response | None] = {"response": None}
 
@@ -664,6 +730,10 @@ class LMStudioProvider:
 
                 if response.status_code >= 400:
                     self._raise_for_status(response)
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    _LMStudioStreamHeaders(),
+                )
 
                 for sse_payload in self._iter_sse_payloads(response):
                     if stop_event.is_set():
@@ -694,7 +764,7 @@ class LMStudioProvider:
         try:
             while True:
                 item = await queue.get()
-                if item is done_sentinel:
+                if isinstance(item, _LMStudioStreamDone):
                     return
                 if isinstance(item, Exception):
                     raise item
@@ -712,9 +782,8 @@ class LMStudioProvider:
         *,
         endpoint: str,
         api_prefix: str,
-        timeout_seconds: float | None,
-    ) -> tuple[str, dict[str, str], float]:
-        timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
+    ) -> tuple[str, dict[str, str], tuple[float, float]]:
+        timeout = self._transport_timeouts.as_requests()
         server_base_url = self._server_base_url()
         url = f"{server_base_url}{api_prefix}{endpoint}"
         headers: dict[str, str] = {
@@ -1103,7 +1172,13 @@ class LMStudioProvider:
         ):
             return exc
         if isinstance(exc, requests.Timeout):
-            return ProviderTimeoutError(str(exc))
+            return ProviderTimeoutError(
+                str(exc),
+                metadata=transport_timeout_metadata(
+                    exc,
+                    timeouts=self._transport_timeouts,
+                ),
+            )
         if isinstance(exc, requests.ConnectionError):
             return ProviderTemporaryError(str(exc))
         if isinstance(exc, requests.RequestException):

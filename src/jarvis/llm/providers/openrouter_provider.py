@@ -34,8 +34,9 @@ from ..types import (
     LLMMessage,
     LLMRequest,
     LLMResponse,
-    LLMStreamEvent,
     LLMUsage,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -46,6 +47,7 @@ from ..types import (
     ToolResultPart,
     UsageDeltaEvent,
 )
+from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 
@@ -59,6 +61,11 @@ class _OpenRouterStreamDone:
     pass
 
 
+@dataclass(slots=True, frozen=True)
+class _OpenRouterStreamActivity:
+    provider_event_type: str
+
+
 class OpenRouterProvider:
     """Provider implementation for OpenRouter OpenAI-compatible HTTP APIs."""
 
@@ -66,10 +73,14 @@ class OpenRouterProvider:
         self,
         *,
         settings: OpenRouterProviderSettings,
-        default_timeout_seconds: float,
+        read_timeout_seconds: float,
+        connect_timeout_seconds: float = 30.0,
     ) -> None:
         self._settings = settings
-        self._default_timeout_seconds = default_timeout_seconds
+        self._transport_timeouts = ProviderTransportTimeouts(
+            connect_seconds=connect_timeout_seconds,
+            read_seconds=read_timeout_seconds,
+        )
 
     @property
     def name(self) -> str:
@@ -92,7 +103,6 @@ class OpenRouterProvider:
         data, response_headers = await self._post_json_with_headers(
             endpoint="/chat/completions",
             payload=payload,
-            timeout_seconds=request.timeout_seconds,
         )
         return self._normalize_chat_response(
             request=request,
@@ -100,7 +110,10 @@ class OpenRouterProvider:
             response_headers=response_headers,
         )
 
-    async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream_generate(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
         if request.model is None:
             raise LLMConfigurationError("request.model must be set before provider dispatch.")
 
@@ -118,23 +131,46 @@ class OpenRouterProvider:
         async for sse_payload in self._stream_sse_payloads(
             endpoint="/chat/completions",
             payload=payload,
-            timeout_seconds=request.timeout_seconds,
         ):
             if isinstance(sse_payload, _OpenRouterStreamHeaders):
                 response_header_metadata = self._extract_response_header_metadata(
                     sse_payload.headers
                 )
+                generation_id = response_header_metadata.get(
+                    "openrouter_generation_id"
+                )
+                yield ProviderActivityEvent(
+                    provider_event_type="http.response_headers",
+                    response_id=(
+                        str(generation_id) if generation_id is not None else None
+                    ),
+                )
+                continue
+            if isinstance(sse_payload, _OpenRouterStreamActivity):
+                yield ProviderActivityEvent(
+                    provider_event_type=sse_payload.provider_event_type,
+                    response_id=response_id,
+                )
                 continue
             if sse_payload == "[DONE]":
                 saw_done_sentinel = True
+                yield ProviderActivityEvent(
+                    provider_event_type="sse.done",
+                    response_id=response_id,
+                )
                 break
 
             chunk = self._decode_stream_chunk(sse_payload)
             response_id = chunk.get("id") or response_id
             response_model = chunk.get("model") or response_model
+            emitted_semantic_event = False
 
             error = chunk.get("error")
             if error is not None:
+                yield ProviderActivityEvent(
+                    provider_event_type="chat.completion.error",
+                    response_id=response_id,
+                )
                 raise self._map_stream_error(
                     error=error,
                     chunk=chunk,
@@ -145,6 +181,7 @@ class OpenRouterProvider:
             chunk_usage = self._normalize_usage(chunk.get("usage"))
             if chunk_usage is not None:
                 usage = chunk_usage
+                emitted_semantic_event = True
                 yield UsageDeltaEvent(usage=chunk_usage)
 
             choices = chunk.get("choices") or []
@@ -157,18 +194,31 @@ class OpenRouterProvider:
                 text_delta = self._extract_stream_text(delta.get("content"))
                 if text_delta:
                     accumulated_text.append(text_delta)
+                    emitted_semantic_event = True
                     yield TextDeltaEvent(delta=text_delta)
 
-                for tool_call_event in self._extract_stream_tool_call_events(
-                    delta.get("tool_calls") or [],
-                    tool_call_states=streamed_tool_calls,
-                ):
+                tool_call_events = list(
+                    self._extract_stream_tool_call_events(
+                        delta.get("tool_calls") or [],
+                        tool_call_states=streamed_tool_calls,
+                    )
+                )
+                for tool_call_event in tool_call_events:
+                    emitted_semantic_event = True
                     yield tool_call_event
 
                 finish_reason = choice.get("finish_reason")
                 if finish_reason is not None:
                     raw_finish_reason = str(finish_reason)
                     saw_terminal_choice = True
+
+            if not emitted_semantic_event:
+                yield ProviderActivityEvent(
+                    provider_event_type=str(
+                        chunk.get("object") or "chat.completion.chunk"
+                    ),
+                    response_id=response_id,
+                )
 
         if not saw_done_sentinel and not saw_terminal_choice:
             raise StreamProtocolError(
@@ -209,7 +259,6 @@ class OpenRouterProvider:
         data = await self._post_json(
             endpoint="/embeddings",
             payload=payload,
-            timeout_seconds=request.timeout_seconds,
         )
 
         embeddings = [
@@ -387,12 +436,10 @@ class OpenRouterProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
-        timeout_seconds: float | None,
     ) -> dict[str, Any]:
         data, _headers = await self._post_json_with_headers(
             endpoint=endpoint,
             payload=payload,
-            timeout_seconds=timeout_seconds,
         )
         return data
 
@@ -401,12 +448,8 @@ class OpenRouterProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
-        timeout_seconds: float | None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
-        url, headers, timeout = self._build_request_context(
-            endpoint=endpoint,
-            timeout_seconds=timeout_seconds,
-        )
+        url, headers, timeout = self._build_request_context(endpoint=endpoint)
 
         try:
             response = await asyncio.to_thread(
@@ -417,7 +460,13 @@ class OpenRouterProvider:
                 timeout=timeout,
             )
         except requests.Timeout as exc:
-            raise ProviderTimeoutError(str(exc)) from exc
+            raise ProviderTimeoutError(
+                str(exc),
+                metadata=transport_timeout_metadata(
+                    exc,
+                    timeouts=self._transport_timeouts,
+                ),
+            ) from exc
         except requests.ConnectionError as exc:
             raise ProviderTemporaryError(str(exc)) from exc
         except requests.RequestException as exc:
@@ -437,15 +486,17 @@ class OpenRouterProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
-        timeout_seconds: float | None,
-    ) -> AsyncIterator[str | _OpenRouterStreamHeaders]:
-        url, headers, timeout = self._build_request_context(
-            endpoint=endpoint,
-            timeout_seconds=timeout_seconds,
-        )
+    ) -> AsyncIterator[
+        str | _OpenRouterStreamHeaders | _OpenRouterStreamActivity
+    ]:
+        url, headers, timeout = self._build_request_context(endpoint=endpoint)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[
-            str | _OpenRouterStreamHeaders | Exception | _OpenRouterStreamDone
+            str
+            | _OpenRouterStreamHeaders
+            | _OpenRouterStreamActivity
+            | Exception
+            | _OpenRouterStreamDone
         ] = asyncio.Queue()
         done_sentinel = _OpenRouterStreamDone()
         stop_event = threading.Event()
@@ -516,13 +567,12 @@ class OpenRouterProvider:
         self,
         *,
         endpoint: str,
-        timeout_seconds: float | None,
-    ) -> tuple[str, dict[str, str], float]:
+    ) -> tuple[str, dict[str, str], tuple[float, float]]:
         api_key = self._settings.api_key or os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise LLMConfigurationError("OPENROUTER_API_KEY is required for the OpenRouter provider.")
 
-        timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout_seconds
+        timeout = self._transport_timeouts.as_requests()
         url = f"{self._settings.base_url.rstrip('/')}{endpoint}"
         headers: dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
@@ -536,7 +586,10 @@ class OpenRouterProvider:
             headers["X-Title"] = self._settings.app_name
         return url, headers, timeout
 
-    def _iter_sse_payloads(self, response: requests.Response) -> Iterator[str]:
+    def _iter_sse_payloads(
+        self,
+        response: requests.Response,
+    ) -> Iterator[str | _OpenRouterStreamActivity]:
         data_lines: list[str] = []
         for raw_line in response.iter_lines(decode_unicode=False):
             if isinstance(raw_line, bytes):
@@ -555,6 +608,10 @@ class OpenRouterProvider:
                     data_lines.clear()
                 continue
             if line.startswith(":"):
+                activity_name = line[1:].strip()
+                yield _OpenRouterStreamActivity(
+                    provider_event_type=activity_name or "sse.comment"
+                )
                 continue
             field_name, separator, value = line.partition(":")
             if separator != ":":
@@ -852,7 +909,13 @@ class OpenRouterProvider:
         ):
             return exc
         if isinstance(exc, requests.Timeout):
-            return ProviderTimeoutError(str(exc))
+            return ProviderTimeoutError(
+                str(exc),
+                metadata=transport_timeout_metadata(
+                    exc,
+                    timeouts=self._transport_timeouts,
+                ),
+            )
         if isinstance(exc, requests.ConnectionError):
             return ProviderTemporaryError(str(exc))
         if isinstance(exc, requests.RequestException):

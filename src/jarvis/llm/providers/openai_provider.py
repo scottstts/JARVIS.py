@@ -46,8 +46,9 @@ from ..types import (
     LLMMessage,
     LLMRequest,
     LLMResponse,
-    LLMStreamEvent,
     LLMUsage,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -58,6 +59,7 @@ from ..types import (
     ToolResultPart,
     UsageDeltaEvent,
 )
+from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import (
     build_tool_schema_map,
     build_recoverable_invalid_tool_call,
@@ -77,10 +79,14 @@ class OpenAIProvider:
         self,
         *,
         settings: OpenAIProviderSettings,
-        default_timeout_seconds: float,
+        read_timeout_seconds: float,
+        connect_timeout_seconds: float = 30.0,
     ) -> None:
         self._settings = settings
-        self._default_timeout_seconds = default_timeout_seconds
+        self._transport_timeouts = ProviderTransportTimeouts(
+            connect_seconds=connect_timeout_seconds,
+            read_seconds=read_timeout_seconds,
+        )
         self._client: AsyncOpenAI | None = None
         self._client_lock = asyncio.Lock()
 
@@ -106,7 +112,10 @@ class OpenAIProvider:
             raise self._map_error(exc) from exc
         return self._normalize_response(request=request, response=response)
 
-    async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream_generate(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
         kwargs = self._build_response_create_kwargs(request, stream=True)
         client = await self._client_instance()
 
@@ -151,6 +160,7 @@ class OpenAIProvider:
                             tool_name_by_item_id[item_id] = tool_name
                         if item_id is not None and call_id is not None:
                             call_id_by_item_id[item_id] = call_id
+                    yield _openai_activity_event(event_type, event)
                     continue
 
                 if event_type == "response.function_call_arguments.delta":
@@ -204,11 +214,15 @@ class OpenAIProvider:
                     if response_error is not None:
                         message = response_error.message
                     _capture_response_state(event.response)
+                    yield _openai_activity_event(event_type, event)
                     raise ProviderResponseError(message)
 
                 if event_type == "error":
                     saw_terminal_event = True
+                    yield _openai_activity_event(event_type, event)
                     raise ProviderResponseError(event.message)
+
+                yield _openai_activity_event(event_type or "unknown", event)
         except Exception as exc:
             if isinstance(
                 exc,
@@ -250,9 +264,6 @@ class OpenAIProvider:
             kwargs["dimensions"] = request.dimensions
         if request.user is not None:
             kwargs["user"] = request.user
-        if request.timeout_seconds is not None:
-            kwargs["timeout"] = request.timeout_seconds
-
         client = await self._client_instance()
         try:
             response = await client.embeddings.create(**kwargs)
@@ -303,7 +314,7 @@ class OpenAIProvider:
                 base_url=self._settings.base_url or os.getenv("OPENAI_BASE_URL"),
                 organization=self._settings.organization or os.getenv("OPENAI_ORG_ID"),
                 project=self._settings.project or os.getenv("OPENAI_PROJECT_ID"),
-                timeout=self._default_timeout_seconds,
+                timeout=self._transport_timeouts.as_httpx(),
                 max_retries=0,
             )
             return self._client
@@ -340,9 +351,6 @@ class OpenAIProvider:
             kwargs["previous_response_id"] = request.previous_response_id
         if request.conversation_id is not None:
             kwargs["conversation"] = request.conversation_id
-        if request.timeout_seconds is not None:
-            kwargs["timeout"] = request.timeout_seconds
-
         reasoning: dict[str, str] = {}
         if self._settings.reasoning_effort is not None:
             reasoning["effort"] = self._settings.reasoning_effort
@@ -638,7 +646,13 @@ class OpenAIProvider:
         if isinstance(error, RateLimitError):
             return ProviderRateLimitError(str(error))
         if isinstance(error, APITimeoutError):
-            return ProviderTimeoutError(str(error))
+            return ProviderTimeoutError(
+                str(error),
+                metadata=transport_timeout_metadata(
+                    error,
+                    timeouts=self._transport_timeouts,
+                ),
+            )
         if isinstance(error, (APIConnectionError, InternalServerError)):
             return ProviderTemporaryError(str(error))
         if isinstance(error, BadRequestError):
@@ -654,6 +668,17 @@ class OpenAIProvider:
         if isinstance(error, OpenAIError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _openai_activity_event(event_type: str, event: Any) -> ProviderActivityEvent:
+    response = getattr(event, "response", None)
+    response_id = _normalize_openai_string(getattr(response, "id", None))
+    if response_id is None:
+        response_id = _normalize_openai_string(getattr(event, "response_id", None))
+    return ProviderActivityEvent(
+        provider_event_type=event_type,
+        response_id=response_id,
+    )
 
 
 def _normalize_openai_incomplete_reason(reason: Any) -> str | None:

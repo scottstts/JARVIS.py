@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import replace
+import inspect
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 from .config import LLMSettings
 from .errors import (
+    LLMError,
     LLMConfigurationError,
     ProviderNotFoundError,
     ProviderTimeoutError,
@@ -23,9 +26,24 @@ from .types import (
     LLMRequest,
     LLMResponse,
     LLMStreamEvent,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
 )
 
 T = TypeVar("T")
+
+
+@dataclass(slots=True)
+class _StreamAttemptState:
+    provider: str
+    model: str | None
+    request_started_at: float
+    attempt_started_at: float
+    accepted: bool = False
+    emitted_output: bool = False
+    last_provider_event_type: str | None = None
+    last_normalized_event_type: str | None = None
+    response_id: str | None = None
 
 
 class ProviderRegistry:
@@ -73,27 +91,33 @@ class LLMService:
             providers = (
                 OpenAIProvider(
                     settings=self.settings.openai,
-                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                    read_timeout_seconds=self.settings.read_timeout_seconds,
+                    connect_timeout_seconds=self.settings.connect_timeout_seconds,
                 ),
                 AnthropicProvider(
                     settings=self.settings.anthropic,
-                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                    read_timeout_seconds=self.settings.read_timeout_seconds,
+                    connect_timeout_seconds=self.settings.connect_timeout_seconds,
                 ),
                 GeminiProvider(
                     settings=self.settings.gemini,
-                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                    read_timeout_seconds=self.settings.read_timeout_seconds,
+                    connect_timeout_seconds=self.settings.connect_timeout_seconds,
                 ),
                 GrokProvider(
                     settings=self.settings.grok,
-                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                    read_timeout_seconds=self.settings.read_timeout_seconds,
+                    connect_timeout_seconds=self.settings.connect_timeout_seconds,
                 ),
                 OpenRouterProvider(
                     settings=self.settings.openrouter,
-                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                    read_timeout_seconds=self.settings.read_timeout_seconds,
+                    connect_timeout_seconds=self.settings.connect_timeout_seconds,
                 ),
                 LMStudioProvider(
                     settings=self.settings.lmstudio,
-                    default_timeout_seconds=self.settings.request_timeout_seconds,
+                    read_timeout_seconds=self.settings.read_timeout_seconds,
+                    connect_timeout_seconds=self.settings.connect_timeout_seconds,
                 ),
             )
         self.registry = ProviderRegistry(providers)
@@ -113,12 +137,14 @@ class LLMService:
         self._assert_generation_capabilities(provider, resolved)
 
         async def attempt() -> LLMResponse:
-            return await self._run_with_optional_timeout(
-                resolved.timeout_seconds,
-                provider.generate(resolved),
-            )
+            return await provider.generate(resolved)
 
-        return await self._run_with_retries(attempt)
+        return await self._run_with_retries(
+            attempt,
+            deadline_seconds=resolved.deadline_seconds,
+            provider=resolved.provider,
+            model=resolved.model,
+        )
 
     async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
         resolved = self._resolve_generate_request(request)
@@ -128,32 +154,49 @@ class LLMService:
         provider = self.registry.get(resolved.provider)
         self._assert_generation_capabilities(provider, resolved, require_streaming=True)
 
+        loop = asyncio.get_running_loop()
+        request_started_at = loop.time()
+        deadline_at = (
+            request_started_at + resolved.deadline_seconds
+            if resolved.deadline_seconds is not None
+            else None
+        )
         attempts = max(1, self.settings.retry_attempts + 1)
         for attempt_index in range(attempts):
-            emitted_any = False
+            state = _StreamAttemptState(
+                provider=resolved.provider,
+                model=resolved.model,
+                request_started_at=request_started_at,
+                attempt_started_at=loop.time(),
+            )
             try:
                 stream = provider.stream_generate(resolved)
-                iterator = (
-                    self._iter_with_per_event_timeout(
-                        stream,
-                        resolved.timeout_seconds,
-                    )
-                    if resolved.timeout_seconds is not None
-                    else stream
-                )
-                async for event in iterator:
-                    emitted_any = True
+                async for event in self._iter_stream_with_deadline(
+                    stream,
+                    deadline_at=deadline_at,
+                    deadline_seconds=resolved.deadline_seconds,
+                    state=state,
+                ):
                     yield event
                 return
             except Exception as exc:
+                self._enrich_stream_error(exc, state=state)
                 should_retry = (
                     attempt_index < attempts - 1
-                    and not emitted_any
-                    and is_retryable_error(exc)
+                    and not state.accepted
+                    and not state.emitted_output
+                    and self._is_safe_to_retry(exc)
                 )
                 if not should_retry:
                     raise
-                await asyncio.sleep(self._retry_delay_seconds(attempt_index))
+                await self._sleep_before_retry(
+                    self._retry_delay_seconds(attempt_index),
+                    deadline_at=deadline_at,
+                    deadline_seconds=resolved.deadline_seconds,
+                    provider=resolved.provider,
+                    model=resolved.model,
+                    request_started_at=request_started_at,
+                )
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         resolved = self._resolve_embedding_request(request)
@@ -167,25 +210,61 @@ class LLMService:
             )
 
         async def attempt() -> EmbeddingResponse:
-            return await self._run_with_optional_timeout(
-                resolved.timeout_seconds,
-                provider.embed(resolved),
-            )
+            return await provider.embed(resolved)
 
-        return await self._run_with_retries(attempt)
+        return await self._run_with_retries(
+            attempt,
+            deadline_seconds=resolved.deadline_seconds,
+            provider=resolved.provider,
+            model=resolved.model,
+        )
 
-    async def _run_with_retries(self, operation: Callable[[], Awaitable[T]]) -> T:
+    async def _run_with_retries(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        deadline_seconds: float | None,
+        provider: str,
+        model: str | None,
+    ) -> T:
+        loop = asyncio.get_running_loop()
+        request_started_at = loop.time()
+        deadline_at = (
+            request_started_at + deadline_seconds
+            if deadline_seconds is not None
+            else None
+        )
         attempts = max(1, self.settings.retry_attempts + 1)
         for attempt_index in range(attempts):
             try:
-                return await operation()
+                return await self._run_with_request_deadline(
+                    operation,
+                    deadline_at=deadline_at,
+                    deadline_seconds=deadline_seconds,
+                    provider=provider,
+                    model=model,
+                    request_started_at=request_started_at,
+                )
             except Exception as exc:
+                self._enrich_request_error(
+                    exc,
+                    provider=provider,
+                    model=model,
+                    request_started_at=request_started_at,
+                )
                 should_retry = (
-                    attempt_index < attempts - 1 and is_retryable_error(exc)
+                    attempt_index < attempts - 1 and self._is_safe_to_retry(exc)
                 )
                 if not should_retry:
                     raise
-                await asyncio.sleep(self._retry_delay_seconds(attempt_index))
+                await self._sleep_before_retry(
+                    self._retry_delay_seconds(attempt_index),
+                    deadline_at=deadline_at,
+                    deadline_seconds=deadline_seconds,
+                    provider=provider,
+                    model=model,
+                    request_started_at=request_started_at,
+                )
 
         raise RuntimeError("Retry loop exited unexpectedly.")
 
@@ -196,70 +275,235 @@ class LLMService:
             "Provider 'codex' is handled by the Codex backend, not by LLMService."
         )
 
-    async def _run_with_optional_timeout(
+    async def _run_with_request_deadline(
         self,
-        timeout_seconds: float | None,
-        awaitable: Awaitable[T],
+        operation: Callable[[], Awaitable[T]],
         *,
-        timeout_message: str = "Request timed out.",
-        timeout_kind: str = "request_deadline",
+        deadline_at: float | None,
+        deadline_seconds: float | None,
+        provider: str,
+        model: str | None,
+        request_started_at: float,
     ) -> T:
-        if timeout_seconds is None:
-            return await awaitable
+        if deadline_at is None:
+            return await operation()
+        remaining = deadline_at - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise self._request_deadline_error(
+                deadline_seconds=deadline_seconds,
+                provider=provider,
+                model=model,
+                request_started_at=request_started_at,
+            )
+        operation_task = asyncio.ensure_future(operation())
         try:
-            return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
-        except asyncio.TimeoutError as exc:
-            raise ProviderTimeoutError(
-                timeout_message,
-                metadata={
-                    "timeout_kind": timeout_kind,
-                    "timeout_seconds": timeout_seconds,
-                },
-            ) from exc
+            done, _ = await asyncio.wait((operation_task,), timeout=remaining)
+            if operation_task in done:
+                return await operation_task
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
+            raise self._request_deadline_error(
+                deadline_seconds=deadline_seconds,
+                provider=provider,
+                model=model,
+                request_started_at=request_started_at,
+            )
+        except BaseException:
+            if not operation_task.done():
+                operation_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await operation_task
+            raise
 
-    async def _iter_with_per_event_timeout(
+    async def _iter_stream_with_deadline(
         self,
-        stream: AsyncIterator[LLMStreamEvent],
-        timeout_seconds: float | None,
+        stream: AsyncIterator[ProviderStreamEvent],
+        *,
+        deadline_at: float | None,
+        deadline_seconds: float | None,
+        state: _StreamAttemptState,
     ) -> AsyncIterator[LLMStreamEvent]:
-        if timeout_seconds is None:
-            async for event in stream:
-                yield event
-            return
-
         iterator = stream.__aiter__()
-        while True:
-            try:
-                event = await asyncio.wait_for(
-                    iterator.__anext__(),
-                    timeout=timeout_seconds,
-                )
-            except StopAsyncIteration:
-                return
-            except asyncio.TimeoutError as exc:
-                await self._close_async_iterator(iterator)
-                raise ProviderTimeoutError(
-                    "Request timed out.",
-                    metadata={
-                        "timeout_kind": "stream_event",
-                        "timeout_seconds": timeout_seconds,
-                    },
-                ) from exc
-            yield event
+        completed = False
+        try:
+            while True:
+                try:
+                    if deadline_at is None:
+                        event = await iterator.__anext__()
+                    else:
+                        remaining = deadline_at - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise self._request_deadline_error(
+                                deadline_seconds=deadline_seconds,
+                                provider=state.provider,
+                                model=state.model,
+                                request_started_at=state.request_started_at,
+                                state=state,
+                            )
+                        next_task = asyncio.ensure_future(iterator.__anext__())
+                        try:
+                            done, _ = await asyncio.wait((next_task,), timeout=remaining)
+                            if next_task not in done:
+                                next_task.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await next_task
+                                raise self._request_deadline_error(
+                                    deadline_seconds=deadline_seconds,
+                                    provider=state.provider,
+                                    model=state.model,
+                                    request_started_at=state.request_started_at,
+                                    state=state,
+                                )
+                            event = await next_task
+                        except BaseException:
+                            if not next_task.done():
+                                next_task.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await next_task
+                            raise
+                except StopAsyncIteration:
+                    completed = True
+                    return
 
-    async def _close_async_iterator(self, iterator: AsyncIterator[LLMStreamEvent]) -> None:
-        if isinstance(iterator, AsyncGenerator):
-            await iterator.aclose()
+                state.accepted = True
+                if isinstance(event, ProviderActivityEvent):
+                    state.last_provider_event_type = event.provider_event_type
+                    if event.response_id is not None:
+                        state.response_id = event.response_id
+                    continue
+
+                state.emitted_output = True
+                state.last_normalized_event_type = event.type
+                state.last_provider_event_type = event.type
+                if event.type == "done" and event.response.response_id is not None:
+                    state.response_id = event.response.response_id
+                yield event
+        finally:
+            if not completed:
+                await self._close_async_iterator(iterator)
+
+    async def _close_async_iterator(
+        self,
+        iterator: AsyncIterator[ProviderStreamEvent],
+    ) -> None:
+        close = getattr(iterator, "aclose", None)
+        if not callable(close):
+            return
+        with suppress(Exception):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
+    async def _sleep_before_retry(
+        self,
+        delay_seconds: float,
+        *,
+        deadline_at: float | None,
+        deadline_seconds: float | None,
+        provider: str,
+        model: str | None,
+        request_started_at: float,
+    ) -> None:
+        if deadline_at is None:
+            await asyncio.sleep(delay_seconds)
+            return
+        remaining = deadline_at - asyncio.get_running_loop().time()
+        if remaining <= delay_seconds:
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            raise self._request_deadline_error(
+                deadline_seconds=deadline_seconds,
+                provider=provider,
+                model=model,
+                request_started_at=request_started_at,
+            )
+        await asyncio.sleep(delay_seconds)
+
+    def _request_deadline_error(
+        self,
+        *,
+        deadline_seconds: float | None,
+        provider: str,
+        model: str | None,
+        request_started_at: float,
+        state: _StreamAttemptState | None = None,
+    ) -> ProviderTimeoutError:
+        now = asyncio.get_running_loop().time()
+        metadata: dict[str, object] = {
+            "timeout_kind": "request_deadline",
+            "request_deadline_seconds": deadline_seconds,
+            "elapsed_seconds": max(0.0, now - request_started_at),
+            "provider": provider,
+            "model": model,
+        }
+        if state is not None:
+            metadata.update(
+                {
+                    "accepted": state.accepted,
+                    "emitted_output": state.emitted_output,
+                    "attempt_elapsed_seconds": max(0.0, now - state.attempt_started_at),
+                    "last_provider_event_type": state.last_provider_event_type,
+                    "last_normalized_event_type": state.last_normalized_event_type,
+                    "response_id": state.response_id,
+                }
+            )
+        return ProviderTimeoutError("Request deadline exceeded.", metadata=metadata)
+
+    def _enrich_stream_error(
+        self,
+        error: Exception,
+        *,
+        state: _StreamAttemptState,
+    ) -> None:
+        if not isinstance(error, LLMError):
+            return
+        now = asyncio.get_running_loop().time()
+        error.metadata.setdefault("provider", state.provider)
+        error.metadata.setdefault("model", state.model)
+        error.metadata.setdefault(
+            "elapsed_seconds",
+            max(0.0, now - state.request_started_at),
+        )
+        error.metadata.setdefault(
+            "attempt_elapsed_seconds",
+            max(0.0, now - state.attempt_started_at),
+        )
+        error.metadata.setdefault("accepted", state.accepted)
+        error.metadata.setdefault("emitted_output", state.emitted_output)
+        error.metadata.setdefault("last_provider_event_type", state.last_provider_event_type)
+        error.metadata.setdefault(
+            "last_normalized_event_type",
+            state.last_normalized_event_type,
+        )
+        error.metadata.setdefault("response_id", state.response_id)
+
+    def _enrich_request_error(
+        self,
+        error: Exception,
+        *,
+        provider: str,
+        model: str | None,
+        request_started_at: float,
+    ) -> None:
+        if not isinstance(error, LLMError):
+            return
+        error.metadata.setdefault("provider", provider)
+        error.metadata.setdefault("model", model)
+        error.metadata.setdefault(
+            "elapsed_seconds",
+            max(0.0, asyncio.get_running_loop().time() - request_started_at),
+        )
 
     def _resolve_generate_request(self, request: LLMRequest) -> LLMRequest:
         provider = request.provider or self.settings.default_provider
         model: str | None = request.model
         temperature: float | None = request.temperature
         max_output_tokens: int | None = request.max_output_tokens
-        timeout_seconds = (
-            request.timeout_seconds
-            if request.timeout_seconds is not None
-            else self.settings.request_timeout_seconds
+        deadline_seconds = (
+            request.deadline_seconds
+            if request.deadline_seconds is not None
+            else self.settings.request_deadline_seconds
         )
 
         if provider == "openai":
@@ -338,22 +582,22 @@ class LLMService:
             model=model,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
-            timeout_seconds=timeout_seconds,
+            deadline_seconds=deadline_seconds,
         )
 
     def _resolve_embedding_request(self, request: EmbeddingRequest) -> EmbeddingRequest:
         provider = request.provider or self.settings.embedding.provider
         model = request.model or self.settings.embedding.model
-        timeout_seconds = (
-            request.timeout_seconds
-            if request.timeout_seconds is not None
-            else self.settings.request_timeout_seconds
+        deadline_seconds = (
+            request.deadline_seconds
+            if request.deadline_seconds is not None
+            else self.settings.request_deadline_seconds
         )
         return replace(
             request,
             provider=provider,
             model=model,
-            timeout_seconds=timeout_seconds,
+            deadline_seconds=deadline_seconds,
         )
 
     def _assert_generation_capabilities(
@@ -385,3 +629,10 @@ class LLMService:
 
     def _retry_delay_seconds(self, attempt_index: int) -> float:
         return self.settings.retry_backoff_seconds * (2**attempt_index)
+
+    def _is_safe_to_retry(self, error: Exception) -> bool:
+        if not is_retryable_error(error):
+            return False
+        if not isinstance(error, ProviderTimeoutError):
+            return True
+        return error.metadata.get("timeout_kind") in {"connect", "pool"}

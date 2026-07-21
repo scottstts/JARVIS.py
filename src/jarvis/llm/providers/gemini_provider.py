@@ -24,26 +24,31 @@ from ..errors import (
     ProviderResponseError,
     ProviderTemporaryError,
     ProviderTimeoutError,
+    StreamProtocolError,
 )
 from ..protocols import ProviderCapabilities
 from ..types import (
     DoneEvent,
     EmbeddingRequest,
     EmbeddingResponse,
+    FinishReason,
     ImagePart,
     LLMRequest,
     LLMResponse,
-    LLMStreamEvent,
     LLMUsage,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
+    ToolCallDeltaEvent,
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
     ToolResultPart,
     UsageDeltaEvent,
 )
+from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 _GEMINI_3_MODEL_PREFIX = "gemini-3"
@@ -58,10 +63,14 @@ class GeminiProvider:
         self,
         *,
         settings: GeminiProviderSettings,
-        default_timeout_seconds: float,
+        read_timeout_seconds: float,
+        connect_timeout_seconds: float = 30.0,
     ) -> None:
         self._settings = settings
-        self._default_timeout_seconds = default_timeout_seconds
+        self._transport_timeouts = ProviderTransportTimeouts(
+            connect_seconds=connect_timeout_seconds,
+            read_seconds=read_timeout_seconds,
+        )
         self._client: genai.Client | None = None
         self._client_lock = asyncio.Lock()
 
@@ -105,13 +114,122 @@ class GeminiProvider:
             cache_metadata=cache_metadata,
         )
 
-    async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
-        response = await self.generate(request)
-        if response.text:
-            yield TextDeltaEvent(delta=response.text)
-        if response.usage is not None:
-            yield UsageDeltaEvent(usage=response.usage)
-        yield DoneEvent(response=response)
+    async def stream_generate(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        if request.model is None:
+            raise LLMConfigurationError("request.model must be set before provider dispatch.")
+
+        client = await self._client_instance()
+        contents, config = self._build_generate_payload(request)
+        cache_metadata = await self._ensure_cached_content(
+            client=client,
+            request=request,
+            config=config,
+        )
+
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        seen_tool_calls: set[tuple[str, str, str]] = set()
+        thought_signatures_b64: list[str] = []
+        seen_thought_signatures: set[str] = set()
+        usage: LLMUsage | None = None
+        response_id: str | None = None
+        model_version: str | None = None
+        candidate_finish: str | None = None
+        saw_chunk = False
+
+        try:
+            stream = await client.aio.models.generate_content_stream(
+                model=request.model,
+                contents=contents,
+                config=config or None,
+            )
+            async for chunk in stream:
+                saw_chunk = True
+                chunk_response_id = _optional_str(getattr(chunk, "response_id", None))
+                if chunk_response_id is not None:
+                    response_id = chunk_response_id
+                chunk_model_version = _optional_str(getattr(chunk, "model_version", None))
+                if chunk_model_version is not None:
+                    model_version = chunk_model_version
+
+                chunk_usage = self._normalize_usage(getattr(chunk, "usage_metadata", None))
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                chunk_finish = self._candidate_finish_reason(chunk)
+                if chunk_finish is not None:
+                    candidate_finish = chunk_finish
+
+                emitted_semantic_event = False
+                chunk_text = self._extract_text_response(chunk)
+                if chunk_text:
+                    text_parts.append(chunk_text)
+                    emitted_semantic_event = True
+                    yield TextDeltaEvent(delta=chunk_text)
+
+                for tool_call in self._extract_tool_calls(
+                    candidates=getattr(chunk, "candidates", None) or [],
+                    request_tools=request.tools,
+                ):
+                    identity = (
+                        tool_call.call_id,
+                        tool_call.name,
+                        tool_call.raw_arguments,
+                    )
+                    if identity in seen_tool_calls:
+                        continue
+                    seen_tool_calls.add(identity)
+                    tool_calls.append(tool_call)
+                    emitted_semantic_event = True
+                    yield ToolCallDeltaEvent(
+                        call_id=tool_call.call_id,
+                        tool_name=tool_call.name,
+                        arguments_delta=tool_call.raw_arguments,
+                    )
+
+                for signature in self._extract_thought_signatures_b64(chunk):
+                    if signature in seen_thought_signatures:
+                        continue
+                    seen_thought_signatures.add(signature)
+                    thought_signatures_b64.append(signature)
+
+                if not emitted_semantic_event:
+                    yield ProviderActivityEvent(
+                        provider_event_type="generate_content.chunk",
+                        response_id=response_id,
+                    )
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+
+        if not saw_chunk:
+            raise StreamProtocolError("Gemini stream closed without any response chunks.")
+
+        provider_metadata: dict[str, Any] = {
+            "model_version": model_version,
+            "finish_reason": candidate_finish,
+            **cache_metadata,
+        }
+        if thought_signatures_b64:
+            provider_metadata["thought_signatures_b64"] = thought_signatures_b64
+
+        normalized = LLMResponse(
+            provider=self.name,
+            model=request.model,
+            text="".join(text_parts),
+            tool_calls=tool_calls,
+            finish_reason=self._normalize_finish_reason(
+                tool_calls=tool_calls,
+                candidate_finish=candidate_finish,
+            ),
+            usage=usage,
+            response_id=response_id,
+            provider_metadata=provider_metadata,
+        )
+        if usage is not None:
+            yield UsageDeltaEvent(usage=usage)
+        yield DoneEvent(response=normalized)
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         if request.model is None:
@@ -121,7 +239,7 @@ class GeminiProvider:
 
         client = await self._client_instance()
         contents: Any = request.inputs if isinstance(request.inputs, str) else list(request.inputs)
-        config: dict[str, Any] = {}
+        config: genai_types.EmbedContentConfigDict = {}
         if request.dimensions is not None:
             config["output_dimensionality"] = request.dimensions
 
@@ -180,7 +298,31 @@ class GeminiProvider:
                     "GOOGLE_API_KEY is required for the Gemini provider."
                 )
 
-            self._client = genai.Client(api_key=api_key)
+            timeout_extension = {
+                "connect": self._transport_timeouts.connect_seconds,
+                "read": self._transport_timeouts.read_seconds,
+                "write": self._transport_timeouts.connect_seconds,
+                "pool": self._transport_timeouts.connect_seconds,
+            }
+
+            async def apply_transport_timeouts(request: httpx.Request) -> None:
+                request.extensions["timeout"] = dict(timeout_extension)
+
+            async_http_client = httpx.AsyncClient(
+                timeout=self._transport_timeouts.as_httpx(),
+                event_hooks={"request": [apply_transport_timeouts]},
+            )
+            try:
+                self._client = genai.Client(
+                    api_key=api_key,
+                    http_options=genai_types.HttpOptions(
+                        timeout=int(self._transport_timeouts.read_seconds * 1000),
+                        httpx_async_client=async_http_client,
+                    ),
+                )
+            except Exception:
+                await async_http_client.aclose()
+                raise
             return self._client
 
     def _build_generate_payload(self, request: LLMRequest) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -454,31 +596,62 @@ class GeminiProvider:
             request_tools=request.tools,
         )
 
-        usage_metadata = getattr(response, "usage_metadata", None)
-        usage = None
-        if usage_metadata is not None:
-            usage = LLMUsage(
-                input_tokens=getattr(usage_metadata, "prompt_token_count", None),
-                output_tokens=getattr(usage_metadata, "candidates_token_count", None),
-                total_tokens=getattr(usage_metadata, "total_token_count", None),
-            )
+        usage = self._normalize_usage(getattr(response, "usage_metadata", None))
+        candidate_finish = self._candidate_finish_reason(response)
 
-        finish_reason = "unknown"
-        first_candidate = (response.candidates or [None])[0]
-        candidate_finish = None
-        if first_candidate is not None:
-            finish_reason_attr = getattr(first_candidate, "finish_reason", None)
-            candidate_finish = (
-                finish_reason_attr.value
-                if hasattr(finish_reason_attr, "value")
-                else str(finish_reason_attr) if finish_reason_attr is not None else None
-            )
+        provider_metadata: dict[str, Any] = {
+            "model_version": getattr(response, "model_version", None),
+            "finish_reason": candidate_finish,
+            **dict(cache_metadata or {}),
+        }
+        thought_signatures_b64 = self._extract_thought_signatures_b64(response)
+        if thought_signatures_b64:
+            provider_metadata["thought_signatures_b64"] = thought_signatures_b64
 
+        return LLMResponse(
+            provider=self.name,
+            model=request.model or "",
+            text=self._extract_text_response(response),
+            tool_calls=tool_calls,
+            finish_reason=self._normalize_finish_reason(
+                tool_calls=tool_calls,
+                candidate_finish=candidate_finish,
+            ),
+            usage=usage,
+            response_id=getattr(response, "response_id", None),
+            provider_metadata=provider_metadata,
+        )
+
+    def _normalize_usage(self, usage_metadata: Any) -> LLMUsage | None:
+        if usage_metadata is None:
+            return None
+        return LLMUsage(
+            input_tokens=getattr(usage_metadata, "prompt_token_count", None),
+            output_tokens=getattr(usage_metadata, "candidates_token_count", None),
+            total_tokens=getattr(usage_metadata, "total_token_count", None),
+        )
+
+    def _candidate_finish_reason(self, response: Any) -> str | None:
+        first_candidate = (getattr(response, "candidates", None) or [None])[0]
+        if first_candidate is None:
+            return None
+        finish_reason = getattr(first_candidate, "finish_reason", None)
+        if finish_reason is None:
+            return None
+        value = getattr(finish_reason, "value", finish_reason)
+        return str(value)
+
+    def _normalize_finish_reason(
+        self,
+        *,
+        tool_calls: Sequence[ToolCall],
+        candidate_finish: str | None,
+    ) -> FinishReason:
         if tool_calls:
-            finish_reason = "tool_calls"
-        elif candidate_finish == "MAX_TOKENS":
-            finish_reason = "length"
-        elif candidate_finish in {
+            return "tool_calls"
+        if candidate_finish == "MAX_TOKENS":
+            return "length"
+        if candidate_finish in {
             "SAFETY",
             "PROHIBITED_CONTENT",
             "BLOCKLIST",
@@ -486,24 +659,10 @@ class GeminiProvider:
             "IMAGE_SAFETY",
             "IMAGE_PROHIBITED_CONTENT",
         }:
-            finish_reason = "content_filter"
-        elif candidate_finish == "STOP":
-            finish_reason = "stop"
-
-        return LLMResponse(
-            provider=self.name,
-            model=request.model or "",
-            text=self._extract_text_response(response),
-            tool_calls=tool_calls,
-            finish_reason=finish_reason,
-            usage=usage,
-            response_id=getattr(response, "response_id", None),
-            provider_metadata={
-                "model_version": getattr(response, "model_version", None),
-                "finish_reason": candidate_finish,
-                **dict(cache_metadata or {}),
-            },
-        )
+            return "content_filter"
+        if candidate_finish == "STOP":
+            return "stop"
+        return "unknown"
 
     def _extract_text_response(self, response: Any) -> str:
         text_parts: list[str] = []
@@ -512,10 +671,24 @@ class GeminiProvider:
             if content is None:
                 continue
             for part in getattr(content, "parts", []) or []:
+                if getattr(part, "thought", False):
+                    continue
                 text = getattr(part, "text", None)
                 if isinstance(text, str) and text:
                     text_parts.append(text)
         return "".join(text_parts)
+
+    def _extract_thought_signatures_b64(self, response: Any) -> list[str]:
+        signatures: list[str] = []
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                signature = _extract_gemini_thought_signature(part)
+                if signature is not None:
+                    signatures.append(base64.b64encode(signature).decode("ascii"))
+        return signatures
 
     def _extract_tool_calls(
         self,
@@ -562,7 +735,13 @@ class GeminiProvider:
 
     def _map_error(self, error: Exception) -> Exception:
         if isinstance(error, (httpx.ReadTimeout, httpx.ConnectTimeout, TimeoutError)):
-            return ProviderTimeoutError(str(error))
+            return ProviderTimeoutError(
+                str(error),
+                metadata=transport_timeout_metadata(
+                    error,
+                    timeouts=self._transport_timeouts,
+                ),
+            )
         if isinstance(error, (httpx.ConnectError, httpx.NetworkError)):
             return ProviderTemporaryError(str(error))
         if isinstance(error, genai_errors.ServerError):

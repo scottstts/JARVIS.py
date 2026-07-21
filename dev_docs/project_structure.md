@@ -206,8 +206,11 @@ Current OpenRouter note:
 - when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse, and it does not request provider throughput sorting because OpenRouter prioritizes sorting over sticky routing
 - chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
 - OpenRouter SSE errors preserve generation, response, endpoint, HTTP, typed-error, and upstream-code metadata in runtime logs, but structured upstream stream failures propagate immediately so the user can retry explicitly
-- `JARVIS_LLM_TIMEOUT_SECONDS` defaults to 300 seconds and bounds provider requests plus the wait between normalized stream events
-- streaming retries retain the original conservative rule: once any normalized stream event has been emitted, failures propagate without replaying the request
+- provider request budgets are split into a 3600-second absolute logical deadline (`JARVIS_LLM_REQUEST_DEADLINE_SECONDS`), a 30-second connection timeout (`JARVIS_LLM_CONNECT_TIMEOUT_SECONDS`), and a 3600-second raw-read inactivity timeout (`JARVIS_LLM_READ_TIMEOUT_SECONDS`)
+- the absolute deadline spans all attempts/backoff and never resets on stream activity; provider adapters never receive it as a provider payload timeout
+- provider lifecycle, keepalive, reasoning, and empty-signature chunks become internal `ProviderActivityEvent` values that `LLMService` consumes without forwarding or persisting
+- Anthropic and Gemini use native incremental streaming rather than buffering a complete response before producing normalized events
+- streaming retries are allowed only before provider acceptance and normalized output; response headers/lifecycle activity mark acceptance, and ambiguous read/write timeouts are not blindly replayed
 
 Current Grok note:
 

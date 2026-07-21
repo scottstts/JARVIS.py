@@ -39,6 +39,20 @@ The normal provider path is:
 
 `LLMService` owns normal provider adapters only. The provider value `codex` is rejected by `LLMService` with `LLMConfigurationError` because Codex uses a separate backend.
 
+## LLM Deadlines, Transport Timeouts, And Streaming Activity
+
+Normal provider requests use three separate limits:
+
+- `JARVIS_LLM_REQUEST_DEADLINE_SECONDS` defaults to 3600 seconds and is one absolute wall-clock budget for the logical request, including service retries and retry backoff. `LLMRequest.deadline_seconds` and `EmbeddingRequest.deadline_seconds` can override it per request.
+- `JARVIS_LLM_CONNECT_TIMEOUT_SECONDS` defaults to 30 seconds and bounds connection establishment, connection-pool acquisition, and request writes.
+- `JARVIS_LLM_READ_TIMEOUT_SECONDS` defaults to 3600 seconds and bounds transport-level inactivity while waiting for the next raw response chunk.
+
+The service deadline never resets when a stream event arrives. Provider transports own connection/read timeouts; request deadlines are not copied into provider SDK payloads or per-request transport options.
+
+Provider adapters may yield internal `ProviderActivityEvent` values for lifecycle, keepalive, reasoning, empty-signature, response-header, and other non-user-visible stream activity. `LLMService` consumes these values for acceptance state and diagnostics, but never forwards them to `AgentLoop` or transcript persistence. Anthropic and Gemini use their native streaming APIs; OpenAI/Grok Responses lifecycle events, OpenRouter SSE comments, and LM Studio Responses lifecycle events follow the same internal activity contract.
+
+Automatic stream retry is allowed only before any provider acceptance or normalized output. A response header or provider lifecycle event marks the request accepted, so later failures propagate instead of replaying a possibly active generation. Transport read/write timeouts are also treated as ambiguous and are not blindly retried; only classified connection and pre-request pool-acquisition timeouts are automatically retry-safe.
+
 ## Provider Context Strategies
 
 Replayable transcript records are always stored as Jarvis archive/debug/audit history. Provider context construction then follows the provider strategy:
@@ -84,6 +98,8 @@ Prompt-visible records persisted during follow-up rounds include:
 - explicit unexecuted-tool-call normalization notices
 
 Completed streaming turns persist one canonical assistant record. Interrupted streams can persist a partial assistant-text checkpoint with interruption metadata so later replay reflects text that was already shown before the stop.
+
+Internal provider activity events are transient control signals. They are never assistant content and must never be written to the transcript.
 
 ## Tool-Call Normalization
 

@@ -76,7 +76,7 @@ class OpenRouterConfigTests(unittest.TestCase):
 
 
 class LLMSettingsTests(unittest.TestCase):
-    def test_request_timeout_defaults_to_five_minutes(self) -> None:
+    def test_timeout_policy_defaults_are_long_running_safe(self) -> None:
         with patch.dict(
             os.environ,
             {
@@ -88,22 +88,42 @@ class LLMSettingsTests(unittest.TestCase):
         ):
             settings = LLMSettings.from_env()
 
-        self.assertEqual(settings.request_timeout_seconds, 300.0)
+        self.assertEqual(settings.request_deadline_seconds, 3600.0)
+        self.assertEqual(settings.connect_timeout_seconds, 30.0)
+        self.assertEqual(settings.read_timeout_seconds, 3600.0)
 
-    def test_request_timeout_reads_env_override(self) -> None:
+    def test_timeout_policy_reads_env_overrides(self) -> None:
         with patch.dict(
             os.environ,
             {
                 "JARVIS_LLM_DEFAULT_PROVIDER": "openai",
                 "JARVIS_EMBEDDING_PROVIDER": "openai",
                 "JARVIS_EMBEDDING_MODEL": "text-embedding-test",
-                "JARVIS_LLM_TIMEOUT_SECONDS": "120",
+                "JARVIS_LLM_REQUEST_DEADLINE_SECONDS": "120",
+                "JARVIS_LLM_CONNECT_TIMEOUT_SECONDS": "12",
+                "JARVIS_LLM_READ_TIMEOUT_SECONDS": "90",
             },
             clear=True,
         ):
             settings = LLMSettings.from_env()
 
-        self.assertEqual(settings.request_timeout_seconds, 120.0)
+        self.assertEqual(settings.request_deadline_seconds, 120.0)
+        self.assertEqual(settings.connect_timeout_seconds, 12.0)
+        self.assertEqual(settings.read_timeout_seconds, 90.0)
+
+    def test_timeout_policy_rejects_non_positive_values(self) -> None:
+        with self.assertRaisesRegex(
+            LLMConfigurationError,
+            "JARVIS_LLM_CONNECT_TIMEOUT_SECONDS",
+        ):
+            LLMSettings(
+                default_provider="openai",
+                embedding=EmbeddingSettings(
+                    provider="openai",
+                    model="text-embedding-test",
+                ),
+                connect_timeout_seconds=0,
+            )
 
 
 class GrokConfigTests(unittest.TestCase):

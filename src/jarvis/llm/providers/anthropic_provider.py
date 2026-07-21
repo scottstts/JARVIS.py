@@ -42,17 +42,20 @@ from ..types import (
     LLMMessage,
     LLMRequest,
     LLMResponse,
-    LLMStreamEvent,
     LLMUsage,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
+    ToolCallDeltaEvent,
     ToolChoice,
     ToolChoiceMode,
     ToolDefinition,
     ToolResultPart,
     UsageDeltaEvent,
 )
+from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 _ANTHROPIC_ADAPTIVE_THINKING_MODEL_MARKERS = (
@@ -74,10 +77,14 @@ class AnthropicProvider:
         self,
         *,
         settings: AnthropicProviderSettings,
-        default_timeout_seconds: float,
+        read_timeout_seconds: float,
+        connect_timeout_seconds: float = 30.0,
     ) -> None:
         self._settings = settings
-        self._default_timeout_seconds = default_timeout_seconds
+        self._transport_timeouts = ProviderTransportTimeouts(
+            connect_seconds=connect_timeout_seconds,
+            read_seconds=read_timeout_seconds,
+        )
         self._client: AsyncAnthropic | None = None
         self._client_lock = asyncio.Lock()
 
@@ -103,13 +110,89 @@ class AnthropicProvider:
             raise self._map_error(exc) from exc
         return self._normalize_message_response(request=request, response=response)
 
-    async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
-        response = await self.generate(request)
-        if response.text:
-            yield TextDeltaEvent(delta=response.text)
-        if response.usage is not None:
-            yield UsageDeltaEvent(usage=response.usage)
-        yield DoneEvent(response=response)
+    async def stream_generate(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        kwargs = self._build_messages_create_kwargs(request)
+        client = await self._client_instance()
+        tool_state_by_index: dict[int, tuple[str, str | None]] = {}
+        tool_call_ids_with_deltas: set[str] = set()
+        response_id: str | None = None
+        saw_text_delta = False
+
+        try:
+            async with client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    event_type = str(getattr(event, "type", "") or "unknown")
+                    event_response_id = _anthropic_event_response_id(event)
+                    if event_response_id is not None:
+                        response_id = event_response_id
+
+                    if event_type == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if getattr(block, "type", None) == "tool_use":
+                            index = int(getattr(event, "index", 0))
+                            call_id = str(getattr(block, "id", "") or f"tool_{index}")
+                            name = _optional_anthropic_string(getattr(block, "name", None))
+                            tool_state_by_index[index] = (call_id, name)
+                        yield ProviderActivityEvent(
+                            provider_event_type=event_type,
+                            response_id=response_id,
+                        )
+                        continue
+
+                    if event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        delta_type = getattr(delta, "type", None)
+                        if delta_type == "text_delta":
+                            text = str(getattr(delta, "text", "") or "")
+                            if text:
+                                saw_text_delta = True
+                            yield TextDeltaEvent(delta=text)
+                            continue
+                        if delta_type == "input_json_delta":
+                            index = int(getattr(event, "index", 0))
+                            call_id, tool_name = tool_state_by_index.get(
+                                index,
+                                (f"tool_{index}", None),
+                            )
+                            tool_call_ids_with_deltas.add(call_id)
+                            yield ToolCallDeltaEvent(
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                arguments_delta=str(
+                                    getattr(delta, "partial_json", "") or ""
+                                ),
+                            )
+                            continue
+
+                    yield ProviderActivityEvent(
+                        provider_event_type=event_type,
+                        response_id=response_id,
+                    )
+
+                final_message = await stream.get_final_message()
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+
+        normalized = self._normalize_message_response(
+            request=request,
+            response=final_message,
+        )
+        if normalized.text and not saw_text_delta:
+            yield TextDeltaEvent(delta=normalized.text)
+        for tool_call in normalized.tool_calls:
+            if tool_call.call_id in tool_call_ids_with_deltas:
+                continue
+            yield ToolCallDeltaEvent(
+                call_id=tool_call.call_id,
+                tool_name=tool_call.name,
+                arguments_delta=tool_call.raw_arguments,
+            )
+        if normalized.usage is not None:
+            yield UsageDeltaEvent(usage=normalized.usage)
+        yield DoneEvent(response=normalized)
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         raise UnsupportedCapabilityError("Provider 'anthropic' does not support embeddings.")
@@ -144,7 +227,7 @@ class AnthropicProvider:
             self._client = AsyncAnthropic(
                 api_key=api_key,
                 base_url=self._settings.base_url or os.getenv("ANTHROPIC_BASE_URL"),
-                timeout=self._default_timeout_seconds,
+                timeout=self._transport_timeouts.as_httpx(),
                 max_retries=0,
             )
             return self._client
@@ -181,8 +264,6 @@ class AnthropicProvider:
             kwargs["system"] = system_prompt
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
-        if request.timeout_seconds is not None:
-            kwargs["timeout"] = request.timeout_seconds
         if request.tools:
             kwargs["tools"] = [self._to_anthropic_tool(tool) for tool in request.tools]
             kwargs["tool_choice"] = self._to_anthropic_tool_choice(request.tool_choice)
@@ -493,7 +574,13 @@ class AnthropicProvider:
         if isinstance(error, RateLimitError):
             return ProviderRateLimitError(str(error))
         if isinstance(error, APITimeoutError):
-            return ProviderTimeoutError(str(error))
+            return ProviderTimeoutError(
+                str(error),
+                metadata=transport_timeout_metadata(
+                    error,
+                    timeouts=self._transport_timeouts,
+                ),
+            )
         if isinstance(error, (APIConnectionError, InternalServerError)):
             return ProviderTemporaryError(str(error))
         if isinstance(error, BadRequestError):
@@ -509,6 +596,18 @@ class AnthropicProvider:
         if isinstance(error, AnthropicError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _anthropic_event_response_id(event: Any) -> str | None:
+    message = getattr(event, "message", None)
+    return _optional_anthropic_string(getattr(message, "id", None))
+
+
+def _optional_anthropic_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _join_text_parts(parts: Sequence[Any], *, unsupported_message: str) -> str:

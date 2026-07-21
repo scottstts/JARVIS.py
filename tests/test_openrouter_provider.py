@@ -17,6 +17,7 @@ from jarvis.llm.types import (
     DoneEvent,
     LLMMessage,
     LLMRequest,
+    ProviderActivityEvent,
     TextDeltaEvent,
     ToolCallDeltaEvent,
     ToolDefinition,
@@ -73,12 +74,11 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                 site_url="https://jarvis.example",
                 app_name="Jarvis",
             ),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
 
         _url, headers, timeout = provider._build_request_context(
             endpoint="/chat/completions",
-            timeout_seconds=None,
         )
 
         self.assertEqual(headers["Authorization"], "Bearer test-key")
@@ -86,12 +86,12 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(headers["X-OpenRouter-Cache"], "true")
         self.assertEqual(headers["X-OpenRouter-Title"], "Jarvis")
         self.assertEqual(headers["X-Title"], "Jarvis")
-        self.assertEqual(timeout, 60.0)
+        self.assertEqual(timeout, (30.0, 60.0))
 
     def test_generate_sends_response_cache_header_and_surfaces_cache_metadata(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="openai/gpt-4o-mini",
@@ -140,7 +140,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_generate_preserves_http_504_metadata(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="z-ai/glm-5.2",
@@ -177,7 +177,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_anthropic_model_payload_enables_prompt_cache_and_sticky_session(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="anthropic/claude-4.5-sonnet",
@@ -197,7 +197,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_non_anthropic_model_payload_omits_prompt_cache_control(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="openai/gpt-4o-mini",
@@ -213,7 +213,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_stream_generate_emits_text_usage_and_done_events(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="openai/gpt-4o-mini",
@@ -302,6 +302,14 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertTrue(captured_request["stream"])
         self.assertTrue(captured_request["json"]["stream"])
         self.assertEqual(captured_request["headers"]["X-OpenRouter-Cache"], "true")
+        activity_types = [
+            event.provider_event_type
+            for event in events
+            if isinstance(event, ProviderActivityEvent)
+        ]
+        self.assertIn("http.response_headers", activity_types)
+        self.assertIn("OPENROUTER PROCESSING", activity_types)
+        self.assertIn("sse.done", activity_types)
         self.assertEqual(
             [event.delta for event in events if isinstance(event, TextDeltaEvent)],
             ["Hel", "lo"],
@@ -329,7 +337,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_stream_generate_assembles_streamed_tool_calls(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="openai/gpt-4o-mini",
@@ -440,7 +448,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_stream_generate_preserves_utf8_text(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="openai/gpt-4o-mini",
@@ -500,7 +508,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_stream_generate_ignores_private_reasoning_chunks(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="z-ai/glm-5.2",
@@ -578,7 +586,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_stream_generate_preserves_structured_error_metadata(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="z-ai/glm-5.2",
@@ -647,7 +655,7 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
     def test_stream_generate_raises_on_stream_error_chunk(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="openai/gpt-4o-mini",

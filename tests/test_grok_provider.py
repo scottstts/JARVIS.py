@@ -62,7 +62,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_build_response_create_kwargs_includes_reasoning_effort(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(reasoning_effort="high"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.3",
@@ -76,7 +76,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_build_response_create_kwargs_preserves_system_messages_in_order(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -106,7 +106,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_assistant_history_prefers_persisted_response_output_items_for_replay(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-reasoning",
@@ -163,7 +163,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_tool_roundtrip_uses_function_call_and_function_call_output_items(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -203,7 +203,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_image_input_uses_input_image_items(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
         request = LLMRequest(
@@ -226,7 +226,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_reasoning_models_request_encrypted_reasoning_and_enable_store(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-reasoning",
@@ -241,7 +241,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_non_reasoning_models_omit_encrypted_reasoning_include(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -256,7 +256,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_stateful_continuation_uses_previous_response_id(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -281,7 +281,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_generate_uses_prompt_cache_header(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -312,7 +312,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_normalize_response_persists_response_output_and_usage_details(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-reasoning",
@@ -347,7 +347,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_stream_generate_emits_text_usage_and_done_events(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -399,7 +399,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_stream_generate_assembles_tool_call_events(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",
@@ -469,7 +469,7 @@ class GrokProviderTests(unittest.TestCase):
     def test_stream_generate_raises_on_failed_event(self) -> None:
         provider = GrokProvider(
             settings=GrokProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="grok-4.20-0309-non-reasoning",

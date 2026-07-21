@@ -15,6 +15,7 @@ from jarvis.llm.types import (
     ImagePart,
     LLMMessage,
     LLMRequest,
+    ProviderActivityEvent,
     ToolCall,
     ToolDefinition,
     ToolResultPart,
@@ -28,7 +29,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_assistant_history_uses_output_text_content_items(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gpt-5.2-2025-12-11",
@@ -52,7 +53,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_stateful_continuation_uses_previous_response_and_conversation(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gpt-5.2-2025-12-11",
@@ -79,7 +80,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_tool_roundtrip_uses_function_call_and_function_call_output_items(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gpt-5.2-2025-12-11",
@@ -119,7 +120,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_strict_tool_schema_normalizes_optional_fields_for_openai(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         tool = ToolDefinition(
             name="bash",
@@ -153,7 +154,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_extract_tool_calls_drops_null_for_optional_fields_in_strict_mode(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         tool = ToolDefinition(
             name="bash",
@@ -187,7 +188,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_extract_tool_calls_recovers_required_null_validation_as_invalid_tool_call(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         tool = ToolDefinition(
             name="bash",
@@ -226,7 +227,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_file_patch_tool_schema_avoids_openai_unsupported_one_of(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         settings = ToolSettings.from_workspace_dir(Path("/workspace"))
         tool = build_file_patch_tool(settings).definition
@@ -245,7 +246,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_image_input_uses_input_image_items(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
         request = LLMRequest(
@@ -269,7 +270,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
     def test_original_detail_downgrades_for_models_without_original_support(self) -> None:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gpt-5.2-2025-12-11",
@@ -309,7 +310,7 @@ class OpenAIProviderStreamingTests(unittest.IsolatedAsyncioTestCase):
     def _provider_with_stream(self, *events: object) -> OpenAIProvider:
         provider = OpenAIProvider(
             settings=OpenAIProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
 
         async def _create(**_kwargs):
@@ -369,6 +370,32 @@ class OpenAIProviderStreamingTests(unittest.IsolatedAsyncioTestCase):
             "max_output_tokens",
         )
 
+    async def test_stream_generate_surfaces_lifecycle_as_internal_activity(self) -> None:
+        response = self._response(status="completed")
+        provider = self._provider_with_stream(
+            SimpleNamespace(type="response.created", response=response),
+            SimpleNamespace(
+                type="response.reasoning_text.delta",
+                response_id="resp_123",
+                delta="private reasoning",
+            ),
+            SimpleNamespace(type="response.completed", response=response),
+        )
+
+        events = [event async for event in provider.stream_generate(self._request())]
+
+        activity_types = [
+            event.provider_event_type
+            for event in events
+            if isinstance(event, ProviderActivityEvent)
+        ]
+        self.assertEqual(
+            activity_types,
+            ["response.created", "response.reasoning_text.delta"],
+        )
+        self.assertNotIn("private reasoning", repr(events))
+        self.assertIsInstance(events[-1], DoneEvent)
+
     async def test_stream_generate_raises_temporary_error_when_stream_closes_before_any_output(
         self,
     ) -> None:
@@ -398,7 +425,7 @@ class GeminiNormalizationRegressionTests(unittest.TestCase):
 
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gemini-3-flash-preview",

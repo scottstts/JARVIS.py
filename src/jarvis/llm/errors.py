@@ -75,7 +75,7 @@ class ToolCallValidationError(LLMError):
 
 
 def is_retryable_error(error: Exception) -> bool:
-    """True when request can be safely retried at the service layer."""
+    """True when an error is retry-eligible, subject to request state."""
     return isinstance(
         error,
         (

@@ -45,8 +45,9 @@ from ..types import (
     LLMMessage,
     LLMRequest,
     LLMResponse,
-    LLMStreamEvent,
     LLMUsage,
+    ProviderActivityEvent,
+    ProviderStreamEvent,
     TextDeltaEvent,
     TextPart,
     ToolCall,
@@ -57,6 +58,7 @@ from ..types import (
     ToolResultPart,
     UsageDeltaEvent,
 )
+from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
 
 
@@ -67,10 +69,14 @@ class GrokProvider:
         self,
         *,
         settings: GrokProviderSettings,
-        default_timeout_seconds: float,
+        read_timeout_seconds: float,
+        connect_timeout_seconds: float = 30.0,
     ) -> None:
         self._settings = settings
-        self._default_timeout_seconds = default_timeout_seconds
+        self._transport_timeouts = ProviderTransportTimeouts(
+            connect_seconds=connect_timeout_seconds,
+            read_seconds=read_timeout_seconds,
+        )
         self._client: AsyncOpenAI | None = None
         self._client_lock = asyncio.Lock()
 
@@ -96,7 +102,10 @@ class GrokProvider:
             raise self._map_error(exc) from exc
         return self._normalize_response(request=request, response=response)
 
-    async def stream_generate(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
+    async def stream_generate(
+        self,
+        request: LLMRequest,
+    ) -> AsyncIterator[ProviderStreamEvent]:
         kwargs = self._build_response_create_kwargs(request, stream=True)
         client = await self._client_for_request(request)
 
@@ -120,6 +129,7 @@ class GrokProvider:
                         if item_id:
                             tool_name_by_item_id[item_id] = item.name
                             call_id_by_item_id[item_id] = item.call_id
+                    yield _grok_activity_event(event_type, event)
                     continue
 
                 if event_type == "response.function_call_arguments.delta":
@@ -140,7 +150,7 @@ class GrokProvider:
                     )
                     continue
 
-                if event_type == "response.completed":
+                if event_type in {"response.completed", "response.incomplete"}:
                     normalized = self._normalize_response(
                         request=request,
                         response=event.response,
@@ -152,12 +162,16 @@ class GrokProvider:
                     continue
 
                 if event_type == "response.failed":
+                    yield _grok_activity_event(event_type, event)
                     raise ProviderResponseError(
                         self._extract_stream_failed_message(getattr(event, "response", None))
                     )
 
                 if event_type == "error":
+                    yield _grok_activity_event(event_type, event)
                     raise ProviderResponseError(event.message)
+
+                yield _grok_activity_event(event_type or "unknown", event)
         except Exception as exc:
             if isinstance(exc, (ProviderResponseError, StreamProtocolError)):
                 raise
@@ -197,7 +211,7 @@ class GrokProvider:
             self._client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=self._settings.base_url.rstrip("/"),
-                timeout=self._default_timeout_seconds,
+                timeout=self._transport_timeouts.as_httpx(),
                 max_retries=0,
             )
             return self._client
@@ -230,8 +244,6 @@ class GrokProvider:
             kwargs["max_output_tokens"] = request.max_output_tokens
         if self._settings.reasoning_effort is not None:
             kwargs["reasoning"] = {"effort": self._settings.reasoning_effort}
-        if request.timeout_seconds is not None:
-            kwargs["timeout"] = request.timeout_seconds
         if request.previous_response_id is not None:
             kwargs["previous_response_id"] = request.previous_response_id
 
@@ -530,7 +542,13 @@ class GrokProvider:
         if isinstance(error, RateLimitError):
             return ProviderRateLimitError(str(error))
         if isinstance(error, APITimeoutError):
-            return ProviderTimeoutError(str(error))
+            return ProviderTimeoutError(
+                str(error),
+                metadata=transport_timeout_metadata(
+                    error,
+                    timeouts=self._transport_timeouts,
+                ),
+            )
         if isinstance(error, (APIConnectionError, InternalServerError)):
             return ProviderTemporaryError(str(error))
         if isinstance(error, BadRequestError):
@@ -546,6 +564,17 @@ class GrokProvider:
         if isinstance(error, OpenAIError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _grok_activity_event(event_type: str, event: Any) -> ProviderActivityEvent:
+    response = getattr(event, "response", None)
+    response_id = _normalize_optional_string(getattr(response, "id", None))
+    if response_id is None:
+        response_id = _normalize_optional_string(getattr(event, "response_id", None))
+    return ProviderActivityEvent(
+        provider_event_type=event_type,
+        response_id=response_id,
+    )
 
 
 def _normalize_grok_image_detail(detail: str) -> str:

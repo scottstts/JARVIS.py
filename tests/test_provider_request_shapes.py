@@ -22,7 +22,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_prompt_caching_uses_top_level_cache_control(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(prompt_cache_ttl="5m"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -42,7 +42,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_prompt_caching_marks_final_system_block(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(prompt_cache_ttl="5m"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -70,7 +70,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -94,7 +94,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_turn_attached_system_messages_stay_inline_for_anthropic(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(prompt_cache_ttl="5m"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -139,7 +139,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_tool_roundtrip_uses_tool_use_and_tool_result_blocks(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -179,7 +179,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_image_input_uses_base64_image_block(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -211,7 +211,7 @@ class AnthropicProviderRequestShapeTests(unittest.TestCase):
     def test_normalize_message_response_surfaces_cache_usage_metadata(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="claude-sonnet-4-6",
@@ -258,7 +258,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_maps_assistant_to_model_role(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gemini-3-flash-preview",
@@ -281,7 +281,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_tool_definitions_use_parameters_json_schema(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gemini-3-flash-preview",
@@ -314,7 +314,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_cached_content_request_omits_disallowed_generate_config_fields(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gemini-3-flash-preview",
@@ -352,7 +352,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_cached_content_create_config_contains_stable_context_and_tools(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gemini-3-flash-preview",
@@ -393,7 +393,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_tool_roundtrip_uses_function_call_and_function_response_parts(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="gemini-3-flash-preview",
@@ -439,7 +439,7 @@ class GeminiProviderRequestShapeTests(unittest.TestCase):
     def test_image_input_uses_inline_data_part(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         image_bytes = b"png-bytes"
         request = LLMRequest(
@@ -468,7 +468,7 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_chat_payload_includes_reasoning_effort(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(reasoning_effort="xhigh"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="z-ai/glm-5.2",
@@ -482,7 +482,7 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_chat_payload_uses_session_id_without_provider_sorting(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="minimax/minimax-m2.5",
@@ -497,7 +497,7 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="minimax/minimax-m2.5",
@@ -518,7 +518,7 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_tool_roundtrip_uses_assistant_tool_calls_and_tool_role_messages(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="minimax/minimax-m2.5",
@@ -557,7 +557,7 @@ class OpenRouterProviderRequestShapeTests(unittest.TestCase):
     def test_image_input_uses_image_url_content_item(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
         request = LLMRequest(
@@ -583,7 +583,7 @@ class LMStudioProviderRequestShapeTests(unittest.TestCase):
     def test_multi_turn_history_preserves_assistant_role(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="loaded-model",
@@ -642,7 +642,7 @@ class LMStudioProviderRequestShapeTests(unittest.TestCase):
     def test_tool_roundtrip_uses_assistant_tool_calls_and_tool_role_messages(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="loaded-model",
@@ -703,7 +703,7 @@ class LMStudioProviderRequestShapeTests(unittest.TestCase):
     def test_image_input_uses_image_url_content_item(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         image_url = f"data:image/png;base64,{base64.b64encode(b'png-bytes').decode('ascii')}"
         request = LLMRequest(

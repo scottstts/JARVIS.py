@@ -64,7 +64,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_stream_generate_discovers_loaded_model_and_uses_responses_endpoint(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(base_url="http://localhost:1234/v1"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             messages=(LLMMessage.text("user", "hello"),),
@@ -172,7 +172,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_loopback_base_url_rewrites_to_host_docker_internal_in_container(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(base_url="http://127.0.0.1:1234"),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
 
         with patch("jarvis.llm.providers.lmstudio_provider._running_in_container", return_value=True):
@@ -184,7 +184,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_raises_when_no_loaded_llm_is_available(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(messages=(LLMMessage.text("user", "hello"),))
 
@@ -213,7 +213,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_raises_when_multiple_loaded_llms_match_request(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(messages=(LLMMessage.text("user", "hello"),))
 
@@ -252,7 +252,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_requires_loaded_tool_capable_model_for_tool_requests(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             messages=(LLMMessage.text("user", "run pwd"),),
@@ -284,7 +284,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_uses_previous_response_id_for_append_only_history(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
 
         first_request = LLMRequest(
@@ -353,7 +353,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_uses_previous_response_id_for_tool_result_followup(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         bash_tool = self._bash_tool()
 
@@ -435,7 +435,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_retries_full_history_when_previous_response_id_is_stale(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
 
         first_request = LLMRequest(
@@ -512,7 +512,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_generate_falls_back_to_full_history_when_prefix_does_not_match(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
 
         first_request = LLMRequest(
@@ -560,7 +560,7 @@ class LMStudioProviderTests(unittest.TestCase):
     def test_stream_generate_assembles_tool_calls(self) -> None:
         provider = LMStudioProvider(
             settings=LMStudioProviderSettings(),
-            default_timeout_seconds=60.0,
+            read_timeout_seconds=60.0,
         )
         request = LLMRequest(
             model="granite-live",

@@ -16,7 +16,9 @@ from .provider_names import (
 )
 
 
-_DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 300.0
+_DEFAULT_LLM_REQUEST_DEADLINE_SECONDS = 3600.0
+_DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS = 30.0
+_DEFAULT_LLM_READ_TIMEOUT_SECONDS = 3600.0
 _DEFAULT_LLM_RETRY_ATTEMPTS = 2
 _DEFAULT_LLM_RETRY_BACKOFF_SECONDS = 0.5
 _DEFAULT_OPENROUTER_SITE_URL = "https://github.com/scottstts/JARVIS.py"
@@ -392,7 +394,9 @@ class LMStudioProviderSettings:
 class LLMSettings:
     default_provider: str = ""
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings.from_env)
-    request_timeout_seconds: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
+    request_deadline_seconds: float = _DEFAULT_LLM_REQUEST_DEADLINE_SECONDS
+    connect_timeout_seconds: float = _DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS
+    read_timeout_seconds: float = _DEFAULT_LLM_READ_TIMEOUT_SECONDS
     retry_attempts: int = _DEFAULT_LLM_RETRY_ATTEMPTS
     retry_backoff_seconds: float = _DEFAULT_LLM_RETRY_BACKOFF_SECONDS
     openai: OpenAIProviderSettings = field(default_factory=OpenAIProviderSettings.from_env)
@@ -413,6 +417,12 @@ class LLMSettings:
             raise LLMConfigurationError("JARVIS_LLM_RETRY_ATTEMPTS must be >= 0.")
         if self.retry_backoff_seconds < 0:
             raise LLMConfigurationError("JARVIS_LLM_RETRY_BACKOFF_SECONDS must be >= 0.")
+        if self.request_deadline_seconds <= 0:
+            raise LLMConfigurationError("JARVIS_LLM_REQUEST_DEADLINE_SECONDS must be > 0.")
+        if self.connect_timeout_seconds <= 0:
+            raise LLMConfigurationError("JARVIS_LLM_CONNECT_TIMEOUT_SECONDS must be > 0.")
+        if self.read_timeout_seconds <= 0:
+            raise LLMConfigurationError("JARVIS_LLM_READ_TIMEOUT_SECONDS must be > 0.")
 
     @classmethod
     def from_env(cls) -> "LLMSettings":
@@ -422,9 +432,17 @@ class LLMSettings:
                 app_settings.JARVIS_LLM_DEFAULT_PROVIDER,
             ),
             embedding=EmbeddingSettings.from_env(),
-            request_timeout_seconds=_parse_float_env(
-                "JARVIS_LLM_TIMEOUT_SECONDS",
-                _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+            request_deadline_seconds=_parse_float_env(
+                "JARVIS_LLM_REQUEST_DEADLINE_SECONDS",
+                _DEFAULT_LLM_REQUEST_DEADLINE_SECONDS,
+            ),
+            connect_timeout_seconds=_parse_float_env(
+                "JARVIS_LLM_CONNECT_TIMEOUT_SECONDS",
+                _DEFAULT_LLM_CONNECT_TIMEOUT_SECONDS,
+            ),
+            read_timeout_seconds=_parse_float_env(
+                "JARVIS_LLM_READ_TIMEOUT_SECONDS",
+                _DEFAULT_LLM_READ_TIMEOUT_SECONDS,
             ),
             retry_attempts=_parse_int_env(
                 "JARVIS_LLM_RETRY_ATTEMPTS",
