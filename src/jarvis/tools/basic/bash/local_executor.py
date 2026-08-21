@@ -25,6 +25,7 @@ from .jobs import (
     sweep_job_artifacts,
     write_job_metadata,
 )
+from .policy import resolve_bash_working_directory
 
 _DEFAULT_RUNTIME_PATH = "/usr/local/bin:/usr/bin:/bin"
 _DEFAULT_MODE = "foreground"
@@ -108,11 +109,23 @@ class DirectBashToolExecutor:
         command = str(arguments.get("command", ""))
         timeout_seconds = _resolve_timeout_seconds(arguments, self._settings)
         soft_timeout_seconds = self._settings.bash_foreground_soft_timeout_seconds
+        try:
+            working_directory = resolve_bash_working_directory(arguments, context)
+        except ValueError as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=f"Bash execution request failed\nreason: {exc}",
+                metadata={"mode": "foreground", "error": str(exc)},
+            )
         if timeout_seconds < soft_timeout_seconds:
             return await self._run_plain_foreground(
                 call_id=call_id,
                 command=command,
                 timeout_seconds=timeout_seconds,
+                execution_cwd=working_directory.resolved,
+                display_cwd=working_directory.display,
                 context=context,
             )
 
@@ -121,6 +134,8 @@ class DirectBashToolExecutor:
             command=command,
             timeout_seconds=timeout_seconds,
             soft_timeout_seconds=soft_timeout_seconds,
+            execution_cwd=working_directory.resolved,
+            display_cwd=working_directory.display,
             context=context,
         )
 
@@ -130,6 +145,8 @@ class DirectBashToolExecutor:
         call_id: str,
         command: str,
         timeout_seconds: float,
+        execution_cwd: Path,
+        display_cwd: str,
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
         started_at = perf_counter()
@@ -142,7 +159,7 @@ class DirectBashToolExecutor:
             f"set -o pipefail\n{command}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(context.workspace_dir),
+            cwd=str(execution_cwd),
             env=_build_scrubbed_environment(self._settings),
             start_new_session=True,
         )
@@ -177,7 +194,7 @@ class DirectBashToolExecutor:
         ok = not timed_out and exit_code == 0
         content = _format_bash_result(
             command=command,
-            cwd=Path("/workspace"),
+            cwd=Path(display_cwd),
             exit_code=exit_code,
             timed_out=timed_out,
             timeout_seconds=timeout_seconds,
@@ -196,7 +213,7 @@ class DirectBashToolExecutor:
             metadata={
                 "mode": "foreground",
                 "command": command,
-                "cwd": "/workspace",
+                "cwd": display_cwd,
                 "workspace_source_dir": str(context.workspace_dir),
                 "environment_scrubbed": True,
                 "approval_consumed": bool(context.approved_action),
@@ -223,12 +240,16 @@ class DirectBashToolExecutor:
         command: str,
         timeout_seconds: float,
         soft_timeout_seconds: float,
+        execution_cwd: Path,
+        display_cwd: str,
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
         started_at = perf_counter()
         try:
             job, process, pid, pgid = await self._launch_background_process(
                 workspace_dir=context.workspace_dir,
+                execution_cwd=execution_cwd,
+                display_cwd=display_cwd,
                 command=command,
             )
         except (BashJobError, OSError) as exc:
@@ -265,7 +286,7 @@ class DirectBashToolExecutor:
             )
             content = _format_background_promotion_result(
                 command=command,
-                cwd=Path("/workspace"),
+                cwd=Path(display_cwd),
                 job_id=job.job_id,
                 pid=pid,
                 pgid=pgid,
@@ -289,7 +310,7 @@ class DirectBashToolExecutor:
                     "status": "running",
                     "state": "running",
                     "command": command,
-                    "cwd": "/workspace",
+                    "cwd": display_cwd,
                     "workspace_source_dir": str(context.workspace_dir),
                     "environment_scrubbed": True,
                     "approval_consumed": bool(context.approved_action),
@@ -337,7 +358,7 @@ class DirectBashToolExecutor:
         exit_code = process.returncode if process.returncode is not None else -1
         content = _format_bash_result(
             command=command,
-            cwd=Path("/workspace"),
+            cwd=Path(display_cwd),
             exit_code=exit_code,
             timed_out=False,
             timeout_seconds=timeout_seconds,
@@ -356,7 +377,7 @@ class DirectBashToolExecutor:
             metadata={
                 "mode": "foreground",
                 "command": command,
-                "cwd": "/workspace",
+                "cwd": display_cwd,
                 "workspace_source_dir": str(context.workspace_dir),
                 "environment_scrubbed": True,
                 "approval_consumed": bool(context.approved_action),
@@ -386,10 +407,22 @@ class DirectBashToolExecutor:
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
         command = str(arguments.get("command", "")).strip()
+        try:
+            working_directory = resolve_bash_working_directory(arguments, context)
+        except ValueError as exc:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name="bash",
+                ok=False,
+                content=f"Bash background job failed\nreason: {exc}",
+                metadata={"mode": "background", "error": str(exc)},
+            )
         started_at = perf_counter()
         try:
             job, _process, pid, pgid = await self._launch_background_process(
                 workspace_dir=context.workspace_dir,
+                execution_cwd=working_directory.resolved,
+                display_cwd=working_directory.display,
                 command=command,
             )
         except (BashJobError, OSError) as exc:
@@ -410,7 +443,7 @@ class DirectBashToolExecutor:
         progress_hint = _derive_progress_hint(stdout_text="", stderr_text="")
         content = _format_background_start_result(
             command=command,
-            cwd=Path("/workspace"),
+            cwd=Path(working_directory.display),
             job_id=job.job_id,
             pid=pid,
             pgid=pgid,
@@ -431,7 +464,7 @@ class DirectBashToolExecutor:
                 "status": "running",
                 "state": "running",
                 "command": command,
-                "cwd": "/workspace",
+                "cwd": working_directory.display,
                 "duration_seconds": round(duration_seconds, 3),
                 "stdout_path": str(job.stdout_path),
                 "stderr_path": str(job.stderr_path),
@@ -457,13 +490,15 @@ class DirectBashToolExecutor:
         self,
         *,
         workspace_dir: Path,
+        execution_cwd: Path,
+        display_cwd: str,
         command: str,
     ) -> tuple[BashJobPaths, asyncio.subprocess.Process, int, int]:
         job = create_background_job(
             workspace_dir=workspace_dir,
             bash_executable=self._settings.bash_executable,
             command=command,
-            cwd="/workspace",
+            cwd=display_cwd,
             log_max_bytes=self._settings.bash_job_log_max_bytes,
             total_storage_budget_bytes=self._settings.bash_job_total_storage_budget_bytes,
             retention_seconds=self._settings.bash_job_retention_seconds,
@@ -477,7 +512,7 @@ class DirectBashToolExecutor:
                     str(job.runner_path),
                     stdout=devnull,
                     stderr=devnull,
-                    cwd=str(workspace_dir),
+                    cwd=str(execution_cwd),
                     env=_build_scrubbed_environment(self._settings),
                     start_new_session=True,
                 )
@@ -495,7 +530,7 @@ class DirectBashToolExecutor:
                 runner_pgid=runner_pgid,
                 command=command,
                 launched_at=_utc_now(),
-                cwd="/workspace",
+                cwd=display_cwd,
             )
         except Exception:
             remove_job_artifacts(job)
@@ -551,6 +586,7 @@ class DirectBashToolExecutor:
         if status["stderr_bytes_dropped"] > 0:
             lines.append(f"stderr_bytes_dropped: {status['stderr_bytes_dropped']}")
         lines.append(f"command: {status['command']}")
+        lines.append(f"cwd: {status['cwd']}")
         return ToolExecutionResult(
             call_id=call_id,
             name="bash",
@@ -635,6 +671,7 @@ class DirectBashToolExecutor:
             metadata={
                 "mode": "tail",
                 "job_id": record.job_id,
+                "cwd": record.cwd,
                 "tail_lines": tail_lines,
                 "tail_bytes": max_bytes,
                 "stdout": tail["stdout"],
@@ -760,6 +797,8 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
     interpreter_path = venv_root / "bin" / "python"
     return (
         "Run linux bash commands from `/workspace` inside an isolated container. "
+        "For foreground/background work, optional `cwd` selects one directory inside "
+        "`/workspace` for that call only; it does not persist. "
         "Built-ins: "
         "`rg`, `jq`, `yq`, `curl`, `wget`, `git`, `ffmpeg`, `sqlite3`, `zip`, "
         "`unzip`, `file`, `ps`, `ip`, `lsof`, `strace`, `shellcheck`, and GNU "
@@ -774,7 +813,8 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
         "on-demand inspection or cancellation; do not rely on proactive polling or sleep loops to keep progress "
         "moving. "
         "Approvals and installation: user approval is required for commands that install packages or "
-        "tools, or otherwise perform system-level mutations outside `/workspace`. "
+        "tools, perform system-level mutations outside `/workspace`, recursively delete or "
+        "restore workspace state, or publish Git changes. "
         "When approval is likely needed, provide clear "
         "`approval_summary`, `approval_details`, and optional `inspection_url` context."
     )

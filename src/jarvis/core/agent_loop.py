@@ -112,9 +112,8 @@ _UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY = "unexecuted_tool_call_notice"
 _ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _SKILLS_BOOTSTRAP_METADATA_KEY = "skills_bootstrap"
-_TOOL_ROUND_LIMIT_RECOVERY_TEXT = (
-    "I reached the per-turn tool round limit before finishing. "
-    "Continue in a new turn if you want me to keep using tools."
+_TOOL_ROUND_CONTINUATION_EMPTY_TEXT = (
+    "I could not produce a continuation after the tool execution slice boundary."
 )
 _FOLLOWUP_COMPACTION_FAILED_TEXT = (
     "Follow-up request overflow occurred and compaction could not proceed."
@@ -1193,13 +1192,14 @@ class AgentLoop:
             session_id=session_id,
             role="system",
             content=(
-                f"Tool round limit reached for this turn at round {attempted_round} "
-                f"(max {max_rounds}). Do not call more tools. "
-                "End this turn with a short status update, summarize what was completed, "
-                "state what remains, and ask the user to continue if more tool work is needed."
+                f"Tool execution slice completed {max_rounds} rounds. Pending round "
+                f"{attempted_round} was not executed. "
+                "Continue the same task now, avoid repeating completed work, and use tools "
+                "as needed. Do not ask the user to continue merely because of this boundary."
             ),
             metadata={
                 _TOOL_ROUND_LIMIT_METADATA_KEY: True,
+                "automatic_continuation": True,
                 "attempted_round": attempted_round,
                 "max_rounds": max_rounds,
             },
@@ -1388,6 +1388,28 @@ class AgentLoop:
         )
         return expected
 
+    def _reset_stateful_provider_continuation_for_replay(self, session_id: str) -> None:
+        provider = self._effective_llm_provider()
+        if provider is None:
+            return
+        state = self._ensure_provider_session_state(
+            session_id=session_id,
+            provider=provider,
+        )
+        if (
+            state is None
+            or state.strategy
+            != ProviderContextStrategy.PROVIDER_STATEFUL_CONTINUATION
+        ):
+            return
+        reset_state = ProviderSessionState.for_provider(provider)
+        if reset_state is None:
+            return
+        self._storage.update_session(
+            session_id,
+            provider_session_state=reset_state.to_dict(),
+        )
+
     def _build_tool_round_limit_recovery_request(
         self,
         *,
@@ -1417,32 +1439,23 @@ class AgentLoop:
                 turn_id=turn_id,
             ),
         )
-        request = self._build_contextual_request(
+        self._reset_stateful_provider_continuation_for_replay(session_id)
+        return self._build_followup_request(
             session_id=session_id,
             base_records=base_records,
-            current_records=pending_records,
-            allow_tools=False,
+            pending_records=pending_records,
+            allow_tools=True,
         )
-        estimated_input_tokens = estimate_request_input_tokens(request)
-        if estimated_input_tokens >= self._settings.context_policy.preflight_limit_tokens:
-            raise ContextBudgetError(
-                "Tool round limit recovery request exceeded the context budget."
-            )
-        return request, estimated_input_tokens
 
     def _normalize_tool_round_limit_recovery_response(
         self,
         response: LLMResponse,
     ) -> LLMResponse:
-        text = response.text if response.text.strip() else _TOOL_ROUND_LIMIT_RECOVERY_TEXT
-        if text == response.text and not response.tool_calls:
+        if response.text.strip() or response.tool_calls:
             return response
-        finish_reason = "stop" if response.tool_calls else response.finish_reason
         return replace(
             response,
-            text=text,
-            tool_calls=[],
-            finish_reason=finish_reason,
+            text=_TOOL_ROUND_CONTINUATION_EMPTY_TEXT,
         )
 
     async def _recover_from_tool_round_limit(
@@ -1545,6 +1558,14 @@ class AgentLoop:
                 AgentAssistantMessageEvent(
                     session_id=session_id,
                     text=normalized.text,
+                    turn_id=turn_id,
+                )
+            )
+        if normalized.tool_calls:
+            recovery_events.append(
+                AgentToolCallEvent(
+                    session_id=session_id,
+                    tool_names=tuple(call.name for call in normalized.tool_calls),
                     turn_id=turn_id,
                 )
             )
@@ -1836,7 +1857,8 @@ class AgentLoop:
                     interrupted_unexecuted_tool_names = tuple(
                         call.name for call in current_response.tool_calls
                     )
-                    break
+                    tool_rounds = 0
+                    continue
 
                 followup_compaction_attempted = False
                 deferred_tool_successes: tuple[_DeferredToolSuccess, ...] = ()
@@ -2946,7 +2968,8 @@ class AgentLoop:
                         approval_rejected,
                         (),
                     )
-                break
+                tool_rounds = 0
+                continue
 
             followup_compaction_attempted = False
             deferred_tool_successes: tuple[_DeferredToolSuccess, ...] = ()

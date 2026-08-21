@@ -930,13 +930,14 @@ class _FakeFilePatchLLMService:
                             "operations": [
                                 {
                                     "type": "write",
-                                    "content": "hello\n",
+                                    "match": "",
+                                    "replacement": "hello\n",
                                 }
                             ],
                         },
                         raw_arguments=(
                             '{"path":"notes/todo.txt","operations":[{"type":"write",'
-                            '"content":"hello\\n"}]}'
+                            '"match":"","replacement":"hello\\n"}]}'
                         ),
                     )
                 ],
@@ -1283,17 +1284,47 @@ class _FakeToolRoundLimitLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.generate_calls += 1
-        if request.tool_choice.mode.value == "none":
-            names = [tool.name for tool in request.tools]
-            if names:
-                raise AssertionError("Recovery request should disable all tools.")
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError("Internal continuation must keep tools available.")
+        if request.tool_choice.mode.value != "auto":
+            raise AssertionError("Internal continuation must allow additional tool calls.")
+
+        if self.generate_calls == 4:
             system_message = request.messages[-1]
             if system_message.role != "system":
-                raise AssertionError("Expected tool-round-limit system recovery message.")
-            return _build_response("Final answer without more tools.")
+                raise AssertionError("Expected tool-slice-boundary system message.")
+            system_text = "".join(
+                part.text
+                for part in system_message.parts
+                if isinstance(part, TextPart)
+            )
+            if "Continue the same task now" not in system_text:
+                raise AssertionError("Expected automatic continuation guidance.")
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="bash_after_boundary",
+                        name="bash",
+                        arguments={
+                            "command": "printf 'continued' | tee continuation.txt"
+                        },
+                        raw_arguments=(
+                            '{"command":"printf \'continued\' | tee continuation.txt"}'
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
 
-        if self.generate_calls > 3:
-            raise AssertionError("Expected recovery request before another tool round executes.")
+        if self.generate_calls == 5:
+            if request.messages[-1].role != "tool":
+                raise AssertionError("Expected post-boundary tool result before final answer.")
+            return _build_response("Final answer after automatic continuation.")
+
+        if self.generate_calls > 5:
+            raise AssertionError("Unexpected model call after automatic continuation completed.")
 
         return _build_response(
             "",
@@ -1310,17 +1341,46 @@ class _FakeToolRoundLimitLLMService:
 
     async def stream_generate(self, request: LLMRequest):
         self.stream_calls += 1
-        if request.tool_choice.mode.value == "none":
-            names = [tool.name for tool in request.tools]
-            if names:
-                raise AssertionError("Recovery request should disable all tools.")
-            yield TextDeltaEvent(delta="Final ")
-            yield TextDeltaEvent(delta="answer without more tools.")
-            yield DoneEvent(response=_build_response("Final answer without more tools."))
+        names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError("Streamed internal continuation must keep tools available.")
+        if request.tool_choice.mode.value != "auto":
+            raise AssertionError("Streamed internal continuation must allow tool calls.")
+
+        if self.stream_calls == 4:
+            system_message = request.messages[-1]
+            if system_message.role != "system":
+                raise AssertionError("Expected streamed tool-slice-boundary system message.")
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="bash_stream_after_boundary",
+                            name="bash",
+                            arguments={
+                                "command": "printf 'continued' | tee continuation.txt"
+                            },
+                            raw_arguments=(
+                                '{"command":"printf \'continued\' | tee continuation.txt"}'
+                            ),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
             return
 
-        if self.stream_calls > 3:
-            raise AssertionError("Expected recovery request before another streamed tool round.")
+        if self.stream_calls == 5:
+            yield TextDeltaEvent(delta="Final ")
+            yield TextDeltaEvent(delta="answer after automatic continuation.")
+            yield DoneEvent(
+                response=_build_response("Final answer after automatic continuation.")
+            )
+            return
+
+        if self.stream_calls > 5:
+            raise AssertionError("Unexpected streamed call after continuation completed.")
 
         yield DoneEvent(
             response=_build_response(
@@ -2018,13 +2078,30 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             result = await loop.handle_user_input("Keep working until done.")
 
-            self.assertEqual(result.response_text, "Final answer without more tools.")
+            self.assertEqual(
+                result.response_text,
+                "Final answer after automatic continuation.",
+            )
             records = storage.load_records(result.session_id)
             message_records = [record for record in records if record.kind == "message"]
             assistant_records = [record for record in message_records if record.role == "assistant"]
-            self.assertEqual(len(assistant_records), 4)
-            self.assertEqual(assistant_records[-1].content, "Final answer without more tools.")
-            self.assertTrue(any(record.metadata.get("tool_round_limit") for record in message_records))
+            self.assertEqual(len(assistant_records), 5)
+            self.assertEqual(
+                assistant_records[-1].content,
+                "Final answer after automatic continuation.",
+            )
+            boundary_records = [
+                record
+                for record in message_records
+                if record.metadata.get("tool_round_limit")
+            ]
+            self.assertEqual(len(boundary_records), 1)
+            self.assertTrue(boundary_records[0].metadata["automatic_continuation"])
+            self.assertIn("Do not ask the user to continue", boundary_records[0].content)
+            self.assertEqual(
+                (settings.workspace_dir / "continuation.txt").read_text(),
+                "continued",
+            )
 
     async def test_stream_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2044,13 +2121,30 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
                 self.fail("Expected final stream event to be AgentTurnDoneEvent.")
-            self.assertEqual(done.response_text, "Final answer without more tools.")
+            self.assertEqual(
+                done.response_text,
+                "Final answer after automatic continuation.",
+            )
             assistant_messages = [
                 event.text
                 for event in events
                 if isinstance(event, AgentAssistantMessageEvent)
             ]
-            self.assertEqual(assistant_messages[-1], "Final answer without more tools.")
+            self.assertEqual(
+                assistant_messages[-1],
+                "Final answer after automatic continuation.",
+            )
+            self.assertTrue(
+                any(
+                    isinstance(event, AgentToolCallEvent)
+                    and "bash" in event.tool_names
+                    for event in events
+                )
+            )
+            self.assertEqual(
+                (settings.workspace_dir / "continuation.txt").read_text(),
+                "continued",
+            )
 
     async def test_handle_user_input_executes_bash_tool_round_and_persists_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

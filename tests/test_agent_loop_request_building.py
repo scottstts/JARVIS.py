@@ -143,6 +143,43 @@ class AgentLoopRequestBuildingTests(unittest.TestCase):
             self.assertEqual(request.messages[0].role, "tool")
             self.assertIsInstance(request.messages[0].parts[0], ToolResultPart)
 
+    def test_internal_tool_slice_rollover_resets_stateful_provider_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = SessionStorage(Path(tmp))
+            session = storage.create_session()
+            state = ProviderSessionState.for_provider("openai")
+            self.assertIsNotNone(state)
+            assert state is not None
+            storage.update_session(
+                session.session_id,
+                provider_session_state=replace(
+                    state,
+                    openai=replace(
+                        state.openai,
+                        conversation_id="conv_1",
+                        previous_response_id="resp_pending_tool_call",
+                        last_response_record_id="assistant_pending_tool_call",
+                    ),
+                ).to_dict(),
+            )
+            loop = object.__new__(AgentLoop)
+            loop._storage = storage
+            loop._llm_provider = "openai"
+
+            AgentLoop._reset_stateful_provider_continuation_for_replay(
+                loop,
+                session.session_id,
+            )
+
+            reset = ProviderSessionState.from_mapping(
+                storage.get_session(session.session_id).provider_session_state
+            )
+            self.assertIsNotNone(reset)
+            assert reset is not None
+            self.assertIsNone(reset.openai.conversation_id)
+            self.assertIsNone(reset.openai.previous_response_id)
+            self.assertIsNone(reset.openai.last_response_record_id)
+
     def test_grok_ephemeral_context_uses_live_delta_and_bounded_recovery_tail(
         self,
     ) -> None:

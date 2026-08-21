@@ -7,6 +7,7 @@ from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from email import policy as email_parser_policy
 from email.parser import BytesParser
+import hashlib
 import os
 import shutil
 import subprocess
@@ -326,6 +327,30 @@ class ToolSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.web_search_result_count, 10)
 
+    def test_uses_500_as_default_tool_round_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(os.environ, {}, clear=True):
+                settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        self.assertEqual(settings.max_tool_rounds_per_turn, 500)
+
+    def test_bash_schema_exposes_optional_per_call_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(workspace_dir)
+            )
+
+        bash = registry.require("bash").definition
+        cwd_schema = bash.input_schema["properties"]["cwd"]
+        self.assertEqual(cwd_schema["type"], "string")
+        self.assertNotIn("cwd", bash.input_schema.get("required", []))
+        self.assertIn("Defaults to /workspace", cwd_schema["description"])
+
     def test_allows_web_search_count_env_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -601,11 +626,100 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("user approval is required", description)
         self.assertIn("install packages or tools", description)
         self.assertIn("system-level mutations outside `/workspace`", description)
+        self.assertIn("publish git changes", description)
         self.assertIn("approval_summary", description)
         self.assertIn("use bare `python`/`python3`", description)
+        self.assertIn("optional `cwd`", description)
+        self.assertIn("for that call only", description)
 
 
 class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cwd_is_scoped_to_one_foreground_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            project_dir = workspace_dir / "project"
+            project_dir.mkdir(parents=True)
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            scoped_result = await executor(
+                call_id="call_bash_scoped_cwd",
+                arguments={
+                    "command": "pwd; printf 'scoped' > result.txt",
+                    "cwd": "project",
+                },
+                context=context,
+            )
+            default_result = await executor(
+                call_id="call_bash_default_cwd",
+                arguments={"command": "pwd"},
+                context=context,
+            )
+
+            self.assertTrue(scoped_result.ok)
+            self.assertEqual(scoped_result.metadata["cwd"], "/workspace/project")
+            self.assertEqual((project_dir / "result.txt").read_text(), "scoped")
+            self.assertFalse((workspace_dir / "result.txt").exists())
+            self.assertTrue(default_result.ok)
+            self.assertEqual(default_result.metadata["cwd"], "/workspace")
+            self.assertEqual(default_result.metadata["stdout"].strip(), str(workspace_dir))
+
+    async def test_background_job_runs_in_requested_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            project_dir = workspace_dir / "project"
+            project_dir.mkdir(parents=True)
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+            executor = DirectBashToolExecutor(
+                settings,
+                target_runtime="test_runtime",
+                runtime_location="test_runtime",
+                runtime_transport="inprocess",
+                container_mutation_boundary="test_boundary",
+            )
+            context = ToolExecutionContext(workspace_dir=workspace_dir)
+
+            start_result = await executor(
+                call_id="call_bash_background_cwd",
+                arguments={
+                    "mode": "background",
+                    "command": "pwd > background-cwd.txt",
+                    "cwd": "/workspace/project",
+                },
+                context=context,
+            )
+            self.assertTrue(start_result.ok)
+            self.assertEqual(start_result.metadata["cwd"], "/workspace/project")
+            job_id = str(start_result.metadata["job_id"])
+
+            status_result = None
+            for _ in range(40):
+                status_result = await executor(
+                    call_id="call_bash_background_cwd_status",
+                    arguments={"mode": "status", "job_id": job_id},
+                    context=context,
+                )
+                if status_result.metadata["status"] == "finished":
+                    break
+                await asyncio.sleep(0.05)
+
+            self.assertIsNotNone(status_result)
+            if status_result is None:
+                self.fail("Expected a bash background status result.")
+            self.assertEqual(status_result.metadata["status"], "finished")
+            self.assertEqual(status_result.metadata["cwd"], "/workspace/project")
+            self.assertEqual(
+                (project_dir / "background-cwd.txt").read_text().strip(),
+                str(project_dir),
+            )
+
     async def test_promotes_long_foreground_command_to_background(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -1562,6 +1676,123 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_bash_policy_allows_existing_workspace_cwd_forms(self) -> None:
+        (self.workspace_dir / "project").mkdir()
+        for cwd in ("project", "/workspace/project"):
+            with self.subTest(cwd=cwd):
+                decision = self.policy.authorize(
+                    tool_name="bash",
+                    arguments={"command": "pwd", "cwd": cwd},
+                    context=self.context,
+                )
+                self.assertTrue(decision.allowed)
+
+    def test_bash_policy_denies_cwd_outside_workspace_or_missing(self) -> None:
+        outside = self.workspace_dir.parent
+        for cwd, reason in (
+            (str(outside), "inside /workspace"),
+            ("missing", "does not exist"),
+        ):
+            with self.subTest(cwd=cwd):
+                decision = self.policy.authorize(
+                    tool_name="bash",
+                    arguments={"command": "pwd", "cwd": cwd},
+                    context=self.context,
+                )
+                self.assertFalse(decision.allowed)
+                self.assertIn(reason, decision.reason or "")
+
+    def test_bash_policy_denies_cwd_for_job_control_modes(self) -> None:
+        decision = self.policy.authorize(
+            tool_name="bash",
+            arguments={"mode": "status", "job_id": "abc123", "cwd": "project"},
+            context=self.context,
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("not valid", decision.reason or "")
+
+    def test_bash_policy_requires_approval_for_destructive_repository_commands(self) -> None:
+        commands = (
+            "git reset --hard HEAD~1",
+            "git clean -fd",
+            "git restore src/app.py",
+            "git checkout -- src/app.py",
+            "git push origin main",
+            "git branch -D obsolete",
+            "rm -rf build",
+            "find . -delete",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                decision = self.policy.authorize(
+                    tool_name="bash",
+                    arguments={"command": command},
+                    context=self.context,
+                )
+                self.assertFalse(decision.allowed)
+                self.assertEqual(
+                    decision.reason,
+                    "bash command requires explicit approval.",
+                )
+
+    def test_bash_destructive_detector_uses_shell_command_boundaries(self) -> None:
+        quoted_example = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "printf 'git push origin main'"},
+            context=self.context,
+        )
+        multiline_command = self.policy.authorize(
+            tool_name="bash",
+            arguments={"command": "printf 'ready\\n'\ngit push origin main"},
+            context=self.context,
+        )
+
+        self.assertTrue(quoted_example.allowed)
+        self.assertFalse(multiline_command.allowed)
+
+    def test_bash_destructive_approval_is_bound_to_requested_cwd(self) -> None:
+        (self.workspace_dir / "project").mkdir()
+        command = "rm -rf build"
+        arguments = {"command": command, "cwd": "project"}
+        initial = self.policy.authorize(
+            tool_name="bash",
+            arguments=arguments,
+            context=self.context,
+        )
+        self.assertIsNotNone(initial.approval_request)
+        if initial.approval_request is None:
+            self.fail("Expected approval request metadata.")
+        self.assertEqual(initial.approval_request["cwd"], "/workspace/project")
+
+        wrong_cwd = self.policy.authorize(
+            tool_name="bash",
+            arguments=arguments,
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                approved_action={
+                    "kind": "bash_command",
+                    "command": command,
+                    "cwd": "/workspace",
+                },
+            ),
+        )
+        exact_cwd = self.policy.authorize(
+            tool_name="bash",
+            arguments=arguments,
+            context=ToolExecutionContext(
+                workspace_dir=self.workspace_dir,
+                approved_action={
+                    "kind": "bash_command",
+                    "command": command,
+                    "cwd": "/workspace/project",
+                },
+            ),
+        )
+
+        self.assertFalse(wrong_cwd.allowed)
+        self.assertTrue(exact_cwd.allowed)
+
     def test_bash_policy_allows_workspace_write_commands(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
@@ -1999,7 +2230,13 @@ class ToolPolicyTests(unittest.TestCase):
             tool_name="file_patch",
             arguments={
                 "path": "src/example.py",
-                "operations": [{"type": "write", "content": "print('hello')\n"}],
+                "operations": [
+                    {
+                        "type": "write",
+                        "match": "",
+                        "replacement": "print('hello')\n",
+                    }
+                ],
             },
             context=self.context,
         )
@@ -2011,7 +2248,13 @@ class ToolPolicyTests(unittest.TestCase):
             tool_name="file_patch",
             arguments={
                 "path": str(outside),
-                "operations": [{"type": "write", "content": "print('hello')\n"}],
+                "operations": [
+                    {
+                        "type": "write",
+                        "match": "",
+                        "replacement": "print('hello')\n",
+                    }
+                ],
             },
             context=self.context,
         )
@@ -2023,7 +2266,13 @@ class ToolPolicyTests(unittest.TestCase):
             tool_name="file_patch",
             arguments={
                 "path": ".env",
-                "operations": [{"type": "write", "content": "SECRET=1\n"}],
+                "operations": [
+                    {
+                        "type": "write",
+                        "match": "",
+                        "replacement": "SECRET=1\n",
+                    }
+                ],
             },
             context=self.context,
         )
@@ -2665,13 +2914,14 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "operations": [
                         {
                             "type": "write",
-                            "content": "print('hello')\n",
+                            "match": "",
+                            "replacement": "print('hello')\n",
                         }
                     ],
                 },
                 raw_arguments=(
                     '{"path":"scripts/example.py","operations":[{"type":"write",'
-                    '"content":"print(\'hello\')\\n"}]}'
+                    '"match":"","replacement":"print(\'hello\')\\n"}]}'
                 ),
             ),
             context=self.context,
@@ -2685,6 +2935,10 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.metadata["status"], "created")
         self.assertTrue(result.metadata["file_created"])
+        self.assertEqual(
+            result.metadata["content_sha256"],
+            hashlib.sha256(b"print('hello')\n").hexdigest(),
+        )
 
     async def test_file_patch_applies_ordered_literal_edits(self) -> None:
         target_path = self.workspace_dir / "note.txt"
@@ -2699,20 +2953,20 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "operations": [
                         {
                             "type": "replace",
-                            "old": "beta",
-                            "new": "gamma",
+                            "match": "beta",
+                            "replacement": "gamma",
                         },
                         {
                             "type": "insert_after",
-                            "anchor": "gamma\n",
-                            "text": "delta\n",
+                            "match": "gamma\n",
+                            "replacement": "delta\n",
                         },
                     ],
                 },
                 raw_arguments=(
-                    '{"path":"note.txt","operations":[{"type":"replace","old":"beta",'
-                    '"new":"gamma"},{"type":"insert_after","anchor":"gamma\\n",'
-                    '"text":"delta\\n"}]}'
+                    '{"path":"note.txt","operations":[{"type":"replace","match":"beta",'
+                    '"replacement":"gamma"},{"type":"insert_after","match":"gamma\\n",'
+                    '"replacement":"delta\\n"}]}'
                 ),
             ),
             context=self.context,
@@ -2739,21 +2993,24 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "operations": [
                         {
                             "type": "insert_before",
-                            "anchor": "beta\n",
-                            "text": "delta\n",
+                            "match": "beta\n",
+                            "replacement": "delta\n",
                         }
                     ],
                 },
                 raw_arguments=(
                     '{"path":"note.txt","operations":[{"type":"insert_before",'
-                    '"anchor":"beta\\n","text":"delta\\n"}]}'
+                    '"match":"beta\\n","replacement":"delta\\n"}]}'
                 ),
             ),
             context=self.context,
         )
 
         self.assertFalse(result.ok)
-        self.assertIn("could not find a unique anchor match", result.content)
+        self.assertIn("could not find a unique exact match", result.content)
+        self.assertIn("nearest line candidates", result.content)
+        self.assertIn("current_sha256", result.content)
+        self.assertIn("next_action", result.content)
         self.assertEqual(target_path.read_text(encoding="utf-8"), "alpha\n")
 
     async def test_file_patch_does_not_partially_write_on_failed_later_operation(self) -> None:
@@ -2769,20 +3026,20 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "operations": [
                         {
                             "type": "replace",
-                            "old": "beta",
-                            "new": "gamma",
+                            "match": "beta",
+                            "replacement": "gamma",
                         },
                         {
                             "type": "insert_after",
-                            "anchor": "missing\n",
-                            "text": "delta\n",
+                            "match": "missing\n",
+                            "replacement": "delta\n",
                         },
                     ],
                 },
                 raw_arguments=(
-                    '{"path":"note.txt","operations":[{"type":"replace","old":"beta",'
-                    '"new":"gamma"},{"type":"insert_after","anchor":"missing\\n",'
-                    '"text":"delta\\n"}]}'
+                    '{"path":"note.txt","operations":[{"type":"replace","match":"beta",'
+                    '"replacement":"gamma"},{"type":"insert_after","match":"missing\\n",'
+                    '"replacement":"delta\\n"}]}'
                 ),
             ),
             context=self.context,
@@ -2791,6 +3048,67 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertIn("operation 2", result.content)
         self.assertEqual(target_path.read_text(encoding="utf-8"), "alpha\nbeta\n")
+
+    async def test_file_patch_rejects_stale_sha256_precondition_without_writing(self) -> None:
+        target_path = self.workspace_dir / "note.txt"
+        original = "alpha\nbeta\n"
+        target_path.write_text(original, encoding="utf-8")
+        current_sha256 = hashlib.sha256(original.encode("utf-8")).hexdigest()
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_patch_stale",
+                name="file_patch",
+                arguments={
+                    "path": "note.txt",
+                    "expected_sha256": "0" * 64,
+                    "operations": [
+                        {
+                            "type": "replace",
+                            "match": "beta",
+                            "replacement": "gamma",
+                        }
+                    ],
+                },
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("expected_sha256 precondition failed", result.content)
+        self.assertEqual(result.metadata["current_sha256"], current_sha256)
+        self.assertEqual(target_path.read_text(encoding="utf-8"), original)
+
+    async def test_file_patch_reports_ambiguous_match_line_locations(self) -> None:
+        target_path = self.workspace_dir / "note.txt"
+        original = "same\nmiddle\nsame\n"
+        target_path.write_text(original, encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_patch_ambiguous",
+                name="file_patch",
+                arguments={
+                    "path": "note.txt",
+                    "operations": [
+                        {
+                            "type": "delete",
+                            "match": "same",
+                            "replacement": "",
+                        }
+                    ],
+                },
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("matched multiple exact occurrences", result.content)
+        self.assertIn("line 1", result.content)
+        self.assertIn("line 3", result.content)
+        self.assertEqual(target_path.read_text(encoding="utf-8"), original)
 
     @unittest.skipUnless(
         _BASH_RUNTIME_AVAILABLE,

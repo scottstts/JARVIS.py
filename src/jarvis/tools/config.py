@@ -40,7 +40,7 @@ from jarvis.tools.discoverable.email.configs import (
 
 _DEFAULT_TOOL_RUNTIME_TIMEOUT_SECONDS = 135.0
 _DEFAULT_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS = 5.0
-_DEFAULT_MAX_TOOL_ROUNDS_PER_TURN = 100
+_DEFAULT_MAX_TOOL_ROUNDS_PER_TURN = 500
 
 
 def _optional_env(name: str) -> str | None:

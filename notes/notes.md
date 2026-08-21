@@ -47,7 +47,7 @@
 - `dev_docs/tool_dev_doc.md` should stay status-oriented and update-friendly: protocol first, then implemented tools, then planned tools split into `basic` vs `discoverable`.
 - OpenRouter chat streaming is SSE-based: ignore comment frames, read text/tool deltas from `choices[].delta`, expect usage in a final empty-choices chunk, and treat `data: [DONE]` as the stream terminator.
 - Agent-facing Python now goes only through the basic `bash` tool using the central `/opt/venv` environment, and the curated starter package list lives in `src/jarvis/settings.py` for `Dockerfile.tool_runtime` image builds.
-- `file_patch` is a basic single-file UTF-8 text editing tool with structured operations (`write`, `replace`, `insert_before`, `insert_after`, `delete`), exact-once literal matching, workspace-only paths, and atomic final writes.
+- `file_patch` is a basic single-file UTF-8 text editing tool with one provider-compatible `type`/`match`/`replacement` operation shape, optional SHA-256 preconditions, exact-match diagnostics, workspace-only paths, and atomic final writes.
 - Prompting guidance for `file_patch`: prefer one `write` for broad rewrites, one patch call for modest targeted edits, and only split across multiple patch calls when a single payload would become too large or unreliable.
 - The bash output cap is now `40_000` chars by default so long single-file reads, such as prose/document patching flows, usually fit in one tool round instead of forcing multiple chunked reads.
 - Streaming turns now use a segmented event model end-to-end: the core loop emits `assistant_message` for each finalized assistant text segment and a separate `done`/`turn_done` only for turn completion, follow-up tool rounds stream via `stream_generate()` instead of blocking `generate()`, and the Telegram bridge preserves each segment as its own final message with fresh drafts per segment.
@@ -67,7 +67,8 @@
 - The `jarvis_runtime` container `shm_size` is intentionally `12gb`; Docker Desktop disk-image size remains a host-level setting outside repo control.
 - Telegram UI is now fail-closed on `JARVIS_UI_TELEGRAM_ALLOWED_USER_ID`; the bot only accepts canonical private-user updates from that owner and rejects bot/sender_chat/mismatched private-chat updates.
 - The gateway default bind is now `127.0.0.1`.
-- Tool round exhaustion no longer raises and aborts the turn: the loop now falls back to a transient system instruction, disables further tools for that turn, and asks the model for a best-effort final answer; the default per-turn tool-round cap is now `100`.
+- Tool execution now uses automatic internal continuation at a `500`-round slice boundary, preserving current-turn tool activation and continuing without asking the user to send another message.
+- General-purpose `PROGRAM.md` now includes scoped inspect-before-edit and validation guidance, while `bash` supports non-persistent per-call workspace `cwd` and approval-gates high-confidence destructive repository/workspace commands.
 - `generate_edit_image` is the first default discoverable executable tool; it activates through `tool_search`, reads its Gemini/OpenAI model defaults from `tools.generate_edit_image` in `settings.yml` (packaged as `gemini-3.1-flash-image-preview` and `gpt-image-2`), and writes to an agent-chosen workspace `output_path`.
 - `generate_edit_image` exposes provider-specific fidelity knobs but should usually leave them unset: OpenAI defaults `quality`, `size`, and `background` to `auto`, while Gemini defaults `resolution` to `1K`.
 - `generate_edit_image` defaults to the OpenAI path; agents should set `provider='gemini'` only when the user asks for Gemini.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ...config import ToolSettings
@@ -120,6 +122,93 @@ _SYSTEM_REDIRECT_PATTERN = re.compile(
     r"(?:^|[;&|])[^#\n]*(?:>|>>)\s*"
     r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*|/var/\S*|/root/\S*)"
 )
+_MUTATING_COMMAND_PREFIX = (
+    _COMMAND_PREFIX
+    + _OPTIONAL_SUDO
+    + _OPTIONAL_ENV_WRAPPER
+    + _OPTIONAL_ENV_ASSIGNMENTS
+)
+_DESTRUCTIVE_WORKSPACE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(_MUTATING_COMMAND_PREFIX + r"git\s+reset\b[^\n;&|]*--hard\b"),
+        "matched destructive git reset --hard",
+    ),
+    (
+        re.compile(
+            _MUTATING_COMMAND_PREFIX
+            + r"git\s+clean\b[^\n;&|]*(?:\s-[a-z]*f[a-z]*|\s--force)(?:\s|$)"
+        ),
+        "matched destructive git clean",
+    ),
+    (
+        re.compile(
+            _MUTATING_COMMAND_PREFIX
+            + r"git\s+(?:checkout\b[^\n;&|]*(?:\s--(?:\s|$)|\s-f(?:\s|$))|restore\b)"
+        ),
+        "matched destructive git working-tree restore",
+    ),
+    (
+        re.compile(_MUTATING_COMMAND_PREFIX + r"git\s+push\b"),
+        "matched external git push",
+    ),
+    (
+        re.compile(
+            _MUTATING_COMMAND_PREFIX
+            + r"git\s+(?:branch|tag)\s+(?:-[a-z]*d[a-z]*|--delete)(?:\s|$)"
+        ),
+        "matched destructive git ref deletion",
+    ),
+    (
+        re.compile(
+            _MUTATING_COMMAND_PREFIX
+            + r"rm\b[^\n;&|]*\s(?:-[a-z]*r[a-z]*|--recursive)(?:\s|$)"
+        ),
+        "matched recursive deletion",
+    ),
+    (
+        re.compile(_MUTATING_COMMAND_PREFIX + r"find\b[^\n;&|]*\s-delete\b"),
+        "matched recursive find deletion",
+    ),
+)
+
+
+@dataclass(slots=True, frozen=True)
+class BashWorkingDirectory:
+    resolved: Path
+    display: str
+
+
+def resolve_bash_working_directory(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> BashWorkingDirectory:
+    workspace = context.workspace_dir.resolve(strict=False)
+    raw_value = arguments.get("cwd")
+    if raw_value is None:
+        candidate = workspace
+    elif not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError("bash cwd must be a non-empty string when provided.")
+    else:
+        raw_path = Path(raw_value.strip())
+        if raw_path.is_absolute():
+            if raw_path == Path("/workspace") or raw_path.is_relative_to(Path("/workspace")):
+                candidate = workspace / raw_path.relative_to("/workspace")
+            else:
+                candidate = raw_path
+        else:
+            candidate = workspace / raw_path
+        candidate = candidate.resolve(strict=False)
+
+    if candidate != workspace and not candidate.is_relative_to(workspace):
+        raise ValueError("bash cwd must stay inside /workspace.")
+    if not candidate.exists():
+        raise ValueError("bash cwd does not exist.")
+    if not candidate.is_dir():
+        raise ValueError("bash cwd must point to a directory.")
+
+    relative = candidate.relative_to(workspace)
+    display = str(Path("/workspace") / relative) if relative.parts else "/workspace"
+    return BashWorkingDirectory(resolved=candidate, display=display)
 
 
 class BashCommandPolicy:
@@ -134,8 +223,6 @@ class BashCommandPolicy:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolPolicyDecision:
-        _ = context
-
         mode = _normalize_mode(arguments.get("mode"))
         if mode not in _MODE_VALUES:
             return ToolPolicyDecision(
@@ -144,6 +231,11 @@ class BashCommandPolicy:
             )
 
         if mode in {"status", "tail", "cancel"}:
+            if arguments.get("cwd") is not None:
+                return ToolPolicyDecision(
+                    allowed=False,
+                    reason=f"bash cwd is not valid for mode '{mode}'.",
+                )
             job_id = str(arguments.get("job_id", "")).strip()
             if not job_id:
                 return ToolPolicyDecision(
@@ -156,6 +248,11 @@ class BashCommandPolicy:
                     reason="bash job_id must be a lowercase hex string.",
                 )
             return ToolPolicyDecision(allowed=True)
+
+        try:
+            working_directory = resolve_bash_working_directory(arguments, context)
+        except ValueError as exc:
+            return ToolPolicyDecision(allowed=False, reason=str(exc))
 
         command = str(arguments.get("command", ""))
         if not command.strip():
@@ -183,6 +280,7 @@ class BashCommandPolicy:
         if (
             approved_action.get("kind") == "bash_command"
             and approved_action.get("command") == command
+            and approved_action.get("cwd", "/workspace") == working_directory.display
         ):
             return ToolPolicyDecision(allowed=True)
 
@@ -190,12 +288,12 @@ class BashCommandPolicy:
         details = str(arguments.get("approval_details", "")).strip()
         inspection_url = str(arguments.get("inspection_url", "")).strip()
         if not summary:
-            summary = "Run a bash command that mutates the isolated tool_runtime container."
+            summary = "Run a bash command that requires explicit review."
         if not details:
             details = (
-                "I want to run a bash command that appears to install, build, or modify "
-                "system-level tooling inside the isolated tool_runtime container. "
-                "Review the exact command before approving."
+                "This command appears to install software, mutate system tooling, overwrite "
+                "or delete workspace state, or publish repository changes. Review the exact "
+                f"command and working directory ({working_directory.display}) before approving."
             )
 
         return ToolPolicyDecision(
@@ -207,6 +305,7 @@ class BashCommandPolicy:
                 "details": details,
                 "inspection_url": inspection_url or None,
                 "command": command,
+                "cwd": working_directory.display,
                 "detector_reason": detector_reason,
                 "target_runtime": "tool_runtime",
                 "runtime_location": "tool_runtime_container",
@@ -327,19 +426,25 @@ def _central_python_guidance(settings: ToolSettings) -> str:
 
 
 def _approval_detector_reason(command: str) -> str | None:
-    lowered = " ".join(command.strip().lower().split())
+    lowered = command.strip().lower()
     if not lowered:
         return None
 
-    if any(keyword in lowered for keyword in _INSTALL_KEYWORDS):
+    for pattern, reason in _DESTRUCTIVE_WORKSPACE_PATTERNS:
+        if pattern.search(lowered):
+            return reason
+
+    compact = " ".join(lowered.split())
+
+    if any(keyword in compact for keyword in _INSTALL_KEYWORDS):
         return "matched install or package-manager mutation pattern for tool_runtime"
 
-    if ("curl " in lowered or "wget " in lowered) and (
-        "| sh" in lowered
-        or "| bash" in lowered
-        or "| zsh" in lowered
-        or "| python" in lowered
-        or "| python3" in lowered
+    if ("curl " in compact or "wget " in compact) and (
+        "| sh" in compact
+        or "| bash" in compact
+        or "| zsh" in compact
+        or "| python" in compact
+        or "| python3" in compact
     ):
         return "matched remote installer pipeline pattern for tool_runtime"
 

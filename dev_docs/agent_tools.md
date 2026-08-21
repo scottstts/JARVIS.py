@@ -132,7 +132,7 @@ Policy routing lives in `src/jarvis/tools/policy.py`; per-tool policy lives besi
 Current policy highlights:
 
 - `bash` is checked in `jarvis_runtime` and executed in isolated `tool_runtime`
-- `bash` requires approval for install/build/system-mutation commands unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
+- `bash` requires approval for install/build/system-mutation commands and high-confidence destructive repository/workspace commands unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
 - `bash` hard-denies upgrade, service/init-control, mount/kernel-admin, and container-runtime-recursion commands
 - `view_image`, `send_file`, generated image paths, transcribe inputs, and email attachments must stay inside `/workspace`
 - `.env` files and `.env` directories are denied for file-send and patch-like surfaces
@@ -157,7 +157,7 @@ Approval request payloads include fields such as:
 - `inspection_url`
 - `manifest_hash`
 
-For `bash`, approval is bound to the exact command and relevant execution parameters. For `tool_register`, approval is bound to the exact manifest payload hash. For `email`, approval is bound to the exact send request hash.
+For `bash`, approval is bound to the exact command and resolved `/workspace` working directory. Changing either requires a new approval. For `tool_register`, approval is bound to the exact manifest payload hash. For `email`, approval is bound to the exact send request hash.
 
 Rejected approvals do not execute the action. The transcript records both approval requests and decisions for auditability.
 
@@ -188,7 +188,7 @@ Files written outside `/workspace` stay local to the long-lived `tool_runtime` c
 - `tail`
 - `cancel`
 
-Foreground jobs that exceed the soft timeout are promoted to background and return a `job_id`. Background job metadata persists under `.jarvis_internal/bash_jobs/` with owner route/session/turn/agent identity.
+Foreground jobs that exceed the soft timeout are promoted to background and return a `job_id`. Background job metadata persists under `.jarvis_internal/bash_jobs/` with owner route/session/turn/agent identity and the resolved display working directory.
 
 Route-scoped supervision owns detached bash monitoring outside the model loop. After a detached start or promotion, the current turn parks. Later progress notices enqueue runtime turns for the owning main agent or subagent.
 
@@ -202,7 +202,7 @@ Route-level `/stop` preempts foreground tool awaits. Foreground bash gets best-e
 
 ### `bash`
 
-Runs shell commands in `tool_runtime` with `/workspace` as the durable boundary. Supports foreground/background execution, status, tail, cancellation, output truncation, log retention, approval-gated installs/builds, and route-level background supervision.
+Runs shell commands in `tool_runtime` with `/workspace` as the durable boundary. Foreground and background calls may provide `cwd` as a relative path or `/workspace`-absolute path; it must resolve to an existing directory inside the workspace, applies only to that call, and defaults to `/workspace`. Job-control calls do not accept `cwd`. The tool also supports status, tail, cancellation, output truncation, log retention, approval-gated installs/builds/destructive commands, and route-level background supervision.
 
 ### `file_patch`
 
@@ -215,6 +215,10 @@ Applies structured one-file text edits inside `/workspace` through literal opera
 - `delete`
 
 Writes are atomic. Non-write operations require exact single matches.
+
+Every operation has the same required shape: `type`, `match`, and `replacement`. `write` uses an empty `match` and full-file `replacement`; `delete` uses an empty `replacement`; the other operations apply their documented literal semantics. This avoids provider-incompatible operation unions and reduces malformed model calls.
+
+Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application. Successful results return the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
 
 The tool description includes a minimal valid replace payload because nested patch operations are a common model-shape failure; runtime schema errors also point to paths such as `$.operations[0].type`.
 

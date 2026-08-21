@@ -565,6 +565,7 @@ def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
         "stdout_bytes_dropped": stdout_stats.bytes_dropped,
         "stderr_bytes_dropped": stderr_stats.bytes_dropped,
         "command": record.command,
+        "cwd": record.cwd,
         "owner_route_id": record.owner_route_id,
         "owner_session_id": record.owner_session_id,
         "owner_turn_id": record.owner_turn_id,

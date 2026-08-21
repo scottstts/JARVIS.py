@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -15,6 +17,8 @@ from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 _MAX_OPERATIONS = 32
 _MAX_PATH_CHARS = 1_024
 _MAX_OPERATION_TEXT_CHARS = 200_000
+_MAX_DIAGNOSTIC_CANDIDATES = 3
+_MAX_DIAGNOSTIC_LINE_CHARS = 240
 
 
 class FilePatchError(RuntimeError):
@@ -36,11 +40,19 @@ class FilePatchToolExecutor:
 
         try:
             operations = _normalize_operations(arguments.get("operations"))
-            outcome = _apply_file_patch(file_path=file_path, operations=operations)
+            expected_sha256 = _normalize_expected_sha256(
+                arguments.get("expected_sha256")
+            )
+            outcome = _apply_file_patch(
+                file_path=file_path,
+                operations=operations,
+                expected_sha256=expected_sha256,
+            )
         except FilePatchError as exc:
             return _file_patch_error(
                 call_id=call_id,
                 raw_path=raw_path,
+                file_path=file_path,
                 reason=str(exc),
             )
 
@@ -52,6 +64,7 @@ class FilePatchToolExecutor:
             "operation_types: " + ", ".join(outcome["operation_types"]),
             f"changed: {str(outcome['changed']).lower()}",
             f"bytes_written: {outcome['bytes_written']}",
+            f"content_sha256: {outcome['content_sha256']}",
         ]
 
         return ToolExecutionResult(
@@ -67,6 +80,7 @@ class FilePatchToolExecutor:
                 "operations_applied": outcome["operations_applied"],
                 "operation_types": list(outcome["operation_types"]),
                 "bytes_written": outcome["bytes_written"],
+                "content_sha256": outcome["content_sha256"],
             },
         )
 
@@ -89,6 +103,16 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                         "maxLength": _MAX_PATH_CHARS,
                         "description": "Workspace file to edit.",
                     },
+                    "expected_sha256": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-fA-F]{64}$",
+                        "description": (
+                            "Optional SHA-256 of the file content inspected before this edit. "
+                            "The patch fails if the current file differs."
+                        ),
+                    },
                     "operations": {
                         "type": "array",
                         "minItems": 1,
@@ -97,8 +121,11 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                         "items": {
                             "type": "object",
                             "description": (
-                                "Use write with content, replace with old/new, insert_* with "
-                                "anchor/text, and delete with text."
+                                "Every operation uses type, match, and replacement. For write, "
+                                "match must be empty and replacement is the full file. For "
+                                "replace, match is replaced by replacement. For insert_before "
+                                "or insert_after, match is the anchor and replacement is inserted. "
+                                "For delete, match is removed and replacement must be empty."
                             ),
                             "properties": {
                                 "type": {
@@ -112,33 +139,20 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                                     ],
                                     "description": "Edit kind.",
                                 },
-                                "content": {
+                                "match": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": "For write: full file content.",
+                                    "description": "Exact target text, or empty for write.",
                                 },
-                                "old": {
+                                "replacement": {
                                     "type": "string",
                                     "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": "For replace: exact text to replace.",
-                                },
-                                "new": {
-                                    "type": "string",
-                                    "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": "For replace: replacement text.",
-                                },
-                                "anchor": {
-                                    "type": "string",
-                                    "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": "For insert_before/insert_after: exact anchor text.",
-                                },
-                                "text": {
-                                    "type": "string",
-                                    "maxLength": _MAX_OPERATION_TEXT_CHARS,
-                                    "description": "For insert_before/insert_after/delete: text to insert or delete.",
+                                    "description": (
+                                        "New, inserted, or full-file text; empty for delete."
+                                    ),
                                 },
                             },
-                            "required": ["type"],
+                            "required": ["type", "match", "replacement"],
                             "additionalProperties": False,
                         },
                     },
@@ -164,8 +178,8 @@ def _build_file_patch_tool_description(settings: ToolSettings) -> str:
         "unreliable. "
         "Matching is exact literal text only and edit operations fail when the target text is "
         "missing or ambiguous. Example: "
-        '{"path":"src/app.py","operations":[{"type":"replace","old":"x = 1",'
-        '"new":"x = 2"}]}.'
+        '{"path":"src/app.py","operations":[{"type":"replace",'
+        '"match":"x = 1","replacement":"x = 2"}]}.'
     )
 
 
@@ -185,81 +199,47 @@ def _normalize_operations(raw_operations: object) -> list[dict[str, str]]:
             field_name=f"operations[{index}].type",
         )
 
-        if operation_type == "write":
-            normalized.append(
-                {
-                    "type": "write",
-                    "content": _require_string(
-                        raw_operation.get("content"),
-                        field_name=f"operations[{index}].content",
-                    ),
-                }
+        if operation_type not in {
+            "write",
+            "replace",
+            "insert_before",
+            "insert_after",
+            "delete",
+        }:
+            raise FilePatchError(
+                f"operations[{index}].type '{operation_type}' is not supported."
             )
-            continue
 
-        if operation_type == "replace":
-            old_text = _require_non_empty_string(
-                raw_operation.get("old"),
-                field_name=f"operations[{index}].old",
+        match = _require_string(
+            raw_operation.get("match"),
+            field_name=f"operations[{index}].match",
+        )
+        replacement = _require_string(
+            raw_operation.get("replacement"),
+            field_name=f"operations[{index}].replacement",
+        )
+        if operation_type == "write" and match:
+            raise FilePatchError(
+                f"operations[{index}].match must be empty for write."
             )
-            normalized.append(
-                {
-                    "type": "replace",
-                    "old": old_text,
-                    "new": _require_string(
-                        raw_operation.get("new"),
-                        field_name=f"operations[{index}].new",
-                    ),
-                }
+        if operation_type != "write" and not match:
+            raise FilePatchError(
+                f"operations[{index}].match must not be empty for {operation_type}."
             )
-            continue
-
-        if operation_type == "insert_before":
-            normalized.append(
-                {
-                    "type": "insert_before",
-                    "anchor": _require_non_empty_string(
-                        raw_operation.get("anchor"),
-                        field_name=f"operations[{index}].anchor",
-                    ),
-                    "text": _require_non_empty_string(
-                        raw_operation.get("text"),
-                        field_name=f"operations[{index}].text",
-                    ),
-                }
+        if operation_type == "delete" and replacement:
+            raise FilePatchError(
+                f"operations[{index}].replacement must be empty for delete."
             )
-            continue
-
-        if operation_type == "insert_after":
-            normalized.append(
-                {
-                    "type": "insert_after",
-                    "anchor": _require_non_empty_string(
-                        raw_operation.get("anchor"),
-                        field_name=f"operations[{index}].anchor",
-                    ),
-                    "text": _require_non_empty_string(
-                        raw_operation.get("text"),
-                        field_name=f"operations[{index}].text",
-                    ),
-                }
+        if operation_type in {"insert_before", "insert_after"} and not replacement:
+            raise FilePatchError(
+                f"operations[{index}].replacement must not be empty for {operation_type}."
             )
-            continue
-
-        if operation_type == "delete":
-            normalized.append(
-                {
-                    "type": "delete",
-                    "text": _require_non_empty_string(
-                        raw_operation.get("text"),
-                        field_name=f"operations[{index}].text",
-                    ),
-                }
-            )
-            continue
-
-        raise FilePatchError(
-            f"operations[{index}].type '{operation_type}' is not supported."
+        normalized.append(
+            {
+                "type": operation_type,
+                "match": match,
+                "replacement": replacement,
+            }
         )
 
     write_count = sum(1 for operation in normalized if operation["type"] == "write")
@@ -267,6 +247,19 @@ def _normalize_operations(raw_operations: object) -> list[dict[str, str]]:
         raise FilePatchError("write must be the only operation in a file_patch call.")
 
     return normalized
+
+
+def _normalize_expected_sha256(value: object) -> str | None:
+    if value is None:
+        return None
+    digest = _require_non_empty_string(value, field_name="expected_sha256").lower()
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise FilePatchError(
+            "expected_sha256 must be a 64-character hexadecimal SHA-256."
+        )
+    return digest
 
 
 def _require_string(value: object, *, field_name: str) -> str:
@@ -286,6 +279,7 @@ def _apply_file_patch(
     *,
     file_path: Path,
     operations: list[dict[str, str]],
+    expected_sha256: str | None,
 ) -> dict[str, object]:
     parent_dir = file_path.parent
     if not parent_dir.exists():
@@ -307,9 +301,16 @@ def _apply_file_patch(
     if file_existed:
         existing_content = _read_utf8_text(file_path)
         existing_mode = file_path.stat().st_mode
+    existing_sha256 = _content_sha256(existing_content) if file_existed else None
+    if expected_sha256 is not None and existing_sha256 != expected_sha256:
+        actual = existing_sha256 or "(file does not exist)"
+        raise FilePatchError(
+            "expected_sha256 precondition failed; "
+            f"current_sha256: {actual}. Reread the file before retrying."
+        )
 
     if operations[0]["type"] == "write":
-        final_content = operations[0]["content"]
+        final_content = operations[0]["replacement"]
     else:
         if not file_existed:
             raise FilePatchError(
@@ -333,6 +334,7 @@ def _apply_file_patch(
         )
 
     bytes_written = len(final_content.encode("utf-8"))
+    content_sha256 = _content_sha256(final_content)
     if not file_existed:
         status = "created"
     elif changed:
@@ -347,6 +349,7 @@ def _apply_file_patch(
         "operations_applied": len(operations),
         "operation_types": operation_types,
         "bytes_written": bytes_written,
+        "content_sha256": content_sha256,
     }
 
 
@@ -359,53 +362,49 @@ def _apply_operation(
     operation_type = operation["type"]
 
     if operation_type == "replace":
-        old_text = operation["old"]
+        match = operation["match"]
         match_index = _require_unique_match(
             content=content,
-            needle=old_text,
+            needle=match,
             index=index,
             operation_type=operation_type,
-            label="old",
         )
         return (
             content[:match_index]
-            + operation["new"]
-            + content[match_index + len(old_text) :]
+            + operation["replacement"]
+            + content[match_index + len(match) :]
         )
 
     if operation_type == "insert_before":
-        anchor = operation["anchor"]
+        match = operation["match"]
         match_index = _require_unique_match(
             content=content,
-            needle=anchor,
+            needle=match,
             index=index,
             operation_type=operation_type,
-            label="anchor",
         )
-        return content[:match_index] + operation["text"] + content[match_index:]
+        return content[:match_index] + operation["replacement"] + content[match_index:]
 
     if operation_type == "insert_after":
-        anchor = operation["anchor"]
+        match = operation["match"]
         match_index = _require_unique_match(
             content=content,
-            needle=anchor,
+            needle=match,
             index=index,
             operation_type=operation_type,
-            label="anchor",
         )
-        insert_at = match_index + len(anchor)
-        return content[:insert_at] + operation["text"] + content[insert_at:]
+        insert_at = match_index + len(match)
+        return content[:insert_at] + operation["replacement"] + content[insert_at:]
 
     if operation_type == "delete":
-        text = operation["text"]
+        match = operation["match"]
         match_index = _require_unique_match(
             content=content,
-            needle=text,
+            needle=match,
             index=index,
             operation_type=operation_type,
-            label="text",
         )
-        return content[:match_index] + content[match_index + len(text) :]
+        return content[:match_index] + content[match_index + len(match) :]
 
     raise FilePatchError(f"operation {index} has unsupported type '{operation_type}'.")
 
@@ -416,16 +415,28 @@ def _require_unique_match(
     needle: str,
     index: int,
     operation_type: str,
-    label: str,
 ) -> int:
     matches = _find_all_match_indexes(content, needle)
     if not matches:
+        candidates = _similar_line_candidates(content=content, needle=needle)
+        candidate_text = (
+            "\nnearest line candidates:\n" + "\n".join(candidates)
+            if candidates
+            else "\nnearest line candidates: none"
+        )
         raise FilePatchError(
-            f"operation {index} ({operation_type}) could not find a unique {label} match."
+            f"operation {index} ({operation_type}) could not find a unique exact match."
+            f"{candidate_text}"
         )
     if len(matches) > 1:
+        locations = _exact_match_locations(
+            content=content,
+            match_indexes=matches,
+        )
         raise FilePatchError(
-            f"operation {index} ({operation_type}) matched multiple {label} occurrences."
+            f"operation {index} ({operation_type}) matched multiple exact occurrences.\n"
+            "exact match locations:\n"
+            + "\n".join(locations)
         )
     return matches[0]
 
@@ -439,6 +450,63 @@ def _find_all_match_indexes(content: str, needle: str) -> list[int]:
             return indexes
         indexes.append(match_index)
         start = match_index + 1
+
+
+def _similar_line_candidates(*, content: str, needle: str) -> list[str]:
+    target = next(
+        (line.strip() for line in needle.splitlines() if line.strip()),
+        needle.strip(),
+    )
+    if not target:
+        return []
+
+    scored: list[tuple[float, int, str]] = []
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        score = difflib.SequenceMatcher(
+            None,
+            target[:_MAX_DIAGNOSTIC_LINE_CHARS],
+            candidate[:_MAX_DIAGNOSTIC_LINE_CHARS],
+        ).ratio()
+        if score >= 0.45:
+            scored.append((score, line_number, line))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        _format_line_candidate(line_number=line_number, line=line)
+        for _, line_number, line in scored[:_MAX_DIAGNOSTIC_CANDIDATES]
+    ]
+
+
+def _exact_match_locations(
+    *,
+    content: str,
+    match_indexes: list[int],
+) -> list[str]:
+    lines = content.splitlines()
+    locations: list[str] = []
+    for match_index in match_indexes[:8]:
+        line_number = content.count("\n", 0, match_index) + 1
+        line = lines[line_number - 1] if line_number <= len(lines) else ""
+        locations.append(
+            _format_line_candidate(line_number=line_number, line=line)
+        )
+    if len(match_indexes) > 8:
+        locations.append(f"... and {len(match_indexes) - 8} more")
+    return locations
+
+
+def _format_line_candidate(*, line_number: int, line: str) -> str:
+    bounded = line
+    if len(bounded) > _MAX_DIAGNOSTIC_LINE_CHARS:
+        bounded = bounded[: _MAX_DIAGNOSTIC_LINE_CHARS - 3] + "..."
+    return f"line {line_number}: {bounded!r}"
+
+
+def _content_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _read_utf8_text(path: Path) -> str:
@@ -497,8 +565,10 @@ def _file_patch_error(
     *,
     call_id: str,
     raw_path: str,
+    file_path: Path,
     reason: str,
 ) -> ToolExecutionResult:
+    current_sha256 = _current_file_sha256(file_path)
     return ToolExecutionResult(
         call_id=call_id,
         name="file_patch",
@@ -506,10 +576,23 @@ def _file_patch_error(
         content=(
             "File patch failed\n"
             f"path: {raw_path}\n"
-            f"reason: {reason}"
+            f"reason: {reason}\n"
+            f"current_sha256: {current_sha256 or '(file unavailable)'}\n"
+            "next_action: Reread the affected region and retry with current exact text. "
+            "Do not repeat the unchanged failed operation."
         ),
         metadata={
             "path": raw_path,
             "error": reason,
+            "current_sha256": current_sha256,
         },
     )
+
+
+def _current_file_sha256(path: Path) -> str | None:
+    try:
+        if not path.is_file():
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None

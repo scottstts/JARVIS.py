@@ -109,11 +109,17 @@ Replay expects unresolved assistant tool calls to be normalized by explicit tran
 
 If a stream or process interruption leaves assistant tool calls without matching tool results, the loop appends an explicit unexecuted-tool-call notice. Replay raises if it encounters unresolved tool calls without either matching results or that persisted notice.
 
-Tool-round-limit recovery follows the same rule:
+Tool execution is divided into bounded internal slices so a pathological tool loop cannot monopolize one counter indefinitely. `JARVIS_TOOL_MAX_ROUNDS_PER_TURN` defaults to `500`. Reaching that boundary is not a successful or terminal user turn and does not require the user to send “Continue.”
+
+Slice rollover follows the same unresolved-call normalization rule:
 
 1. persist the unexecuted-tool-call notice
-2. persist the tool-round-limit instruction
-3. build the recovery request
+2. persist an automatic-continuation instruction with boundary diagnostics
+3. reset stateful provider continuation lineage so the normalized transcript can be replayed without leaving a server-side tool call unresolved
+4. rebuild a normal follow-up request with basic tools and all current-turn discoverable activations still available
+5. reset the internal slice counter and continue executing any newly returned tool calls
+
+A completely empty continuation response is normalized to an explicit failure message. A text or tool-call continuation is preserved as returned. Streaming additionally emits the continued tool-call event so UI state remains accurate.
 
 ## Crash And Restart Recovery
 

@@ -243,7 +243,7 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
                     name="file_patch",
                     arguments=(
                         '{"path":"src/app.py","operations":'
-                        '[{"type":123,"old":"x = 1","new":"x = 2"}]}'
+                        '[{"type":123,"match":"x = 1","replacement":"x = 2"}]}'
                     ),
                 )
             ],
@@ -273,6 +273,11 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
             operation_items["properties"]["type"]["enum"],
             ["write", "replace", "insert_before", "insert_after", "delete"],
         )
+        self.assertEqual(
+            operation_items["required"],
+            ["type", "match", "replacement"],
+        )
+        self.assertIn("expected_sha256", parameters["properties"])
         self.assertIn(
             '{"path":"src/app.py","operations":[{"type":"replace"',
             tool.description,

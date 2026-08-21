@@ -72,6 +72,15 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                             "Shell command for 'foreground' or 'background'."
                         ),
                     },
+                    "cwd": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Optional working directory for foreground/background execution. "
+                            "Absolute paths must stay inside /workspace; relative paths resolve "
+                            "from /workspace. Defaults to /workspace."
+                        ),
+                    },
                     "job_id": {
                         "type": "string",
                         "description": "Background job id for 'status', 'tail', or 'cancel'.",
