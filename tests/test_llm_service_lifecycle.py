@@ -6,7 +6,11 @@ import asyncio
 import unittest
 
 from jarvis.llm.config import EmbeddingSettings, LLMSettings
-from jarvis.llm.errors import LLMConfigurationError, ProviderTemporaryError, ProviderTimeoutError
+from jarvis.llm.errors import (
+    LLMConfigurationError,
+    ProviderTemporaryError,
+    ProviderTimeoutError,
+)
 from jarvis.llm.protocols import ProviderCapabilities
 from jarvis.llm.service import LLMService
 from jarvis.llm.types import (
@@ -103,7 +107,10 @@ class _PartialOutputThenRetryableStreamProvider(_FakeProvider):
     async def stream_generate(self, request):
         self.stream_attempts += 1
         yield TextDeltaEvent(delta="partial")
-        raise ProviderTemporaryError("transient stream failure")
+        raise ProviderTemporaryError(
+            "transient stream failure",
+            metadata={"retry_safe_after_acceptance": True},
+        )
 
 
 class _ActivityThenRetryableStreamProvider(_FakeProvider):
@@ -118,6 +125,34 @@ class _ActivityThenRetryableStreamProvider(_FakeProvider):
             response_id="resp_accepted",
         )
         raise ProviderTemporaryError("failure after provider acceptance")
+
+
+class _TerminalFailureThenSuccessfulStreamProvider(_FakeProvider):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.stream_attempts = 0
+
+    async def stream_generate(self, request):
+        self.stream_attempts += 1
+        if self.stream_attempts == 1:
+            yield ProviderActivityEvent(
+                provider_event_type="chat.completion.error",
+                response_id="gen_failed",
+            )
+            raise ProviderTemporaryError(
+                "provider overloaded",
+                metadata={"retry_safe_after_acceptance": True},
+            )
+        yield DoneEvent(
+            response=LLMResponse(
+                provider=self.name,
+                model=request.model or "retry-model",
+                text="recovered",
+                tool_calls=[],
+                finish_reason="stop",
+                usage=LLMUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            )
+        )
 
 
 class _ContinuouslyActiveStreamProvider(_FakeProvider):
@@ -174,7 +209,9 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         service = LLMService(
             settings=LLMSettings(
                 default_provider="lmstudio",
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             )
         )
 
@@ -188,7 +225,9 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         service = LLMService(
             settings=LLMSettings(
                 default_provider="openai",
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             ),
             providers=(_SlowProvider("openai"),),
         )
@@ -206,7 +245,9 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         service = LLMService(
             settings=LLMSettings(
                 default_provider="openai",
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             ),
             providers=(provider,),
         )
@@ -218,11 +259,15 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.text, "complete")
         self.assertEqual(provider.request_deadline_seconds, 3600.0)
 
-    async def test_stream_generate_maps_request_deadline_to_provider_timeout(self) -> None:
+    async def test_stream_generate_maps_request_deadline_to_provider_timeout(
+        self,
+    ) -> None:
         service = LLMService(
             settings=LLMSettings(
                 default_provider="openai",
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             ),
             providers=(_SlowProvider("openai"),),
         )
@@ -242,7 +287,9 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             settings=LLMSettings(
                 default_provider="openai",
                 retry_attempts=1,
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             ),
             providers=(provider,),
         )
@@ -268,7 +315,9 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             settings=LLMSettings(
                 default_provider="openrouter",
                 retry_attempts=2,
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             ),
             providers=(provider,),
         )
@@ -322,6 +371,38 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "response.created",
         )
         self.assertEqual(raised.exception.metadata["response_id"], "resp_accepted")
+
+    async def test_stream_generate_retries_explicit_terminal_failure_after_acceptance(
+        self,
+    ) -> None:
+        provider = _TerminalFailureThenSuccessfulStreamProvider("openrouter")
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openrouter",
+                retry_attempts=1,
+                retry_backoff_seconds=0,
+                embedding=EmbeddingSettings(
+                    provider="openai",
+                    model="text-embedding-test",
+                ),
+            ),
+            providers=(provider,),
+        )
+
+        events = [
+            event
+            async for event in service.stream_generate(
+                LLMRequest(
+                    model="stealth/ox-alpha",
+                    messages=(LLMMessage.text("user", "hello"),),
+                )
+            )
+        ]
+
+        self.assertEqual(provider.stream_attempts, 2)
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], DoneEvent)
+        self.assertEqual(events[0].response.text, "recovered")
 
     async def test_stream_activity_does_not_extend_absolute_deadline(self) -> None:
         provider = _ContinuouslyActiveStreamProvider("openai")
@@ -404,11 +485,15 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(provider.generate_attempts, 1)
 
-    async def test_generate_rejects_codex_backend_provider_with_clear_error(self) -> None:
+    async def test_generate_rejects_codex_backend_provider_with_clear_error(
+        self,
+    ) -> None:
         service = LLMService(
             settings=LLMSettings(
                 default_provider="codex",
-                embedding=EmbeddingSettings(provider="openai", model="text-embedding-test"),
+                embedding=EmbeddingSettings(
+                    provider="openai", model="text-embedding-test"
+                ),
             ),
             providers=(_FakeProvider("openai"),),
         )

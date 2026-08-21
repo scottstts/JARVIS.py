@@ -51,7 +51,9 @@ The service deadline never resets when a stream event arrives. Provider transpor
 
 Provider adapters may yield internal `ProviderActivityEvent` values for lifecycle, keepalive, reasoning, empty-signature, response-header, and other non-user-visible stream activity. `LLMService` consumes these values for acceptance state and diagnostics, but never forwards them to `AgentLoop` or transcript persistence. Anthropic and Gemini use their native streaming APIs; OpenAI/Grok Responses lifecycle events, OpenRouter SSE comments, and LM Studio Responses lifecycle events follow the same internal activity contract.
 
-Automatic stream retry is allowed only before any provider acceptance or normalized output. A response header or provider lifecycle event marks the request accepted, so later failures propagate instead of replaying a possibly active generation. Transport read/write timeouts are also treated as ambiguous and are not blindly retried; only classified connection and pre-request pool-acquisition timeouts are automatically retry-safe.
+Automatic stream retry is normally allowed only before provider acceptance or normalized output. A response header or provider lifecycle event marks the request accepted, so ambiguous later failures propagate instead of replaying a possibly active generation. A provider adapter may explicitly mark a structured terminal failure as retry-safe after acceptance; `LLMService` still forbids that retry after any normalized output was exposed. Transport read/write timeouts remain ambiguous and are not blindly retried; only classified connection and pre-request pool-acquisition timeouts, plus explicitly terminal provider failures, are automatically retry-safe.
+
+OpenRouter treats a terminal chat response with neither visible text nor a usable tool call as invalid. The adapter performs at most two provider-local retries when the failed attempt exposed no text or tool-call delta. Each retry preserves the request and sticky `session_id`, sends both `X-OpenRouter-Cache: true` and `X-OpenRouter-Cache-Clear: true`, and remains inside the original absolute request deadline. Empty attempts log generation id, raw finish reason, usage, response-cache status, reasoning activity, terminal signal, attempt number, and whether semantic output was exposed. Exhaustion raises `ProviderResponseError`; it never produces an empty successful turn.
 
 ## Provider Context Strategies
 
@@ -97,7 +99,7 @@ Prompt-visible records persisted during follow-up rounds include:
 - orchestrator waiting notices
 - explicit unexecuted-tool-call normalization notices
 
-Completed streaming turns persist one canonical assistant record. Interrupted streams can persist a partial assistant-text checkpoint with interruption metadata so later replay reflects text that was already shown before the stop.
+Completed streaming turns persist one canonical assistant record. Interrupted streams and streams that end in a runtime failure persist a partial assistant-text checkpoint with incomplete-stream metadata so later replay reflects text that was already shown before the stop or failure.
 
 Internal provider activity events are transient control signals. They are never assistant content and must never be written to the transcript.
 
@@ -125,7 +127,7 @@ The loop:
 - appends an orphaned-turn recovery system note
 - marks the turn `interrupted`
 
-Same-process runtime failures use the same normalization immediately for the active turn.
+Same-process runtime failures first persist any partial streamed assistant text, then use the same normalization immediately for the active turn.
 
 ## User Message Interruption
 

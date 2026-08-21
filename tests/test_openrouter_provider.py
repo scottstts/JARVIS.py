@@ -9,8 +9,10 @@ from unittest.mock import patch
 
 from jarvis.llm.config import OpenRouterProviderSettings
 from jarvis.llm.errors import (
+    ProviderRateLimitError,
     ProviderResponseError,
     ProviderTemporaryError,
+    ProviderTimeoutError,
 )
 from jarvis.llm.providers.openrouter_provider import OpenRouterProvider
 from jarvis.llm.types import (
@@ -86,9 +88,19 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(headers["X-OpenRouter-Cache"], "true")
         self.assertEqual(headers["X-OpenRouter-Title"], "Jarvis")
         self.assertEqual(headers["X-Title"], "Jarvis")
+        self.assertNotIn("X-OpenRouter-Cache-Clear", headers)
         self.assertEqual(timeout, (30.0, 60.0))
 
-    def test_generate_sends_response_cache_header_and_surfaces_cache_metadata(self) -> None:
+        _url, retry_headers, _timeout = provider._build_request_context(
+            endpoint="/chat/completions",
+            clear_response_cache=True,
+        )
+        self.assertEqual(retry_headers["X-OpenRouter-Cache"], "true")
+        self.assertEqual(retry_headers["X-OpenRouter-Cache-Clear"], "true")
+
+    def test_generate_sends_response_cache_header_and_surfaces_cache_metadata(
+        self,
+    ) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
             read_timeout_seconds=60.0,
@@ -135,7 +147,75 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(result.provider_metadata["openrouter_cache_status"], "HIT")
         self.assertEqual(result.provider_metadata["openrouter_cache_age_seconds"], 12)
         self.assertEqual(result.provider_metadata["openrouter_cache_ttl_seconds"], 300)
-        self.assertEqual(result.provider_metadata["openrouter_generation_id"], "gen_header_123")
+        self.assertEqual(
+            result.provider_metadata["openrouter_generation_id"], "gen_header_123"
+        )
+
+    def test_generate_retries_empty_response_with_cache_clear(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            read_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="openai/gpt-4o-mini",
+            messages=(LLMMessage.text("user", "hello"),),
+        )
+        empty = _FakeJsonResponse(
+            data={
+                "id": "gen_empty",
+                "model": "openai/gpt-4o-mini",
+                "choices": [
+                    {
+                        "message": {"content": "", "reasoning": "private"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 0,
+                    "total_tokens": 5,
+                },
+            },
+            headers={
+                "X-OpenRouter-Cache-Status": "HIT",
+                "X-Generation-Id": "header_empty",
+            },
+        )
+        recovered = _FakeJsonResponse(
+            data={
+                "id": "gen_recovered",
+                "model": "openai/gpt-4o-mini",
+                "choices": [
+                    {
+                        "message": {"content": "Recovered"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                side_effect=(empty, recovered),
+            ) as post:
+                with self.assertLogs(
+                    "llm.providers.openrouter_provider", level="WARNING"
+                ) as logs:
+                    result = asyncio.run(provider.generate(request))
+
+        self.assertEqual(result.text, "Recovered")
+        self.assertEqual(post.call_count, 2)
+        self.assertNotIn(
+            "X-OpenRouter-Cache-Clear", post.call_args_list[0].kwargs["headers"]
+        )
+        self.assertEqual(
+            post.call_args_list[1].kwargs["headers"]["X-OpenRouter-Cache-Clear"],
+            "true",
+        )
+        self.assertIn('"generation_id": "header_empty"', logs.output[0])
+        self.assertIn('"reasoning_activity": true', logs.output[0])
+        self.assertIn('"termination_source": "terminal_choice"', logs.output[0])
 
     def test_generate_preserves_http_504_metadata(self) -> None:
         provider = OpenRouterProvider(
@@ -167,14 +247,17 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                 "jarvis.llm.providers.openrouter_provider.requests.post",
                 return_value=response,
             ):
-                with self.assertRaises(ProviderTemporaryError) as caught:
+                with self.assertRaises(ProviderTimeoutError) as caught:
                     asyncio.run(provider.generate(request))
 
         self.assertEqual(caught.exception.metadata["generation_id"], "gen_header_504")
         self.assertEqual(caught.exception.metadata["http_code"], 504)
         self.assertEqual(caught.exception.metadata["error_type"], "timeout")
+        self.assertEqual(caught.exception.metadata["timeout_kind"], "upstream")
 
-    def test_anthropic_model_payload_enables_prompt_cache_and_sticky_session(self) -> None:
+    def test_anthropic_model_payload_enables_prompt_cache_and_sticky_session(
+        self,
+    ) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
             read_timeout_seconds=60.0,
@@ -296,7 +379,10 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             return response
 
         with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
-            with patch("jarvis.llm.providers.openrouter_provider.requests.post", side_effect=fake_post):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                side_effect=fake_post,
+            ):
                 events = asyncio.run(self._collect_events(provider, request))
 
         self.assertTrue(captured_request["stream"])
@@ -325,9 +411,15 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
         self.assertEqual(done.response.finish_reason, "stop")
         self.assertEqual(done.response.usage.total_tokens, 5)
         self.assertEqual(done.response.response_id, "gen_123")
-        self.assertEqual(done.response.provider_metadata["openrouter_cache_status"], "HIT")
-        self.assertEqual(done.response.provider_metadata["openrouter_cache_age_seconds"], 12)
-        self.assertEqual(done.response.provider_metadata["openrouter_cache_ttl_seconds"], 300)
+        self.assertEqual(
+            done.response.provider_metadata["openrouter_cache_status"], "HIT"
+        )
+        self.assertEqual(
+            done.response.provider_metadata["openrouter_cache_age_seconds"], 12
+        )
+        self.assertEqual(
+            done.response.provider_metadata["openrouter_cache_ttl_seconds"], 300
+        )
         self.assertEqual(
             done.response.provider_metadata["openrouter_generation_id"],
             "gen_header_123",
@@ -431,7 +523,9 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             ):
                 events = asyncio.run(self._collect_events(provider, request))
 
-        tool_events = [event for event in events if isinstance(event, ToolCallDeltaEvent)]
+        tool_events = [
+            event for event in events if isinstance(event, ToolCallDeltaEvent)
+        ]
         self.assertEqual(
             [event.arguments_delta for event in tool_events],
             ['{"command"', ':"pwd"}'],
@@ -583,6 +677,195 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             ["Hello"],
         )
 
+    def test_stream_generate_retries_reasoning_only_response_with_cache_clear(
+        self,
+    ) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            read_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="stealth/ox-alpha",
+            messages=(LLMMessage.text("user", "continue"),),
+        )
+        empty = _FakeStreamingResponse(
+            lines=[
+                self._sse_chunk(
+                    {
+                        "id": "gen_empty",
+                        "model": "stealth/ox-alpha",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "reasoning_details": [
+                                        {
+                                            "type": "reasoning.text",
+                                            "text": "private reasoning",
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ),
+                "",
+                self._sse_chunk(
+                    {
+                        "id": "gen_empty",
+                        "model": "stealth/ox-alpha",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                self._sse_chunk(
+                    {
+                        "id": "gen_empty",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 50,
+                            "completion_tokens": 10,
+                            "total_tokens": 60,
+                        },
+                    }
+                ),
+                "",
+                "data: [DONE]",
+                "",
+            ],
+            headers={
+                "X-OpenRouter-Cache-Status": "HIT",
+                "X-OpenRouter-Cache-Age": "4",
+                "X-OpenRouter-Cache-TTL": "300",
+                "X-Generation-Id": "header_empty",
+            },
+        )
+        recovered = _FakeStreamingResponse(
+            lines=[
+                self._sse_chunk(
+                    {
+                        "id": "gen_recovered",
+                        "model": "stealth/ox-alpha",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "Recovered"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ),
+                "",
+                self._sse_chunk(
+                    {
+                        "id": "gen_recovered",
+                        "model": "stealth/ox-alpha",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                side_effect=(empty, recovered),
+            ) as post:
+                with self.assertLogs(
+                    "llm.providers.openrouter_provider", level="WARNING"
+                ) as logs:
+                    events = asyncio.run(self._collect_events(provider, request))
+
+        self.assertEqual(post.call_count, 2)
+        self.assertNotIn(
+            "X-OpenRouter-Cache-Clear", post.call_args_list[0].kwargs["headers"]
+        )
+        self.assertEqual(
+            post.call_args_list[1].kwargs["headers"]["X-OpenRouter-Cache-Clear"],
+            "true",
+        )
+        self.assertEqual(
+            [event.delta for event in events if isinstance(event, TextDeltaEvent)],
+            ["Recovered"],
+        )
+        self.assertEqual(
+            [event for event in events if isinstance(event, UsageDeltaEvent)],
+            [],
+        )
+        done = events[-1]
+        self.assertIsInstance(done, DoneEvent)
+        self.assertEqual(done.response.text, "Recovered")
+        self.assertIn('"finish_reason_raw": "stop"', logs.output[0])
+        self.assertIn('"reasoning_activity": true', logs.output[0])
+        self.assertIn(
+            '"termination_source": "terminal_choice_then_done_sentinel"',
+            logs.output[0],
+        )
+        self.assertIn('"total_tokens": 60', logs.output[0])
+
+    def test_stream_generate_rejects_empty_response_after_retries(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            read_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="stealth/ox-alpha",
+            messages=(LLMMessage.text("user", "continue"),),
+        )
+        responses = tuple(
+            _FakeStreamingResponse(
+                lines=["data: [DONE]", ""],
+                headers={"X-Generation-Id": f"header_empty_{index}"},
+            )
+            for index in range(3)
+        )
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                side_effect=responses,
+            ) as post:
+                with self.assertLogs(
+                    "llm.providers.openrouter_provider", level="WARNING"
+                ):
+                    with self.assertRaises(ProviderResponseError) as caught:
+                        asyncio.run(self._collect_events(provider, request))
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(caught.exception.metadata["failure_kind"], "empty_response")
+        self.assertEqual(caught.exception.metadata["attempt"], 3)
+        self.assertEqual(caught.exception.metadata["max_attempts"], 3)
+        self.assertEqual(caught.exception.metadata["generation_id"], "header_empty_2")
+        self.assertEqual(caught.exception.metadata["finish_reason_raw"], "unknown")
+        self.assertEqual(
+            caught.exception.metadata["termination_source"], "done_sentinel"
+        )
+        self.assertFalse(caught.exception.metadata["reasoning_activity"])
+        self.assertIsNone(caught.exception.metadata["usage"])
+        self.assertEqual(
+            [
+                call.kwargs["headers"].get("X-OpenRouter-Cache-Clear")
+                for call in post.call_args_list
+            ],
+            [None, "true", "true"],
+        )
+
     def test_stream_generate_preserves_structured_error_metadata(self) -> None:
         provider = OpenRouterProvider(
             settings=OpenRouterProviderSettings(),
@@ -593,13 +876,13 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             messages=(LLMMessage.text("user", "hello"),),
         )
         cases = (
-            ("timeout", 504),
-            ("provider_unavailable", 502),
-            ("provider_overloaded", 503),
-            ("rate_limit_exceeded", 429),
+            ("timeout", 504, ProviderTimeoutError),
+            ("provider_unavailable", 502, ProviderTemporaryError),
+            ("provider_overloaded", 503, ProviderTemporaryError),
+            ("rate_limit_exceeded", 429, ProviderRateLimitError),
         )
 
-        for error_type, http_code in cases:
+        for error_type, http_code, expected_error_type in cases:
             with self.subTest(error_type=error_type):
                 response = _FakeStreamingResponse(
                     lines=[
@@ -636,21 +919,22 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                         "jarvis.llm.providers.openrouter_provider.requests.post",
                         return_value=response,
                     ):
-                        with self.assertRaises(ProviderResponseError) as caught:
+                        with self.assertRaises(expected_error_type) as caught:
                             asyncio.run(self._collect_events(provider, request))
 
-                self.assertIs(type(caught.exception), ProviderResponseError)
-                self.assertEqual(
-                    caught.exception.metadata,
-                    {
-                        "generation_id": f"header_{error_type}",
-                        "response_id": f"gen_{error_type}",
-                        "provider_name": "Z.ai",
-                        "http_code": http_code,
-                        "error_type": error_type,
-                        "upstream_provider_code": f"upstream_{error_type}",
-                    },
-                )
+                self.assertIs(type(caught.exception), expected_error_type)
+                expected_metadata = {
+                    "generation_id": f"header_{error_type}",
+                    "response_id": f"gen_{error_type}",
+                    "provider_name": "Z.ai",
+                    "http_code": http_code,
+                    "error_type": error_type,
+                    "upstream_provider_code": f"upstream_{error_type}",
+                    "retry_safe_after_acceptance": True,
+                }
+                if error_type == "timeout":
+                    expected_metadata["timeout_kind"] = "upstream"
+                self.assertEqual(caught.exception.metadata, expected_metadata)
 
     def test_stream_generate_raises_on_stream_error_chunk(self) -> None:
         provider = OpenRouterProvider(

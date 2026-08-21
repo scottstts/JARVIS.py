@@ -183,8 +183,11 @@ class LLMService:
                 self._enrich_stream_error(exc, state=state)
                 should_retry = (
                     attempt_index < attempts - 1
-                    and not state.accepted
                     and not state.emitted_output
+                    and (
+                        not state.accepted
+                        or self._is_retry_safe_after_acceptance(exc)
+                    )
                     and self._is_safe_to_retry(exc)
                 )
                 if not should_retry:
@@ -633,6 +636,14 @@ class LLMService:
     def _is_safe_to_retry(self, error: Exception) -> bool:
         if not is_retryable_error(error):
             return False
+        if self._is_retry_safe_after_acceptance(error):
+            return True
         if not isinstance(error, ProviderTimeoutError):
             return True
         return error.metadata.get("timeout_kind") in {"connect", "pool"}
+
+    def _is_retry_safe_after_acceptance(self, error: Exception) -> bool:
+        return (
+            isinstance(error, LLMError)
+            and error.metadata.get("retry_safe_after_acceptance") is True
+        )

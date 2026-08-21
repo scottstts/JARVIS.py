@@ -13,6 +13,8 @@ from typing import Any
 
 import requests
 
+from jarvis.logging_setup import get_application_logger
+
 from ..config import OpenRouterProviderSettings
 from ..errors import (
     LLMConfigurationError,
@@ -49,6 +51,9 @@ from ..types import (
 )
 from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
+
+LOGGER = get_application_logger(__name__)
+_EMPTY_RESPONSE_MAX_ATTEMPTS = 3
 
 
 @dataclass(slots=True, frozen=True)
@@ -97,151 +102,231 @@ class OpenRouterProvider:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if request.model is None:
-            raise LLMConfigurationError("request.model must be set before provider dispatch.")
+            raise LLMConfigurationError(
+                "request.model must be set before provider dispatch."
+            )
 
         payload = self._build_chat_payload(request, stream=False)
-        data, response_headers = await self._post_json_with_headers(
-            endpoint="/chat/completions",
-            payload=payload,
-        )
-        return self._normalize_chat_response(
-            request=request,
-            response_json=data,
-            response_headers=response_headers,
-        )
+        for attempt_index in range(_EMPTY_RESPONSE_MAX_ATTEMPTS):
+            response_cache_cleared = attempt_index > 0
+            data, response_headers = await self._post_json_with_headers(
+                endpoint="/chat/completions",
+                payload=payload,
+                clear_response_cache=response_cache_cleared,
+            )
+            response = self._normalize_chat_response(
+                request=request,
+                response_json=data,
+                response_headers=response_headers,
+            )
+            if self._response_has_semantic_output(response):
+                return response
+
+            choices = data.get("choices") or []
+            choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+            message = choice.get("message") if isinstance(choice, dict) else None
+            diagnostics = self._build_empty_response_diagnostics(
+                response_id=response.response_id,
+                raw_finish_reason=response.provider_metadata.get("finish_reason_raw"),
+                usage=response.usage,
+                response_header_metadata=response.provider_metadata,
+                reasoning_activity=self._has_reasoning_activity(message),
+                saw_done_sentinel=False,
+                saw_terminal_choice=(
+                    isinstance(choice, dict) and choice.get("finish_reason") is not None
+                ),
+                semantic_output_emitted=False,
+                attempt_index=attempt_index,
+                response_cache_cleared=response_cache_cleared,
+                streaming=False,
+            )
+            self._log_empty_response(diagnostics)
+            if attempt_index == _EMPTY_RESPONSE_MAX_ATTEMPTS - 1:
+                raise self._empty_response_error(diagnostics)
+
+        raise RuntimeError("OpenRouter empty-response retry loop exited unexpectedly.")
 
     async def stream_generate(
         self,
         request: LLMRequest,
     ) -> AsyncIterator[ProviderStreamEvent]:
         if request.model is None:
-            raise LLMConfigurationError("request.model must be set before provider dispatch.")
-
-        payload = self._build_chat_payload(request, stream=True)
-        accumulated_text: list[str] = []
-        streamed_tool_calls: dict[int | str, dict[str, Any]] = {}
-        usage: LLMUsage | None = None
-        response_id: str | None = None
-        response_model = request.model
-        raw_finish_reason = "unknown"
-        response_header_metadata: dict[str, Any] = {}
-        saw_done_sentinel = False
-        saw_terminal_choice = False
-
-        async for sse_payload in self._stream_sse_payloads(
-            endpoint="/chat/completions",
-            payload=payload,
-        ):
-            if isinstance(sse_payload, _OpenRouterStreamHeaders):
-                response_header_metadata = self._extract_response_header_metadata(
-                    sse_payload.headers
-                )
-                generation_id = response_header_metadata.get(
-                    "openrouter_generation_id"
-                )
-                yield ProviderActivityEvent(
-                    provider_event_type="http.response_headers",
-                    response_id=(
-                        str(generation_id) if generation_id is not None else None
-                    ),
-                )
-                continue
-            if isinstance(sse_payload, _OpenRouterStreamActivity):
-                yield ProviderActivityEvent(
-                    provider_event_type=sse_payload.provider_event_type,
-                    response_id=response_id,
-                )
-                continue
-            if sse_payload == "[DONE]":
-                saw_done_sentinel = True
-                yield ProviderActivityEvent(
-                    provider_event_type="sse.done",
-                    response_id=response_id,
-                )
-                break
-
-            chunk = self._decode_stream_chunk(sse_payload)
-            response_id = chunk.get("id") or response_id
-            response_model = chunk.get("model") or response_model
-            emitted_semantic_event = False
-
-            error = chunk.get("error")
-            if error is not None:
-                yield ProviderActivityEvent(
-                    provider_event_type="chat.completion.error",
-                    response_id=response_id,
-                )
-                raise self._map_stream_error(
-                    error=error,
-                    chunk=chunk,
-                    response_id=response_id,
-                    response_header_metadata=response_header_metadata,
-                )
-
-            chunk_usage = self._normalize_usage(chunk.get("usage"))
-            if chunk_usage is not None:
-                usage = chunk_usage
-                emitted_semantic_event = True
-                yield UsageDeltaEvent(usage=chunk_usage)
-
-            choices = chunk.get("choices") or []
-            for fallback_choice_index, choice in enumerate(choices):
-                choice_index = choice.get("index", fallback_choice_index)
-                if choice_index not in {0, None}:
-                    continue
-
-                delta = choice.get("delta") or {}
-                text_delta = self._extract_stream_text(delta.get("content"))
-                if text_delta:
-                    accumulated_text.append(text_delta)
-                    emitted_semantic_event = True
-                    yield TextDeltaEvent(delta=text_delta)
-
-                tool_call_events = list(
-                    self._extract_stream_tool_call_events(
-                        delta.get("tool_calls") or [],
-                        tool_call_states=streamed_tool_calls,
-                    )
-                )
-                for tool_call_event in tool_call_events:
-                    emitted_semantic_event = True
-                    yield tool_call_event
-
-                finish_reason = choice.get("finish_reason")
-                if finish_reason is not None:
-                    raw_finish_reason = str(finish_reason)
-                    saw_terminal_choice = True
-
-            if not emitted_semantic_event:
-                yield ProviderActivityEvent(
-                    provider_event_type=str(
-                        chunk.get("object") or "chat.completion.chunk"
-                    ),
-                    response_id=response_id,
-                )
-
-        if not saw_done_sentinel and not saw_terminal_choice:
-            raise StreamProtocolError(
-                "OpenRouter stream closed without a terminal chunk or [DONE]."
+            raise LLMConfigurationError(
+                "request.model must be set before provider dispatch."
             )
 
-        response = LLMResponse(
-            provider=self.name,
-            model=response_model or request.model or "",
-            text="".join(accumulated_text),
-            tool_calls=self._extract_tool_calls(
-                message_tool_calls=self._materialize_stream_tool_calls(streamed_tool_calls),
-                request_tools=request.tools,
-            ),
-            finish_reason=self._map_finish_reason(raw_finish_reason),
-            usage=usage,
-            response_id=response_id,
-            provider_metadata={
-                "finish_reason_raw": raw_finish_reason,
-                **response_header_metadata,
-            },
-        )
-        yield DoneEvent(response=response)
+        payload = self._build_chat_payload(request, stream=True)
+        for attempt_index in range(_EMPTY_RESPONSE_MAX_ATTEMPTS):
+            response_cache_cleared = attempt_index > 0
+            accumulated_text: list[str] = []
+            pending_text_deltas: list[str] = []
+            streamed_tool_calls: dict[int | str, dict[str, Any]] = {}
+            usage: LLMUsage | None = None
+            response_id: str | None = None
+            response_model = request.model
+            raw_finish_reason = "unknown"
+            response_header_metadata: dict[str, Any] = {}
+            saw_done_sentinel = False
+            saw_terminal_choice = False
+            saw_reasoning_activity = False
+            semantic_output_emitted = False
+
+            async for sse_payload in self._stream_sse_payloads(
+                endpoint="/chat/completions",
+                payload=payload,
+                clear_response_cache=response_cache_cleared,
+            ):
+                if isinstance(sse_payload, _OpenRouterStreamHeaders):
+                    response_header_metadata = self._extract_response_header_metadata(
+                        sse_payload.headers
+                    )
+                    generation_id = response_header_metadata.get(
+                        "openrouter_generation_id"
+                    )
+                    yield ProviderActivityEvent(
+                        provider_event_type="http.response_headers",
+                        response_id=(
+                            str(generation_id) if generation_id is not None else None
+                        ),
+                    )
+                    continue
+                if isinstance(sse_payload, _OpenRouterStreamActivity):
+                    yield ProviderActivityEvent(
+                        provider_event_type=sse_payload.provider_event_type,
+                        response_id=response_id,
+                    )
+                    continue
+                if sse_payload == "[DONE]":
+                    saw_done_sentinel = True
+                    yield ProviderActivityEvent(
+                        provider_event_type="sse.done",
+                        response_id=response_id,
+                    )
+                    break
+
+                chunk = self._decode_stream_chunk(sse_payload)
+                response_id = chunk.get("id") or response_id
+                response_model = chunk.get("model") or response_model
+                emitted_normalized_event = False
+
+                error = chunk.get("error")
+                if error is not None:
+                    yield ProviderActivityEvent(
+                        provider_event_type="chat.completion.error",
+                        response_id=response_id,
+                    )
+                    raise self._map_stream_error(
+                        error=error,
+                        chunk=chunk,
+                        response_id=response_id,
+                        response_header_metadata=response_header_metadata,
+                    )
+
+                chunk_usage = self._normalize_usage(chunk.get("usage"))
+                if chunk_usage is not None:
+                    usage = chunk_usage
+
+                choices = chunk.get("choices") or []
+                for fallback_choice_index, choice in enumerate(choices):
+                    choice_index = choice.get("index", fallback_choice_index)
+                    if choice_index not in {0, None}:
+                        continue
+
+                    delta = choice.get("delta") or {}
+                    if self._has_reasoning_activity(delta):
+                        saw_reasoning_activity = True
+
+                    text_delta = self._extract_stream_text(delta.get("content"))
+                    if text_delta:
+                        accumulated_text.append(text_delta)
+                        if semantic_output_emitted:
+                            emitted_normalized_event = True
+                            yield TextDeltaEvent(delta=text_delta)
+                        else:
+                            pending_text_deltas.append(text_delta)
+                            if any(part.strip() for part in pending_text_deltas):
+                                semantic_output_emitted = True
+                                emitted_normalized_event = True
+                                for pending_delta in pending_text_deltas:
+                                    yield TextDeltaEvent(delta=pending_delta)
+                                pending_text_deltas.clear()
+
+                    tool_call_events = list(
+                        self._extract_stream_tool_call_events(
+                            delta.get("tool_calls") or [],
+                            tool_call_states=streamed_tool_calls,
+                        )
+                    )
+                    for tool_call_event in tool_call_events:
+                        semantic_output_emitted = True
+                        emitted_normalized_event = True
+                        yield tool_call_event
+
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason is not None:
+                        raw_finish_reason = str(finish_reason)
+                        saw_terminal_choice = True
+
+                if not emitted_normalized_event:
+                    yield ProviderActivityEvent(
+                        provider_event_type=str(
+                            chunk.get("object") or "chat.completion.chunk"
+                        ),
+                        response_id=response_id,
+                    )
+
+            if not saw_done_sentinel and not saw_terminal_choice:
+                raise StreamProtocolError(
+                    "OpenRouter stream closed without a terminal chunk or [DONE]."
+                )
+
+            response = LLMResponse(
+                provider=self.name,
+                model=response_model or request.model or "",
+                text="".join(accumulated_text),
+                tool_calls=self._extract_tool_calls(
+                    message_tool_calls=self._materialize_stream_tool_calls(
+                        streamed_tool_calls
+                    ),
+                    request_tools=request.tools,
+                ),
+                finish_reason=self._map_finish_reason(raw_finish_reason),
+                usage=usage,
+                response_id=response_id,
+                provider_metadata={
+                    "finish_reason_raw": raw_finish_reason,
+                    **response_header_metadata,
+                },
+            )
+            if not self._response_has_semantic_output(response):
+                diagnostics = self._build_empty_response_diagnostics(
+                    response_id=response.response_id,
+                    raw_finish_reason=raw_finish_reason,
+                    usage=usage,
+                    response_header_metadata=response_header_metadata,
+                    reasoning_activity=saw_reasoning_activity,
+                    saw_done_sentinel=saw_done_sentinel,
+                    saw_terminal_choice=saw_terminal_choice,
+                    semantic_output_emitted=semantic_output_emitted,
+                    attempt_index=attempt_index,
+                    response_cache_cleared=response_cache_cleared,
+                    streaming=True,
+                )
+                self._log_empty_response(diagnostics)
+                can_retry = (
+                    not semantic_output_emitted
+                    and attempt_index < _EMPTY_RESPONSE_MAX_ATTEMPTS - 1
+                )
+                if can_retry:
+                    continue
+                raise self._empty_response_error(diagnostics)
+
+            if usage is not None:
+                yield UsageDeltaEvent(usage=usage)
+            yield DoneEvent(response=response)
+            return
+
+        raise RuntimeError("OpenRouter empty-response retry loop exited unexpectedly.")
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         if request.model is None:
@@ -251,7 +336,9 @@ class OpenRouterProvider:
 
         payload: dict[str, Any] = {
             "model": request.model,
-            "input": request.inputs if isinstance(request.inputs, str) else list(request.inputs),
+            "input": request.inputs
+            if isinstance(request.inputs, str)
+            else list(request.inputs),
         }
         if request.dimensions is not None:
             payload["dimensions"] = request.dimensions
@@ -261,10 +348,7 @@ class OpenRouterProvider:
             payload=payload,
         )
 
-        embeddings = [
-            list(item.get("embedding", []))
-            for item in data.get("data", [])
-        ]
+        embeddings = [list(item.get("embedding", [])) for item in data.get("data", [])]
         usage_obj = data.get("usage", {})
         usage = None
         if usage_obj:
@@ -284,7 +368,9 @@ class OpenRouterProvider:
     async def aclose(self) -> None:
         return
 
-    def _build_chat_payload(self, request: LLMRequest, *, stream: bool = False) -> dict[str, Any]:
+    def _build_chat_payload(
+        self, request: LLMRequest, *, stream: bool = False
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,
             "messages": self._to_openrouter_messages(request),
@@ -304,8 +390,12 @@ class OpenRouterProvider:
             payload["reasoning"] = {"effort": self._settings.reasoning_effort}
 
         if request.tools:
-            payload["tools"] = [self._to_openrouter_tool(tool) for tool in request.tools]
-            payload["tool_choice"] = self._to_openrouter_tool_choice(request.tool_choice)
+            payload["tools"] = [
+                self._to_openrouter_tool(tool) for tool in request.tools
+            ]
+            payload["tool_choice"] = self._to_openrouter_tool_choice(
+                request.tool_choice
+            )
         elif request.tool_choice.mode not in {ToolChoiceMode.AUTO, ToolChoiceMode.NONE}:
             raise LLMConfigurationError(
                 "Specific tool-choice mode requires non-empty request.tools."
@@ -315,7 +405,9 @@ class OpenRouterProvider:
 
     def _to_openrouter_messages(self, request: LLMRequest) -> list[dict[str, Any]]:
         if not _openrouter_model_uses_anthropic_system_rules(request.model):
-            return [self._to_openrouter_message(message) for message in request.messages]
+            return [
+                self._to_openrouter_message(message) for message in request.messages
+            ]
 
         system_parts: list[str] = []
         out_messages: list[dict[str, Any]] = []
@@ -422,7 +514,9 @@ class OpenRouterProvider:
             function_obj["description"] = tool.description
         return {"type": "function", "function": function_obj}
 
-    def _to_openrouter_tool_choice(self, tool_choice: ToolChoice) -> dict[str, Any] | str:
+    def _to_openrouter_tool_choice(
+        self, tool_choice: ToolChoice
+    ) -> dict[str, Any] | str:
         if tool_choice.mode == ToolChoiceMode.AUTO:
             return "auto"
         if tool_choice.mode == ToolChoiceMode.REQUIRED:
@@ -448,8 +542,12 @@ class OpenRouterProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
+        clear_response_cache: bool = False,
     ) -> tuple[dict[str, Any], dict[str, str]]:
-        url, headers, timeout = self._build_request_context(endpoint=endpoint)
+        url, headers, timeout = self._build_request_context(
+            endpoint=endpoint,
+            clear_response_cache=clear_response_cache,
+        )
 
         try:
             response = await asyncio.to_thread(
@@ -478,7 +576,9 @@ class OpenRouterProvider:
         try:
             data = response.json()
         except ValueError as exc:
-            raise ProviderResponseError("OpenRouter returned non-JSON response.") from exc
+            raise ProviderResponseError(
+                "OpenRouter returned non-JSON response."
+            ) from exc
         return data, dict(response.headers)
 
     async def _stream_sse_payloads(
@@ -486,10 +586,12 @@ class OpenRouterProvider:
         *,
         endpoint: str,
         payload: dict[str, Any],
-    ) -> AsyncIterator[
-        str | _OpenRouterStreamHeaders | _OpenRouterStreamActivity
-    ]:
-        url, headers, timeout = self._build_request_context(endpoint=endpoint)
+        clear_response_cache: bool = False,
+    ) -> AsyncIterator[str | _OpenRouterStreamHeaders | _OpenRouterStreamActivity]:
+        url, headers, timeout = self._build_request_context(
+            endpoint=endpoint,
+            clear_response_cache=clear_response_cache,
+        )
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[
             str
@@ -567,10 +669,13 @@ class OpenRouterProvider:
         self,
         *,
         endpoint: str,
+        clear_response_cache: bool = False,
     ) -> tuple[str, dict[str, str], tuple[float, float]]:
         api_key = self._settings.api_key or os.getenv("OPENROUTER_API_KEY")
         if not api_key:
-            raise LLMConfigurationError("OPENROUTER_API_KEY is required for the OpenRouter provider.")
+            raise LLMConfigurationError(
+                "OPENROUTER_API_KEY is required for the OpenRouter provider."
+            )
 
         timeout = self._transport_timeouts.as_requests()
         url = f"{self._settings.base_url.rstrip('/')}{endpoint}"
@@ -579,6 +684,8 @@ class OpenRouterProvider:
             "Content-Type": "application/json",
             "X-OpenRouter-Cache": "true",
         }
+        if clear_response_cache:
+            headers["X-OpenRouter-Cache-Clear"] = "true"
         if self._settings.site_url:
             headers["HTTP-Referer"] = self._settings.site_url
         if self._settings.app_name:
@@ -627,7 +734,11 @@ class OpenRouterProvider:
     def _raise_for_status(self, response: requests.Response) -> None:
         status = response.status_code
         error = self._extract_http_error(response)
-        message = self._extract_stream_error_message(error) if error is not None else response.text
+        message = (
+            self._extract_stream_error_message(error)
+            if error is not None
+            else response.text
+        )
         metadata = self._build_error_metadata(
             error=error,
             provider_name=None,
@@ -635,13 +746,11 @@ class OpenRouterProvider:
             response_headers=dict(response.headers),
             fallback_http_code=status,
         )
-        if status == 429:
-            raise ProviderRateLimitError(message, metadata=metadata)
-        if status in {401, 403}:
-            raise ProviderAuthenticationError(message, metadata=metadata)
-        if status >= 500:
-            raise ProviderTemporaryError(message, metadata=metadata)
-        raise ProviderBadRequestError(message, metadata=metadata)
+        raise self._map_openrouter_error(
+            message=message,
+            metadata=metadata,
+            stream_terminal=False,
+        )
 
     def _normalize_chat_response(
         self,
@@ -675,6 +784,104 @@ class OpenRouterProvider:
                 "finish_reason_raw": finish_reason,
                 **self._extract_response_header_metadata(response_headers),
             },
+        )
+
+    def _response_has_semantic_output(self, response: LLMResponse) -> bool:
+        return bool(response.text.strip() or response.tool_calls)
+
+    def _has_reasoning_activity(self, value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for key in ("reasoning", "reasoning_content", "reasoning_details"):
+            reasoning_value = value.get(key)
+            if reasoning_value not in (None, "", [], {}):
+                return True
+        return False
+
+    def _build_empty_response_diagnostics(
+        self,
+        *,
+        response_id: str | None,
+        raw_finish_reason: Any,
+        usage: LLMUsage | None,
+        response_header_metadata: dict[str, Any],
+        reasoning_activity: bool,
+        saw_done_sentinel: bool,
+        saw_terminal_choice: bool,
+        semantic_output_emitted: bool,
+        attempt_index: int,
+        response_cache_cleared: bool,
+        streaming: bool,
+    ) -> dict[str, Any]:
+        generation_id = (
+            response_header_metadata.get("openrouter_generation_id") or response_id
+        )
+        if saw_done_sentinel and saw_terminal_choice:
+            termination_source = "terminal_choice_then_done_sentinel"
+        elif saw_done_sentinel:
+            termination_source = "done_sentinel"
+        elif saw_terminal_choice:
+            termination_source = "terminal_choice"
+        else:
+            termination_source = "non_stream_response"
+        usage_diagnostics = (
+            {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+            }
+            if usage is not None
+            else None
+        )
+        return {
+            "failure_kind": "empty_response",
+            "generation_id": _optional_string(generation_id),
+            "response_id": response_id,
+            "finish_reason_raw": _optional_string(raw_finish_reason) or "unknown",
+            "usage": usage_diagnostics,
+            "cache_status": _optional_string(
+                response_header_metadata.get("openrouter_cache_status")
+            ),
+            "cache_age_seconds": response_header_metadata.get(
+                "openrouter_cache_age_seconds"
+            ),
+            "cache_ttl_seconds": response_header_metadata.get(
+                "openrouter_cache_ttl_seconds"
+            ),
+            "reasoning_activity": reasoning_activity,
+            "saw_done_sentinel": saw_done_sentinel,
+            "saw_terminal_choice": saw_terminal_choice,
+            "termination_source": termination_source,
+            "semantic_output_emitted": semantic_output_emitted,
+            "streaming": streaming,
+            "attempt": attempt_index + 1,
+            "max_attempts": _EMPTY_RESPONSE_MAX_ATTEMPTS,
+            "response_cache_cleared": response_cache_cleared,
+        }
+
+    def _log_empty_response(self, diagnostics: dict[str, Any]) -> None:
+        exhausted = diagnostics["attempt"] == diagnostics["max_attempts"]
+        if exhausted:
+            action = "retry exhausted"
+        elif diagnostics["semantic_output_emitted"]:
+            action = "not retrying because semantic output was already emitted"
+        else:
+            action = "retrying"
+        LOGGER.warning(
+            "OpenRouter returned a terminal response without visible text or usable "
+            "tool calls; %s. diagnostics=%s",
+            action,
+            json.dumps(diagnostics, ensure_ascii=False, sort_keys=True),
+        )
+
+    def _empty_response_error(
+        self,
+        diagnostics: dict[str, Any],
+    ) -> ProviderResponseError:
+        return ProviderResponseError(
+            "OpenRouter returned a terminal response without visible text or usable "
+            "tool calls.",
+            metadata=diagnostics,
         )
 
     def _extract_response_header_metadata(
@@ -812,9 +1019,13 @@ class OpenRouterProvider:
         try:
             chunk = json.loads(sse_payload)
         except json.JSONDecodeError as exc:
-            raise ProviderResponseError("OpenRouter returned malformed streaming JSON.") from exc
+            raise ProviderResponseError(
+                "OpenRouter returned malformed streaming JSON."
+            ) from exc
         if not isinstance(chunk, dict):
-            raise ProviderResponseError("OpenRouter returned a non-object streaming chunk.")
+            raise ProviderResponseError(
+                "OpenRouter returned a non-object streaming chunk."
+            )
         return chunk
 
     def _extract_stream_error_message(self, error: Any) -> str:
@@ -844,6 +1055,51 @@ class OpenRouterProvider:
             response_headers=response_header_metadata,
         )
         message = self._extract_stream_error_message(error)
+        return self._map_openrouter_error(
+            message=message,
+            metadata=metadata,
+            stream_terminal=True,
+        )
+
+    def _map_openrouter_error(
+        self,
+        *,
+        message: str,
+        metadata: dict[str, Any],
+        stream_terminal: bool,
+    ) -> Exception:
+        error_type = str(metadata.get("error_type") or "").strip().lower()
+        http_code = _parse_error_code(metadata.get("http_code"))
+
+        if error_type in {"rate_limit", "rate_limit_exceeded"} or http_code == 429:
+            if stream_terminal:
+                metadata["retry_safe_after_acceptance"] = True
+            return ProviderRateLimitError(message, metadata=metadata)
+
+        if error_type in {
+            "timeout",
+            "provider_timeout",
+            "upstream_timeout",
+        } or http_code in {
+            408,
+            504,
+        }:
+            metadata["timeout_kind"] = "upstream"
+            if stream_terminal:
+                metadata["retry_safe_after_acceptance"] = True
+            return ProviderTimeoutError(message, metadata=metadata)
+
+        if error_type in {"provider_unavailable", "provider_overloaded"} or (
+            http_code is not None and http_code >= 500
+        ):
+            if stream_terminal:
+                metadata["retry_safe_after_acceptance"] = True
+            return ProviderTemporaryError(message, metadata=metadata)
+
+        if http_code in {401, 403}:
+            return ProviderAuthenticationError(message, metadata=metadata)
+        if http_code is not None and 400 <= http_code < 500:
+            return ProviderBadRequestError(message, metadata=metadata)
         return ProviderResponseError(message, metadata=metadata)
 
     def _build_error_metadata(
@@ -859,8 +1115,7 @@ class OpenRouterProvider:
         error_metadata = error_obj.get("metadata")
         metadata_obj = error_metadata if isinstance(error_metadata, dict) else {}
         normalized_headers = {
-            str(key).lower(): value
-            for key, value in (response_headers or {}).items()
+            str(key).lower(): value for key, value in (response_headers or {}).items()
         }
         generation_id = (
             normalized_headers.get("openrouter_generation_id")
@@ -871,12 +1126,10 @@ class OpenRouterProvider:
             "generation_id": _optional_string(generation_id),
             "response_id": response_id,
             "provider_name": (
-                provider_name
-                or _optional_string(metadata_obj.get("provider_name"))
+                provider_name or _optional_string(metadata_obj.get("provider_name"))
             ),
             "http_code": (
-                _parse_error_code(error_obj.get("code"))
-                or fallback_http_code
+                _parse_error_code(error_obj.get("code")) or fallback_http_code
             ),
             "error_type": _optional_string(metadata_obj.get("error_type")),
             "upstream_provider_code": _optional_string(

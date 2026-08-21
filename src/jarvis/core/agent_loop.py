@@ -2494,6 +2494,19 @@ class AgentLoop:
                 interruption_reason=interrupted.interruption_reason,
             )
         except Exception:
+            if interrupted_stream_fragment_text:
+                partial_record = self._build_streamed_assistant_text_record(
+                    session_id=session.session_id,
+                    text=interrupted_stream_fragment_text,
+                    turn_id=turn_id,
+                    reason="runtime_error",
+                )
+                if partial_record is not None:
+                    self._append_turn_record(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        record=partial_record,
+                    )
             self._fail_turn_after_runtime_error(
                 session_id=session.session_id,
                 turn_id=turn_id,
@@ -3643,14 +3656,17 @@ class AgentLoop:
         session_id: str,
         text: str,
         turn_id: str,
+        reason: Literal["interrupted", "runtime_error"] = "interrupted",
     ) -> ConversationRecord | None:
         if not text:
             return None
+        metadata = {"incomplete_stream_fragment": True}
+        metadata[f"{reason}_stream_fragment"] = True
         return self._build_message_record(
             session_id=session_id,
             role="assistant",
             content=text,
-            metadata={"interrupted_stream_fragment": True},
+            metadata=metadata,
             turn_id=turn_id,
         )
 

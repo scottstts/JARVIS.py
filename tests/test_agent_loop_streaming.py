@@ -9,7 +9,14 @@ import unittest
 from pathlib import Path
 
 from jarvis.core import AgentAssistantMessageEvent, AgentLoop, AgentTurnDoneEvent
-from jarvis.llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent, TextPart
+from jarvis.llm import (
+    DoneEvent,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    TextDeltaEvent,
+    TextPart,
+)
 from jarvis.storage import SessionStorage
 from tests.helpers import build_core_settings
 
@@ -33,7 +40,8 @@ def _is_compaction_request(request: LLMRequest) -> bool:
         and request.messages[1].role == "user"
         and any(
             isinstance(part, TextPart)
-            and "Compact the following transcript items into replacement history JSON." in part.text
+            and "Compact the following transcript items into replacement history JSON."
+            in part.text
             for part in request.messages[1].parts
         )
     )
@@ -73,6 +81,20 @@ class _FakeStreamingLLMService:
         yield TextDeltaEvent(delta="stream-")
         yield TextDeltaEvent(delta="reply")
         yield DoneEvent(response=_build_response("stream-reply"))
+
+
+class _RuntimeFailingStreamingLLMService:
+    def __init__(self) -> None:
+        self.generate_requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest):
+        self.generate_requests.append(request)
+        return _build_response("recovered")
+
+    async def stream_generate(self, _request):
+        yield TextDeltaEvent(delta="partial ")
+        yield TextDeltaEvent(delta="answer")
+        raise RuntimeError("provider stream failed")
 
 
 class _FakeTurnContextLLMService:
@@ -126,7 +148,9 @@ class _BlockedFirstTokenStreamingLLMService:
 
 
 class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stream_user_input_emits_delta_and_done_and_persists_turn(self) -> None:
+    async def test_stream_user_input_emits_delta_and_done_and_persists_turn(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -139,7 +163,13 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in loop.stream_user_input("hello")]
             self.assertEqual(
                 [event.type for event in events],
-                ["turn_started", "text_delta", "text_delta", "assistant_message", "done"],
+                [
+                    "turn_started",
+                    "text_delta",
+                    "text_delta",
+                    "assistant_message",
+                    "done",
+                ],
             )
             self.assertTrue(events[0].turn_id)
             self.assertIsInstance(events[-2], AgentAssistantMessageEvent)
@@ -156,7 +186,65 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-1].role, "assistant")
             self.assertEqual(message_records[-1].content, "stream-reply")
 
-    async def test_stream_new_archives_previous_session_without_running_model(self) -> None:
+    async def test_stream_runtime_failure_persists_partial_text_before_recovery_note(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _RuntimeFailingStreamingLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+
+            events = []
+            with self.assertRaisesRegex(RuntimeError, "provider stream failed"):
+                async for event in loop.stream_user_input("hello"):
+                    events.append(event)
+
+            session_id = events[0].session_id
+            turn_id = events[0].turn_id
+            all_records = storage.load_records(session_id, include_all_turns=True)
+            failed_turn_records = [
+                record
+                for record in all_records
+                if record.metadata.get("turn_id") == turn_id
+            ]
+            assistant_record = next(
+                record for record in failed_turn_records if record.role == "assistant"
+            )
+            self.assertEqual(assistant_record.content, "partial answer")
+            self.assertTrue(assistant_record.metadata["incomplete_stream_fragment"])
+            self.assertTrue(assistant_record.metadata["runtime_error_stream_fragment"])
+            self.assertEqual(failed_turn_records[-1].role, "system")
+            self.assertTrue(failed_turn_records[-1].metadata["orphaned_turn_recovery"])
+
+            session = storage.get_session(session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.turn_states[turn_id], "interrupted")
+
+            result = await loop.handle_user_input("continue")
+            self.assertEqual(result.response_text, "recovered")
+            replay = llm_service.generate_requests[0]
+            replay_text = [
+                part.text
+                for message in replay.messages
+                for part in message.parts
+                if isinstance(part, TextPart)
+            ]
+            self.assertIn("partial answer", replay_text)
+            self.assertTrue(
+                any(
+                    "ended unexpectedly before it completed" in text
+                    for text in replay_text
+                )
+            )
+
+    async def test_stream_new_archives_previous_session_without_running_model(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -168,7 +256,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
 
             old_session_id = await loop.prepare_session()
             events = [event async for event in loop.stream_user_input("/new")]
-            self.assertEqual([event.type for event in events], ["assistant_message", "done"])
+            self.assertEqual(
+                [event.type for event in events], ["assistant_message", "done"]
+            )
             self.assertIsInstance(events[-1], AgentTurnDoneEvent)
             done = events[-1]
             if not isinstance(done, AgentTurnDoneEvent):
@@ -231,7 +321,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
                 persisted_records[0].content,
             )
 
-    async def test_handle_user_input_logs_basic_tool_bootstrap_into_transcript_only(self) -> None:
+    async def test_handle_user_input_logs_basic_tool_bootstrap_into_transcript_only(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -248,12 +340,15 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             tool_bootstrap_records = [
                 record
                 for record in records
-                if record.role == "system" and record.metadata.get("tool_bootstrap") == "basic"
+                if record.role == "system"
+                and record.metadata.get("tool_bootstrap") == "basic"
             ]
             self.assertEqual(len(tool_bootstrap_records), 1)
             serialized_tools = json.loads(tool_bootstrap_records[0].content)
             self.assertIn("tool_definitions", tool_bootstrap_records[0].metadata)
-            self.assertEqual(serialized_tools, tool_bootstrap_records[0].metadata["tool_definitions"])
+            self.assertEqual(
+                serialized_tools, tool_bootstrap_records[0].metadata["tool_definitions"]
+            )
             self.assertIn("bash", [tool["name"] for tool in serialized_tools])
             self.assertIn("tool_search", [tool["name"] for tool in serialized_tools])
 
@@ -268,7 +363,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("bash", [tool.name for tool in request.tools])
             self.assertIn("tool_search", [tool.name for tool in request.tools])
 
-    async def test_stream_user_input_interrupts_after_current_streamed_message(self) -> None:
+    async def test_stream_user_input_interrupts_after_current_streamed_message(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -296,7 +393,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(done.response_text, "stream-")
 
             visible_records = storage.load_records(done.session_id)
-            visible_message_records = [record for record in visible_records if record.kind == "message"]
+            visible_message_records = [
+                record for record in visible_records if record.kind == "message"
+            ]
             self.assertEqual(visible_message_records[-3].role, "user")
             self.assertEqual(visible_message_records[-3].content, "hello")
             self.assertEqual(visible_message_records[-2].role, "assistant")
@@ -304,7 +403,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(visible_message_records[-1].role, "system")
 
             all_records = storage.load_records(done.session_id, include_all_turns=True)
-            message_records = [record for record in all_records if record.kind == "message"]
+            message_records = [
+                record for record in all_records if record.kind == "message"
+            ]
             self.assertEqual(message_records[-3].role, "user")
             self.assertEqual(message_records[-2].role, "assistant")
             self.assertEqual(message_records[-1].role, "system")
@@ -317,7 +418,9 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(session)
             self.assertTrue(session.pending_interruption_notice)  # type: ignore[union-attr]
 
-    async def test_stream_user_input_stop_preempts_stream_before_first_event(self) -> None:
+    async def test_stream_user_input_stop_preempts_stream_before_first_event(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -348,7 +451,8 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any(
                     record.role == "system"
-                    and record.content == "The user interrupted this turn before it completed."
+                    and record.content
+                    == "The user interrupted this turn before it completed."
                     for record in all_records
                 )
             )
@@ -381,14 +485,20 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any(
                     message.role == "user"
-                    and any(isinstance(part, TextPart) and part.text == "hello" for part in message.parts)
+                    and any(
+                        isinstance(part, TextPart) and part.text == "hello"
+                        for part in message.parts
+                    )
                     for message in request.messages
                 )
             )
             self.assertTrue(
                 any(
                     message.role == "assistant"
-                    and any(isinstance(part, TextPart) and part.text == "stream-" for part in message.parts)
+                    and any(
+                        isinstance(part, TextPart) and part.text == "stream-"
+                        for part in message.parts
+                    )
                     for message in request.messages
                 )
             )
@@ -427,15 +537,15 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
 
             task = asyncio.create_task(_collect_events())
             await llm_service.stream_started.wait()
-            self.assertTrue(
-                loop.request_stop(reason="superseded_by_user_message")
-            )
+            self.assertTrue(loop.request_stop(reason="superseded_by_user_message"))
             llm_service.release_stream.set()
             _ = await task
 
             active_session_id = loop.active_session_id()
             self.assertIsNotNone(active_session_id)
-            all_records = storage.load_records(active_session_id, include_all_turns=True)
+            all_records = storage.load_records(
+                active_session_id, include_all_turns=True
+            )
             self.assertTrue(
                 any(
                     record.content
@@ -488,9 +598,7 @@ class AgentLoopStreamingTests(unittest.IsolatedAsyncioTestCase):
 
             task = asyncio.create_task(_collect_events())
             await llm_service.stream_started.wait()
-            self.assertTrue(
-                loop.request_stop(reason="superseded_by_user_message")
-            )
+            self.assertTrue(loop.request_stop(reason="superseded_by_user_message"))
             llm_service.release_stream.set()
             _ = await task
 

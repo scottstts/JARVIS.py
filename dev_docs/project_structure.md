@@ -201,17 +201,18 @@ Includes:
 
 Current OpenRouter note:
 
-- the OpenRouter adapter always sends `X-OpenRouter-Cache: true` on provider HTTP requests so OpenRouter can reuse identical response payloads independently of prompt caching
+- the OpenRouter adapter always sends `X-OpenRouter-Cache: true` on provider HTTP requests so OpenRouter can reuse identical response payloads independently of prompt caching; its two bounded empty-response retries additionally send `X-OpenRouter-Cache-Clear: true` to remove only the matching response-cache entry while preserving provider prompt-cache locality
 - OpenRouter Claude/Anthropic requests also include top-level `cache_control: {"type": "ephemeral"}` so OpenRouter strictly routes them to Anthropic prompt caching instead of third-party Anthropic-compatible vendors
 - configured OpenRouter reasoning effort is sent through the normalized `reasoning.effort` field; accepted effort levels remain model-specific
 - when the agent loop supplies a prompt-cache key, the OpenRouter adapter passes it as `session_id` for sticky routing and better provider prompt-cache reuse, and it does not request provider throughput sorting because OpenRouter prioritizes sorting over sticky routing
 - chat responses surface OpenRouter response-cache headers in normalized `provider_metadata` for cache hit/miss inspection, while the agent loop remains unaware of the provider-specific header contract
-- OpenRouter SSE errors preserve generation, response, endpoint, HTTP, typed-error, and upstream-code metadata in runtime logs, but structured upstream stream failures propagate immediately so the user can retry explicitly
+- terminal OpenRouter responses containing neither visible text nor usable tool calls are invalid, never successful; retry-safe empty attempts retain no transient transcript content, and diagnostics include generation id, raw finish reason, usage, cache status, reasoning activity, and terminal source
+- OpenRouter SSE errors preserve generation, response, endpoint, HTTP, typed-error, and upstream-code metadata in runtime logs; timeout, provider-unavailable, provider-overloaded, and rate-limit failures map to their normalized exception classes and explicitly terminal failures may retry only before normalized output is exposed
 - provider request budgets are split into a 3600-second absolute logical deadline (`JARVIS_LLM_REQUEST_DEADLINE_SECONDS`), a 30-second connection timeout (`JARVIS_LLM_CONNECT_TIMEOUT_SECONDS`), and a 3600-second raw-read inactivity timeout (`JARVIS_LLM_READ_TIMEOUT_SECONDS`)
 - the absolute deadline spans all attempts/backoff and never resets on stream activity; provider adapters never receive it as a provider payload timeout
 - provider lifecycle, keepalive, reasoning, and empty-signature chunks become internal `ProviderActivityEvent` values that `LLMService` consumes without forwarding or persisting
 - Anthropic and Gemini use native incremental streaming rather than buffering a complete response before producing normalized events
-- streaming retries are allowed only before provider acceptance and normalized output; response headers/lifecycle activity mark acceptance, and ambiguous read/write timeouts are not blindly replayed
+- streaming retries are normally allowed only before provider acceptance and normalized output; explicitly terminal provider failures may opt into retry after acceptance but never after normalized output, and ambiguous read/write timeouts are not blindly replayed
 
 Current Grok note:
 
