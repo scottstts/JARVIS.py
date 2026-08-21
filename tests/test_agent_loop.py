@@ -111,8 +111,10 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 old_records = storage.load_records(old_session_id)
                 self.assertTrue(any(record.kind == "compaction" for record in old_records))
                 audit_record = next(record for record in old_records if record.kind == "compaction")
-                self.assertIn("structured handover items", audit_record.content)
+                self.assertIn("verified bundle", audit_record.content)
                 self.assertTrue(audit_record.metadata["replacement_items"])
+                self.assertTrue(audit_record.metadata["bundle"])
+                self.assertEqual(audit_record.metadata["user_instruction"], "keep constraints and marker")
 
                 new_records = storage.load_records(compacted.session_id)
                 compaction_records = [
@@ -122,10 +124,18 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertGreaterEqual(len(compaction_records), 2)
                 self.assertEqual(compaction_records[0].role, "system")
-                self.assertEqual(compaction_records[0].metadata["compaction_kind"], "session_frame")
-                self.assertEqual(compaction_records[-1].role, "system")
-                self.assertEqual(compaction_records[-1].metadata["compaction_kind"], "handover_state")
-                self.assertTrue(all(record.metadata["type"] == "compaction" for record in compaction_records))
+                self.assertEqual(
+                    compaction_records[0].metadata["compaction_kind"],
+                    "history_boundary",
+                )
+                self.assertEqual(compaction_records[-1].role, "assistant")
+                self.assertEqual(compaction_records[-1].metadata["compaction_kind"], "handover")
+                self.assertTrue(
+                    all(
+                        record.metadata["type"] == "compaction_replay"
+                        for record in compaction_records
+                    )
+                )
 
                 follow_up = await loop.handle_user_input(
                     "What marker do you have from previous context?"

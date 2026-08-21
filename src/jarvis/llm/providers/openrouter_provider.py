@@ -1258,7 +1258,7 @@ def _openrouter_system_message_is_global(message: LLMMessage) -> bool:
     return bool(
         metadata.get("bootstrap_identity")
         or metadata.get("memory_bootstrap")
-        or metadata.get("summary_seed")
+        or metadata.get("compaction_item")
     )
 
 

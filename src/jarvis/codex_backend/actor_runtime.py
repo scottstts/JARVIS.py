@@ -25,9 +25,12 @@ from jarvis.core.agent_loop import (
     InterruptionReason,
 )
 from jarvis.core.compaction import (
+    CompactionBundle,
     CompactionOutcome,
-    CompactionReplacementItem,
+    CompactionReplayItem,
     ContextCompactor,
+    build_compaction_bundle_record,
+    load_compaction_bundle,
     prune_compaction_source_records,
 )
 from jarvis.core.commands import ParsedCommand, parse_user_command
@@ -1053,6 +1056,7 @@ class CodexActorRuntime:
     async def _start_fresh_session(self, *, start_reason: str) -> SessionMetadata:
         return await self._start_fresh_session_with_replacement_history(
             start_reason=start_reason,
+            compaction_bundle=None,
             replacement_items=(),
             compaction_count=None,
         )
@@ -1061,7 +1065,8 @@ class CodexActorRuntime:
         self,
         *,
         start_reason: str,
-        replacement_items: Sequence[CompactionReplacementItem],
+        compaction_bundle: CompactionBundle | None,
+        replacement_items: Sequence[CompactionReplayItem],
         compaction_count: int | None,
     ) -> SessionMetadata:
         active = self._storage.get_active_session()
@@ -1077,11 +1082,18 @@ class CodexActorRuntime:
             start_reason=start_reason,
         )
         await self._persist_session_bootstrap(session.session_id)
+        if compaction_bundle is not None:
+            self._storage.append_record(
+                session.session_id,
+                build_compaction_bundle_record(
+                    session_id=session.session_id,
+                    bundle=compaction_bundle,
+                ),
+            )
         if replacement_items:
             self._persist_compaction_replacement_items(
                 session.session_id,
                 items=replacement_items,
-                generation=max(compaction_count or 0, 1),
             )
         updates: dict[str, Any] = {
             "backend_state": {
@@ -1285,8 +1297,9 @@ class CodexActorRuntime:
     ) -> SessionMetadata | None:
         records = self._storage.load_records(session.session_id, include_all_turns=True)
         compactable_records = [record for record in records if record.kind == "message"]
+        previous_bundle = load_compaction_bundle(records)
         source_records = prune_compaction_source_records(compactable_records)
-        if not source_records:
+        if not source_records and previous_bundle is None:
             return None
 
         if self._memory_mode.maintenance:
@@ -1301,11 +1314,18 @@ class CodexActorRuntime:
 
         outcome = await self._compactor.compact(
             source_records,
+            previous_bundle=previous_bundle,
             user_instruction=user_instruction,
         )
-        self._append_compaction_record(session.session_id, outcome=outcome, reason=reason)
+        self._append_compaction_record(
+            session.session_id,
+            outcome=outcome,
+            reason=reason,
+            user_instruction=user_instruction,
+        )
         next_session = await self._start_fresh_session_with_replacement_history(
             start_reason="manual_compaction" if reason == "manual" else "compaction",
+            compaction_bundle=outcome.bundle,
             replacement_items=outcome.items,
             compaction_count=session.compaction_count + 1,
         )
@@ -1317,6 +1337,7 @@ class CodexActorRuntime:
         *,
         outcome: CompactionOutcome,
         reason: str,
+        user_instruction: str | None,
     ) -> None:
         self._storage.append_record(
             session_id,
@@ -1326,17 +1347,22 @@ class CodexActorRuntime:
                 created_at=_utc_now_iso(),
                 role="system",
                 content=(
-                    "Compaction replaced prior session history with "
-                    f"{len(outcome.items)} structured handover items."
+                    f"Compaction activated verified bundle {outcome.bundle.bundle_id} with "
+                    f"{len(outcome.items)} deterministic replay items."
                 ),
                 kind="compaction",
                 metadata={
                     "reason": reason,
+                    "user_instruction": user_instruction.strip() if user_instruction else None,
                     "provider": outcome.provider,
                     "model": outcome.model,
                     "response_id": outcome.response_id,
                     "replacement_items": [item.to_dict() for item in outcome.items],
-                    "response_payload": outcome.response_payload,
+                    "bundle": outcome.bundle.to_dict(),
+                    "draft_payload": outcome.draft_payload,
+                    "verification_payload": outcome.verification_payload,
+                    "repair_count": outcome.repair_count,
+                    "call_traces": [trace.to_dict() for trace in outcome.call_traces],
                     "usage": {
                         "input_tokens": outcome.input_tokens,
                         "output_tokens": outcome.output_tokens,
@@ -1350,8 +1376,7 @@ class CodexActorRuntime:
         self,
         session_id: str,
         *,
-        items: Sequence[CompactionReplacementItem],
-        generation: int,
+        items: Sequence[CompactionReplayItem],
     ) -> None:
         for item in items:
             self._storage.append_record(
@@ -1362,7 +1387,7 @@ class CodexActorRuntime:
                     created_at=_utc_now_iso(),
                     role=item.role,
                     content=item.content,
-                    metadata=item.record_metadata(generation=generation),
+                    metadata=item.record_metadata(),
                 ),
             )
 
@@ -1849,21 +1874,14 @@ def _render_runtime_input_text(message: AgentRuntimeMessage) -> str:
 
 def _render_compaction_input_text(record: ConversationRecord) -> str:
     metadata = record.metadata
-    lines = [
-        "Compacted prior-session history item:",
-        "type: compaction",
-        f"role: {record.role}",
-        f"kind: {str(metadata.get('compaction_kind', 'condensed_span')).strip() or 'condensed_span'}",
-    ]
-    if metadata.get("verbatim"):
-        lines.append("verbatim: true")
-    lines.extend(
-        [
-            "",
-            record.content,
-        ]
-    )
-    return "\n".join(lines)
+    kind = str(metadata.get("compaction_kind", "episode")).strip()
+    if kind == "history_boundary":
+        return record.content
+    if kind == "preserved_message" and record.role == "user":
+        return "Exact prior user message:\n\n" + record.content
+    if kind == "preserved_message" and record.role == "assistant":
+        return "Exact prior assistant message:\n\n" + record.content
+    return "Evidence-backed prior-session assistant context:\n\n" + record.content
 
 
 def _collect_turn_activated_discoverable_tool_names(
@@ -1925,6 +1943,6 @@ def _is_compaction_replacement_record(record: ConversationRecord) -> bool:
     metadata = record.metadata
     return bool(
         metadata.get("compaction_item")
-        and metadata.get("type") == "compaction"
+        and metadata.get("type") == "compaction_replay"
         and record.role in {"system", "user", "assistant"}
     )

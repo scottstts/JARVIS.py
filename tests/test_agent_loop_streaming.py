@@ -18,7 +18,12 @@ from jarvis.llm import (
     TextPart,
 )
 from jarvis.storage import SessionStorage
-from tests.helpers import build_core_settings
+from tests.helpers import (
+    build_compaction_test_response,
+    build_core_settings,
+    is_compaction_generate_request,
+    is_compaction_verify_request,
+)
 
 
 def _build_response(text: str) -> LLMResponse:
@@ -34,43 +39,14 @@ def _build_response(text: str) -> LLMResponse:
 
 
 def _is_compaction_request(request: LLMRequest) -> bool:
-    return (
-        len(request.messages) == 2
-        and request.messages[0].role == "system"
-        and request.messages[1].role == "user"
-        and any(
-            isinstance(part, TextPart)
-            and "Compact the following transcript items into replacement history JSON."
-            in part.text
-            for part in request.messages[1].parts
-        )
+    return is_compaction_generate_request(request) or is_compaction_verify_request(request)
+
+
+def _build_compaction_response(request: LLMRequest) -> LLMResponse:
+    return build_compaction_test_response(
+        request,
+        marker="The previous streaming turn was compacted.",
     )
-
-
-def _build_compaction_response() -> LLMResponse:
-    payload = {
-        "items": [
-            {
-                "type": "compaction",
-                "role": "system",
-                "kind": "session_frame",
-                "content": "Session frame: interrupted streaming turn.",
-            },
-            {
-                "type": "compaction",
-                "role": "assistant",
-                "kind": "condensed_span",
-                "content": "The previous turn began streaming a reply and was superseded before it completed.",
-            },
-            {
-                "type": "compaction",
-                "role": "system",
-                "kind": "handover_state",
-                "content": "Handover state: resume from the superseded-turn boundary.",
-            },
-        ]
-    }
-    return _build_response(json.dumps(payload, ensure_ascii=False))
 
 
 class _FakeStreamingLLMService:
@@ -118,7 +94,7 @@ class _InterruptibleStreamingLLMService:
     async def generate(self, request: LLMRequest):
         self.generate_requests.append(request)
         if _is_compaction_request(request):
-            return _build_compaction_response()
+            return _build_compaction_response(request)
         return _build_response("next-turn")
 
     async def stream_generate(self, _request):

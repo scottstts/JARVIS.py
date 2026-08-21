@@ -19,7 +19,6 @@ from jarvis.core import (
     AgentTurnResult,
 )
 from jarvis.llm import DoneEvent, LLMResponse, LLMUsage, ProviderTimeoutError, TextPart
-from jarvis.core.compaction import CompactionOutcome, CompactionReplacementItem
 from jarvis.gateway.bash_job_supervisor import (
     BashJobNotice,
     BashJobResetResult,
@@ -40,6 +39,7 @@ from jarvis.gateway.route_runtime import (
     _RouteTurnRequest,
     _tool_result_for_payload,
 )
+from tests.helpers import build_compaction_test_outcome
 from jarvis.gateway.session_router import SessionRouter, validate_route_id
 from jarvis.subagent.types import SubagentSnapshot
 from jarvis.subagent.primitives import build_subagent_primitive_definitions
@@ -1368,27 +1368,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(
                     runtime._main_loop._compactor,
                     "compact",
-                    return_value=CompactionOutcome(
-                        items=(
-                            CompactionReplacementItem(
-                                role="system",
-                                kind="session_frame",
-                                content="Session frame",
-                            ),
-                            CompactionReplacementItem(
-                                role="system",
-                                kind="handover_state",
-                                content="Handover state",
-                            ),
-                        ),
-                        response_payload={"items": []},
-                        model="fake-model",
-                        provider="fake-provider",
-                        input_tokens=10,
-                        output_tokens=5,
-                        total_tokens=15,
-                        response_id="resp_fake",
-                    ),
+                    return_value=build_compaction_test_outcome(),
                 ):
                     await runtime.enqueue_user_message(
                         "/compact",

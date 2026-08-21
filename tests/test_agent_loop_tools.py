@@ -38,7 +38,12 @@ from jarvis.llm import (
     ToolResultPart,
 )
 from jarvis.storage import SessionStorage
-from tests.helpers import build_core_settings
+from tests.helpers import (
+    build_compaction_test_response,
+    build_core_settings,
+    is_compaction_generate_request,
+    is_compaction_verify_request,
+)
 from jarvis.tools import (
     DiscoverableTool,
     RegisteredTool,
@@ -88,16 +93,7 @@ def _build_response(
 
 
 def _is_compaction_request(request: LLMRequest) -> bool:
-    return (
-        len(request.messages) == 2
-        and request.messages[0].role == "system"
-        and request.messages[1].role == "user"
-        and any(
-            isinstance(part, TextPart)
-            and "Compact the following transcript items into replacement history JSON." in part.text
-            for part in request.messages[1].parts
-        )
-    )
+    return is_compaction_generate_request(request) or is_compaction_verify_request(request)
 
 
 def _has_compaction_history_message(request: LLMRequest) -> bool:
@@ -107,30 +103,12 @@ def _has_compaction_history_message(request: LLMRequest) -> bool:
     )
 
 
-def _build_compaction_response(*, marker: str = "Compacted summary") -> LLMResponse:
-    payload = {
-        "items": [
-            {
-                "type": "compaction",
-                "role": "system",
-                "kind": "session_frame",
-                "content": f"Session frame: {marker}",
-            },
-            {
-                "type": "compaction",
-                "role": "assistant",
-                "kind": "condensed_span",
-                "content": marker,
-            },
-            {
-                "type": "compaction",
-                "role": "system",
-                "kind": "handover_state",
-                "content": "Handover state: continue from the latest task state.",
-            },
-        ]
-    }
-    return _build_response(json.dumps(payload, ensure_ascii=False))
+def _build_compaction_response(
+    request: LLMRequest,
+    *,
+    marker: str = "Compacted summary",
+) -> LLMResponse:
+    return build_compaction_test_response(request, marker=marker)
 
 
 def _build_web_fetch_tool_result(
@@ -1366,7 +1344,7 @@ class _FakeFollowupPreflightCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_compaction_response()
+            return _build_compaction_response(request)
 
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
@@ -1407,7 +1385,7 @@ class _FakeStreamingFollowupOverflowCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_compaction_response()
+            return _build_compaction_response(request)
         raise AssertionError("Non-compaction generate should not be used in this test.")
 
     async def stream_generate(self, request: LLMRequest):
@@ -1464,7 +1442,7 @@ class _FakeFollowupOverflowCompactionLLMService:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if _is_compaction_request(request):
-            return _build_compaction_response()
+            return _build_compaction_response(request)
 
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
@@ -1652,7 +1630,10 @@ class _FakeCurrentTurnResidualCompactionLLMService:
             )
             if "L" * 512 in compaction_text:
                 raise AssertionError("Active-turn large tool output should not be included in compaction source.")
-            return _build_compaction_response(marker="Compacted current-turn summary")
+            return _build_compaction_response(
+                request,
+                marker="Compacted current-turn summary",
+            )
 
         self.generate_calls += 1
         names = [tool.name for tool in request.tools]
@@ -1698,7 +1679,10 @@ class _FakeCompactionProviderSplitLLMService:
     async def generate(self, request: LLMRequest) -> LLMResponse:
         self.request_providers.append(request.provider)
         if _is_compaction_request(request):
-            return _build_compaction_response(marker="Compaction provider split test")
+            return _build_compaction_response(
+                request,
+                marker="Compaction provider split test",
+            )
         return _build_response("OK.")
 
     async def stream_generate(self, request: LLMRequest):
@@ -2248,7 +2232,10 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             compacted = await loop.handle_user_input("/compact keep the latest state")
 
             self.assertTrue(compacted.compaction_performed)
-            self.assertEqual(llm_service.request_providers, ["anthropic", "openai"])
+            self.assertEqual(
+                llm_service.request_providers,
+                ["anthropic", "openai", "openai"],
+            )
 
     async def test_handle_user_input_auto_compacts_when_current_turn_itself_overflows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

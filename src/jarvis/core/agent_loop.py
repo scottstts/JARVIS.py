@@ -68,9 +68,12 @@ from jarvis.tools import (
 
 from .commands import ParsedCommand, parse_user_command
 from .compaction import (
+    CompactionBundle,
     CompactionOutcome,
-    CompactionReplacementItem,
+    CompactionReplayItem,
     ContextCompactor,
+    build_compaction_bundle_record,
+    load_compaction_bundle,
     prune_compaction_source_records,
 )
 from .config import CoreSettings
@@ -3327,7 +3330,8 @@ class AgentLoop:
         *,
         start_reason: str,
         parent_session_id: str | None = None,
-        replacement_items: Sequence[CompactionReplacementItem] = (),
+        compaction_bundle: CompactionBundle | None = None,
+        replacement_items: Sequence[CompactionReplayItem] = (),
         compaction_count: int = 0,
     ) -> SessionMetadata:
         session = self._storage.create_session(
@@ -3384,11 +3388,18 @@ class AgentLoop:
                     content="Runtime ongoing memory bootstrap:\n\n" + ongoing_memory_bootstrap,
                     metadata={"memory_bootstrap": "ongoing"},
                 )
+        if compaction_bundle is not None:
+            self._storage.append_record(
+                session.session_id,
+                build_compaction_bundle_record(
+                    session_id=session.session_id,
+                    bundle=compaction_bundle,
+                ),
+            )
         if replacement_items:
             self._persist_compaction_replacement_items(
                 session_id=session.session_id,
                 items=replacement_items,
-                generation=max(compaction_count, 1),
             )
 
         if compaction_count > 0:
@@ -3420,8 +3431,9 @@ class AgentLoop:
             and str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip()
             not in excluded_turn_id_set
         ]
+        previous_bundle = load_compaction_bundle(records)
         source_records = prune_compaction_source_records(compactable_records)
-        if not source_records:
+        if not source_records and previous_bundle is None:
             if excluded_turn_id_set:
                 next_compaction_count = session.compaction_count + 1
                 self._storage.archive_session(session.session_id)
@@ -3461,15 +3473,22 @@ class AgentLoop:
 
         outcome = await self._compactor.compact(
             source_records,
+            previous_bundle=previous_bundle,
             user_instruction=user_instruction,
         )
-        self._append_compaction_record(session.session_id, outcome=outcome, reason=reason)
+        self._append_compaction_record(
+            session.session_id,
+            outcome=outcome,
+            reason=reason,
+            user_instruction=user_instruction,
+        )
         self._storage.archive_session(session.session_id)
 
         next_compaction_count = session.compaction_count + 1
         next_session = await self._start_session(
             start_reason="compaction",
             parent_session_id=session.session_id,
+            compaction_bundle=outcome.bundle,
             replacement_items=outcome.items,
             compaction_count=next_compaction_count,
         )
@@ -3553,14 +3572,20 @@ class AgentLoop:
         *,
         outcome: CompactionOutcome,
         reason: str,
+        user_instruction: str | None,
     ) -> None:
         metadata = {
             "reason": reason,
+            "user_instruction": user_instruction.strip() if user_instruction else None,
             "provider": outcome.provider,
             "model": outcome.model,
             "response_id": outcome.response_id,
             "replacement_items": [item.to_dict() for item in outcome.items],
-            "response_payload": outcome.response_payload,
+            "bundle": outcome.bundle.to_dict(),
+            "draft_payload": outcome.draft_payload,
+            "verification_payload": outcome.verification_payload,
+            "repair_count": outcome.repair_count,
+            "call_traces": [trace.to_dict() for trace in outcome.call_traces],
             "usage": {
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
@@ -3573,8 +3598,8 @@ class AgentLoop:
             created_at=_utc_now_iso(),
             role="system",
             content=(
-                "Compaction replaced prior session history with "
-                f"{len(outcome.items)} structured handover items."
+                f"Compaction activated verified bundle {outcome.bundle.bundle_id} with "
+                f"{len(outcome.items)} deterministic replay items."
             ),
             kind="compaction",
             metadata=metadata,
@@ -3585,15 +3610,14 @@ class AgentLoop:
         self,
         *,
         session_id: str,
-        items: Sequence[CompactionReplacementItem],
-        generation: int,
+        items: Sequence[CompactionReplayItem],
     ) -> None:
         for item in items:
             self._append_message(
                 session_id=session_id,
                 role=item.role,
                 content=item.content,
-                metadata=item.record_metadata(generation=generation),
+                metadata=item.record_metadata(),
             )
 
     def _build_message_record(

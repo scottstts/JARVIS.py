@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,10 +12,10 @@ from jarvis.codex_backend.actor_runtime import CodexActorRuntime
 from jarvis.codex_backend.config import CodexBackendSettings
 from jarvis.codex_backend.types import CodexNativeCapabilityError
 from jarvis.core import AgentIdentity, AgentMemoryMode, AgentRuntimeMessage
-from jarvis.llm import LLMMessage, LLMResponse, LLMUsage, ToolDefinition
+from jarvis.llm import LLMMessage, ToolDefinition
 from jarvis.storage import ConversationRecord, SessionStorage
 from jarvis.tools import ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
-from tests.helpers import build_core_settings
+from tests.helpers import build_compaction_test_response, build_core_settings
 
 
 class _FakeBootstrapLoader:
@@ -125,37 +124,9 @@ def _build_runtime(
 
 class _FakeCompactionLLMService:
     async def generate(self, request):  # type: ignore[no-untyped-def]
-        return LLMResponse(
-            provider=request.provider or "openai",
-            model="fake-compactor",
-            text=json.dumps(
-                {
-                    "items": [
-                        {
-                            "type": "compaction",
-                            "role": "system",
-                            "kind": "session_frame",
-                            "content": "Session frame from compacted Codex history.",
-                        },
-                        {
-                            "type": "compaction",
-                            "role": "assistant",
-                            "kind": "condensed_span",
-                            "content": "Condensed work summary from the previous session.",
-                        },
-                        {
-                            "type": "compaction",
-                            "role": "system",
-                            "kind": "handover_state",
-                            "content": "Resume by continuing from the latest verified state.",
-                        },
-                    ]
-                }
-            ),
-            tool_calls=[],
-            finish_reason="stop",
-            usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
-            response_id="resp_compact",
+        return build_compaction_test_response(
+            request,
+            marker="Compacted Codex history.",
         )
 
 
@@ -239,7 +210,10 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(
                 [record.metadata["compaction_kind"] for record in compaction_records],
-                ["session_frame", "condensed_span", "handover_state"],
+                ["history_boundary", "episode", "state_snapshot", "handover"],
+            )
+            self.assertTrue(
+                any(record.metadata.get("compaction_bundle_anchor") for record in new_records)
             )
 
     async def test_first_turn_after_compaction_seeds_codex_thread_once(self) -> None:
@@ -274,8 +248,11 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             seed_input = coordinator.turn_start_requests[0]["input"]
             self.assertGreaterEqual(len(seed_input), 2)
-            self.assertIn("Compacted prior-session history item:", seed_input[0]["text"])
-            self.assertIn("kind: session_frame", seed_input[0]["text"])
+            self.assertIn("Historical context from earlier Jarvis sessions", seed_input[0]["text"])
+            self.assertIn(
+                "Evidence-backed prior-session assistant context:",
+                seed_input[1]["text"],
+            )
             self.assertEqual(seed_input[-1]["text"], "continue")
 
             await runtime.handle_notification(
