@@ -108,9 +108,9 @@ class CodexToolBridge:
             "awaiting_approval",
         }:
             return (
-                "Codex runtime note: the subagent is now running independently and Jarvis is "
-                "yielding control back to the route orchestrator. Do not call "
-                "`subagent_monitor` or any other tool again in this turn."
+                "Codex runtime note: the subagent is now running independently. Continue any "
+                "useful main-task work in this turn. Do not poll `subagent_monitor`; let "
+                "orchestrator updates drive supervision."
             )
         if action == "monitor" and result.metadata.get("changed") is False:
             return (

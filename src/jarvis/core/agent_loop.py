@@ -969,7 +969,7 @@ class AgentLoop:
         turn_id: str,
         extra_records: Sequence[ConversationRecord] = (),
     ) -> tuple[LLMRequest, int, tuple[ConversationRecord, ...]]:
-        if pending_detached_job_ids or pending_subagent_ids:
+        if pending_detached_job_ids:
             return self._build_orchestrator_monitored_waiting_request(
                 session_id=session_id,
                 base_records=base_records,

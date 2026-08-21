@@ -22,6 +22,9 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 - Runtime tool manifests under `/workspace/runtime_tools/` remain visible to subagents.
 - The user does not directly converse with subagents.
 - `/stop` cooperatively stops the main agent and active subagents.
+- `/new` hard-stops and disposes route subagents.
+- Ordinary user messages supersede only the active main turn; they never redirect, pause, or stop a child.
+- Jarvis decides whether to continue independent main-task work, inspect a child, step in, stop it, or wait.
 
 ## Architecture
 
@@ -65,8 +68,12 @@ The dynamic assignment includes:
 
 - codename
 - stable `subagent_id`
-- main-agent instructions
-- optional context
+- required stable `task_label`
+- bounded main-agent instructions
+- optional exact user constraints
+- optional shared environment, dependency, and interface context
+- optional owned workspace paths
+- optional selected skill ids, whose full `SKILL.md` documents are embedded into bootstrap
 - optional deliverable or success criteria
 
 The assignment is injected after the static subagent prompts.
@@ -83,16 +90,22 @@ Starts a new background subagent with a fresh starter context.
 
 Arguments:
 
+- `task_label`
 - `instructions`
-- optional `context`
+- optional `user_constraints`
+- optional `shared_context`
+- optional `owned_paths`
+- optional `skill_ids`
 - optional `deliverable`
 
 Returns:
 
 - `subagent_id`
 - codename
+- task label
 - status
 - session id
+- selected skill ids and owned paths
 - active count
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
@@ -101,9 +114,9 @@ It allocates a codename, creates child storage/catalog entries, starts the child
 
 Inspects current subagent state without side effects.
 
-It accepts an optional codename or `subagent_id`. Omitted `agent` summarizes all non-disposed subagents. Full output includes status, recent activity, pause reason, last reports, and `pending_background_job_ids`.
+It accepts an optional codename or `subagent_id`. Omitted `agent` summarizes all non-disposed subagents. Full output includes the durable assignment, selected skills, owned paths, recent activity, pause reason, complete report or latest checkpoint, report-completeness flag, provider error metadata, error-log path, transcript path, and `pending_background_job_ids`.
 
-Repeated unchanged monitor calls return a minimal no-delta nudge instead of another full snapshot.
+Repeated unchanged monitor calls return a minimal no-delta nudge instead of another full snapshot. Automatic main-context status snapshots are also suppressed while unchanged within one main session, but a fresh snapshot is emitted after `/new` or compaction because compaction prunes older status records.
 
 ### `subagent_stop`
 
@@ -143,8 +156,12 @@ Important metadata:
 
 - `pause_reason`
 - `last_error`
+- `last_error_metadata`
+- `error_log_path`
 - `last_tool_name`
 - `last_activity_at`
+- `task_label`
+- `report_complete`
 - `owner_main_session_id`
 - `owner_main_turn_id`
 - `current_subagent_session_id`
@@ -198,9 +215,10 @@ The route-level catalog stores:
 - created/updated/disposed timestamps
 - route id
 - owner main session and turn ids
+- durable task label and structured assignment fields
 - current subagent session id
 - pause reason
-- last error
+- last error, structured provider metadata, and error-log path
 
 Each subagent has its own `SessionStorage` root and normal session compaction lineage.
 
@@ -223,13 +241,15 @@ Approval requests include the acting agent name. Rejected subagent approvals pau
 
 `/stop` asks the main loop and active subagents to stop through the same route stop path. Active provider/tool awaits are preempted and foreground bash gets best-effort cancellation; already-detached bash jobs are not cancelled by plain `/stop`.
 
-When a newer user message supersedes active work, active subagents tied to that task are asked to stop with reason `superseded_by_user_message`. Completed child tool results remain in child archives and main-session progress notes can point Jarvis back to child state when useful.
+When a newer ordinary user message arrives, it supersedes only the active main turn. Existing children continue their original Jarvis assignments unchanged. The user message cannot become child context or an implicit child stop/redirect. Jarvis can later inspect, stop, or step into a child explicitly.
 
 `/new` does not use either cooperative path. It hard-preempts active child turns with reason `new_session`, waits for their persisted turn state to settle, terminates route-owned detached jobs, archives and disposes every remaining child, and clears pending child notices before the replacement main session is created.
 
 ## Codex-Backed Subagents
 
 Subagents can use provider `codex`. Codex-backed subagents share the Codex route connection with the main actor when applicable and use `CodexActorRuntime` with subagent identity, subagent bootstrap, filtered tools, and memory disabled.
+
+Starting or stepping into a child does not force a Codex main turn to yield. Jarvis can continue useful independent work in the same turn; child progress remains orchestrator-monitored and should not be polled.
 
 Subagent disposal closes the child loop so Codex-backed subagents unregister their thread mapping from the route coordinator.
 
@@ -244,3 +264,6 @@ When changing subagents:
 - keep runtime tools visible unless policy changes
 - keep public UI progress minimal
 - preserve child transcript linkability to the owning main session and turn
+- preserve the rule that ordinary user messages affect only the main turn
+- treat paused, approval-rejected, and failed children as inspect decisions, not finalize decisions
+- keep full child reports and failure evidence accessible through full monitoring

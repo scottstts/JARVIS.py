@@ -238,7 +238,9 @@ class RouteRuntime:
                 tool_definitions_provider=self._build_main_tool_definitions,
                 tool_executor=self._execute_main_tool_call,
                 publish_route_event=self.publish_event,
-                runtime_messages_provider=lambda _session_id: self._subagent_manager.main_turn_runtime_messages(),
+                runtime_messages_provider=lambda session_id: self._subagent_manager.main_turn_runtime_messages(
+                    session_id=session_id
+                ),
             )
         return AgentLoop(
             llm_service=self._llm_service,
@@ -251,7 +253,9 @@ class RouteRuntime:
             llm_provider=provider,
             tool_definitions_provider=self._build_main_tool_definitions,
             tool_executor=self._execute_main_tool_call,
-            runtime_messages_provider=lambda _session_id: self._subagent_manager.main_turn_runtime_messages(),
+            runtime_messages_provider=lambda session_id: self._subagent_manager.main_turn_runtime_messages(
+                session_id=session_id
+            ),
             local_notice_callback=self._publish_main_local_notice,
         )
 
@@ -340,10 +344,7 @@ class RouteRuntime:
         Console(stderr=True).print(text, highlight=False)
 
     def request_stop(self) -> bool:
-        stop_requested, affected_subagents, pending_bash_jobs = self._request_route_stop(
-            main_reason="user_stop",
-            subagent_stop_reason="user_stop",
-        )
+        stop_requested, affected_subagents, pending_bash_jobs = self._request_route_stop()
         if stop_requested and not self._main_resume_requires_user_message:
             self._main_resume_requires_user_message = True
             self._invalidate_stale_internal_followups()
@@ -355,10 +356,10 @@ class RouteRuntime:
         return stop_requested
 
     def _request_user_message_supersede(self) -> None:
-        self._request_route_stop(
-            main_reason="superseded_by_user_message",
-            subagent_stop_reason="superseded_by_user_message",
+        self._main_loop.request_stop(
+            reason="superseded_by_user_message"
         )
+        self._invalidate_stale_internal_followups()
 
     def _request_new_session_hard_reset(self) -> None:
         self._new_session_boundary_pending = True
@@ -368,23 +369,10 @@ class RouteRuntime:
 
     def _request_route_stop(
         self,
-        *,
-        main_reason: str,
-        subagent_stop_reason: str,
     ) -> tuple[bool, tuple[SubagentSnapshot, ...], tuple[object, ...]]:
-        if main_reason == "superseded_by_user_message":
-            main_stop_requested = self._main_loop.request_stop(
-                reason="superseded_by_user_message"
-            )
-        else:
-            main_stop_requested = self._main_loop.request_stop(reason="user_stop")
+        main_stop_requested = self._main_loop.request_stop(reason="user_stop")
 
-        if subagent_stop_reason == "superseded_by_user_message":
-            affected_subagents = (
-                self._subagent_manager.request_stop_all_for_superseded_user_message()
-            )
-        else:
-            affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
+        affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
 
         pending_bash_jobs = self._bash_job_supervisor.pending_jobs()
         self._invalidate_stale_internal_followups()
@@ -683,7 +671,7 @@ class RouteRuntime:
                         continue
                     event_stream = self._main_loop.stream_runtime_turn(
                         force_session_id=force_session_id,
-                        pre_turn_messages=self._build_wait_only_runtime_messages(system_message),
+                        pre_turn_messages=(),
                     )
                 elif request.parse_commands:
                     if request.user_text is None:
@@ -938,17 +926,28 @@ class RouteRuntime:
         try:
             payload: dict[str, Any]
             if tool_call.name == "subagent_invoke":
+                task_label = str(tool_call.arguments.get("task_label", "")).strip()
                 instructions = str(tool_call.arguments.get("instructions", "")).strip()
-                if not instructions:
-                    raise ValueError("'instructions' is required.")
+                if not task_label or not instructions:
+                    raise ValueError("'task_label' and 'instructions' are required.")
                 session_id = context.session_id
                 turn_id = context.turn_id
                 if session_id is None or turn_id is None:
                     raise ValueError("Subagent invocation requires a main session and turn id.")
                 payload = await self._subagent_manager.invoke(
                     requester_kind=context.agent_kind,
+                    task_label=task_label,
                     instructions=instructions,
-                    context=_optional_string(tool_call.arguments.get("context")),
+                    user_constraints=_optional_string(
+                        tool_call.arguments.get("user_constraints")
+                    ),
+                    shared_context=_optional_string(
+                        tool_call.arguments.get("shared_context")
+                    ),
+                    owned_paths=_optional_string_tuple(
+                        tool_call.arguments.get("owned_paths")
+                    ),
+                    skill_ids=_optional_string_tuple(tool_call.arguments.get("skill_ids")),
                     deliverable=_optional_string(tool_call.arguments.get("deliverable")),
                     owner_main_session_id=session_id,
                     owner_main_turn_id=turn_id,
@@ -1618,6 +1617,17 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _optional_string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("Expected an array of strings.")
+    normalized = tuple(str(item).strip() for item in value)
+    if any(not item for item in normalized):
+        raise ValueError("Array values must be non-empty strings.")
+    return normalized
 
 
 def _exception_metadata(exc: Exception) -> dict[str, Any]:

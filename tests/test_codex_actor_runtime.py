@@ -883,7 +883,7 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(recovery_records[0].metadata["item_type"], "commandExecution")
 
-    async def test_subagent_invoke_yields_turn_back_to_route_when_async_work_begins(self) -> None:
+    async def test_subagent_invoke_keeps_main_turn_active_for_independent_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = _FakeCoordinator()
             executor_calls: list[str] = []
@@ -947,7 +947,7 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "threadId": "thread_1",
                     "turnId": "turn_1",
                     "itemId": "msg_1",
-                    "delta": "This should be suppressed",
+                    "delta": "Jarvis continues independent work.",
                 },
             )
             await runtime.handle_notification(
@@ -957,7 +957,7 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "turn": {
                         "id": "turn_1",
                         "items": [],
-                        "status": "interrupted",
+                        "status": "completed",
                         "error": None,
                     },
                 },
@@ -966,17 +966,27 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 [event.type for event in events],
-                ["turn_started", "tool_call", "done"],
+                [
+                    "turn_started",
+                    "tool_call",
+                    "tool_call",
+                    "text_delta",
+                    "assistant_message",
+                    "done",
+                ],
             )
             self.assertEqual(response["success"], True)
-            self.assertIn("yielding control back to the route orchestrator", response["contentItems"][1]["text"])
-            self.assertEqual(extra_response["success"], False)
-            self.assertEqual(executor_calls, ["subagent_invoke"])
-            self.assertEqual(events[-1].response_text, "")
+            self.assertNotIn(
+                "yielding control back to the route orchestrator",
+                response["contentItems"][1]["text"],
+            )
+            self.assertEqual(extra_response["success"], True)
+            self.assertEqual(executor_calls, ["subagent_invoke", "subagent_monitor"])
+            self.assertEqual(events[-1].response_text, "Jarvis continues independent work.")
             self.assertFalse(events[-1].interrupted)
             self.assertEqual(
                 [method for method, _params in coordinator.requests if method == "turn/interrupt"],
-                ["turn/interrupt"],
+                [],
             )
             active = storage.get_active_session()
             self.assertIsNotNone(active)

@@ -33,6 +33,8 @@ Executable tool exposure classes:
 
 The initial `LLMRequest` contains only basic tools. The session transcript logs the raw basic `ToolDefinition` payloads as transcript-only audit data; that record is not replayed as model-visible history.
 
+Invalid model tool arguments are recoverable tool results. Schema diagnostics identify the exact JSON argument path, received value, and failing schema rule so the model can correct nested payloads instead of guessing from a generic validation error.
+
 Discoverable catalog entries are separate from executable `ToolDefinition`s. They provide compact search docs for `tool_search` and may optionally link to a backing executable tool through `backing_tool_name`.
 
 `ToolRegistry.filtered_view(...)` provides actor-scoped visibility. Every executable and backed discoverable tool declares `allowed_agent_kinds`; new tools should not rely on implicit defaults.
@@ -213,6 +215,8 @@ Applies structured one-file text edits inside `/workspace` through literal opera
 - `delete`
 
 Writes are atomic. Non-write operations require exact single matches.
+
+The tool description includes a minimal valid replace payload because nested patch operations are a common model-shape failure; runtime schema errors also point to paths such as `$.operations[0].type`.
 
 ### `view_image`
 

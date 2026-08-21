@@ -19,16 +19,58 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
             name="subagent_invoke",
             description=(
                 "Start a background subagent for bounded side work that can run independently "
-                "while you supervise."
+                "while you supervise. Supply a stable task label and only the context the child "
+                "needs: explicit user constraints, shared interfaces/environment, owned paths, "
+                "and selected skill ids."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "instructions": {"type": "string"},
-                    "context": {"type": "string"},
-                    "deliverable": {"type": "string"},
+                    "task_label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120,
+                        "description": "Short stable identity for the delegated task.",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Bounded work the child must perform.",
+                    },
+                    "user_constraints": {
+                        "type": "string",
+                        "description": "Exact user constraints relevant to this child.",
+                    },
+                    "shared_context": {
+                        "type": "string",
+                        "description": (
+                            "Relevant environment facts, shared interfaces, dependencies, and "
+                            "coordination boundaries."
+                        ),
+                    },
+                    "owned_paths": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 32,
+                        "uniqueItems": True,
+                        "description": "Workspace paths the child owns or may edit.",
+                    },
+                    "skill_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 4,
+                        "uniqueItems": True,
+                        "description": (
+                            "Canonical installed skill ids Jarvis selected; their SKILL.md "
+                            "documents are embedded into the child bootstrap."
+                        ),
+                    },
+                    "deliverable": {
+                        "type": "string",
+                        "description": "Concrete completion evidence Jarvis expects back.",
+                    },
                 },
-                "required": ["instructions"],
+                "required": ["task_label", "instructions"],
                 "additionalProperties": False,
             },
         ),
@@ -103,7 +145,9 @@ def render_subagent_primitive_docs() -> str:
         "Subagent control primitives are available only to Jarvis.",
         "Use subagents only for bounded side work; Jarvis remains responsible for the final answer.",
         f"- `{definitions['subagent_invoke'].name}`: start bounded background side work. "
-        "After invoking, wait for orchestrator updates before polling by default.",
+        "Give it a stable `task_label`, explicit constraints, shared interfaces, owned paths, "
+        "selected `skill_ids`, and a concrete deliverable. Continue independent main-task work "
+        "after invoking; do not poll, and let orchestrator updates drive supervision.",
         f"- `{definitions['subagent_monitor'].name}`: inspect on demand. Omit `agent` to summarize all active "
         "subagents; use `detail=\"full\"` only when you need current internals.",
         f"- `{definitions['subagent_stop'].name}`: cooperatively pause a running or approval-blocked child.",
@@ -112,5 +156,7 @@ def render_subagent_primitive_docs() -> str:
         f"- `{definitions['subagent_dispose'].name}`: dispose completed, failed, or no-longer-needed children "
         "to free their slots.",
         "Subagents cannot spawn subagents.",
+        "A paused, rejected, or failed child requires inspection and a Jarvis decision; only a "
+        "completed child with a complete report is ready to finalize.",
     ]
     return "\n".join(lines)

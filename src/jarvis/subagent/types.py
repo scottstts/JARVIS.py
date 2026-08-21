@@ -16,10 +16,8 @@ SubagentStatus = Literal[
 ]
 SubagentPauseReason = Literal[
     "main_stop",
-    "superseded_by_user_message",
     "new_session",
     "approval_rejected",
-    "gateway_disconnect_recovery",
 ]
 
 
@@ -55,10 +53,19 @@ class SubagentCatalogEntry:
     route_id: str
     owner_main_session_id: str
     owner_main_turn_id: str
+    task_label: str = ""
+    instructions: str = ""
+    user_constraints: str | None = None
+    shared_context: str | None = None
+    owned_paths: tuple[str, ...] = field(default_factory=tuple)
+    skill_ids: tuple[str, ...] = field(default_factory=tuple)
+    deliverable: str | None = None
     current_subagent_session_id: str | None = None
     disposed_at: str | None = None
     pause_reason: SubagentPauseReason | None = None
     last_error: str | None = None
+    last_error_metadata: dict[str, Any] = field(default_factory=dict)
+    error_log_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,10 +77,19 @@ class SubagentCatalogEntry:
             "route_id": self.route_id,
             "owner_main_session_id": self.owner_main_session_id,
             "owner_main_turn_id": self.owner_main_turn_id,
+            "task_label": self.task_label,
+            "instructions": self.instructions,
+            "user_constraints": self.user_constraints,
+            "shared_context": self.shared_context,
+            "owned_paths": list(self.owned_paths),
+            "skill_ids": list(self.skill_ids),
+            "deliverable": self.deliverable,
             "current_subagent_session_id": self.current_subagent_session_id,
             "disposed_at": self.disposed_at,
             "pause_reason": self.pause_reason,
             "last_error": self.last_error,
+            "last_error_metadata": self.last_error_metadata,
+            "error_log_path": self.error_log_path,
         }
 
     @classmethod
@@ -95,10 +111,8 @@ class SubagentCatalogEntry:
             if str(pause_reason)
             in {
                 "main_stop",
-                "superseded_by_user_message",
                 "new_session",
                 "approval_rejected",
-                "gateway_disconnect_recovery",
             }
             else None
         )
@@ -111,6 +125,25 @@ class SubagentCatalogEntry:
             route_id=str(payload.get("route_id", "")),
             owner_main_session_id=str(payload.get("owner_main_session_id", "")),
             owner_main_turn_id=str(payload.get("owner_main_turn_id", "")),
+            task_label=str(payload.get("task_label", "")),
+            instructions=str(payload.get("instructions", "")),
+            user_constraints=(
+                str(payload["user_constraints"])
+                if payload.get("user_constraints") is not None
+                else None
+            ),
+            shared_context=(
+                str(payload["shared_context"])
+                if payload.get("shared_context") is not None
+                else None
+            ),
+            owned_paths=tuple(str(item) for item in payload.get("owned_paths", ())),
+            skill_ids=tuple(str(item) for item in payload.get("skill_ids", ())),
+            deliverable=(
+                str(payload["deliverable"])
+                if payload.get("deliverable") is not None
+                else None
+            ),
             current_subagent_session_id=(
                 str(payload["current_subagent_session_id"])
                 if payload.get("current_subagent_session_id") is not None
@@ -127,6 +160,16 @@ class SubagentCatalogEntry:
                 if payload.get("last_error") is not None
                 else None
             ),
+            last_error_metadata=(
+                dict(payload["last_error_metadata"])
+                if isinstance(payload.get("last_error_metadata"), dict)
+                else {}
+            ),
+            error_log_path=(
+                str(payload["error_log_path"])
+                if payload.get("error_log_path") is not None
+                else None
+            ),
         )
 
 
@@ -137,11 +180,22 @@ class SubagentSnapshot:
     status: SubagentStatus
     owner_main_session_id: str
     owner_main_turn_id: str
+    task_label: str = ""
+    instructions: str = ""
+    user_constraints: str | None = None
+    shared_context: str | None = None
+    owned_paths: tuple[str, ...] = field(default_factory=tuple)
+    skill_ids: tuple[str, ...] = field(default_factory=tuple)
+    deliverable: str | None = None
     current_subagent_session_id: str | None = None
     pause_reason: SubagentPauseReason | None = None
     last_error: str | None = None
+    last_error_metadata: dict[str, Any] = field(default_factory=dict)
+    error_log_path: str | None = None
     last_tool_name: str | None = None
     last_activity_at: str | None = None
+    latest_report: str | None = None
+    report_complete: bool = False
     pending_background_job_count: int = 0
     pending_background_job_ids: tuple[str, ...] = field(default_factory=tuple)
     notable_events: tuple[SubagentEventNote, ...] = field(default_factory=tuple)

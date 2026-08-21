@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
+import json
+import traceback
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -29,8 +31,10 @@ from jarvis.gateway.route_events import (
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
 )
-from jarvis.llm import LLMService
+from jarvis.llm import LLMError, LLMService
 from jarvis.logging_setup import get_application_logger
+from jarvis.skills import SkillsSettings, get_skill
+from jarvis.skills.catalog import read_skill_markdown
 from jarvis.storage import SessionStorage
 from jarvis.storage.layout import transcript_archive_root_from_runtime_path
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime
@@ -107,18 +111,32 @@ class SubagentManager:
         self._subagents: dict[str, SubagentRuntime] = {}
         self._pending_bash_job_notices: dict[str, dict[str, BashJobNotice]] = {}
         self._last_monitor_signatures: dict[str, str] = {}
+        self._last_main_context_signature: tuple[str, str] | None = None
 
     async def invoke(
         self,
         *,
         requester_kind: AgentKind,
+        task_label: str,
         instructions: str,
         owner_main_session_id: str,
         owner_main_turn_id: str,
-        context: str | None = None,
+        user_constraints: str | None = None,
+        shared_context: str | None = None,
+        owned_paths: tuple[str, ...] = (),
+        skill_ids: tuple[str, ...] = (),
         deliverable: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_main_requester(requester_kind)
+        normalized_task_label = task_label.strip()
+        normalized_instructions = instructions.strip()
+        if not normalized_task_label:
+            raise ValueError("Subagent task_label cannot be empty.")
+        if not normalized_instructions:
+            raise ValueError("Subagent instructions cannot be empty.")
+        normalized_owned_paths = _normalize_unique_strings(owned_paths)
+        normalized_skill_ids = _normalize_unique_strings(skill_ids)
+        skill_documents = self._load_skill_documents(normalized_skill_ids)
         active = self._non_disposed_runtimes()
         if len(active) >= self._settings.max_active:
             raise ValueError(
@@ -139,8 +157,12 @@ class SubagentManager:
             assignment_message=build_assignment_message(
                 codename=codename,
                 subagent_id=subagent_id,
-                instructions=instructions,
-                context=context,
+                task_label=normalized_task_label,
+                instructions=normalized_instructions,
+                user_constraints=user_constraints,
+                shared_context=shared_context,
+                owned_paths=normalized_owned_paths,
+                skill_documents=skill_documents,
                 deliverable=deliverable,
             )
         )
@@ -159,6 +181,13 @@ class SubagentManager:
             status="running",
             created_at=created_at,
             updated_at=created_at,
+            task_label=normalized_task_label,
+            instructions=normalized_instructions,
+            user_constraints=user_constraints,
+            shared_context=shared_context,
+            owned_paths=normalized_owned_paths,
+            skill_ids=normalized_skill_ids,
+            deliverable=deliverable,
             notable_events=deque(),
         )
         session_id = await runtime.loop.prepare_session(start_reason="subagent_initial")
@@ -173,6 +202,13 @@ class SubagentManager:
                 route_id=self._route_id,
                 owner_main_session_id=owner_main_session_id,
                 owner_main_turn_id=owner_main_turn_id,
+                task_label=normalized_task_label,
+                instructions=normalized_instructions,
+                user_constraints=user_constraints,
+                shared_context=shared_context,
+                owned_paths=normalized_owned_paths,
+                skill_ids=normalized_skill_ids,
+                deliverable=deliverable,
                 current_subagent_session_id=session_id,
             )
         )
@@ -199,8 +235,11 @@ class SubagentManager:
         return {
             "subagent_id": subagent_id,
             "codename": codename,
+            "task_label": normalized_task_label,
             "status": runtime.status,
             "session_id": session_id,
+            "skill_ids": list(normalized_skill_ids),
+            "owned_paths": list(normalized_owned_paths),
             "active_count": len(self._non_disposed_runtimes()),
         }
 
@@ -217,7 +256,7 @@ class SubagentManager:
         payload = {
             "count": len(targets),
             "subagents": [
-                self._serialize_snapshot(runtime.snapshot(), detail=detail)
+                self._serialize_snapshot(runtime, detail=detail)
                 for runtime in targets
             ],
         }
@@ -237,7 +276,10 @@ class SubagentManager:
                     {
                         "subagent_id": snapshot["subagent_id"],
                         "codename": snapshot["codename"],
+                        "task_label": snapshot["task_label"],
                         "status": snapshot["status"],
+                        "last_activity_at": snapshot["last_activity_at"],
+                        "report_complete": snapshot["report_complete"],
                         "pending_background_job_count": snapshot["pending_background_job_count"],
                         "pending_background_job_ids": snapshot.get(
                             "pending_background_job_ids",
@@ -254,16 +296,6 @@ class SubagentManager:
         affected: list[SubagentSnapshot] = []
         for runtime in self._non_disposed_runtimes():
             if self._request_runtime_stop(runtime, pause_reason="main_stop"):
-                affected.append(runtime.snapshot())
-        return tuple(affected)
-
-    def request_stop_all_for_superseded_user_message(self) -> tuple[SubagentSnapshot, ...]:
-        affected: list[SubagentSnapshot] = []
-        for runtime in self._non_disposed_runtimes():
-            if self._request_runtime_stop(
-                runtime,
-                pause_reason="superseded_by_user_message",
-            ):
                 affected.append(runtime.snapshot())
         return tuple(affected)
 
@@ -311,6 +343,7 @@ class SubagentManager:
             await self._wait_for_turn_settle(runtime)
         runtime.pause_reason = None
         runtime.status = "running"
+        runtime.report_complete = False
         self._sync_catalog(runtime)
         self._append_notable_event(runtime, kind="step_in", summary="Jarvis stepped in with new direction.")
         self._launch_runtime_task(
@@ -375,6 +408,7 @@ class SubagentManager:
             disposed_subagent_ids.append(entry.subagent_id)
 
         self._last_monitor_signatures.clear()
+        self._last_main_context_signature = None
         return {
             "disposed_subagent_ids": disposed_subagent_ids,
             "cancelled_job_ids": cancelled_job_ids,
@@ -382,18 +416,19 @@ class SubagentManager:
             "cancelled_job_count": len(cancelled_job_ids),
         }
 
-    def main_turn_runtime_messages(self) -> tuple[AgentRuntimeMessage, ...]:
+    def main_turn_runtime_messages(self, *, session_id: str) -> tuple[AgentRuntimeMessage, ...]:
         runtimes = self._non_disposed_runtimes()
         if not runtimes:
-            return (
-                AgentRuntimeMessage(
+            return self._deduplicate_main_context_message(
+                session_id=session_id,
+                message=AgentRuntimeMessage(
                     role="system",
                     metadata={
                         "subagent_status_snapshot": True,
                         "pending_subagent_ids": [],
                     },
                     content="Subagent status snapshot:\n- no non-disposed subagents.",
-                ),
+                )
             )
 
         lines = ["Subagent status snapshot:"]
@@ -401,7 +436,10 @@ class SubagentManager:
         pending_subagent_ids: list[str] = []
         for runtime in runtimes:
             snapshot = runtime.snapshot()
-            status_line = f"- {snapshot.codename} ({snapshot.subagent_id}): {snapshot.status}"
+            status_line = (
+                f"- {snapshot.codename} [{snapshot.task_label}] "
+                f"({snapshot.subagent_id}): {snapshot.status}"
+            )
             extras: list[str] = []
             if snapshot.pending_background_job_count > 0:
                 extras.append(
@@ -415,6 +453,9 @@ class SubagentManager:
                 extras.append(f"pause_reason={snapshot.pause_reason}")
             if snapshot.last_tool_name is not None:
                 extras.append(f"last_tool={snapshot.last_tool_name}")
+            if snapshot.last_activity_at is not None:
+                extras.append(f"last_activity_at={snapshot.last_activity_at}")
+            extras.append(f"report_complete={str(snapshot.report_complete).lower()}")
             if snapshot.last_error is not None:
                 extras.append(f"last_error={snapshot.last_error}")
             if extras:
@@ -431,15 +472,16 @@ class SubagentManager:
             for codename, kind, summary in recent_events[-self._settings.main_context_event_limit :]:
                 lines.append(f"- {codename} [{kind}]: {summary}")
 
-        return (
-            AgentRuntimeMessage(
+        return self._deduplicate_main_context_message(
+            session_id=session_id,
+            message=AgentRuntimeMessage(
                 role="system",
                 metadata={
                     "subagent_status_snapshot": True,
                     "pending_subagent_ids": pending_subagent_ids,
                 },
                 content="\n".join(lines),
-            ),
+            )
         )
 
     def active_snapshots(self) -> tuple[SubagentSnapshot, ...]:
@@ -459,6 +501,8 @@ class SubagentManager:
         notice_text: str,
     ) -> tuple[str | None, AgentRuntimeMessage] | None:
         runtime = self._subagents.get(agent)
+        if runtime is not None and runtime.latest_report is None:
+            runtime.latest_report = self._latest_assistant_report(runtime)
         snapshot = runtime.snapshot() if runtime is not None else self.snapshot_for(agent)
         if snapshot is None:
             return None
@@ -470,6 +514,7 @@ class SubagentManager:
         )
         parts = [
             f"subagent={snapshot.codename}",
+            f'task="{self._truncate_for_notice(snapshot.task_label, max_length=120)}"',
             f"id={snapshot.subagent_id}",
             f"status={snapshot.status}",
             f"notice={notice_kind}",
@@ -481,12 +526,15 @@ class SubagentManager:
             )
         if notice_text.strip():
             parts.append(f'note="{self._truncate_for_notice(notice_text, max_length=140)}"')
-        latest_report = self._latest_assistant_report(runtime) if runtime is not None else None
+        latest_report = snapshot.latest_report
+        rendered_report, report_truncated = self._render_subagent_report_for_main(latest_report)
         content = "\n".join(
             self._build_main_progress_lines(
                 parts=parts,
                 recommendation=recommendation,
-                latest_report=latest_report,
+                latest_report=rendered_report,
+                report_complete=snapshot.report_complete,
+                report_truncated=report_truncated,
             )
         )
         return (
@@ -500,6 +548,8 @@ class SubagentManager:
                     "subagent_notice_kind": notice_kind,
                     "recommended_action": recommendation,
                     "latest_subagent_report_included": bool(latest_report),
+                    "latest_subagent_report_complete": snapshot.report_complete,
+                    "latest_subagent_report_truncated": report_truncated,
                     "pending_subagent_ids": (
                         [snapshot.subagent_id]
                         if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
@@ -516,6 +566,8 @@ class SubagentManager:
         parts: list[str],
         recommendation: str,
         latest_report: str | None,
+        report_complete: bool,
+        report_truncated: bool,
     ) -> list[str]:
         lines = [
             "Subagent update.",
@@ -523,17 +575,28 @@ class SubagentManager:
             f"recommendation={recommendation}",
         ]
         if recommendation in {"finalize", "inspect"} and latest_report is not None:
+            report_heading = (
+                "Complete subagent report:"
+                if report_complete and not report_truncated
+                else "Latest subagent checkpoint:"
+            )
             lines.extend(
                 [
-                    "Latest subagent report:",
-                    self._truncate_subagent_report_for_main(latest_report),
-                    (
-                        "The latest subagent report is already included above. Use it directly "
-                        "instead of calling `subagent_monitor` or `subagent_step_in` unless the "
-                        "report is clearly incomplete or contradictory."
-                    ),
+                    report_heading,
+                    latest_report,
                 ]
             )
+            if report_complete and not report_truncated:
+                lines.append(
+                    "The complete report is included above. Use it directly unless verification "
+                    "or contradictory evidence requires inspection."
+                )
+            else:
+                lines.append(
+                    "This checkpoint is incomplete or truncated. Inspect the child with "
+                    "`subagent_monitor(detail=\"full\")` before relying on it or deciding how to "
+                    "continue."
+                )
         else:
             lines.append(
                 "This is a system update from the orchestrator, not a new user message. "
@@ -574,6 +637,7 @@ class SubagentManager:
         lines = [
             "Subagent supervisor follow-up:",
             f"- codename: {snapshot.codename}",
+            f"- task_label: {snapshot.task_label}",
             f"- subagent_id: {snapshot.subagent_id}",
             f"- status: {snapshot.status}",
             f"- notice_kind: {notice_kind}",
@@ -585,6 +649,13 @@ class SubagentManager:
             lines.append(f"- pause_reason: {snapshot.pause_reason}")
         if snapshot.last_error is not None:
             lines.append(f"- last_error: {snapshot.last_error}")
+        if snapshot.last_error_metadata:
+            lines.append(
+                "- last_error_metadata: "
+                + json.dumps(snapshot.last_error_metadata, ensure_ascii=False, sort_keys=True)
+            )
+        if snapshot.error_log_path is not None:
+            lines.append(f"- error_log_path: {snapshot.error_log_path}")
         if snapshot.last_tool_name is not None:
             lines.append(f"- last_tool_name: {snapshot.last_tool_name}")
         if snapshot.last_activity_at is not None:
@@ -594,13 +665,14 @@ class SubagentManager:
             for note in snapshot.notable_events[-self._settings.main_context_event_limit :]:
                 lines.append(f"  - {note.created_at} [{note.kind}] {note.summary}")
 
-        final_report = self._latest_assistant_report(runtime)
+        final_report = runtime.latest_report or self._latest_assistant_report(runtime)
         if final_report is not None:
             lines.extend(
                 [
                     "",
                     "Latest subagent report:",
                     final_report,
+                    f"report_complete: {str(snapshot.report_complete).lower()}",
                 ]
             )
 
@@ -653,6 +725,9 @@ class SubagentManager:
         runtime.status = "running"
         runtime.pause_reason = None
         runtime.last_error = None
+        runtime.last_error_metadata.clear()
+        runtime.error_log_path = None
+        runtime.report_complete = False
         self._sync_catalog(runtime)
         try:
             if runtime_turn:
@@ -693,6 +768,7 @@ class SubagentManager:
                 if isinstance(event, AgentTextDeltaEvent):
                     continue
                 if isinstance(event, AgentAssistantMessageEvent):
+                    self._capture_assistant_checkpoint(runtime, event.text)
                     continue
                 if isinstance(event, AgentToolCallEvent):
                     runtime.last_tool_name = event.tool_names[-1] if event.tool_names else None
@@ -740,9 +816,11 @@ class SubagentManager:
                     )
                     continue
                 if isinstance(event, AgentTurnDoneEvent):
+                    self._capture_assistant_checkpoint(runtime, event.response_text)
                     if event.interrupted:
                         runtime.status = "paused"
                         runtime.pause_reason = runtime.pending_pause_reason or "main_stop"
+                        runtime.report_complete = False
                         self._append_notable_event(
                             runtime,
                             kind="paused",
@@ -757,6 +835,7 @@ class SubagentManager:
                     elif event.approval_rejected:
                         runtime.status = "paused"
                         runtime.pause_reason = "approval_rejected"
+                        runtime.report_complete = False
                         self._append_notable_event(
                             runtime,
                             kind="approval_rejected",
@@ -772,6 +851,7 @@ class SubagentManager:
                         if runtime.pending_background_job_ids:
                             runtime.status = "waiting_background"
                             runtime.pause_reason = None
+                            runtime.report_complete = False
                             self._append_notable_event(
                                 runtime,
                                 kind="waiting_background",
@@ -792,6 +872,7 @@ class SubagentManager:
                         else:
                             runtime.status = "completed"
                             runtime.pause_reason = None
+                            runtime.report_complete = bool(runtime.latest_report)
                             self._append_notable_event(
                                 runtime,
                                 kind="completed",
@@ -809,6 +890,9 @@ class SubagentManager:
         except Exception as exc:
             runtime.status = "failed"
             runtime.last_error = f"{type(exc).__name__}: {exc}"
+            runtime.last_error_metadata = _exception_metadata(exc)
+            runtime.error_log_path = self._record_subagent_error(runtime, exc)
+            runtime.report_complete = False
             runtime.pending_pause_reason = None
             self._append_notable_event(
                 runtime,
@@ -816,6 +900,11 @@ class SubagentManager:
                 summary=runtime.last_error,
             )
             self._sync_catalog(runtime)
+            LOGGER.exception(
+                "Subagent %s (%s) failed.",
+                runtime.codename,
+                runtime.subagent_id,
+            )
             await self._publish_lifecycle_notice(
                 runtime,
                 notice_kind="subagent_failed",
@@ -915,10 +1004,17 @@ class SubagentManager:
         result: ToolExecutionResult,
         context: ToolExecutionContext,
     ) -> None:
-        if result.name != "bash":
-            return
         runtime = self._subagents.get(subagent_id)
         if runtime is None:
+            return
+        runtime.last_tool_name = result.name
+        self._append_notable_event(
+            runtime,
+            kind="tool_result",
+            summary=self._summarize_tool_result(result),
+        )
+        self._sync_catalog(runtime)
+        if result.name != "bash":
             return
         if self._tool_result_observer is not None:
             try:
@@ -1162,7 +1258,15 @@ class SubagentManager:
     ) -> str:
         if notice_kind in {"subagent_needs_attention", "subagent_failed"}:
             return "inspect"
-        if notice_kind in {"subagent_completed", "subagent_approval_rejected", "subagent_paused"}:
+        if notice_kind in {"subagent_approval_rejected", "subagent_paused"}:
+            return "inspect"
+        if notice_kind == "subagent_completed":
+            return "finalize" if snapshot.report_complete and snapshot.latest_report else "inspect"
+        if snapshot.status in {"paused", "failed"}:
+            return "inspect"
+        if snapshot.status == "completed":
+            return "finalize" if snapshot.report_complete and snapshot.latest_report else "inspect"
+        if snapshot.status == "disposed":
             return "finalize"
         if snapshot.status in {"running", "waiting_background", "awaiting_approval"}:
             return "wait"
@@ -1225,16 +1329,18 @@ class SubagentManager:
             return normalized
         return normalized[: max_length - 3] + "..."
 
-    def _truncate_subagent_report_for_main(
+    def _render_subagent_report_for_main(
         self,
-        value: str,
+        value: str | None,
         *,
-        max_length: int = 1600,
-    ) -> str:
+        max_length: int = 8_000,
+    ) -> tuple[str | None, bool]:
+        if value is None:
+            return None, False
         normalized = value.strip()
         if len(normalized) <= max_length:
-            return normalized
-        return normalized[: max_length - 15].rstrip() + "\n...[truncated]"
+            return normalized, False
+        return normalized[: max_length - 15].rstrip() + "\n...[truncated]", True
 
     def _last_non_empty_line(self, text: str) -> str | None:
         for line in reversed(text.splitlines()):
@@ -1371,6 +1477,46 @@ class SubagentManager:
         while len(runtime.notable_events) > max(self._settings.main_context_event_limit * 2, 12):
             runtime.notable_events.popleft()
 
+    def _capture_assistant_checkpoint(self, runtime: SubagentRuntime, text: str) -> None:
+        normalized = text.strip()
+        if not normalized or normalized == runtime.latest_report:
+            return
+        runtime.latest_report = normalized
+        runtime.report_complete = False
+        summary = self._truncate_for_notice(normalized, max_length=240)
+        if summary is not None:
+            self._append_notable_event(
+                runtime,
+                kind="assistant_checkpoint",
+                summary=summary,
+            )
+
+    def _summarize_tool_result(self, result: ToolExecutionResult) -> str:
+        outcome = "succeeded" if result.ok else "failed"
+        details: list[str] = []
+        if result.name == "file_patch":
+            path = str(result.metadata.get("path", "")).strip()
+            if path:
+                details.append(f"path={path}")
+            if "changed" in result.metadata:
+                details.append(f"changed={str(bool(result.metadata['changed'])).lower()}")
+        elif result.name == "bash":
+            status = str(result.metadata.get("status") or result.metadata.get("state") or "").strip()
+            job_id = str(result.metadata.get("job_id", "")).strip()
+            if status:
+                details.append(f"status={status}")
+            if job_id:
+                details.append(f"job_id={job_id[:8]}")
+        elif result.name == "get_skills":
+            skill_id = str(result.metadata.get("skill_id", "")).strip()
+            mode = str(result.metadata.get("mode", "")).strip()
+            if mode:
+                details.append(f"mode={mode}")
+            if skill_id:
+                details.append(f"skill_id={skill_id}")
+        suffix = " " + " ".join(details) if details else ""
+        return f"{result.name} {outcome}.{suffix}".rstrip()
+
     def _latest_assistant_report(self, runtime: SubagentRuntime) -> str | None:
         session_id = runtime.loop.active_session_id()
         if session_id is None:
@@ -1382,6 +1528,39 @@ class SubagentManager:
             if content:
                 return content
         return None
+
+    def _load_skill_documents(
+        self,
+        skill_ids: tuple[str, ...],
+    ) -> tuple[tuple[str, str], ...]:
+        if not skill_ids:
+            return ()
+        settings = SkillsSettings.from_workspace_dir(self._core_settings.workspace_dir)
+        documents: list[tuple[str, str]] = []
+        for skill_id in skill_ids:
+            skill = get_skill(settings, skill_id)
+            if skill is None:
+                raise ValueError(f"Unknown selected skill id: {skill_id}")
+            documents.append((skill_id, read_skill_markdown(settings, skill)))
+        return tuple(documents)
+
+    def _record_subagent_error(self, runtime: SubagentRuntime, exc: Exception) -> str:
+        error_log_path = runtime.storage.root_dir / "errors.jsonl"
+        entry = {
+            "created_at": _utc_now_iso(),
+            "subagent_id": runtime.subagent_id,
+            "codename": runtime.codename,
+            "task_label": runtime.task_label,
+            "exception_type": type(exc).__name__,
+            "exception_module": type(exc).__module__,
+            "exception_message": str(exc),
+            "exception_metadata": _exception_metadata(exc),
+            "traceback": traceback.format_exc(),
+        }
+        with error_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False, default=str))
+            handle.write("\n")
+        return str(error_log_path)
 
     async def _publish_lifecycle_notice(
         self,
@@ -1411,29 +1590,74 @@ class SubagentManager:
             current_subagent_session_id=runtime.loop.active_session_id(),
             pause_reason=runtime.pause_reason,
             last_error=runtime.last_error,
+            last_error_metadata=runtime.last_error_metadata,
+            error_log_path=runtime.error_log_path,
             disposed_at=disposed_at,
         )
 
-    def _serialize_snapshot(self, snapshot: SubagentSnapshot, *, detail: str) -> dict[str, Any]:
+    def _serialize_snapshot(self, runtime: SubagentRuntime, *, detail: str) -> dict[str, Any]:
+        if runtime.latest_report is None:
+            runtime.latest_report = self._latest_assistant_report(runtime)
+        snapshot = runtime.snapshot()
         payload: dict[str, Any] = {
             "subagent_id": snapshot.subagent_id,
             "codename": snapshot.codename,
+            "task_label": snapshot.task_label,
             "status": snapshot.status,
             "owner_main_session_id": snapshot.owner_main_session_id,
             "owner_main_turn_id": snapshot.owner_main_turn_id,
             "current_subagent_session_id": snapshot.current_subagent_session_id,
             "pause_reason": snapshot.pause_reason,
             "last_error": snapshot.last_error,
+            "last_error_metadata": snapshot.last_error_metadata,
+            "error_log_path": snapshot.error_log_path,
             "last_tool_name": snapshot.last_tool_name,
             "last_activity_at": snapshot.last_activity_at,
+            "report_complete": snapshot.report_complete,
             "pending_background_job_count": snapshot.pending_background_job_count,
             "pending_background_job_ids": list(snapshot.pending_background_job_ids),
         }
         if detail == "full":
+            payload.update(
+                {
+                    "instructions": snapshot.instructions,
+                    "user_constraints": snapshot.user_constraints,
+                    "shared_context": snapshot.shared_context,
+                    "owned_paths": list(snapshot.owned_paths),
+                    "skill_ids": list(snapshot.skill_ids),
+                    "deliverable": snapshot.deliverable,
+                    "latest_report": snapshot.latest_report,
+                    "transcript_path": self._transcript_path(runtime),
+                }
+            )
             payload["notable_events"] = [
                 note.to_dict() for note in snapshot.notable_events
             ]
         return payload
+
+    def _transcript_path(self, runtime: SubagentRuntime) -> str | None:
+        session_id = runtime.loop.active_session_id()
+        if session_id is None:
+            return None
+        return str(runtime.storage.root_dir / "sessions" / f"{session_id}.jsonl")
+
+    def _deduplicate_main_context_message(
+        self,
+        *,
+        session_id: str,
+        message: AgentRuntimeMessage,
+    ) -> tuple[AgentRuntimeMessage, ...]:
+        signature = json.dumps(
+            {"metadata": message.metadata, "content": message.content},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        cache_key = (session_id, signature)
+        if cache_key == self._last_main_context_signature:
+            return ()
+        self._last_main_context_signature = cache_key
+        return (message,)
 
     async def _wait_for_turn_settle(self, runtime: SubagentRuntime) -> None:
         task = runtime.task
@@ -1454,9 +1678,7 @@ class SubagentManager:
         if runtime.pending_pause_reason == pause_reason:
             return False
         interruption_reason: str
-        if pause_reason == "superseded_by_user_message":
-            interruption_reason = "superseded_by_user_message"
-        elif pause_reason == "new_session":
+        if pause_reason == "new_session":
             interruption_reason = "new_session"
         else:
             interruption_reason = "user_stop"
@@ -1476,9 +1698,18 @@ class SubagentManager:
         if normalized in self._subagents:
             return self._subagents[normalized]
         lowered = normalized.lower()
-        for runtime in self._subagents.values():
-            if runtime.codename.lower() == lowered:
-                return runtime
+        matches = [
+            runtime
+            for runtime in self._subagents.values()
+            if runtime.codename.lower() == lowered
+        ]
+        active_matches = [runtime for runtime in matches if runtime.status != "disposed"]
+        if len(active_matches) == 1:
+            return active_matches[0]
+        if len(active_matches) > 1:
+            raise ValueError(f"Ambiguous active subagent codename: {agent}")
+        if matches:
+            return matches[-1]
         raise ValueError(f"Unknown subagent: {agent}")
 
     def _non_disposed_runtimes(self) -> list[SubagentRuntime]:
@@ -1496,6 +1727,24 @@ class SubagentManager:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _normalize_unique_strings(values: tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return tuple(normalized)
+
+
+def _exception_metadata(exc: Exception) -> dict[str, Any]:
+    if not isinstance(exc, LLMError):
+        return {}
+    return json.loads(json.dumps(exc.metadata, ensure_ascii=False, default=str))
 
 
 def _terminal_notice_kind_for_status(*, status: str, exit_code: object) -> str:

@@ -42,6 +42,7 @@ from jarvis.gateway.route_runtime import (
 )
 from jarvis.gateway.session_router import SessionRouter, validate_route_id
 from jarvis.subagent.types import SubagentSnapshot
+from jarvis.subagent.primitives import build_subagent_primitive_definitions
 from tests.helpers import build_core_settings
 from jarvis.tools import ToolExecutionResult, ToolSettings
 from jarvis.tools.basic.bash.jobs import (
@@ -269,15 +270,30 @@ class CompositeMainBootstrapLoaderTests(unittest.TestCase):
         self.assertIsNotNone(subagent_text)
         if subagent_text is None:
             self.fail("Expected subagent control bootstrap text.")
-        self.assertIn("wait for orchestrator updates before polling", subagent_text)
+        self.assertIn("Continue independent main-task work after invoking", subagent_text)
+        self.assertIn("stable `task_label`", subagent_text)
         self.assertIn("not live prompt injection", subagent_text)
         self.assertIn("detail=\"full\"", subagent_text)
         self.assertNotIn("Arguments:", subagent_text)
         self.assertNotIn("Subagent runtime control reference:", subagent_text)
-        self.assertLess(len(subagent_text), 900)
+        self.assertLess(len(subagent_text), 1_500)
 
 
 class RouteRuntimeToolResultTests(unittest.TestCase):
+    def test_subagent_invoke_schema_requires_structured_assignment_identity(self) -> None:
+        definitions = {
+            definition.name: definition
+            for definition in build_subagent_primitive_definitions()
+        }
+        schema = definitions["subagent_invoke"].input_schema
+
+        self.assertEqual(schema["required"], ["task_label", "instructions"])
+        self.assertNotIn("context", schema["properties"])
+        self.assertIn("user_constraints", schema["properties"])
+        self.assertIn("shared_context", schema["properties"])
+        self.assertIn("owned_paths", schema["properties"])
+        self.assertIn("skill_ids", schema["properties"])
+
     def test_subagent_tool_results_mark_control_metadata(self) -> None:
         result = _tool_result_for_payload(
             call_id="call_1",
@@ -413,7 +429,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 ) as request_stop:
                     with patch.object(
                         runtime._subagent_manager,
-                        "request_stop_all_for_superseded_user_message",
+                        "request_stop_all_for_user_stop",
                         return_value=(),
                     ) as stop_subagents:
                         await runtime.enqueue_user_message(
@@ -422,7 +438,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                         )
 
             request_stop.assert_called_once_with(reason="superseded_by_user_message")
-            stop_subagents.assert_called_once_with()
+            stop_subagents.assert_not_called()
             queued = runtime._user_message_queue.get_nowait()
             self.assertEqual(queued.user_text, "continue")
             self.assertEqual(queued.client_message_id, "msg_2")
@@ -479,20 +495,14 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     with patch.object(
                         runtime._subagent_manager,
-                        "request_stop_all_for_superseded_user_message",
+                        "request_stop_all_for_user_stop",
                         return_value=(),
-                    ) as stop_superseded:
-                        with patch.object(
-                            runtime._subagent_manager,
-                            "request_stop_all_for_user_stop",
-                            return_value=(),
-                        ) as stop_cooperative:
-                            await runtime.enqueue_user_message("/new")
+                    ) as stop_cooperative:
+                        await runtime.enqueue_user_message("/new")
 
-            stop_superseded.assert_not_called()
             stop_cooperative.assert_not_called()
 
-    async def test_enqueue_user_message_supersedes_background_subagent_work_when_main_idle(
+    async def test_enqueue_user_message_does_not_interrupt_background_subagent_when_main_idle(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,7 +519,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             ) as request_stop:
                 with patch.object(
                     runtime._subagent_manager,
-                    "request_stop_all_for_superseded_user_message",
+                    "request_stop_all_for_user_stop",
                     return_value=(),
                 ) as stop_subagents:
                     await runtime.enqueue_user_message(
@@ -518,7 +528,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                     )
 
             request_stop.assert_called_once_with(reason="superseded_by_user_message")
-            stop_subagents.assert_called_once_with()
+            stop_subagents.assert_not_called()
             queued = runtime._user_message_queue.get_nowait()
             self.assertEqual(queued.user_text, "redirect the task")
             self.assertEqual(queued.client_message_id, "msg_3")
@@ -1157,7 +1167,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 owner_main_session_id=session_id,
                 owner_main_turn_id="turn_1",
                 current_subagent_session_id="sub_session",
-                pause_reason="superseded_by_user_message",
+                pause_reason="main_stop",
             )
 
             with patch.object(runtime, "_ensure_message_worker"):
@@ -1174,7 +1184,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                             subagent_id="sub_1",
                             session_id="sub_session",
                             notice_kind="subagent_paused",
-                            text="paused (superseded_by_user_message).",
+                            text="paused (main_stop).",
                         )
                     )
 

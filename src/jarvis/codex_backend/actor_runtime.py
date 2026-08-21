@@ -1901,16 +1901,6 @@ def _orchestrator_wait_reason(result: ToolExecutionResult) -> str | None:
         ):
             return "orchestrator_wait_bash"
         return None
-    if not result.metadata.get("subagent_control"):
-        return None
-    action = str(result.metadata.get("subagent_action", "")).strip()
-    status = str(result.metadata.get("status", "")).strip()
-    if action in {"invoke", "step_in"} and status in {
-        "running",
-        "waiting_background",
-        "awaiting_approval",
-    }:
-        return "orchestrator_wait_subagent"
     return None
 
 

@@ -275,7 +275,6 @@ If a Jarvis tool result starts async work that the route orchestrator is meant t
 Current yield-producing tool results are:
 
 - `bash` results where the job is still `running` in background mode or was promoted to background
-- `subagent_invoke` / `subagent_step_in` results whose status is `running`, `waiting_background`, or `awaiting_approval`
 
 Behavior:
 
@@ -285,16 +284,17 @@ Behavior:
 4. if Codex races and sends another `item/tool/call` before the interrupt lands, Jarvis returns a backend-local rejection response instead of executing more work
 5. when Codex reports the interrupted/completed turn, Jarvis emits a normal `done` event, not `codex_backend_error`
 
-This is how Codex-backed actors rejoin the same orchestration model used by normal providers:
+This is how Codex-backed actors rejoin orchestration for detached bash work:
 
 - the current turn ends cleanly
 - `RouteRuntime` regains control
-- later bash/subagent notices can enqueue new runtime follow-up turns
+- later bash notices can enqueue new runtime follow-up turns
 
 The last point applies within one live session. A `/new` hard boundary invalidates those queued turns, terminates detached jobs, disposes subagents, and prevents any old-session orchestrator notice from resuming the new Codex session.
 
-For main-agent subagent completion/finalize notices, the orchestrator progress message now includes the latest persisted subagent assistant report when available.
-That lets Codex finalize against the child’s actual reported result instead of reopening the child with `subagent_monitor` or `subagent_step_in` just to recover the already-persisted output.
+`subagent_invoke` and `subagent_step_in` do not yield the current Codex main turn. Their advisory tells Jarvis to continue useful independent work without polling; later child notices can enqueue runtime follow-up turns.
+
+For main-agent child notices, completed children can include a complete report while paused, rejected, failed, or truncated cases include an explicitly incomplete checkpoint and recommend inspection. Full monitoring exposes the untruncated report, structured failure metadata, and transcript/error-log paths.
 
 The backend does not currently force a synthetic assistant progress message before yielding.
 If no assistant text was already produced, the user-visible output for that turn comes from the normal tool/system notice path rather than a final assistant message.

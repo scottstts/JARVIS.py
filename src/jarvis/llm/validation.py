@@ -86,8 +86,12 @@ def validate_tool_call_arguments(
     try:
         Draft202012Validator(schema).validate(arguments)
     except ValidationError as exc:
+        instance_path = _format_json_path(exc.absolute_path)
+        schema_path = _format_json_path(exc.absolute_schema_path, root="$schema")
+        received = _format_validation_value(exc.instance)
         raise ToolCallValidationError(
-            f"Tool '{name}' arguments failed schema validation: {exc.message}",
+            f"Tool '{name}' arguments failed schema validation at {instance_path}: "
+            f"{exc.message}. Received: {received}. Schema rule: {schema_path}.",
             tool_name=name,
             call_id=call_id,
         ) from exc
@@ -191,3 +195,24 @@ def _best_effort_load_tool_call_arguments(raw_arguments: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return {}
     return parsed
+
+
+def _format_json_path(path: Sequence[object], *, root: str = "$") -> str:
+    rendered = root
+    for component in path:
+        if isinstance(component, int):
+            rendered += f"[{component}]"
+            continue
+        name = str(component)
+        if name.isidentifier():
+            rendered += f".{name}"
+        else:
+            rendered += "[" + json.dumps(name, ensure_ascii=False) + "]"
+    return rendered
+
+
+def _format_validation_value(value: Any, *, max_chars: int = 240) -> str:
+    rendered = json.dumps(value, ensure_ascii=False, default=str)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 15].rstrip() + "...[truncated]"

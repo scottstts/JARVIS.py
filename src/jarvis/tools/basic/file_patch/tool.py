@@ -163,7 +163,9 @@ def _build_file_patch_tool_description(settings: ToolSettings) -> str:
         "file_patch calls only when one patch payload would otherwise become too large or "
         "unreliable. "
         "Matching is exact literal text only and edit operations fail when the target text is "
-        "missing or ambiguous."
+        "missing or ambiguous. Example: "
+        '{"path":"src/app.py","operations":[{"type":"replace","old":"x = 1",'
+        '"new":"x = 2"}]}.'
     )
 
 

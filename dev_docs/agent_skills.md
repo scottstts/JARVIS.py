@@ -204,6 +204,7 @@ Current behavior:
 - subagents receive the same skill bootstrap mode as configured
 - subagents may read `/workspace/skills`
 - subagents should not install, create, or update skills unless the assignment explicitly asks for it
+- `subagent_invoke.skill_ids` lets Jarvis select up to four canonical installed skills; Jarvis validates those ids and embeds each selected `SKILL.md` into the child assignment bootstrap
 
 Codex-backed subagents receive skill context through their Codex developer-instructions path.
 

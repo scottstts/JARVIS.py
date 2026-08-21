@@ -20,7 +20,15 @@ from jarvis.gateway.route_events import (
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
 )
-from jarvis.llm import DoneEvent, LLMRequest, LLMResponse, LLMUsage, TextDeltaEvent
+from jarvis.llm import (
+    DoneEvent,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    ProviderBadRequestError,
+    TextDeltaEvent,
+    TextPart,
+)
 from jarvis.storage import ConversationRecord
 from jarvis.subagent.manager import SubagentManager
 from jarvis.subagent.runtime import SubagentRuntime
@@ -108,6 +116,17 @@ class _FakeSubagentLoop:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _FailingSubagentLoop(_FakeSubagentLoop):
+    async def stream_turn(self, *, user_text: str, force_session_id: str | None, pre_turn_messages):
+        _ = (user_text, force_session_id, pre_turn_messages)
+        if False:
+            yield None
+        raise ProviderBadRequestError(
+            "provider rejected child request",
+            metadata={"provider": "fake", "request_id": "req_child_1"},
+        )
 
 
 class SubagentSettingsTests(unittest.TestCase):
@@ -200,6 +219,8 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 status="completed",
                 created_at="2026-04-07T00:00:00+00:00",
                 updated_at="2026-04-07T00:00:00+00:00",
+                task_label="Inspect workspace",
+                report_complete=True,
             )
 
             payload = manager.build_main_progress_message(
@@ -212,13 +233,122 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             if payload is None:
                 self.fail("Expected a progress payload.")
             _session_id, message = payload
-            self.assertIn("Latest subagent report:", message.content)
+            self.assertIn("Complete subagent report:", message.content)
             self.assertIn("one\ntwo\nUsed bash.", message.content)
             self.assertIn(
-                "instead of calling `subagent_monitor` or `subagent_step_in`",
+                "The complete report is included above.",
                 message.content,
             )
             self.assertEqual(message.metadata["latest_subagent_report_included"], True)
+            self.assertEqual(message.metadata["latest_subagent_report_complete"], True)
+
+    async def test_paused_subagent_checkpoint_requires_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            )
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            storage = manager._catalog.session_storage(
+                owner_main_session_id="main_session",
+                subagent_id="sub_paused",
+            )
+            manager._subagents["sub_paused"] = SubagentRuntime(
+                subagent_id="sub_paused",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="paused_session"),  # type: ignore[arg-type]
+                storage=storage,
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="paused",
+                created_at="2026-04-07T00:00:00+00:00",
+                updated_at="2026-04-07T00:00:00+00:00",
+                task_label="Partial review",
+                latest_report="I inspected the schema but did not run validation.",
+                report_complete=False,
+                pause_reason="main_stop",
+            )
+
+            payload = manager.build_main_progress_message(
+                agent="sub_paused",
+                notice_kind="subagent_paused",
+                notice_text="paused.",
+            )
+
+            self.assertIsNotNone(payload)
+            if payload is None:
+                self.fail("Expected paused progress payload.")
+            _session_id, message = payload
+            self.assertEqual(message.metadata["recommended_action"], "inspect")
+            self.assertIn("Latest subagent checkpoint:", message.content)
+            self.assertIn("incomplete or truncated", message.content)
+
+    async def test_main_status_snapshot_is_suppressed_until_subagent_state_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            )
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="running_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="running",
+                created_at="2026-04-07T00:00:00+00:00",
+                updated_at="2026-04-07T00:00:00+00:00",
+                task_label="Inspect runtime",
+            )
+            manager._subagents[runtime.subagent_id] = runtime
+
+            first = manager.main_turn_runtime_messages(session_id="main_session")
+            unchanged = manager.main_turn_runtime_messages(session_id="main_session")
+            compacted_session = manager.main_turn_runtime_messages(
+                session_id="compacted_session"
+            )
+            manager._append_notable_event(
+                runtime,
+                kind="checkpoint",
+                summary="Inspected the runtime interface.",
+            )
+            changed = manager.main_turn_runtime_messages(session_id="compacted_session")
+
+            self.assertEqual(len(first), 1)
+            self.assertIn("Inspect runtime", first[0].content)
+            self.assertEqual(unchanged, ())
+            self.assertEqual(len(compacted_session), 1)
+            self.assertEqual(len(changed), 1)
+            self.assertIn("Inspected the runtime interface.", changed[0].content)
 
     async def test_invoke_returns_session_id_and_catalog_owner_linkage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -242,6 +372,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             payload = await manager.invoke(
                 requester_kind="main",
+                task_label="Inspect workspace",
                 instructions="Inspect the workspace and report back.",
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
@@ -267,6 +398,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected subagent catalog entry to exist.")
             self.assertEqual(entry.owner_main_session_id, "main_session")
             self.assertEqual(entry.owner_main_turn_id, "main_turn")
+            self.assertEqual(entry.task_label, "Inspect workspace")
             self.assertEqual(entry.current_subagent_session_id, payload["session_id"])
             self.assertEqual(entry.status, "completed")
             self.assertTrue(
@@ -304,6 +436,128 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completion_notice.notice_kind, "subagent_completed")
             self.assertEqual(completion_notice.text, "completed.")
             self.assertFalse(completion_notice.public)
+
+    async def test_invoke_forwards_structured_context_and_selected_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            skill_dir = core_settings.workspace_dir / "skills" / "review-check"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: Review Check\n"
+                "description: Enforce the selected review protocol.\n"
+                "---\n\n"
+                "Always include SKILL_FORWARDING_SENTINEL in the review.\n",
+                encoding="utf-8",
+            )
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+            llm_service = _FakeSubagentLLMService()
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=llm_service,
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Review storage contract",
+                instructions="Review the storage boundary.",
+                user_constraints="Do not edit production files.",
+                shared_context="SessionStorage is the shared interface.",
+                owned_paths=("tests/test_storage.py",),
+                skill_ids=("review-check",),
+                deliverable="A concise evidence-backed review.",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+
+            bootstrap_text = "\n".join(
+                part.text
+                for message in llm_service.requests[0].messages
+                for part in message.parts
+                if isinstance(part, TextPart)
+            )
+            self.assertIn("task_label: Review storage contract", bootstrap_text)
+            self.assertIn("Do not edit production files.", bootstrap_text)
+            self.assertIn("SessionStorage is the shared interface.", bootstrap_text)
+            self.assertIn("- tests/test_storage.py", bootstrap_text)
+            self.assertIn("--- BEGIN SKILL review-check ---", bootstrap_text)
+            self.assertIn("SKILL_FORWARDING_SENTINEL", bootstrap_text)
+            self.assertEqual(payload["skill_ids"], ["review-check"])
+
+            entry = manager._catalog.get_entry(payload["subagent_id"])
+            self.assertIsNotNone(entry)
+            if entry is None:
+                self.fail("Expected structured assignment to be persisted.")
+            self.assertEqual(entry.task_label, "Review storage contract")
+            self.assertEqual(entry.skill_ids, ("review-check",))
+            self.assertEqual(entry.owned_paths, ("tests/test_storage.py",))
+
+    async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            registry = ToolRegistry.default(tool_settings)
+
+            async def publish_event(_event: object) -> None:
+                return None
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            failing_loop = _FailingSubagentLoop([], session_id="failed_session")
+
+            with patch.object(manager, "_build_subagent_loop", return_value=failing_loop):
+                payload = await manager.invoke(
+                    requester_kind="main",
+                    task_label="Fail visibly",
+                    instructions="Exercise provider error reporting.",
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="main_turn",
+                )
+
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+
+            self.assertEqual(runtime.status, "failed")
+            self.assertEqual(runtime.last_error_metadata["request_id"], "req_child_1")
+            self.assertIsNotNone(runtime.error_log_path)
+            if runtime.error_log_path is None:
+                self.fail("Expected a child error log path.")
+            error_log = Path(runtime.error_log_path)
+            self.assertTrue(error_log.exists())
+            error_text = error_log.read_text(encoding="utf-8")
+            self.assertIn("ProviderBadRequestError", error_text)
+            self.assertIn("req_child_1", error_text)
+            self.assertIn("traceback", error_text)
+
+            monitored = await manager.monitor(agent=payload["subagent_id"], detail="full")
+            snapshot = monitored["subagents"][0]
+            self.assertEqual(snapshot["last_error_metadata"]["provider"], "fake")
+            self.assertEqual(snapshot["error_log_path"], str(error_log))
+            entry = manager._catalog.get_entry(payload["subagent_id"])
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertEqual(entry.last_error_metadata["request_id"], "req_child_1")
 
     async def test_subagent_publishes_resume_and_completion_notices_after_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,6 +613,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(manager, "_build_subagent_loop", return_value=fake_loop):
                 payload = await manager.invoke(
                     requester_kind="main",
+                    task_label="Approval workflow",
                     instructions="Do the task.",
                     owner_main_session_id="main_session",
                     owner_main_turn_id="main_turn",
@@ -504,114 +759,6 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(awaiting_loop.stop_reasons, ["user_stop"])
             self.assertEqual(manager._subagents["sub_running"].pending_pause_reason, "main_stop")
             self.assertEqual(manager._subagents["sub_awaiting"].pending_pause_reason, "main_stop")
-            self.assertIsNone(manager._subagents["sub_paused"].pending_pause_reason)
-            self.assertIsNone(manager._subagents["sub_completed"].pending_pause_reason)
-
-    async def test_request_stop_all_for_superseded_user_message_marks_superseded_pause_reason(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            core_settings = build_core_settings(root_dir=Path(tmp))
-            tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
-            registry = ToolRegistry.default(tool_settings)
-
-            async def publish_event(_event: object) -> None:
-                return None
-
-            manager = SubagentManager(
-                route_id="route_1",
-                llm_service=_FakeSubagentLLMService(),
-                core_settings=core_settings,
-                tool_registry=registry,
-                tool_execution_guard=asyncio.Semaphore(1),
-                publish_event=publish_event,
-                register_approval_target=lambda _approval_id, _loop: None,
-            )
-
-            running_loop = _FakeSubagentLoop([], session_id="running_session")
-            paused_loop = _FakeSubagentLoop([], session_id="paused_session")
-            awaiting_loop = _FakeSubagentLoop([], session_id="awaiting_session")
-            completed_loop = _FakeSubagentLoop([], session_id="completed_session")
-
-            manager._subagents = {
-                "sub_running": SubagentRuntime(
-                    subagent_id="sub_running",
-                    codename="Friday",
-                    loop=running_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage(
-                        owner_main_session_id="main_session",
-                        subagent_id="sub_running",
-                    ),
-                    owner_main_session_id="main_session",
-                    owner_main_turn_id="main_turn",
-                    status="running",
-                    created_at="2026-03-19T12:00:00+00:00",
-                    updated_at="2026-03-19T12:00:00+00:00",
-                ),
-                "sub_paused": SubagentRuntime(
-                    subagent_id="sub_paused",
-                    codename="Karen",
-                    loop=paused_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage(
-                        owner_main_session_id="main_session",
-                        subagent_id="sub_paused",
-                    ),
-                    owner_main_session_id="main_session",
-                    owner_main_turn_id="main_turn",
-                    status="paused",
-                    created_at="2026-03-19T12:00:00+00:00",
-                    updated_at="2026-03-19T12:00:00+00:00",
-                ),
-                "sub_awaiting": SubagentRuntime(
-                    subagent_id="sub_awaiting",
-                    codename="Ultron",
-                    loop=awaiting_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage(
-                        owner_main_session_id="main_session",
-                        subagent_id="sub_awaiting",
-                    ),
-                    owner_main_session_id="main_session",
-                    owner_main_turn_id="main_turn",
-                    status="awaiting_approval",
-                    created_at="2026-03-19T12:00:00+00:00",
-                    updated_at="2026-03-19T12:00:00+00:00",
-                ),
-                "sub_completed": SubagentRuntime(
-                    subagent_id="sub_completed",
-                    codename="Edith",
-                    loop=completed_loop,  # type: ignore[arg-type]
-                    storage=manager._catalog.session_storage(
-                        owner_main_session_id="main_session",
-                        subagent_id="sub_completed",
-                    ),
-                    owner_main_session_id="main_session",
-                    owner_main_turn_id="main_turn",
-                    status="completed",
-                    created_at="2026-03-19T12:00:00+00:00",
-                    updated_at="2026-03-19T12:00:00+00:00",
-                ),
-            }
-
-            affected = manager.request_stop_all_for_superseded_user_message()
-
-            self.assertEqual(
-                [snapshot.subagent_id for snapshot in affected],
-                ["sub_running", "sub_awaiting"],
-            )
-            self.assertEqual(running_loop.stop_requests, 1)
-            self.assertEqual(awaiting_loop.stop_requests, 1)
-            self.assertEqual(paused_loop.stop_requests, 0)
-            self.assertEqual(completed_loop.stop_requests, 0)
-            self.assertEqual(running_loop.stop_reasons, ["superseded_by_user_message"])
-            self.assertEqual(awaiting_loop.stop_reasons, ["superseded_by_user_message"])
-            self.assertEqual(
-                manager._subagents["sub_running"].pending_pause_reason,
-                "superseded_by_user_message",
-            )
-            self.assertEqual(
-                manager._subagents["sub_awaiting"].pending_pause_reason,
-                "superseded_by_user_message",
-            )
             self.assertIsNone(manager._subagents["sub_paused"].pending_pause_reason)
             self.assertIsNone(manager._subagents["sub_completed"].pending_pause_reason)
 
@@ -1038,6 +1185,14 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 runtime.pending_background_job_ids,
                 {"deadbeefdeadbeefdeadbeefdeadbeef"},
             )
+            self.assertTrue(
+                any(
+                    note.kind == "tool_result"
+                    and "bash succeeded" in note.summary
+                    and "status=running" in note.summary
+                    for note in runtime.notable_events
+                )
+            )
 
     async def test_bash_job_followup_resumes_waiting_subagent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1281,12 +1436,23 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 status="waiting_background",
                 created_at="2026-03-21T10:00:00+00:00",
                 updated_at="2026-03-21T10:00:00+00:00",
+                task_label="Wait for validation",
+                instructions="Run the detached validation and report results.",
+                user_constraints="Do not modify source files.",
+                shared_context="Validation owns the shared test database.",
+                owned_paths=("tests/",),
+                skill_ids=("testing",),
+                deliverable="Validation evidence.",
+                latest_report="Validation started; terminal result is pending.",
+                report_complete=False,
+                last_activity_at="2026-03-21T10:00:01+00:00",
             )
             runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
             manager._subagents[runtime.subagent_id] = runtime
 
             first = await manager.monitor(agent="sub_1", detail="summary")
             second = await manager.monitor(agent="sub_1", detail="summary")
+            full = await manager.monitor(agent="sub_1", detail="full")
 
             self.assertTrue(first["changed"])
             self.assertEqual(
@@ -1295,6 +1461,13 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(second["changed"])
             self.assertIn("Wait for orchestrator updates", second["message"])
+            full_snapshot = full["subagents"][0]
+            self.assertEqual(full_snapshot["task_label"], "Wait for validation")
+            self.assertEqual(full_snapshot["latest_report"], runtime.latest_report)
+            self.assertFalse(full_snapshot["report_complete"])
+            self.assertEqual(full_snapshot["owned_paths"], ["tests/"])
+            self.assertEqual(full_snapshot["skill_ids"], ["testing"])
+            self.assertTrue(full_snapshot["transcript_path"].endswith("subagent_session.jsonl"))
 
     async def test_completed_subagent_counts_until_dispose_and_codename_reuses_after_dispose(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1331,6 +1504,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             first = await manager.invoke(
                 requester_kind="main",
+                task_label="First task",
                 instructions="First task.",
                 owner_main_session_id="main_session",
                 owner_main_turn_id="turn_1",
@@ -1342,6 +1516,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "Subagent limit reached"):
                 await manager.invoke(
                     requester_kind="main",
+                    task_label="Blocked second task",
                     instructions="Second task should wait.",
                     owner_main_session_id="main_session",
                     owner_main_turn_id="turn_2",
@@ -1360,6 +1535,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             second = await manager.invoke(
                 requester_kind="main",
+                task_label="Second task",
                 instructions="Second task.",
                 owner_main_session_id="main_session",
                 owner_main_turn_id="turn_2",
@@ -1368,6 +1544,11 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             second_runtime = manager._subagents[second["subagent_id"]]
             if second_runtime.task is not None:
                 await asyncio.wait_for(second_runtime.task, timeout=1)
+
+            dispose_current = await manager.dispose(agent="Friday")
+            self.assertEqual(dispose_current["subagent_id"], second["subagent_id"])
+            self.assertTrue(dispose_current["changed"])
+            self.assertEqual(second_runtime.status, "disposed")
 
     async def test_subagent_loop_uses_configured_provider_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1404,6 +1585,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             payload = await manager.invoke(
                 requester_kind="main",
+                task_label="Provider override",
                 instructions="Do the task.",
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",

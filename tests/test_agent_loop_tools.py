@@ -825,9 +825,11 @@ class _FakeStreamingViewImageWaitingLLMService:
         expected_image_bytes: bytes,
         *,
         waiting_metadata: dict[str, object],
+        expect_waiting: bool = True,
     ) -> None:
         self._expected_image_bytes = expected_image_bytes
         self._waiting_metadata = waiting_metadata
+        self._expect_waiting = expect_waiting
         self.stream_calls = 0
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -856,6 +858,20 @@ class _FakeStreamingViewImageWaitingLLMService:
                     finish_reason="tool_calls",
                 )
             )
+            return
+
+        if not self._expect_waiting:
+            if names != _EXPECTED_BASIC_TOOL_NAMES:
+                raise AssertionError(
+                    "Expected pending subagents to leave follow-up tools available."
+                )
+            if request.messages[-3].role != "assistant":
+                raise AssertionError("Expected assistant tool-call message before tool result.")
+            if request.messages[-2].role != "tool":
+                raise AssertionError("Expected tool result before image attachment.")
+            if request.messages[-1].role != "user":
+                raise AssertionError("Expected transient image attachment without a waiting note.")
+            yield DoneEvent(response=_build_response("Continued independent main work."))
             return
 
         if names:
@@ -3283,7 +3299,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-2].metadata["detached_bash_job_ids"], ["job_1"])
             self.assertEqual(message_records[-1].role, "assistant")
 
-    async def test_stream_turn_keeps_waiting_note_after_view_image_with_pending_subagent(self) -> None:
+    async def test_stream_turn_keeps_tools_available_with_pending_subagent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             image_path = settings.workspace_dir / "temp" / "sample.png"
@@ -3299,6 +3315,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                         "subagents_pending": True,
                         "pending_subagent_ids": ["subagent_1"],
                     },
+                    expect_waiting=False,
                 ),
                 settings=settings,
                 storage=storage,
@@ -3317,17 +3334,20 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             done_events = [event for event in events if isinstance(event, AgentTurnDoneEvent)]
             self.assertEqual(len(done_events), 1)
-            self.assertEqual(done_events[0].response_text, "Waiting on background work.")
+            self.assertEqual(done_events[0].response_text, "Continued independent main work.")
 
             records = storage.load_records(done_events[0].session_id)
             message_records = [record for record in records if record.kind == "message"]
-            self.assertEqual(message_records[-4].role, "assistant")
-            self.assertEqual(message_records[-4].metadata["tool_calls"][0]["name"], "view_image")
-            self.assertEqual(message_records[-3].role, "tool")
-            self.assertEqual(message_records[-2].role, "system")
-            self.assertTrue(message_records[-2].metadata["orchestrator_monitored_waiting"])
-            self.assertEqual(message_records[-2].metadata["pending_subagent_ids"], ["subagent_1"])
+            self.assertEqual(message_records[-3].role, "assistant")
+            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "view_image")
+            self.assertEqual(message_records[-2].role, "tool")
             self.assertEqual(message_records[-1].role, "assistant")
+            self.assertFalse(
+                any(
+                    record.metadata.get("orchestrator_monitored_waiting")
+                    for record in message_records
+                )
+            )
 
     async def test_handle_user_input_executes_file_patch_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

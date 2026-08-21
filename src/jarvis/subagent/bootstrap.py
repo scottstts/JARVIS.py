@@ -30,8 +30,12 @@ def build_assignment_message(
     *,
     codename: str,
     subagent_id: str,
+    task_label: str,
     instructions: str,
-    context: str | None = None,
+    user_constraints: str | None = None,
+    shared_context: str | None = None,
+    owned_paths: tuple[str, ...] = (),
+    skill_documents: tuple[tuple[str, str], ...] = (),
     deliverable: str | None = None,
 ) -> LLMMessage:
     return LLMMessage.text(
@@ -39,8 +43,12 @@ def build_assignment_message(
         _render_assignment_text(
             codename=codename,
             subagent_id=subagent_id,
+            task_label=task_label,
             instructions=instructions,
-            context=context,
+            user_constraints=user_constraints,
+            shared_context=shared_context,
+            owned_paths=owned_paths,
+            skill_documents=skill_documents,
             deliverable=deliverable,
         ),
     )
@@ -73,25 +81,58 @@ def _render_assignment_text(
     *,
     codename: str,
     subagent_id: str,
+    task_label: str,
     instructions: str,
-    context: str | None,
+    user_constraints: str | None,
+    shared_context: str | None,
+    owned_paths: tuple[str, ...],
+    skill_documents: tuple[tuple[str, str], ...],
     deliverable: str | None,
 ) -> str:
     lines = [
         "Task assignment from Jarvis.",
         f"codename: {codename}",
         f"subagent_id: {subagent_id}",
+        f"task_label: {task_label.strip()}",
         "instructions:",
         instructions.strip(),
     ]
-    if context is not None and context.strip():
+    if user_constraints is not None and user_constraints.strip():
         lines.extend(
             [
                 "",
-                "context:",
-                context.strip(),
+                "user_constraints (preserve exactly; do not reinterpret):",
+                user_constraints.strip(),
             ]
         )
+    if shared_context is not None and shared_context.strip():
+        lines.extend(
+            [
+                "",
+                "shared_context (interfaces, environment, and coordination facts):",
+                shared_context.strip(),
+            ]
+        )
+    if owned_paths:
+        lines.extend(["", "owned_paths:"])
+        lines.extend(f"- {path}" for path in owned_paths)
+    if skill_documents:
+        lines.extend(
+            [
+                "",
+                "selected_skills:",
+                "Jarvis selected the following skills for this assignment. Follow them.",
+            ]
+        )
+        for skill_id, document in skill_documents:
+            lines.extend(
+                [
+                    "",
+                    f"--- BEGIN SKILL {skill_id} ---",
+                    document.strip(),
+                    f"--- END SKILL {skill_id} ---",
+                ]
+            )
     if deliverable is not None and deliverable.strip():
         lines.extend(
             [

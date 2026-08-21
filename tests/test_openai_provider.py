@@ -223,6 +223,37 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
             "arguments failed schema validation",
             calls[0].provider_metadata["tool_call_validation_error"],
         )
+        self.assertIn("at $.command", calls[0].provider_metadata["tool_call_validation_error"])
+        self.assertIn("Received: null", calls[0].provider_metadata["tool_call_validation_error"])
+
+    def test_nested_tool_schema_error_names_exact_argument_path(self) -> None:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            read_timeout_seconds=60.0,
+        )
+        tool = build_file_patch_tool(
+            ToolSettings.from_workspace_dir(Path("/workspace"))
+        ).definition
+
+        calls = provider._extract_tool_calls(
+            response_output=[
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_patch",
+                    name="file_patch",
+                    arguments=(
+                        '{"path":"src/app.py","operations":'
+                        '[{"type":123,"old":"x = 1","new":"x = 2"}]}'
+                    ),
+                )
+            ],
+            request_tools=(tool,),
+        )
+
+        error = calls[0].provider_metadata["tool_call_validation_error"]
+        self.assertIn("at $.operations[0].type", error)
+        self.assertIn("Received: 123", error)
+        self.assertIn("Schema rule: $schema.properties.operations.items.properties.type.type", error)
 
     def test_file_patch_tool_schema_avoids_openai_unsupported_one_of(self) -> None:
         provider = OpenAIProvider(
@@ -241,6 +272,10 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
         self.assertEqual(
             operation_items["properties"]["type"]["enum"],
             ["write", "replace", "insert_before", "insert_after", "delete"],
+        )
+        self.assertIn(
+            '{"path":"src/app.py","operations":[{"type":"replace"',
+            tool.description,
         )
 
     def test_image_input_uses_input_image_items(self) -> None:

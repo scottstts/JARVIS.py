@@ -137,15 +137,15 @@ When a new user message arrives while a main turn is active:
 
 1. the new user message is accepted immediately as a normal queued user turn
 2. `RouteRuntime` requests interruption of the active work with reason `superseded_by_user_message`
-3. active subagents tied to the superseded task are also asked to stop
-4. active provider streams, provider requests, and tool awaits race against the turn stop signal
-5. completed tool results remain persisted and replayable; in-flight tool results are not fabricated
-6. the interrupted turn emits `turn_done(interrupted=true, interruption_reason="superseded_by_user_message")`
-7. the queued user turn begins automatically
+3. active subagents continue the assignments Jarvis gave them and receive no user-message injection
+4. active main provider streams, provider requests, and tool awaits race against the turn stop signal
+5. completed main tool results remain persisted and replayable; in-flight tool results are not fabricated
+6. the interrupted main turn emits `turn_done(interrupted=true, interruption_reason="superseded_by_user_message")`
+7. the queued user turn begins automatically and Jarvis decides what to do with any continuing children
 
 Multiple mid-turn user messages remain distinct turns and run FIFO.
 
-Explicit `/stop` is separate. `/stop` cooperatively stops active agent work, suppresses automatic follow-ups, and pauses until the next user message. Already-detached bash jobs keep running. A newer user message means supersede the active task and continue automatically into the newer request.
+Explicit `/stop` is separate. `/stop` cooperatively stops active main and subagent work, suppresses automatic follow-ups, and pauses until the next user message. Already-detached bash jobs keep running. A newer ordinary user message supersedes only the active main task and continues automatically into the newer request.
 
 `/new` is a control-only hard session boundary and does not reuse `/stop` semantics. As soon as the command is accepted, `RouteRuntime` closes the internal-follow-up gate, hard-preempts active main and subagent turns with reason `new_session`, and invalidates queued runtime continuations. Before the replacement session is created, the runtime terminates and finalizes all route-owned detached bash jobs, disposes every old subagent, clears retained bash/subagent notices, and persists a hard-reset trace in the old main transcript. The old main session is archived, provider/thread continuity is severed, and the fresh session remains idle. Only a later ordinary user message can start its agent loop.
 
@@ -321,5 +321,6 @@ When changing the agent loop:
 - persist continuation/cache handles in provider session state
 - preserve truthful transcript chronology
 - keep `/stop` and superseding-user-message semantics separate
+- never treat an ordinary user message as child input or a child interruption request
 - keep `/new` on its distinct hard-reset path and never let the command itself open the runtime-follow-up gate
 - ensure subagent prompt-visible behavior follows the same shared-loop persistence rules
