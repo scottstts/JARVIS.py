@@ -130,6 +130,22 @@ class _FakeCompactionLLMService:
         )
 
 
+class _BlockingCompactionLLMService:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def generate(self, request):  # type: ignore[no-untyped-def]
+        _ = request
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise AssertionError("Blocked compaction unexpectedly resumed.")
+
+
 class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_session_persists_bootstrap_and_codex_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -216,6 +232,43 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 any(record.metadata.get("compaction_bundle_anchor") for record in new_records)
             )
 
+    async def test_stop_cancels_manual_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llm_service = _BlockingCompactionLLMService()
+            runtime, storage, _coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                llm_service=llm_service,
+            )
+            session_id = await runtime.prepare_session()
+            storage.append_record(
+                session_id,
+                ConversationRecord(
+                    record_id="user_1",
+                    session_id=session_id,
+                    created_at="2026-04-11T00:00:00+00:00",
+                    role="user",
+                    content="Keep marker CODE-12345.",
+                ),
+            )
+
+            task = asyncio.create_task(
+                _collect_events(runtime.stream_user_input("/compact"))
+            )
+            await asyncio.wait_for(llm_service.started.wait(), timeout=1.0)
+            self.assertTrue(runtime.has_active_turn())
+            self.assertTrue(runtime.request_stop())
+            events = await asyncio.wait_for(task, timeout=1.0)
+
+            self.assertTrue(llm_service.cancelled.is_set())
+            self.assertFalse(runtime.has_active_turn())
+            self.assertEqual(events[-1].type, "done")
+            self.assertTrue(events[-1].interrupted)
+            self.assertEqual(events[-1].interruption_reason, "user_stop")
+            session = storage.get_session(session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.status, "active")  # type: ignore[union-attr]
+            self.assertEqual(session.compaction_count, 0)  # type: ignore[union-attr]
+
     async def test_first_turn_after_compaction_seeds_codex_thread_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = _FakeCoordinator(turn_start_ids=["turn_1"])
@@ -248,7 +301,7 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             seed_input = coordinator.turn_start_requests[0]["input"]
             self.assertGreaterEqual(len(seed_input), 2)
-            self.assertIn("Historical context from earlier Jarvis sessions", seed_input[0]["text"])
+            self.assertIn("Historical context from an earlier Jarvis session", seed_input[0]["text"])
             self.assertIn(
                 "Evidence-backed prior-session assistant context:",
                 seed_input[1]["text"],

@@ -218,13 +218,13 @@ Rejected approvals stop the waiting section without executing the action. For ma
 
 ## Compaction
 
-Jarvis compacts sessions into a canonical, evidence-backed `CompactionBundle` and then deterministically compiles that bundle into replayable history. The provider never authors replay roles, system messages, exact copied content, bundle identity, chronology, lineage, or source hashes.
+Jarvis compacts sessions into a canonical structured `CompactionBundle` and deterministically compiles it into replayable history. The model performs semantic compression only. Jarvis owns the output schema, replay roles, system boundary, exact-message copying, bundle identity, chronology, source lineage, and hashes.
 
-The compaction provider is configured separately as `core.compaction.provider`. It resolves the model from that provider's existing chat-model settings. `codex` is not a valid compaction provider because compaction uses the normal `LLMService` path. Generation, verification, malformed-verifier retry, and targeted repair all use this same user-selected provider and the existing user-controlled compaction output budget. Jarvis intentionally does not inspect the selected model's capacity, resize the budget, or select a fallback model.
+The compaction provider is configured separately as `core.compaction.provider` and resolves its model from that provider's existing chat-model settings. `codex` is not valid because compaction uses the normal `LLMService` path. Jarvis does not inspect model capacity, resize the user-controlled output budget, select a fallback model, or change provider automatically.
 
 ### Source ledger
 
-Jarvis first converts replayable transcript records into an ordered typed event ledger. Each event includes:
+Jarvis first converts replayable transcript records into an internal ordered typed event ledger. Each event retains:
 
 - stable event and record IDs
 - source session, creation timestamp, generation, and sequence
@@ -234,45 +234,38 @@ Jarvis first converts replayable transcript records into an ordered typed event 
 - exact record content
 - a small allowlist of semantically useful metadata
 
-Provider-specific metadata and raw provider argument encodings, bootstrap material, memory bootstrap, skill bootstrap, transcript-only records, transient datetime records, transient subagent snapshots, waiting boilerplate, prior replay items, and internal compaction records do not enter the delta ledger. Normalized tool names, call IDs, structured arguments, and exact result/error content remain. Tool-call validation failures and terminal subagent progress/outcomes are retained because they can explain later corrections or state.
+Provider-specific metadata and raw provider argument encodings, bootstrap material, memory bootstrap, skill bootstrap, transcript-only records, transient datetime records, transient subagent snapshots, waiting boilerplate, prior replay items, and internal compaction records do not enter the delta ledger. Tool-call validation failures and terminal subagent outcomes remain because they can explain later state.
+
+The provider does not receive this verbose internal representation. Jarvis renders a compact causal transcript with short local references (`E1`, `E2`, ...), short tool-call/result links, event type, role, time, and semantic content. Internal record, session, turn, and call IDs are not exposed. When an exact long tool argument already appears in its paired result, the renderer substitutes a reference instead of sending the bytes twice.
+
+Every compaction request is estimated before dispatch. Its safety ceiling is 70% of the normal preflight input limit to absorb provider-tokenizer variance. If necessary, Jarvis bounds only large tool evidence with a head/tail excerpt, omitted-character count, and hash; user and assistant messages are never shortened. If the request still cannot fit, compaction fails before contacting the provider and logs the estimate, ceiling, source count, selected bound, and truncation count.
 
 ### Canonical bundle
 
-Schema version 2 contains:
+Schema version 3 contains:
 
-- Jarvis-owned bundle ID, generation, creation time, prior-bundle lineage, ordered source sessions, delta IDs, cumulative evidence IDs, cutoff record ID, and a deterministic delta-content hash
-- current objective with evidence IDs
+- Jarvis-owned bundle ID, generation, creation time, prior-bundle lineage, ordered source sessions, current delta record IDs, cutoff record ID, delta hash, rolling cumulative hash, and cumulative record count
+- current objective and essential background
 - exact preserved user/assistant records copied by Jarvis, including source role, bytes, content hash, reason, and derived chronology
-- chronological episodes with stable IDs, source/evidence IDs, outcomes, and derived chronology
-- stable state entries for constraints, decisions, artifacts, open loops, and uncertainties
+- chronological episodes with Jarvis-derived stable IDs, outcomes, and chronology
+- structured current entries for constraints, decisions, artifacts, open loops, and uncertainties, with Jarvis-derived IDs
 - current handover focus, next actions, work not to repeat, and required verification
-- cumulative coverage groups recording how every delta event was represented or intentionally omitted
 
 Artifact entries carry an exact locator, last-observed state, and `needs_verification`; they do not assert mutable external state as timeless truth. Open-loop entries require a next action and may carry a blocker.
 
-New or changed artifact locators must appear exactly in the operation's cited delta event content or normalized metadata. This makes paths, URLs, and IDs deterministically grounded instead of trusting a rewritten literal.
-
 ### Incremental merge
 
-The first compaction builds a bundle from the current session ledger. Later compactions load the verified bundle anchor from the active session and pass only new non-replay transcript records as the delta.
+The first compaction builds a bundle from the current session ledger. Later compactions load the canonical bundle anchor and pass its compact semantic state plus only new non-replay transcript records. The model returns one complete current semantic record rather than an incremental database mutation protocol. This lets it retire stale state and consolidate older episodes without authoring stable IDs, supersession graphs, evidence links, or exhaustive coverage bookkeeping.
 
-- Prior exact records, episodes, and state remain unchanged by default.
-- Exact records can be added only by source record ID; Jarvis copies their stored role and content. Removing one requires current delta evidence.
-- New episodes can summarize only current delta events.
-- Old episodes may be deliberately consolidated hierarchically; source-event lineage and chronology are inherited.
-- State changes use `add`, `update`, `resolve`, or `supersede` operations. Every operation requires current delta evidence.
-- Supersession is same-category, single-successor, active-entry-only, and acyclic. Superseded entries remain in the canonical record.
-- Objective changes require current delta evidence.
+Previously preserved exact messages receive short `P1`, `P2`, ... references. Current delta events receive `E1`, `E2`, ... references. The model lists only exact messages that should remain material; Jarvis resolves those local references and copies stored bytes. It never accepts model-authored exact content.
 
-This prevents later generations from re-summarizing prompt-visible summaries and preserves original evidence lineage across repeated compactions.
+### Validation and exceptional repair
 
-### Validation, verification, and repair
+The provider is forced through the shared `submit_compaction` tool schema and instructed to perform its semantic fidelity review before the single submission. A normal compaction therefore makes one model call. Jarvis then atomically validates exact field sets and types, non-empty values, local preservation references, exact-copy hashes, state shapes, and canonical bundle integrity.
 
-Jarvis validates the entire draft atomically. It never drops invalid middle items. Deterministic validation checks exact field sets and types, identifiers, evidence existence, chronology, exact-copy hashes, episode sources, state shapes, supersession lineage, and coverage.
+No second model verifier resends the source. The earlier verifier duplicated cost and latency while asking another model response to police bookkeeping that Jarvis should own. If a provider nevertheless returns malformed output or an invalid local reference, Jarvis may make at most two targeted full-record repairs. Those retries are fault containment, not a normal stage. Rejection issues and call traces are logged immediately.
 
-Every current delta event must appear in exactly one coverage group. User events cannot be omitted. Non-omitted groups must point to an existing preserved record, episode, state entry, objective, or handover.
-
-After deterministic validation, a second request to the configured compaction provider verifies semantic fidelity against the prior bundle and delta ledger. It checks omissions, contradictions, unsupported claims, false completion, stale external state, active constraints, causal outcomes, and the proposed continuation. A malformed verifier response is retried once with an explicit contract retry. A negative verdict or deterministic validation failure produces a targeted full-draft repair request. Jarvis permits two repair attempts and activates nothing unless the final bundle passes deterministic and semantic verification.
+The workflow shares one total deadline across all exceptional attempts. Compaction provider and memory awaits participate in route interruption. Mid-turn compaction races against the active turn stop signal. Reactive, preflight, and manual compaction register their own active operation before a normal turn exists, so `/stop`, a superseding user message, and `/new` can cancel them as well. A validated result is checked for interruption before the old session is archived; bundle activation then runs as a consistency-sensitive commit. Phase, attempt, call trace, validation issue, budget, deadline, session, reason, and turn metadata are attached to runtime failures.
 
 ## Compaction Pruning
 
@@ -312,9 +305,9 @@ The replay compiler emits:
 - one assistant `state_snapshot`
 - one assistant `handover`
 
-Replay records use `type="compaction_replay"` metadata with bundle/generation IDs, exact-copy status, source record IDs, and evidence event IDs. No model-authored text receives system authority.
+Replay records use `type="compaction_replay"` metadata with bundle/generation IDs, exact-copy status, and source record IDs. No model-authored text receives system authority.
 
-The old session receives one `kind="compaction"` audit record containing the explicit manual instruction, provider/model, canonical bundle, accepted draft, verifier report, repair count, per-call traces, aggregate usage, and deterministic replay items. The old session remains active until the bundle has passed all validation and verification.
+The old session receives one `kind="compaction"` audit record containing the explicit manual instruction, provider/model, canonical bundle, accepted semantic submission, deterministic validation report, repair count, per-call traces, aggregate usage, and replay items. The old session remains active until the bundle has passed validation.
 
 Mid-turn compaction excludes active in-progress turn records from compaction source. Active-turn carry-forward records remain separate so the same content is not duplicated into replacement history.
 

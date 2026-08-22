@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from jarvis.core.compaction_contract import (
     compile_compaction_replay,
 )
 from jarvis.core.config import CompactionSettings, ContextPolicySettings, CoreSettings
-from jarvis.llm import LLMRequest, LLMResponse, LLMUsage, TextPart
+from jarvis.llm import LLMRequest, LLMResponse, LLMUsage, TextPart, ToolCall
 
 
 def build_core_settings(
@@ -48,14 +49,13 @@ def build_core_settings(
 
 def is_compaction_generate_request(request: LLMRequest) -> bool:
     return _request_system_text(request).startswith(
-        "You produce a complete canonical compaction draft for Jarvis."
+        "You compact a Jarvis session into a complete semantic continuation record."
     )
 
 
 def is_compaction_verify_request(request: LLMRequest) -> bool:
-    return _request_system_text(request).startswith(
-        "You verify a candidate Jarvis compaction bundle"
-    )
+    _ = request
+    return False
 
 
 def build_compaction_test_response(
@@ -63,71 +63,50 @@ def build_compaction_test_response(
     *,
     marker: str = "Compacted summary",
 ) -> LLMResponse:
-    if is_compaction_verify_request(request):
-        payload: dict[str, object] = {"valid": True, "issues": []}
-    elif is_compaction_generate_request(request):
-        request_payload = _compaction_request_payload(request)
-        delta_events = request_payload.get("delta_events", [])
-        if not isinstance(delta_events, list):
-            raise AssertionError("Compaction request delta_events must be a list.")
-        event_ids = [
-            str(event["event_id"])
-            for event in delta_events
-            if isinstance(event, dict) and event.get("event_id")
-        ]
-        previous_bundle = request_payload.get("previous_bundle")
-        if event_ids:
-            objective = {
-                "summary": marker,
-                "evidence_event_ids": [event_ids[0]],
-            }
-            episode_actions = [
+    if not is_compaction_generate_request(request):
+        raise AssertionError("Request is not a compaction request.")
+    user_text = _request_user_text(request)
+    event_refs = re.findall(r"\[EVENT (E\d+) \|", user_text)
+    payload: dict[str, object] = {
+        "objective": marker,
+        "background": [],
+        "preserved_messages": [],
+        "episodes": (
+            [
                 {
-                    "action": "add",
-                    "episode_id": f"episode_{event_ids[0]}",
                     "summary": marker,
-                    "source_ids": event_ids,
                     "outcomes": ["Continue from the compacted state."],
                 }
             ]
-            handover = {
-                "current_focus": "Continue from the latest task state.",
-                "next_actions": ["Resume the task."],
-                "do_not_repeat": [],
-                "verification_needed": [],
-                "evidence_event_ids": [event_ids[-1]],
-            }
-            coverage = [
-                {
-                    "source_event_ids": event_ids,
-                    "disposition": "episode",
-                    "target_ids": [f"episode_{event_ids[0]}"],
-                    "reason": "Represented by the test episode.",
-                }
-            ]
-        elif isinstance(previous_bundle, dict):
-            objective = previous_bundle["objective"]
-            episode_actions = []
-            handover = previous_bundle["handover"]
-            coverage = []
-        else:
-            raise AssertionError("Compaction test request has no evidence.")
-        payload = {
-            "objective": objective,
-            "preserved_actions": [],
-            "episode_actions": episode_actions,
-            "state_operations": [],
-            "handover": handover,
-            "coverage": coverage,
-        }
-    else:
-        raise AssertionError("Request is not a compaction generator or verifier request.")
+            if event_refs
+            else []
+        ),
+        "constraints": [],
+        "decisions": [],
+        "artifacts": [],
+        "open_loops": [],
+        "uncertainties": [],
+        "handover": {
+            "current_focus": "Continue from the latest task state.",
+            "next_actions": ["Resume the task."],
+            "do_not_repeat": [],
+            "verification_needed": [],
+        },
+    }
+    raw_payload = json.dumps(payload, ensure_ascii=False)
     return LLMResponse(
         provider=request.provider or "openai",
         model="fake-compactor",
-        text=json.dumps(payload, ensure_ascii=False),
-        tool_calls=[],
-        finish_reason="stop",
+        text="",
+        tool_calls=[
+            ToolCall(
+                call_id="call_compact",
+                name="submit_compaction",
+                arguments=payload,
+                raw_arguments=raw_payload,
+            )
+        ],
+        finish_reason="tool_calls",
         usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
         response_id="resp_compact",
     )
@@ -151,36 +130,26 @@ def build_compaction_test_outcome() -> CompactionOutcome:
         source_events=(source_event,),
     )
     draft = {
-        "objective": {
-            "summary": "Preserve the current task context.",
-            "evidence_event_ids": ["source_1"],
-        },
-        "preserved_actions": [],
-        "episode_actions": [
+        "objective": "Preserve the current task context.",
+        "background": [],
+        "preserved_messages": [],
+        "episodes": [
             {
-                "action": "add",
-                "episode_id": "episode_source_1",
                 "summary": "The prior task context was compacted.",
-                "source_ids": ["source_1"],
                 "outcomes": [],
             }
         ],
-        "state_operations": [],
+        "constraints": [],
+        "decisions": [],
+        "artifacts": [],
+        "open_loops": [],
+        "uncertainties": [],
         "handover": {
             "current_focus": "Continue the current task.",
             "next_actions": ["Resume from the compacted context."],
             "do_not_repeat": [],
             "verification_needed": [],
-            "evidence_event_ids": ["source_1"],
         },
-        "coverage": [
-            {
-                "source_event_ids": ["source_1"],
-                "disposition": "episode",
-                "target_ids": ["episode_source_1"],
-                "reason": "Represented in the compacted episode.",
-            }
-        ],
     }
     bundle = apply_compaction_draft(
         draft,
@@ -194,7 +163,11 @@ def build_compaction_test_outcome() -> CompactionOutcome:
         bundle=bundle,
         items=compile_compaction_replay(bundle),
         draft_payload=draft,
-        verification_payload={"valid": True, "issues": []},
+        verification_payload={
+            "valid": True,
+            "method": "jarvis_deterministic_contract",
+            "schema_version": 3,
+        },
         call_traces=(
             CompactionCallTrace(
                 phase="generate",
@@ -219,18 +192,11 @@ def _request_system_text(request: LLMRequest) -> str:
     )
 
 
-def _compaction_request_payload(request: LLMRequest) -> dict[str, object]:
-    user_text = "\n".join(
+def _request_user_text(request: LLMRequest) -> str:
+    return "\n".join(
         part.text
         for message in request.messages
         if message.role == "user"
         for part in message.parts
         if isinstance(part, TextPart)
     )
-    json_start = user_text.find("{")
-    if json_start < 0:
-        raise AssertionError("Compaction request is missing its JSON input.")
-    payload = json.loads(user_text[json_start:])
-    if not isinstance(payload, dict):
-        raise AssertionError("Compaction request input must be an object.")
-    return payload

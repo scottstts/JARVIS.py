@@ -294,6 +294,23 @@ class _TurnStopRequested(Exception):
     """Internal control-flow signal raised when a turn stop preempts an await."""
 
 
+class _CompactionStopRequested(Exception):
+    """Internal signal raised when stop preempts compaction before a turn starts."""
+
+    def __init__(self, *, session_id: str, reason: InterruptionReason) -> None:
+        super().__init__(f"Compaction for session {session_id} was interrupted: {reason}")
+        self.session_id = session_id
+        self.interruption_reason: InterruptionReason = reason
+
+
+@dataclass(slots=True)
+class _ActiveCompactionControl:
+    operation_id: str
+    session_id: str
+    stop_event: asyncio.Event
+    interruption_reason: InterruptionReason | None = None
+
+
 @dataclass(slots=True, frozen=True)
 class _ToolExecutionOutcome:
     approval_rejected: bool = False
@@ -390,6 +407,7 @@ class AgentLoop:
         self._pending_approval_id: str | None = None
         self._pending_approval_turn_id: str | None = None
         self._turn_stop_event: asyncio.Event | None = None
+        self._active_compaction_control: _ActiveCompactionControl | None = None
 
     @property
     def agent_kind(self) -> AgentKind:
@@ -489,13 +507,16 @@ class AgentLoop:
         return active.session_id if active is not None else None
 
     def active_turn_id(self) -> str | None:
-        return self._active_turn_id
+        if self._active_turn_id is not None:
+            return self._active_turn_id
+        control = self._active_compaction_control
+        return control.operation_id if control is not None else None
 
     def has_active_turn(self) -> bool:
-        return self._active_turn_id is not None
+        return self._active_turn_id is not None or self._active_compaction_control is not None
 
     async def aclose(self) -> None:
-        return None
+        self.request_hard_stop(reason="new_session")
 
     def append_system_note(
         self,
@@ -538,15 +559,21 @@ class AgentLoop:
         reason: InterruptionReason = "user_stop",
     ) -> bool:
         active_turn_id = self._active_turn_id
-        if active_turn_id is None:
+        if active_turn_id is not None:
+            self._requested_interruption = _RequestedInterruption(
+                turn_id=active_turn_id,
+                reason=reason,
+            )
+            stop_event = self._turn_stop_event
+            if stop_event is not None:
+                stop_event.set()
+            return True
+
+        compaction_control = self._active_compaction_control
+        if compaction_control is None:
             return False
-        self._requested_interruption = _RequestedInterruption(
-            turn_id=active_turn_id,
-            reason=reason,
-        )
-        stop_event = self._turn_stop_event
-        if stop_event is not None:
-            stop_event.set()
+        compaction_control.interruption_reason = reason
+        compaction_control.stop_event.set()
         return True
 
     def request_hard_stop(
@@ -556,18 +583,24 @@ class AgentLoop:
     ) -> bool:
         """Immediately preempt the active turn for a destructive session reset."""
         active_turn_id = self._active_turn_id
-        if active_turn_id is None:
+        if active_turn_id is not None:
+            self._requested_interruption = _RequestedInterruption(
+                turn_id=active_turn_id,
+                reason=reason,
+            )
+            pending_approval = self._pending_approval_future
+            if pending_approval is not None and not pending_approval.done():
+                pending_approval.cancel()
+            stop_event = self._turn_stop_event
+            if stop_event is not None:
+                stop_event.set()
+            return True
+
+        compaction_control = self._active_compaction_control
+        if compaction_control is None:
             return False
-        self._requested_interruption = _RequestedInterruption(
-            turn_id=active_turn_id,
-            reason=reason,
-        )
-        pending_approval = self._pending_approval_future
-        if pending_approval is not None and not pending_approval.done():
-            pending_approval.cancel()
-        stop_event = self._turn_stop_event
-        if stop_event is not None:
-            stop_event.set()
+        compaction_control.interruption_reason = reason
+        compaction_control.stop_event.set()
         return True
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
@@ -595,11 +628,20 @@ class AgentLoop:
     async def _handle_compact_command(self, command: ParsedCommand) -> AgentTurnResult:
         await self._ensure_memory_runtime_ready()
         active = await self._ensure_active_session()
-        compacted = await self._compact_session(
-            active,
-            reason="manual",
-            user_instruction=command.body or None,
-        )
+        try:
+            compacted = await self._compact_session(
+                active,
+                reason="manual",
+                user_instruction=command.body or None,
+            )
+        except _CompactionStopRequested as exc:
+            return AgentTurnResult(
+                session_id=exc.session_id,
+                response_text="",
+                command="/compact",
+                interrupted=True,
+                interruption_reason=exc.interruption_reason,
+            )
         if compacted is None:
             return AgentTurnResult(
                 session_id=active.session_id,
@@ -637,16 +679,19 @@ class AgentLoop:
         command: ParsedCommand,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         result = await self._handle_compact_command(command)
-        yield AgentAssistantMessageEvent(
-            session_id=result.session_id,
-            text=result.response_text,
-        )
+        if result.response_text:
+            yield AgentAssistantMessageEvent(
+                session_id=result.session_id,
+                text=result.response_text,
+            )
         yield AgentTurnDoneEvent(
             session_id=result.session_id,
             response_text=result.response_text,
             turn_id=result.turn_id,
             command=result.command,
             compaction_performed=result.compaction_performed,
+            interrupted=result.interrupted,
+            interruption_reason=result.interruption_reason,
         )
 
     async def _handle_message_turn(
@@ -657,20 +702,29 @@ class AgentLoop:
         command_override: str | None = None,
         pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> AgentTurnResult:
-        (
-            session,
-            base_records,
-            turn_context_text,
-            interruption_notice_text,
-            turn_runtime_messages,
-            request,
-            estimated_input_tokens,
-            did_compaction,
-        ) = await self._prepare_turn(
-            user_text=user_text,
-            force_session_id=force_session_id,
-            pre_turn_messages=pre_turn_messages,
-        )
+        try:
+            (
+                session,
+                base_records,
+                turn_context_text,
+                interruption_notice_text,
+                turn_runtime_messages,
+                request,
+                estimated_input_tokens,
+                did_compaction,
+            ) = await self._prepare_turn(
+                user_text=user_text,
+                force_session_id=force_session_id,
+                pre_turn_messages=pre_turn_messages,
+            )
+        except _CompactionStopRequested as exc:
+            return AgentTurnResult(
+                session_id=exc.session_id,
+                response_text="",
+                command=command_override,
+                interrupted=True,
+                interruption_reason=exc.interruption_reason,
+            )
         turn_id = uuid4().hex
         pending_records = self._build_pending_turn_records(
             session_id=session.session_id,
@@ -1579,20 +1633,30 @@ class AgentLoop:
         command_override: str | None = None,
         pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> AsyncIterator[AgentTurnStreamEvent]:
-        (
-            session,
-            _base_records,
-            turn_context_text,
-            interruption_notice_text,
-            turn_runtime_messages,
-            request,
-            estimated_input_tokens,
-            did_compaction,
-        ) = await self._prepare_turn(
-            user_text=user_text,
-            force_session_id=force_session_id,
-            pre_turn_messages=pre_turn_messages,
-        )
+        try:
+            (
+                session,
+                _base_records,
+                turn_context_text,
+                interruption_notice_text,
+                turn_runtime_messages,
+                request,
+                estimated_input_tokens,
+                did_compaction,
+            ) = await self._prepare_turn(
+                user_text=user_text,
+                force_session_id=force_session_id,
+                pre_turn_messages=pre_turn_messages,
+            )
+        except _CompactionStopRequested as exc:
+            yield AgentTurnDoneEvent(
+                session_id=exc.session_id,
+                response_text="",
+                command=command_override,
+                interrupted=True,
+                interruption_reason=exc.interruption_reason,
+            )
+            return
         turn_id = uuid4().hex
         pending_records = self._build_pending_turn_records(
             session_id=session.session_id,
@@ -3273,6 +3337,7 @@ class AgentLoop:
             session,
             reason=reason,
             excluded_turn_ids=(turn_id,),
+            turn_id=turn_id,
         )
         if compacted is None:
             raise ContextBudgetError(_FOLLOWUP_COMPACTION_FAILED_TEXT)
@@ -3441,6 +3506,7 @@ class AgentLoop:
         reason: str,
         user_instruction: str | None = None,
         excluded_turn_ids: tuple[str, ...] = (),
+        turn_id: str | None = None,
     ) -> SessionMetadata | None:
         excluded_turn_id_set = {turn_id.strip() for turn_id in excluded_turn_ids if turn_id.strip()}
         records = self._storage.load_records(
@@ -3480,25 +3546,82 @@ class AgentLoop:
             self._storage.update_session(session.session_id, pending_reactive_compaction=False)
             return None
 
-        await self._emit_local_notice(
-            notice_kind="compaction_started",
-            text="Compacting...",
-        )
-        if self._memory_mode.maintenance:
-            try:
-                await self._memory_service.flush_before_compaction(
-                    route_id=self._tool_context.route_id,
-                    session_id=session.session_id,
-                    records=tuple(records),
-                )
-            except Exception:
-                LOGGER.exception("Memory pre-compaction flush failed.")
+        compaction_operation_id: str | None = None
+        if turn_id is None:
+            compaction_operation_id = self._begin_compaction_control(session.session_id)
 
-        outcome = await self._compactor.compact(
-            source_records,
-            previous_bundle=previous_bundle,
-            user_instruction=user_instruction,
+        LOGGER.info(
+            "Compaction started for session %s (reason=%s, source_records=%d, "
+            "previous_bundle=%s, turn_id=%s).",
+            session.session_id,
+            reason,
+            len(source_records),
+            previous_bundle.bundle_id if previous_bundle is not None else None,
+            turn_id,
         )
+        try:
+            await self._emit_local_notice(
+                notice_kind="compaction_started",
+                text="Compacting...",
+            )
+            if self._memory_mode.maintenance:
+                try:
+                    await self._await_compaction_operation(
+                        self._memory_service.flush_before_compaction(
+                            route_id=self._tool_context.route_id,
+                            session_id=session.session_id,
+                            records=tuple(records),
+                        ),
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                        compaction_operation_id=compaction_operation_id,
+                        operation="memory_pre_compaction_flush",
+                    )
+                except (_TurnStopRequested, _CompactionStopRequested):
+                    raise
+                except Exception:
+                    LOGGER.exception("Memory pre-compaction flush failed.")
+
+            outcome = await self._await_compaction_operation(
+                self._compactor.compact(
+                    source_records,
+                    previous_bundle=previous_bundle,
+                    user_instruction=user_instruction,
+                ),
+                session_id=session.session_id,
+                turn_id=turn_id,
+                compaction_operation_id=compaction_operation_id,
+                operation="llm_compaction",
+            )
+        except (_TurnStopRequested, _CompactionStopRequested):
+            LOGGER.info(
+                "Compaction interrupted for session %s (reason=%s, turn_id=%s).",
+                session.session_id,
+                reason,
+                turn_id,
+            )
+            raise
+        except Exception as exc:
+            metadata = getattr(exc, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata.setdefault("compaction_session_id", session.session_id)
+                metadata.setdefault("compaction_reason", reason)
+                metadata.setdefault("compaction_turn_id", turn_id)
+            LOGGER.exception(
+                "Compaction failed for session %s (reason=%s, turn_id=%s).",
+                session.session_id,
+                reason,
+                turn_id,
+            )
+            raise
+        finally:
+            if compaction_operation_id is not None:
+                self._clear_compaction_control(compaction_operation_id)
+
+        # Activating the verified bundle is a short, consistency-sensitive commit. Stop is
+        # checked before it begins; once archival starts, the commit runs to completion.
+        if turn_id is not None and self._stop_requested(turn_id):
+            raise _TurnStopRequested
         self._append_compaction_record(
             session.session_id,
             outcome=outcome,
@@ -3526,6 +3649,15 @@ class AgentLoop:
         await self._emit_local_notice(
             notice_kind="compaction_completed",
             text="Context compacted into a new session.",
+        )
+        LOGGER.info(
+            "Compaction completed for session %s into session %s "
+            "(reason=%s, calls=%d, repairs=%d).",
+            session.session_id,
+            next_session.session_id,
+            reason,
+            len(outcome.call_traces),
+            outcome.repair_count,
         )
         return self._storage.get_session(next_session.session_id) or next_session
 
@@ -4277,6 +4409,92 @@ class AgentLoop:
         if requested is None or requested.turn_id != turn_id:
             return None
         return requested.reason
+
+    def _begin_compaction_control(self, session_id: str) -> str:
+        if self._active_compaction_control is not None:
+            raise RuntimeError("A compaction operation is already active.")
+        operation_id = f"compaction_{uuid4().hex}"
+        self._active_compaction_control = _ActiveCompactionControl(
+            operation_id=operation_id,
+            session_id=session_id,
+            stop_event=asyncio.Event(),
+        )
+        return operation_id
+
+    def _clear_compaction_control(self, operation_id: str) -> None:
+        control = self._active_compaction_control
+        if control is not None and control.operation_id == operation_id:
+            self._active_compaction_control = None
+
+    async def _await_compaction_operation(
+        self,
+        awaitable: Awaitable[T],
+        *,
+        session_id: str,
+        turn_id: str | None,
+        compaction_operation_id: str | None,
+        operation: str,
+    ) -> T:
+        if turn_id is not None:
+            return await self._await_with_stop(
+                awaitable,
+                turn_id=turn_id,
+                operation=operation,
+            )
+        if compaction_operation_id is None:
+            _close_unstarted_awaitable(awaitable)
+            raise RuntimeError("Pre-turn compaction is missing its operation control.")
+        return await self._await_with_compaction_stop(
+            awaitable,
+            session_id=session_id,
+            operation_id=compaction_operation_id,
+            operation=operation,
+        )
+
+    async def _await_with_compaction_stop(
+        self,
+        awaitable: Awaitable[T],
+        *,
+        session_id: str,
+        operation_id: str,
+        operation: str,
+    ) -> T:
+        control = self._active_compaction_control
+        if control is None or control.operation_id != operation_id:
+            _close_unstarted_awaitable(awaitable)
+            raise RuntimeError("Compaction operation control is no longer active.")
+        if control.interruption_reason is not None:
+            _close_unstarted_awaitable(awaitable)
+            raise _CompactionStopRequested(
+                session_id=session_id,
+                reason=control.interruption_reason,
+            )
+
+        task = asyncio.ensure_future(awaitable)
+        stop_task = asyncio.create_task(
+            control.stop_event.wait(),
+            name=f"jarvis-compaction-stop-wait-{operation}-{operation_id}",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done and control.interruption_reason is not None:
+                task.cancel()
+                await self._drain_preempted_task(task, operation=operation)
+                raise _CompactionStopRequested(
+                    session_id=session_id,
+                    reason=control.interruption_reason,
+                )
+
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+            return task.result()
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
 
     async def _await_with_stop(
         self,

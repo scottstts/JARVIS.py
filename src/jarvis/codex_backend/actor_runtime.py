@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
@@ -122,6 +122,10 @@ class _TurnState:
         return ""
 
 
+class _CodexCompactionStopRequested(Exception):
+    """Internal signal raised when a manual Codex compaction is interrupted."""
+
+
 class CodexActorRuntime:
     """Actor runtime with AgentLoop-compatible surface over Codex app-server."""
 
@@ -199,6 +203,10 @@ class CodexActorRuntime:
         self._pending_approval_future: asyncio.Future[bool] | None = None
         self._pending_approval_id: str | None = None
         self._current_turn: _TurnState | None = None
+        self._active_compaction_id: str | None = None
+        self._active_compaction_task: asyncio.Task[SessionMetadata | None] | None = None
+        self._active_compaction_stop_event: asyncio.Event | None = None
+        self._compaction_interruption_reason: InterruptionReason | None = None
         self._loaded_thread_id: str | None = None
         self._loaded_session_id: str | None = None
         self._loaded_dynamic_tools_signature: str | None = None
@@ -274,10 +282,10 @@ class CodexActorRuntime:
         return active.session_id if active is not None else None
 
     def active_turn_id(self) -> str | None:
-        return self._active_turn_id
+        return self._active_turn_id or self._active_compaction_id
 
     def has_active_turn(self) -> bool:
-        return self._active_turn_id is not None
+        return self._active_turn_id is not None or self._active_compaction_id is not None
 
     async def aclose(self) -> None:
         pending_approval = self._pending_approval_future
@@ -286,7 +294,19 @@ class CodexActorRuntime:
         loaded_thread_id = self._loaded_thread_id
         if loaded_thread_id is not None:
             self._coordinator.unregister_actor(thread_id=loaded_thread_id, actor=self)
+        compaction_task = self._active_compaction_task
+        if compaction_task is not None and not compaction_task.done():
+            self._compaction_interruption_reason = "new_session"
+            compaction_stop_event = self._active_compaction_stop_event
+            if compaction_stop_event is not None:
+                compaction_stop_event.set()
+            with contextlib.suppress(_CodexCompactionStopRequested):
+                await compaction_task
         self._active_turn_id = None
+        self._active_compaction_id = None
+        self._active_compaction_task = None
+        self._active_compaction_stop_event = None
+        self._compaction_interruption_reason = None
         self._requested_interruption = None
         self._pending_approval_future = None
         self._pending_approval_id = None
@@ -343,18 +363,26 @@ class CodexActorRuntime:
     ) -> bool:
         active_turn_id = self._active_turn_id
         turn = self._current_turn
-        if active_turn_id is None or turn is None:
+        if active_turn_id is not None and turn is not None:
+            self._requested_interruption = reason
+            pending_approval = self._pending_approval_future
+            if pending_approval is not None and not pending_approval.done():
+                pending_approval.cancel()
+            provider_turn_id = turn.provider_turn_id
+            if provider_turn_id is not None:
+                turn.provider_interrupt_task = self._request_provider_turn_interrupt(
+                    provider_turn_id=provider_turn_id,
+                    reason=reason,
+                )
+            return True
+
+        compaction_task = self._active_compaction_task
+        if compaction_task is None or compaction_task.done():
             return False
-        self._requested_interruption = reason
-        pending_approval = self._pending_approval_future
-        if pending_approval is not None and not pending_approval.done():
-            pending_approval.cancel()
-        provider_turn_id = turn.provider_turn_id
-        if provider_turn_id is not None:
-            turn.provider_interrupt_task = self._request_provider_turn_interrupt(
-                provider_turn_id=provider_turn_id,
-                reason=reason,
-            )
+        self._compaction_interruption_reason = reason
+        compaction_stop_event = self._active_compaction_stop_event
+        if compaction_stop_event is not None:
+            compaction_stop_event.set()
         return True
 
     def request_hard_stop(
@@ -364,18 +392,26 @@ class CodexActorRuntime:
     ) -> bool:
         active_turn_id = self._active_turn_id
         turn = self._current_turn
-        if active_turn_id is None or turn is None:
+        if active_turn_id is not None and turn is not None:
+            self._requested_interruption = reason
+            pending_approval = self._pending_approval_future
+            if pending_approval is not None and not pending_approval.done():
+                pending_approval.cancel()
+            provider_turn_id = turn.provider_turn_id
+            if provider_turn_id is not None:
+                turn.provider_interrupt_task = self._request_provider_turn_interrupt(
+                    provider_turn_id=provider_turn_id,
+                    reason=reason,
+                )
+            return True
+
+        compaction_task = self._active_compaction_task
+        if compaction_task is None or compaction_task.done():
             return False
-        self._requested_interruption = reason
-        pending_approval = self._pending_approval_future
-        if pending_approval is not None and not pending_approval.done():
-            pending_approval.cancel()
-        provider_turn_id = turn.provider_turn_id
-        if provider_turn_id is not None:
-            turn.provider_interrupt_task = self._request_provider_turn_interrupt(
-                provider_turn_id=provider_turn_id,
-                reason=reason,
-            )
+        self._compaction_interruption_reason = reason
+        compaction_stop_event = self._active_compaction_stop_event
+        if compaction_stop_event is not None:
+            compaction_stop_event.set()
         return True
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
@@ -601,11 +637,56 @@ class CodexActorRuntime:
     ) -> AsyncIterator[AgentTurnStreamEvent]:
         session_id = await self.prepare_session()
         active = self._require_session(session_id)
-        compacted = await self._compact_session(
-            active,
-            reason="manual",
-            user_instruction=command.body or None,
+        compaction_id = f"compaction_{uuid4().hex}"
+        compaction_stop_event = asyncio.Event()
+        compaction_task = asyncio.create_task(
+            self._compact_session(
+                active,
+                reason="manual",
+                user_instruction=command.body or None,
+                stop_event=compaction_stop_event,
+            ),
+            name=f"jarvis-codex-manual-compaction-{compaction_id}",
         )
+        self._active_compaction_id = compaction_id
+        self._active_compaction_task = compaction_task
+        self._active_compaction_stop_event = compaction_stop_event
+        self._compaction_interruption_reason = None
+        late_interruption_reason: InterruptionReason | None = None
+        try:
+            compacted = await compaction_task
+        except _CodexCompactionStopRequested:
+            interruption_reason = self._compaction_interruption_reason
+            if interruption_reason is None:
+                interruption_reason = "user_stop"
+            yield AgentTurnDoneEvent(
+                session_id=active.session_id,
+                response_text="",
+                command="/compact",
+                interrupted=True,
+                interruption_reason=interruption_reason,
+            )
+            return
+        else:
+            late_interruption_reason = self._compaction_interruption_reason
+        finally:
+            if self._active_compaction_id == compaction_id:
+                self._active_compaction_id = None
+                self._active_compaction_task = None
+                self._active_compaction_stop_event = None
+                self._compaction_interruption_reason = None
+        if late_interruption_reason is not None:
+            yield AgentTurnDoneEvent(
+                session_id=(
+                    compacted.session_id if compacted is not None else active.session_id
+                ),
+                response_text="",
+                command="/compact",
+                compaction_performed=compacted is not None,
+                interrupted=True,
+                interruption_reason=late_interruption_reason,
+            )
+            return
         if compacted is None:
             response_text = "No conversation history to compact yet."
             session = active
@@ -1294,6 +1375,7 @@ class CodexActorRuntime:
         *,
         reason: str,
         user_instruction: str | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> SessionMetadata | None:
         records = self._storage.load_records(session.session_id, include_all_turns=True)
         compactable_records = [record for record in records if record.kind == "message"]
@@ -1304,19 +1386,44 @@ class CodexActorRuntime:
 
         if self._memory_mode.maintenance:
             try:
-                await self._memory_service.flush_before_compaction(
-                    route_id=self._tool_context.route_id,
-                    session_id=session.session_id,
-                    records=tuple(records),
+                await self._await_manual_compaction_operation(
+                    self._memory_service.flush_before_compaction(
+                        route_id=self._tool_context.route_id,
+                        session_id=session.session_id,
+                        records=tuple(records),
+                    ),
+                    stop_event=stop_event,
                 )
+            except _CodexCompactionStopRequested:
+                raise
             except Exception:
                 LOGGER.exception("Codex memory pre-compaction flush failed.")
 
-        outcome = await self._compactor.compact(
-            source_records,
-            previous_bundle=previous_bundle,
-            user_instruction=user_instruction,
-        )
+        try:
+            outcome = await self._await_manual_compaction_operation(
+                self._compactor.compact(
+                    source_records,
+                    previous_bundle=previous_bundle,
+                    user_instruction=user_instruction,
+                ),
+                stop_event=stop_event,
+            )
+        except _CodexCompactionStopRequested:
+            raise
+        except Exception as exc:
+            metadata = getattr(exc, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata.setdefault("compaction_session_id", session.session_id)
+                metadata.setdefault("compaction_reason", reason)
+                metadata.setdefault("compaction_turn_id", None)
+            LOGGER.exception(
+                "Codex compaction failed for session %s (reason=%s).",
+                session.session_id,
+                reason,
+            )
+            raise
+        if stop_event is not None and stop_event.is_set():
+            raise _CodexCompactionStopRequested
         self._append_compaction_record(
             session.session_id,
             outcome=outcome,
@@ -1330,6 +1437,39 @@ class CodexActorRuntime:
             compaction_count=session.compaction_count + 1,
         )
         return self._storage.get_session(next_session.session_id) or next_session
+
+    async def _await_manual_compaction_operation(
+        self,
+        awaitable: Awaitable[Any],
+        *,
+        stop_event: asyncio.Event | None,
+    ) -> Any:
+        if stop_event is None:
+            return await awaitable
+        if stop_event.is_set():
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise _CodexCompactionStopRequested
+
+        task = asyncio.ensure_future(awaitable)
+        stop_task = asyncio.create_task(stop_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done and stop_event.is_set():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise _CodexCompactionStopRequested
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+            return task.result()
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
 
     def _append_compaction_record(
         self,

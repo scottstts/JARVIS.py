@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,7 +11,16 @@ from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
 from uuid import uuid4
 
-from jarvis.llm import LLMMessage, LLMRequest, LLMResponse, LLMService
+from jarvis.logging_setup import get_application_logger
+from jarvis.llm import (
+    LLMMessage,
+    LLMRequest,
+    LLMResponse,
+    LLMService,
+    ToolChoice,
+    ToolDefinition,
+)
+from jarvis.llm.errors import ProviderTimeoutError
 from jarvis.storage import ConversationRecord
 
 from .compaction_contract import (
@@ -23,16 +34,126 @@ from .compaction_contract import (
     compile_compaction_replay,
 )
 from .config import ContextPolicySettings
+from .errors import ContextBudgetError
+from .token_estimator import estimate_request_input_tokens
 
 
 _COMPACTION_PROMPT_PATH = Path(__file__).with_name("prompts") / "COMPACTION.md"
-_COMPACTION_VERIFY_PROMPT_PATH = Path(__file__).with_name("prompts") / "COMPACTION_VERIFY.md"
 _COMPACTION_SYSTEM_PROMPT = _COMPACTION_PROMPT_PATH.read_text(encoding="utf-8").strip()
-_COMPACTION_VERIFY_SYSTEM_PROMPT = _COMPACTION_VERIFY_PROMPT_PATH.read_text(
-    encoding="utf-8"
-).strip()
 _MAX_COMPACTION_REPAIR_ATTEMPTS = 2
-_MAX_VERIFICATION_ATTEMPTS = 2
+_COMPACTION_INPUT_SAFETY_PERCENT = 70
+_COMPACTION_SOURCE_EVENT_LIMITS: tuple[int | None, ...] = (
+    None,
+    32_000,
+    16_000,
+    8_000,
+    4_000,
+    2_000,
+)
+_COMPACTION_TOOL_NAME = "submit_compaction"
+_COMPACTION_TOOL = ToolDefinition(
+    name=_COMPACTION_TOOL_NAME,
+    description="Submit the complete semantic continuation record for this compaction.",
+    strict=True,
+    input_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "objective": {"type": "string"},
+            "background": {"type": "array", "items": {"type": "string"}},
+            "preserved_messages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "source_ref": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["source_ref", "reason"],
+                },
+            },
+            "episodes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "outcomes": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["summary", "outcomes"],
+                },
+            },
+            "constraints": {"type": "array", "items": {"type": "string"}},
+            "decisions": {"type": "array", "items": {"type": "string"}},
+            "artifacts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "locator": {"type": "string"},
+                        "last_observed_state": {"type": "string"},
+                        "needs_verification": {"type": "boolean"},
+                    },
+                    "required": [
+                        "summary",
+                        "locator",
+                        "last_observed_state",
+                        "needs_verification",
+                    ],
+                },
+            },
+            "open_loops": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "next_action": {"type": "string"},
+                        "blocker": {"type": ["string", "null"]},
+                    },
+                    "required": ["summary", "next_action", "blocker"],
+                },
+            },
+            "uncertainties": {"type": "array", "items": {"type": "string"}},
+            "handover": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "current_focus": {"type": "string"},
+                    "next_actions": {"type": "array", "items": {"type": "string"}},
+                    "do_not_repeat": {"type": "array", "items": {"type": "string"}},
+                    "verification_needed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "current_focus",
+                    "next_actions",
+                    "do_not_repeat",
+                    "verification_needed",
+                ],
+            },
+        },
+        "required": [
+            "objective",
+            "background",
+            "preserved_messages",
+            "episodes",
+            "constraints",
+            "decisions",
+            "artifacts",
+            "open_loops",
+            "uncertainties",
+            "handover",
+        ],
+    },
+)
 _TURN_CONTEXT_PREFIX = "System context auto-appended for this turn only."
 _SUBAGENT_STATUS_PREFIX = "Subagent status snapshot:"
 _TRANSIENT_SYSTEM_METADATA_KEYS = {
@@ -69,11 +190,12 @@ _SOURCE_METADATA_KEYS = {
     "carry_forward_compaction_strength",
     "image_input",
 }
+LOGGER = get_application_logger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
 class CompactionCallTrace:
-    phase: Literal["generate", "verify", "repair"]
+    phase: Literal["generate", "repair"]
     provider: str
     model: str
     response_id: str | None
@@ -93,13 +215,6 @@ class CompactionCallTrace:
                 "total_tokens": self.total_tokens,
             },
         }
-
-
-@dataclass(slots=True, frozen=True)
-class CompactionVerification:
-    valid: bool
-    issues: tuple[CompactionContractIssue, ...]
-    payload: dict[str, Any]
 
 
 @dataclass(slots=True, frozen=True)
@@ -145,10 +260,15 @@ class ContextCompactor:
         llm_service: LLMService,
         context_policy: ContextPolicySettings,
         provider: str | None = None,
+        deadline_seconds: float | None = None,
     ) -> None:
         self._llm_service = llm_service
         self._context_policy = context_policy
         self._provider = provider
+        self._deadline_seconds = _resolve_compaction_deadline_seconds(
+            llm_service,
+            explicit_deadline_seconds=deadline_seconds,
+        )
 
     async def compact(
         self,
@@ -156,6 +276,47 @@ class ContextCompactor:
         *,
         previous_bundle: CompactionBundle | None = None,
         user_instruction: str | None = None,
+    ) -> CompactionOutcome:
+        diagnostics: dict[str, Any] = {
+            "operation": "compaction",
+            "compaction_phase": "prepare",
+            "compaction_draft_attempt": 0,
+            "compaction_max_draft_attempts": _MAX_COMPACTION_REPAIR_ATTEMPTS + 1,
+            "compaction_call_count": 0,
+            "compaction_call_traces": [],
+            "compaction_deadline_seconds": self._deadline_seconds,
+        }
+        try:
+            if self._deadline_seconds is None:
+                return await self._compact_bounded(
+                    records,
+                    previous_bundle=previous_bundle,
+                    user_instruction=user_instruction,
+                    diagnostics=diagnostics,
+                )
+            async with asyncio.timeout(self._deadline_seconds):
+                return await self._compact_bounded(
+                    records,
+                    previous_bundle=previous_bundle,
+                    user_instruction=user_instruction,
+                    diagnostics=diagnostics,
+                )
+        except TimeoutError as exc:
+            raise ProviderTimeoutError(
+                "Compaction exceeded its total request deadline.",
+                metadata=dict(diagnostics),
+            ) from exc
+        except Exception as exc:
+            _attach_compaction_error_metadata(exc, diagnostics)
+            raise
+
+    async def _compact_bounded(
+        self,
+        records: Sequence[ConversationRecord],
+        *,
+        previous_bundle: CompactionBundle | None,
+        user_instruction: str | None,
+        diagnostics: dict[str, Any],
     ) -> CompactionOutcome:
         source_records = prune_compaction_source_records(records)
         if not source_records and previous_bundle is None:
@@ -169,49 +330,48 @@ class ContextCompactor:
             source_events=source_events,
         )
         instruction = user_instruction.strip() if user_instruction else ""
-        base_input = {
-            "mode": "generate",
-            "user_instruction": instruction or None,
-            "previous_bundle": (
-                previous_bundle.to_dict() if previous_bundle is not None else None
-            ),
-            "delta_events": [event.to_dict() for event in source_events],
-        }
 
         call_traces: list[CompactionCallTrace] = []
         repair_issues: tuple[CompactionContractIssue, ...] = ()
         rejected_payload: dict[str, Any] | None = None
         rejected_raw_text: str | None = None
-        final_verification: CompactionVerification | None = None
-        final_draft: dict[str, Any] | None = None
-        final_bundle: CompactionBundle | None = None
 
         for attempt in range(_MAX_COMPACTION_REPAIR_ATTEMPTS + 1):
             phase: Literal["generate", "repair"] = "generate" if attempt == 0 else "repair"
-            request_input = dict(base_input)
-            if attempt > 0:
-                request_input.update(
-                    {
-                        "mode": "repair",
-                        "validation_issues": [issue.to_dict() for issue in repair_issues],
-                        "rejected_draft": rejected_payload,
-                        "rejected_raw_text": rejected_raw_text,
-                    }
-                )
-            response = await self._llm_service.generate(
-                self._build_request(
-                    system_prompt=_COMPACTION_SYSTEM_PROMPT,
-                    user_text=(
-                        "Generate the complete canonical compaction draft from this JSON input:\n"
-                        + _canonical_json(request_input)
-                    ),
-                )
+            diagnostics.update(
+                {
+                    "compaction_phase": phase,
+                    "compaction_draft_attempt": attempt + 1,
+                }
             )
-            call_traces.append(_trace_response(response, phase=phase))
+            LOGGER.info(
+                "Compaction %s request started (draft attempt %d/%d).",
+                phase,
+                attempt + 1,
+                _MAX_COMPACTION_REPAIR_ATTEMPTS + 1,
+            )
+            request = self._build_bounded_request(
+                source_events=source_events,
+                previous_bundle=previous_bundle,
+                user_instruction=instruction or None,
+                repair_issues=repair_issues if attempt > 0 else (),
+                rejected_payload=rejected_payload if attempt > 0 else None,
+                rejected_raw_text=(
+                    rejected_raw_text
+                    if attempt > 0 and rejected_payload is None
+                    else None
+                ),
+                diagnostics=diagnostics,
+            )
+            response = await self._llm_service.generate(request)
+            call_trace = _trace_response(response, phase=phase)
+            call_traces.append(call_trace)
+            _update_call_trace_diagnostics(diagnostics, call_traces)
+            _log_completed_call(call_trace)
             rejected_raw_text = response.text
             draft_payload: dict[str, Any] | None = None
             try:
-                draft_payload = _parse_json_object(response.text)
+                draft_payload = _extract_compaction_submission(response)
                 bundle = apply_compaction_draft(
                     draft_payload,
                     bundle_id=uuid4().hex,
@@ -223,78 +383,108 @@ class ContextCompactor:
             except (ValueError, CompactionContractError) as exc:
                 rejected_payload = draft_payload
                 repair_issues = _issues_from_exception(exc)
+                diagnostics["compaction_last_issues"] = [
+                    issue.to_dict() for issue in repair_issues
+                ]
+                LOGGER.warning(
+                    "Compaction %s response rejected (draft attempt %d/%d, issues=%s).",
+                    phase,
+                    attempt + 1,
+                    _MAX_COMPACTION_REPAIR_ATTEMPTS + 1,
+                    _canonical_json(diagnostics["compaction_last_issues"]),
+                )
                 if attempt >= _MAX_COMPACTION_REPAIR_ATTEMPTS:
                     raise CompactionContractError(repair_issues) from exc
                 continue
-
-            verification_input: dict[str, Any] = {
-                "user_instruction": instruction or None,
-                "previous_bundle": (
-                    previous_bundle.to_dict() if previous_bundle is not None else None
-                ),
-                "delta_events": [event.to_dict() for event in source_events],
-                "candidate_bundle": bundle.to_dict(),
+            verification_payload = {
+                "valid": True,
+                "method": "jarvis_deterministic_contract",
+                "schema_version": bundle.schema_version,
             }
-            verification: CompactionVerification | None = None
-            invalid_verifier_output: str | None = None
-            for verification_attempt in range(_MAX_VERIFICATION_ATTEMPTS):
-                current_verification_input = dict(verification_input)
-                if verification_attempt > 0:
-                    current_verification_input.update(
-                        {
-                            "verifier_contract_retry": True,
-                            "previous_invalid_verifier_output": invalid_verifier_output,
-                        }
-                    )
-                verification_response = await self._llm_service.generate(
-                    self._build_request(
-                        system_prompt=_COMPACTION_VERIFY_SYSTEM_PROMPT,
-                        user_text=(
-                            "Verify this candidate compaction against its evidence:\n"
-                            + _canonical_json(current_verification_input)
-                        ),
-                    )
-                )
-                call_traces.append(_trace_response(verification_response, phase="verify"))
-                try:
-                    verification = _parse_verification(verification_response.text)
-                except ValueError:
-                    invalid_verifier_output = verification_response.text
-                    if verification_attempt + 1 >= _MAX_VERIFICATION_ATTEMPTS:
-                        raise
-                    continue
-                break
-            if verification is None:
-                raise RuntimeError("Compaction verifier ended without a valid verdict.")
-            if verification.valid:
-                final_bundle = bundle
-                final_draft = draft_payload
-                final_verification = verification
-                break
+            return CompactionOutcome(
+                bundle=bundle,
+                items=compile_compaction_replay(bundle),
+                draft_payload=draft_payload,
+                verification_payload=verification_payload,
+                call_traces=tuple(call_traces),
+                repair_count=attempt,
+            )
 
-            rejected_payload = draft_payload
-            repair_issues = verification.issues
-            if attempt >= _MAX_COMPACTION_REPAIR_ATTEMPTS:
-                raise CompactionContractError(repair_issues)
+        raise RuntimeError("Compaction ended without a valid canonical bundle.")
 
-        if final_bundle is None or final_draft is None or final_verification is None:
-            raise RuntimeError("Compaction ended without a verified canonical bundle.")
-        return CompactionOutcome(
-            bundle=final_bundle,
-            items=compile_compaction_replay(final_bundle),
-            draft_payload=final_draft,
-            verification_payload=final_verification.payload,
-            call_traces=tuple(call_traces),
-            repair_count=sum(trace.phase == "repair" for trace in call_traces),
+    def _build_bounded_request(
+        self,
+        *,
+        source_events: Sequence[CompactionSourceEvent],
+        previous_bundle: CompactionBundle | None,
+        user_instruction: str | None,
+        repair_issues: Sequence[CompactionContractIssue],
+        rejected_payload: Mapping[str, Any] | None,
+        rejected_raw_text: str | None,
+        diagnostics: dict[str, Any],
+    ) -> LLMRequest:
+        safe_input_limit = max(
+            1,
+            (
+                self._context_policy.preflight_limit_tokens
+                * _COMPACTION_INPUT_SAFETY_PERCENT
+            )
+            // 100,
         )
+        last_estimate = 0
+        for event_content_limit in _COMPACTION_SOURCE_EVENT_LIMITS:
+            user_text, truncated_event_count = _render_compaction_input(
+                source_events=source_events,
+                previous_bundle=previous_bundle,
+                user_instruction=user_instruction,
+                repair_issues=repair_issues,
+                rejected_payload=rejected_payload,
+                rejected_raw_text=rejected_raw_text,
+                event_content_limit=event_content_limit,
+            )
+            request = self._build_request(user_text=user_text)
+            last_estimate = estimate_request_input_tokens(request)
+            diagnostics.update(
+                {
+                    "compaction_estimated_input_tokens": last_estimate,
+                    "compaction_safe_input_limit_tokens": safe_input_limit,
+                    "compaction_preflight_limit_tokens": (
+                        self._context_policy.preflight_limit_tokens
+                    ),
+                    "compaction_source_event_count": len(source_events),
+                    "compaction_source_input_chars": len(user_text),
+                    "compaction_source_event_char_limit": event_content_limit,
+                    "compaction_source_truncated_event_count": truncated_event_count,
+                }
+            )
+            if last_estimate < safe_input_limit:
+                LOGGER.info(
+                    "Compaction input prepared (events=%d, chars=%d, estimated_tokens=%d, "
+                    "safe_limit=%d, truncated_events=%d, event_char_limit=%s).",
+                    len(source_events),
+                    len(user_text),
+                    last_estimate,
+                    safe_input_limit,
+                    truncated_event_count,
+                    event_content_limit,
+                )
+                return request
+        error = ContextBudgetError(
+            "Compaction source remains over its safe input budget after bounded rendering."
+        )
+        _attach_compaction_error_metadata(error, diagnostics)
+        raise error
 
-    def _build_request(self, *, system_prompt: str, user_text: str) -> LLMRequest:
+    def _build_request(self, *, user_text: str) -> LLMRequest:
         return LLMRequest(
             messages=(
-                LLMMessage.text("system", system_prompt),
+                LLMMessage.text("system", _COMPACTION_SYSTEM_PROMPT),
                 LLMMessage.text("user", user_text),
             ),
             provider=self._provider,
+            tools=(_COMPACTION_TOOL,),
+            tool_choice=ToolChoice.tool(_COMPACTION_TOOL_NAME),
+            parallel_tool_calls=False,
             max_output_tokens=self._context_policy.compact_reserve_output_tokens,
         )
 
@@ -463,44 +653,279 @@ def _source_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     return selected
 
 
-def _parse_verification(text: str) -> CompactionVerification:
-    payload = _parse_json_object(text)
-    if set(payload) != {"valid", "issues"}:
-        raise ValueError("Compaction verifier must return exactly valid and issues.")
-    valid = payload.get("valid")
-    raw_issues = payload.get("issues")
-    if not isinstance(valid, bool) or not isinstance(raw_issues, list):
-        raise ValueError("Compaction verifier returned invalid field types.")
-    issues: list[CompactionContractIssue] = []
-    for index, raw_issue in enumerate(raw_issues):
-        if not isinstance(raw_issue, Mapping) or set(raw_issue) != {
-            "code",
-            "message",
-            "source_event_ids",
-        }:
-            raise ValueError(f"Compaction verifier issue {index} has invalid shape.")
-        code = _optional_string(raw_issue.get("code"))
-        message = _optional_string(raw_issue.get("message"))
-        raw_source_ids = raw_issue.get("source_event_ids")
-        if code is None or message is None or not isinstance(raw_source_ids, list):
-            raise ValueError(f"Compaction verifier issue {index} has invalid values.")
-        source_ids = tuple(
-            source_id
-            for raw_source_id in raw_source_ids
-            if (source_id := _optional_string(raw_source_id)) is not None
+def _render_compaction_input(
+    *,
+    source_events: Sequence[CompactionSourceEvent],
+    previous_bundle: CompactionBundle | None,
+    user_instruction: str | None,
+    repair_issues: Sequence[CompactionContractIssue],
+    rejected_payload: Mapping[str, Any] | None,
+    rejected_raw_text: str | None,
+    event_content_limit: int | None,
+) -> tuple[str, int]:
+    previous_context = (
+        _canonical_json(_previous_bundle_semantics(previous_bundle))
+        if previous_bundle is not None
+        else "none"
+    )
+    transcript, truncated_event_count = _render_source_transcript(
+        source_events,
+        event_content_limit=event_content_limit,
+    )
+    sections = [
+        "Create the complete current continuation record and call submit_compaction once.",
+        "Review the record for omissions, contradictions, stale observations, and false "
+        "completion before submitting it.",
+        "",
+        "EXPLICIT COMPACTION INSTRUCTION:",
+        user_instruction or "none",
+        "",
+        "PREVIOUS CANONICAL CONTEXT:",
+        previous_context,
+        "",
+        "NEW ORDERED TRANSCRIPT EVIDENCE:",
+        transcript or "none",
+    ]
+    if repair_issues:
+        sections.extend(
+            [
+                "",
+                "THE PREVIOUS SUBMISSION FAILED DETERMINISTIC VALIDATION:",
+                _canonical_json([issue.to_dict() for issue in repair_issues]),
+                "",
+                "REJECTED SUBMISSION:",
+                (
+                    _canonical_json(rejected_payload)
+                    if rejected_payload is not None
+                    else (rejected_raw_text or "unavailable")
+                ),
+                "Return a complete corrected submission, not a patch.",
+            ]
         )
-        issues.append(
-            CompactionContractIssue(
-                code=code,
-                message=message,
-                source_event_ids=source_ids,
+    return "\n".join(sections), truncated_event_count
+
+
+def _previous_bundle_semantics(bundle: CompactionBundle) -> dict[str, Any]:
+    by_category: dict[str, list[dict[str, Any] | str]] = {
+        "constraints": [],
+        "decisions": [],
+        "artifacts": [],
+        "open_loops": [],
+        "uncertainties": [],
+    }
+    for entry in bundle.state_entries:
+        if entry.category == "constraint":
+            by_category["constraints"].append(entry.summary)
+        elif entry.category == "decision":
+            by_category["decisions"].append(entry.summary)
+        elif entry.category == "uncertainty":
+            by_category["uncertainties"].append(entry.summary)
+        elif entry.category == "artifact":
+            by_category["artifacts"].append(
+                {
+                    "summary": entry.summary,
+                    "locator": entry.locator,
+                    "last_observed_state": entry.last_observed_state,
+                    "needs_verification": entry.needs_verification,
+                }
             )
+        elif entry.category == "open_loop":
+            by_category["open_loops"].append(
+                {
+                    "summary": entry.summary,
+                    "next_action": entry.next_action,
+                    "blocker": entry.blocker,
+                }
+            )
+    return {
+        "objective": bundle.objective.summary,
+        "background": list(bundle.background),
+        "preserved_messages": [
+            {
+                "source_ref": f"P{index}",
+                "role": record.role,
+                "content": record.content,
+                "reason": record.reason,
+            }
+            for index, record in enumerate(bundle.preserved_records, start=1)
+        ],
+        "episodes": [
+            {"summary": episode.summary, "outcomes": list(episode.outcomes)}
+            for episode in bundle.episodes
+        ],
+        **by_category,
+        "handover": bundle.handover.to_dict(),
+    }
+
+
+def _render_source_transcript(
+    source_events: Sequence[CompactionSourceEvent],
+    *,
+    event_content_limit: int | None,
+) -> tuple[str, int]:
+    event_ref_by_call_id: dict[str, str] = {}
+    result_by_call_id: dict[str, tuple[str, str]] = {}
+    for index, event in enumerate(source_events, start=1):
+        source_ref = f"E{index}"
+        if event.event_type == "assistant_tool_call":
+            for call_id in event.causal_ids:
+                event_ref_by_call_id[call_id] = source_ref
+        if event.event_type == "tool_result":
+            for call_id in event.causal_ids:
+                result_by_call_id[call_id] = (source_ref, event.content)
+
+    blocks: list[str] = []
+    truncated_event_count = 0
+    for index, event in enumerate(source_events, start=1):
+        source_ref = f"E{index}"
+        header_parts = [
+            source_ref,
+            f"role={event.role}",
+            f"type={event.event_type}",
+            f"at={event.created_at}",
+        ]
+        tool_name = _optional_string((event.metadata or {}).get("tool_name"))
+        if tool_name is not None:
+            header_parts.append(f"tool={tool_name}")
+        ok = (event.metadata or {}).get("ok")
+        if isinstance(ok, bool):
+            header_parts.append(f"ok={str(ok).lower()}")
+        if event.event_type == "tool_result" and event.causal_ids:
+            call_ref = event_ref_by_call_id.get(event.causal_ids[0])
+            if call_ref is not None:
+                header_parts.append(f"responds_to={call_ref}")
+
+        body_parts: list[str] = []
+        if event.content:
+            content_limit = event_content_limit if event.role == "tool" else None
+            rendered_content, truncated = _bounded_source_text(
+                event.content,
+                max_chars=content_limit,
+            )
+            body_parts.append(rendered_content)
+            truncated_event_count += int(truncated)
+
+        raw_calls = (event.metadata or {}).get("tool_calls")
+        if isinstance(raw_calls, list):
+            rendered_calls: list[str] = []
+            for raw_call in raw_calls:
+                if not isinstance(raw_call, Mapping):
+                    continue
+                call_id = _optional_string(raw_call.get("call_id"))
+                name = _optional_string(raw_call.get("name")) or "unknown"
+                paired_result = result_by_call_id.get(call_id or "")
+                call_header = f"tool call: {name}"
+                if paired_result is not None:
+                    call_header += f" -> result {paired_result[0]}"
+                arguments, arguments_truncated = _render_tool_arguments(
+                    raw_call.get("arguments", {}),
+                    paired_result_content=(
+                        paired_result[1] if paired_result is not None else None
+                    ),
+                    max_string_chars=event_content_limit,
+                )
+                if arguments:
+                    call_header += "\narguments: " + arguments
+                rendered_calls.append(call_header)
+                truncated_event_count += int(arguments_truncated)
+            if rendered_calls:
+                body_parts.append("\n".join(rendered_calls))
+
+        metadata_notes = _render_event_metadata_notes(event.metadata)
+        if metadata_notes:
+            body_parts.append(metadata_notes)
+        blocks.append(
+            "[EVENT "
+            + " | ".join(header_parts)
+            + "]\n"
+            + ("\n".join(body_parts) or "(no visible content)")
+            + f"\n[/EVENT {source_ref}]"
         )
-    if valid and issues:
-        raise ValueError("A valid compaction verification cannot contain issues.")
-    if not valid and not issues:
-        raise ValueError("An invalid compaction verification must contain issues.")
-    return CompactionVerification(valid=valid, issues=tuple(issues), payload=payload)
+    return "\n\n".join(blocks), truncated_event_count
+
+
+def _render_tool_arguments(
+    value: Any,
+    *,
+    paired_result_content: str | None,
+    max_string_chars: int | None,
+) -> tuple[str, bool]:
+    truncated = False
+
+    def compact(item: Any) -> Any:
+        nonlocal truncated
+        if isinstance(item, str):
+            if (
+                paired_result_content is not None
+                and len(item) >= 80
+                and item in paired_result_content
+            ):
+                return "<exact value appears in paired tool result>"
+            bounded, was_truncated = _bounded_source_text(
+                item,
+                max_chars=max_string_chars,
+            )
+            truncated = truncated or was_truncated
+            return bounded
+        if isinstance(item, Mapping):
+            return {str(key): compact(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [compact(child) for child in item]
+        return _normalize_json_value(item)
+
+    normalized = compact(value)
+    if normalized in ({}, [], None, ""):
+        return "", truncated
+    return _canonical_json(normalized), truncated
+
+
+def _render_event_metadata_notes(metadata: Mapping[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    notes = {
+        key: metadata[key]
+        for key in (
+            "reason",
+            "approved",
+            "interruption_reason",
+            "recommended_action",
+            "latest_subagent_report_complete",
+            "latest_subagent_report_truncated",
+            "pending_subagent_ids",
+            "carry_forward_compacted",
+            "carry_forward_compaction_strength",
+        )
+        if key in metadata
+    }
+    return "metadata: " + _canonical_json(notes) if notes else ""
+
+
+def _bounded_source_text(text: str, *, max_chars: int | None) -> tuple[str, bool]:
+    if max_chars is None or len(text) <= max_chars:
+        return text, False
+    marker = (
+        f"\n...[{len(text) - max_chars} source characters omitted; "
+        f"sha256={_sha256_text(text)}]...\n"
+    )
+    remaining = max(0, max_chars - len(marker))
+    leading = remaining // 2
+    trailing = remaining - leading
+    suffix = text[-trailing:] if trailing else ""
+    return text[:leading] + marker + suffix, True
+
+
+def _extract_compaction_submission(response: LLMResponse) -> dict[str, Any]:
+    matching_calls = [
+        call for call in response.tool_calls if call.name == _COMPACTION_TOOL_NAME
+    ]
+    if len(matching_calls) == 1:
+        return dict(matching_calls[0].arguments)
+    if matching_calls:
+        raise ValueError("Compaction model submitted more than one compaction tool call.")
+    if response.tool_calls:
+        names = ", ".join(call.name for call in response.tool_calls)
+        raise ValueError(f"Compaction model called unexpected tools: {names}.")
+    return _parse_json_object(response.text)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -565,7 +990,7 @@ def _extract_first_json_object(text: str) -> str | None:
 def _trace_response(
     response: LLMResponse,
     *,
-    phase: Literal["generate", "verify", "repair"],
+    phase: Literal["generate", "repair"],
 ) -> CompactionCallTrace:
     usage = response.usage
     return CompactionCallTrace(
@@ -588,6 +1013,67 @@ def _issues_from_exception(exc: Exception) -> tuple[CompactionContractIssue, ...
             message=str(exc) or exc.__class__.__name__,
         ),
     )
+
+
+def _resolve_compaction_deadline_seconds(
+    llm_service: object,
+    *,
+    explicit_deadline_seconds: float | None,
+) -> float | None:
+    if explicit_deadline_seconds is not None:
+        if explicit_deadline_seconds <= 0:
+            raise ValueError("Compaction deadline must be greater than zero.")
+        return float(explicit_deadline_seconds)
+
+    service_settings = getattr(llm_service, "settings", None)
+    configured_deadline = getattr(service_settings, "request_deadline_seconds", None)
+    if configured_deadline is None:
+        return None
+    try:
+        normalized = float(configured_deadline)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
+
+
+def _update_call_trace_diagnostics(
+    diagnostics: dict[str, Any],
+    call_traces: Sequence[CompactionCallTrace],
+) -> None:
+    diagnostics["compaction_call_count"] = len(call_traces)
+    diagnostics["compaction_call_traces"] = [trace.to_dict() for trace in call_traces]
+
+
+def _log_completed_call(trace: CompactionCallTrace) -> None:
+    LOGGER.info(
+        "Compaction %s response completed "
+        "(provider=%s, model=%s, response_id=%s, input_tokens=%s, "
+        "output_tokens=%s, total_tokens=%s).",
+        trace.phase,
+        trace.provider,
+        trace.model,
+        trace.response_id,
+        trace.input_tokens,
+        trace.output_tokens,
+        trace.total_tokens,
+    )
+
+
+def _attach_compaction_error_metadata(
+    exc: Exception,
+    diagnostics: Mapping[str, Any],
+) -> None:
+    existing = getattr(exc, "metadata", None)
+    merged = dict(existing) if isinstance(existing, Mapping) else {}
+    for key, value in diagnostics.items():
+        merged.setdefault(key, value)
+    try:
+        setattr(exc, "metadata", merged)
+    except (AttributeError, TypeError):
+        LOGGER.debug(
+            "Could not attach compaction diagnostics to %s.",
+            type(exc).__name__,
+        )
 
 
 def _normalize_json_value(value: Any) -> Any:
@@ -616,6 +1102,10 @@ def _sum_optional(values: Iterable[int | None]) -> int | None:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _utc_now_iso() -> str:

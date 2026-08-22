@@ -195,10 +195,10 @@ Behavior:
 - new Jarvis session -> new Codex thread
 - resumed Jarvis session -> `thread/resume` with stored `thread_id`
 - `/new` -> hard-interrupt the current Codex turn with reason `new_session`, archive the old Jarvis session and reset trace, unregister its thread mapping, and create an idle fresh session whose first later user message starts a new Codex thread
-- `/compact` -> generate and verify an evidence-backed canonical bundle, archive the current session only after validation succeeds, persist the bundle anchor plus deterministic replay into a fresh session, and mark the next Codex turn to seed that new thread exactly once
+- `/compact` -> generate and validate a structured canonical bundle, archive the current session only after validation succeeds, persist the bundle anchor plus deterministic replay into a fresh session, and mark the next Codex turn to seed that new thread exactly once
 
 Jarvis still does not rebuild Codex continuity by replaying the full old transcript into a new thread.
-Instead, post-compaction Codex sessions persist the same schema-v2 bundle used by the normal agent loop. The shared replay compiler produces one fixed history boundary, exact source-copied user/assistant messages, and assistant-only episode/state/handover context. The Codex adapter renders those roles deterministically into text inputs and injects them once into the first turn of the fresh thread. Later compactions load the prior bundle and merge only new transcript delta records.
+Instead, post-compaction Codex sessions persist the same schema-v3 bundle used by the normal agent loop. The shared replay compiler produces one fixed history boundary, exact source-copied user/assistant messages, and assistant-only episode/state/handover context. The Codex adapter renders those roles deterministically into text inputs and injects them once into the first turn of the fresh thread. Later compactions pass the prior semantic bundle plus only new transcript delta records to the compactor.
 
 ## Main And Subagent Reuse
 

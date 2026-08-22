@@ -1439,6 +1439,52 @@ class _FakeFollowupPreflightCompactionLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _BlockingCompactionLLMService:
+    def __init__(
+        self,
+        *,
+        propose_tool: str | None = None,
+        propose_tool_on_call: int = 1,
+    ) -> None:
+        self._propose_tool = propose_tool
+        self._propose_tool_on_call = propose_tool_on_call
+        self.normal_generate_calls = 0
+        self.compaction_started = asyncio.Event()
+        self.compaction_cancelled = asyncio.Event()
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        if _is_compaction_request(request):
+            self.compaction_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.compaction_cancelled.set()
+                raise
+            raise AssertionError("Blocked compaction unexpectedly resumed.")
+
+        self.normal_generate_calls += 1
+        if (
+            self._propose_tool is not None
+            and self.normal_generate_calls == self._propose_tool_on_call
+        ):
+            return _build_response(
+                "Running the tool before compaction.",
+                tool_calls=[
+                    ToolCall(
+                        call_id="compaction_stop_tool_1",
+                        name=self._propose_tool,
+                        arguments={},
+                        raw_arguments="{}",
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        return _build_response("Seed history.")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _FakeStreamingFollowupOverflowCompactionLLMService:
     def __init__(self) -> None:
         self.stream_calls = 0
@@ -2279,6 +2325,128 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(new_records[-1].role, "assistant")
             self.assertEqual(new_records[-1].content, "Recovered after compaction.")
 
+    async def test_stop_cancels_followup_compaction_and_interrupts_the_active_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _BlockingCompactionLLMService(
+                propose_tool="instant_tool",
+                propose_tool_on_call=2,
+            )
+            registry = ToolRegistry(
+                tools=[
+                    RegisteredTool(
+                        name="instant_tool",
+                        exposure="basic",
+                        definition=ToolDefinition(
+                            name="instant_tool",
+                            input_schema={
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                            description="Immediate tool used before compaction.",
+                        ),
+                        executor=_ImmediateToolExecutor(name="instant_tool"),
+                    )
+                ]
+            )
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            seeded = await loop.handle_user_input("Seed history.")
+
+            def _estimate_with_followup_overflow(request: LLMRequest) -> int:
+                if any(message.role == "tool" for message in request.messages):
+                    return settings.context_policy.preflight_limit_tokens
+                return 10
+
+            with patch(
+                "jarvis.core.agent_loop.estimate_request_input_tokens",
+                side_effect=_estimate_with_followup_overflow,
+            ):
+                task = asyncio.create_task(loop.handle_user_input("Run the tool."))
+                await asyncio.wait_for(llm_service.compaction_started.wait(), timeout=1.0)
+                self.assertTrue(loop.has_active_turn())
+                self.assertTrue(loop.request_stop())
+                result = await asyncio.wait_for(task, timeout=1.0)
+
+            self.assertTrue(result.interrupted)
+            self.assertEqual(result.interruption_reason, "user_stop")
+            self.assertTrue(llm_service.compaction_cancelled.is_set())
+            self.assertFalse(loop.has_active_turn())
+            old_session = storage.get_session(seeded.session_id)
+            self.assertIsNotNone(old_session)
+            self.assertEqual(old_session.status, "active")  # type: ignore[union-attr]
+            self.assertEqual(old_session.compaction_count, 0)  # type: ignore[union-attr]
+
+    async def test_stop_cancels_reactive_compaction_before_turn_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _BlockingCompactionLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+            seeded = await loop.handle_user_input("Seed history.")
+            storage.update_session(
+                seeded.session_id,
+                pending_reactive_compaction=True,
+            )
+
+            task = asyncio.create_task(loop.handle_user_input("Continue."))
+            await asyncio.wait_for(llm_service.compaction_started.wait(), timeout=1.0)
+            self.assertTrue(loop.has_active_turn())
+            self.assertTrue(loop.request_stop())
+            result = await asyncio.wait_for(task, timeout=1.0)
+
+            self.assertTrue(result.interrupted)
+            self.assertEqual(result.interruption_reason, "user_stop")
+            self.assertTrue(llm_service.compaction_cancelled.is_set())
+            self.assertFalse(loop.has_active_turn())
+            session = storage.get_session(seeded.session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.status, "active")  # type: ignore[union-attr]
+            self.assertEqual(session.compaction_count, 0)  # type: ignore[union-attr]
+
+    async def test_stop_cancels_manual_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _BlockingCompactionLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,
+                settings=settings,
+                storage=storage,
+            )
+            seeded = await loop.handle_user_input("Seed history.")
+
+            task = asyncio.create_task(loop.handle_user_input("/compact"))
+            await asyncio.wait_for(llm_service.compaction_started.wait(), timeout=1.0)
+            self.assertTrue(loop.has_active_turn())
+            self.assertTrue(loop.request_stop())
+            result = await asyncio.wait_for(task, timeout=1.0)
+
+            self.assertTrue(result.interrupted)
+            self.assertEqual(result.command, "/compact")
+            self.assertEqual(result.interruption_reason, "user_stop")
+            self.assertTrue(llm_service.compaction_cancelled.is_set())
+            self.assertFalse(loop.has_active_turn())
+            session = storage.get_session(seeded.session_id)
+            self.assertIsNotNone(session)
+            self.assertEqual(session.status, "active")  # type: ignore[union-attr]
+            self.assertEqual(session.compaction_count, 0)  # type: ignore[union-attr]
+
     async def test_local_notice_callback_wraps_manual_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -2328,7 +2496,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(compacted.compaction_performed)
             self.assertEqual(
                 llm_service.request_providers,
-                ["anthropic", "openai", "openai"],
+                ["anthropic", "openai"],
             )
 
     async def test_handle_user_input_auto_compacts_when_current_turn_itself_overflows(self) -> None:
