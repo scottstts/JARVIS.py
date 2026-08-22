@@ -35,6 +35,12 @@ class RouteEventBase:
     turn_kind: RouteTurnKind | None = None
     client_message_id: str | None = None
     subagent_id: str | None = None
+    origin_session_id: str | None = None
+    origin_turn_id: str | None = None
+    actor_id: str | None = None
+    actor_run_generation: int | None = None
+    actor_sequence: int | None = None
+    sequence: int | None = None
     public: bool = True
     event_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=lambda: _utc_now_iso())
@@ -92,6 +98,7 @@ class RouteTurnDoneEvent(RouteEventBase):
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    completion_blocked: bool = False
     interruption_reason: str | None = None
     type: Literal["turn_done"] = "turn_done"
 

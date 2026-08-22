@@ -496,6 +496,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--- BEGIN SKILL review-check ---", bootstrap_text)
             self.assertIn("SKILL_FORWARDING_SENTINEL", bootstrap_text)
             self.assertEqual(payload["skill_ids"], ["review-check"])
+            self.assertEqual(payload["skill_selection_reason"], "explicit_or_inherited")
 
             entry = manager._catalog.get_entry(payload["subagent_id"])
             self.assertIsNotNone(entry)
@@ -503,6 +504,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected structured assignment to be persisted.")
             self.assertEqual(entry.task_label, "Review storage contract")
             self.assertEqual(entry.skill_ids, ("review-check",))
+            self.assertEqual(entry.skill_selection_reason, "explicit_or_inherited")
             self.assertEqual(entry.owned_paths, ("tests/test_storage.py",))
 
     async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
@@ -1070,6 +1072,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             await manager._run_turn(
                 runtime,
+                run_generation=runtime.run_generation,
                 user_text="Continue.",
                 force_session_id="subagent_session",
                 pre_turn_messages=(),
@@ -1394,15 +1397,12 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(manager, "_launch_runtime_task", side_effect=fake_launch_runtime_task):
                 await manager.enqueue_bash_job_followup((notice,))
 
-            self.assertEqual(runtime.status, "running")
+            self.assertEqual(runtime.status, "waiting_background")
             self.assertEqual(
                 runtime.pending_background_job_ids,
                 {"deadbeefdeadbeefdeadbeefdeadbeef"},
             )
-            note_content, _note_session_id, note_metadata = runtime.loop.system_notes[0]
-            self.assertIn("recommendation=wait", note_content)
-            self.assertIn("Do not call tools for this update", note_content)
-            self.assertEqual(note_metadata["recommended_action"], "wait")
+            self.assertEqual(runtime.loop.system_notes, [])
 
     async def test_monitor_returns_full_pending_job_ids_and_nudges_on_unchanged_poll(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

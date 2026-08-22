@@ -31,6 +31,12 @@ class GatewayRouteEventBase:
     agent_kind: str = "main"
     agent_name: str = "Jarvis"
     subagent_id: str | None = None
+    origin_session_id: str | None = None
+    origin_turn_id: str | None = None
+    actor_id: str | None = None
+    actor_run_generation: int | None = None
+    actor_sequence: int | None = None
+    sequence: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -85,6 +91,7 @@ class GatewayTurnDoneEvent(GatewayRouteEventBase):
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    completion_blocked: bool = False
     interruption_reason: str | None = None
     type: str = "turn_done"
 
@@ -495,6 +502,12 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
             if payload.get("subagent_id") is not None
             else None
         ),
+        "origin_session_id": _optional_string(payload.get("origin_session_id")),
+        "origin_turn_id": _optional_string(payload.get("origin_turn_id")),
+        "actor_id": _optional_string(payload.get("actor_id")),
+        "actor_run_generation": _optional_integer(payload.get("actor_run_generation")),
+        "actor_sequence": _optional_integer(payload.get("actor_sequence")),
+        "sequence": _optional_integer(payload.get("sequence")),
     }
     event_type = str(payload.get("type", ""))
     if event_type == "turn_started":
@@ -556,6 +569,7 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
             compaction_performed=bool(payload.get("compaction_performed", False)),
             interrupted=bool(payload.get("interrupted", False)),
             approval_rejected=bool(payload.get("approval_rejected", False)),
+            completion_blocked=bool(payload.get("completion_blocked", False)),
             interruption_reason=(
                 str(payload["interruption_reason"])
                 if payload.get("interruption_reason") is not None
@@ -590,3 +604,21 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
         code="invalid_gateway_payload",
         message=f"Unsupported gateway event type: {event_type}",
     )
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _optional_integer(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

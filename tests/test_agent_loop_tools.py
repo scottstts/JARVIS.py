@@ -55,8 +55,12 @@ from jarvis.tools import (
 )
 
 _EXPECTED_BASIC_TOOL_NAMES = [
+    "acceptance_record",
+    "acceptance_run",
     "bash",
     "file_patch",
+    "file_write",
+    "file_replace",
     "memory_search",
     "memory_get",
     "memory_write",
@@ -1299,7 +1303,7 @@ class _FakeToolRoundLimitLLMService:
                 for part in system_message.parts
                 if isinstance(part, TextPart)
             )
-            if "Continue the same task now" not in system_text:
+            if "continuation is allowed only" not in system_text:
                 raise AssertionError("Expected automatic continuation guidance.")
             return _build_response(
                 "",
@@ -2095,12 +2099,10 @@ class _FakeInvalidToolCallLLMService:
             raise AssertionError("Expected one tool result part before follow-up model call.")
         if tool_result_parts[0].is_error is not True:
             raise AssertionError("Expected invalid tool call recovery to be marked as an error.")
-        if "ToolCallValidationError" not in tool_result_parts[0].content:
-            raise AssertionError("Expected recovered tool result to include the validation error type.")
-        if "body_sections" not in tool_result_parts[0].content:
-            raise AssertionError("Expected recovered tool result to mention the bad body_sections shape.")
-        if "raw_arguments" not in tool_result_parts[0].content:
-            raise AssertionError("Expected recovered tool result to echo raw arguments.")
+        if "error_code: tool_call_validation_error" not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to include a stable error code.")
+        if "canonical_example" not in tool_result_parts[0].content:
+            raise AssertionError("Expected recovered tool result to include a correction example.")
 
         yield DoneEvent(
             response=_build_response(
@@ -2143,7 +2145,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(boundary_records), 1)
             self.assertTrue(boundary_records[0].metadata["automatic_continuation"])
-            self.assertIn("Do not ask the user to continue", boundary_records[0].content)
+            self.assertIn("continuation is allowed only", boundary_records[0].content)
             self.assertEqual(
                 (settings.workspace_dir / "continuation.txt").read_text(),
                 "continued",
@@ -2611,10 +2613,10 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 original_tool_call["arguments"],
                 large_arguments,
             )
-            self.assertGreater(len(original_tool_call["raw_arguments"]), 1_200)
+            self.assertNotIn("raw_arguments", original_tool_call)
             self.assertTrue(cloned_record.metadata.get("carry_forward_compacted"))
             self.assertTrue(cloned_record.metadata.get("carry_forward_tool_calls_compacted"))
-            self.assertLess(len(cloned_tool_call["raw_arguments"]), 400)
+            self.assertNotIn("raw_arguments", cloned_tool_call)
             self.assertTrue(cloned_tool_call["arguments"]["compacted"])
             self.assertIn(
                 "archived session transcript",
@@ -2674,7 +2676,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(tool_records), 1)
             self.assertFalse(tool_records[0].metadata.get("ok", True))
             self.assertTrue(tool_records[0].metadata.get("tool_call_validation_failed"))
-            self.assertIn("ToolCallValidationError", tool_records[0].content)
+            self.assertIn("error_code: tool_call_validation_error", tool_records[0].content)
             self.assertTrue(any(isinstance(event, AgentToolCallEvent) for event in events))
             self.assertTrue(any(isinstance(event, AgentAssistantMessageEvent) for event in events))
 
@@ -3613,7 +3615,13 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             result = await loop.handle_user_input("Create notes/todo.txt with hello.")
 
-            self.assertEqual(result.response_text, "Patched file.")
+            self.assertTrue(result.response_text.startswith("Patched file."))
+            self.assertIn("no acceptance ledger was recorded", result.response_text)
+            self.assertTrue(result.completion_blocked)
+            session = storage.get_session(result.session_id)
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.turn_states[result.turn_id], "blocked")
             self.assertEqual(
                 (notes_dir / "todo.txt").read_text(encoding="utf-8"),
                 "hello\n",
@@ -3621,12 +3629,18 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             records = storage.load_records(result.session_id)
             message_records = [record for record in records if record.kind == "message"]
-            self.assertEqual(message_records[-4].role, "user")
-            self.assertEqual(message_records[-3].role, "assistant")
-            self.assertEqual(message_records[-2].role, "tool")
-            self.assertEqual(message_records[-1].role, "assistant")
-            self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "file_patch")
-            self.assertIn("File patch applied", message_records[-2].content)
+            semantic_turn_records = [
+                record for record in message_records if record.role != "system"
+            ][-4:]
+            self.assertEqual(
+                [record.role for record in semantic_turn_records],
+                ["user", "assistant", "tool", "assistant"],
+            )
+            self.assertEqual(
+                semantic_turn_records[1].metadata["tool_calls"][0]["name"],
+                "file_patch",
+            )
+            self.assertIn("File patch applied", semantic_turn_records[2].content)
 
     async def test_handle_user_input_executes_bash_python_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3913,7 +3927,8 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             final_event = events[-1]
             if not isinstance(final_event, AgentTurnDoneEvent):
                 self.fail("Expected streamed turn to finish with AgentTurnDoneEvent.")
-            self.assertEqual(final_event.response_text, "Registered runtime tool.")
+            self.assertTrue(final_event.response_text.startswith("Registered runtime tool."))
+            self.assertIn("no acceptance ledger was recorded", final_event.response_text)
             self.assertTrue(
                 (
                     settings.workspace_dir

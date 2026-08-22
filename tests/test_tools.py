@@ -327,7 +327,7 @@ class ToolSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.web_search_result_count, 10)
 
-    def test_uses_500_as_default_tool_round_slice(self) -> None:
+    def test_uses_bounded_default_tool_round_budgets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
@@ -335,7 +335,8 @@ class ToolSettingsTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 settings = ToolSettings.from_workspace_dir(workspace_dir)
 
-        self.assertEqual(settings.max_tool_rounds_per_turn, 500)
+        self.assertEqual(settings.max_tool_rounds_per_turn, 64)
+        self.assertEqual(settings.max_tool_rounds_per_task, 256)
 
     def test_bash_schema_exposes_optional_per_call_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1375,8 +1376,12 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 basic_names,
                 [
+                    "acceptance_record",
+                    "acceptance_run",
                     "bash",
                     "file_patch",
+                    "file_write",
+                    "file_replace",
                     "memory_search",
                     "memory_get",
                     "memory_write",
@@ -3596,9 +3601,9 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.name, "memory_write")
         self.assertIn("Tool execution failed", result.content)
-        self.assertIn("ToolCallValidationError", result.content)
-        self.assertIn("raw_arguments", result.content)
-        self.assertIn("match the tool schema", result.content)
+        self.assertIn("error_code: tool_call_validation_error", result.content)
+        self.assertIn("canonical_example", result.content)
+        self.assertNotIn("raw_arguments", result.content)
         self.assertTrue(result.metadata["tool_call_validation_failed"])
 
     async def test_memory_write_runtime_accepts_explicit_none_truth_decision(self) -> None:

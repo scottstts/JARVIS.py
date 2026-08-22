@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ _INSTALL_KEYWORDS = (
     "pipx install",
     "poetry add",
 )
-_MODE_VALUES = {"foreground", "background", "status", "tail", "cancel"}
+_MODE_VALUES = {"foreground", "background", "service", "status", "tail", "cancel"}
 _COMMAND_PREFIX = r"(?:^|[;&|()]\s*|\n\s*)"
 _OPTIONAL_SUDO = r"(?:sudo\s+)?"
 _OPTIONAL_ENV_WRAPPER = r"(?:env\s+)?"
@@ -76,6 +77,17 @@ _PYTHON_ENV_CREATION_PATTERN = re.compile(
     + r"(?:python(?:\d+(?:\.\d+)*)?\s+-m\s+venv|uv\s+venv|virtualenv|conda\s+create)\b"
 )
 _PYTHON_COMMAND_NAME_PATTERN = re.compile(r"python(?:\d+(?:\.\d+)*)?$")
+_UNMANAGED_PROCESS_COMMAND_PATTERN = re.compile(
+    r"(?:^|[;&|()\n]\s*)(?:sudo\s+)?(?:env\s+)?"
+    r"(?:[a-z_][a-z0-9_]*=[^\s;&|()]+\s+)*(?:nohup|disown|setsid)\b",
+    re.IGNORECASE,
+)
+_DETACH_WRAPPER_PATTERN = re.compile(
+    r"(?:^|[;&|()\n]\s*)(?:sudo\s+)?(?:command|builtin)\s+"
+    r"(?:nohup|disown|setsid)\b|"
+    r"(?:^|[;&|()\n]\s*)(?:daemonize|start-stop-daemon\b[^\n;&|]*--background|systemd-run)\b",
+    re.IGNORECASE,
+)
 _HARD_DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -249,6 +261,12 @@ class BashCommandPolicy:
                 )
             return ToolPolicyDecision(allowed=True)
 
+        if arguments.get("_disable_auto_promote") not in {None, True}:
+            return ToolPolicyDecision(
+                allowed=False,
+                reason="internal bash auto-promotion control must be true when supplied.",
+            )
+
         try:
             working_directory = resolve_bash_working_directory(arguments, context)
         except ValueError as exc:
@@ -261,6 +279,15 @@ class BashCommandPolicy:
             return ToolPolicyDecision(
                 allowed=False,
                 reason="bash command cannot contain null bytes.",
+            )
+        if _unmanaged_background_reason(command) is not None:
+            return ToolPolicyDecision(
+                allowed=False,
+                reason=(
+                    "Shell-level backgrounding is not allowed. Use bash mode='background' "
+                    "so Jarvis owns the process group, logs, readiness, cancellation, and "
+                    "terminal result."
+                ),
             )
 
         hard_deny_reason = _python_environment_violation_reason(command, self._settings)
@@ -318,6 +345,90 @@ def _normalize_mode(value: object) -> str:
         return "foreground"
     normalized = str(value).strip().lower()
     return normalized or "foreground"
+
+
+def _unmanaged_background_reason(command: str) -> str | None:
+    """Detect process detachment syntax while ignoring quoted text and comments."""
+
+    visible: list[str] = []
+    quote: str | None = None
+    escaped = False
+    comment = False
+    for index, char in enumerate(command):
+        if comment:
+            visible.append("\n" if char == "\n" else " ")
+            if char == "\n":
+                comment = False
+            continue
+        if escaped:
+            visible.append(" ")
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            visible.append(" ")
+            escaped = True
+            continue
+        if quote is not None:
+            visible.append(" ")
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            visible.append(" ")
+            quote = char
+            continue
+        if char == "#" and (index == 0 or command[index - 1].isspace()):
+            visible.append(" ")
+            comment = True
+            continue
+        visible.append(char)
+    masked = "".join(visible)
+    for index, char in enumerate(masked):
+        if char != "&":
+            continue
+        before = masked[index - 1] if index > 0 else ""
+        after = masked[index + 1] if index + 1 < len(masked) else ""
+        if before != "&" and after != "&":
+            return "ampersand"
+    if _UNMANAGED_PROCESS_COMMAND_PATTERN.search(masked) or _DETACH_WRAPPER_PATTERN.search(
+        masked
+    ):
+        return "detachment_command"
+    nested_reason = _nested_shell_background_reason(command)
+    if nested_reason is not None:
+        return nested_reason
+    return None
+
+
+def _nested_shell_background_reason(command: str) -> str | None:
+    """Inspect direct shell/eval wrappers whose quoted payload was masked above."""
+
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    shell_names = {"bash", "dash", "fish", "ksh", "sh", "zsh"}
+    for index, token in enumerate(tokens):
+        basename = Path(token).name
+        if basename == "eval" and index + 1 < len(tokens):
+            if _unmanaged_background_reason(tokens[index + 1]) is not None:
+                return "nested_detachment_command"
+            continue
+        if basename not in shell_names:
+            continue
+        option_index = index + 1
+        while option_index < len(tokens) and tokens[option_index].startswith("-"):
+            option = tokens[option_index]
+            if option == "-c" or "c" in option[1:]:
+                payload_index = option_index + 1
+                if (
+                    payload_index < len(tokens)
+                    and _unmanaged_background_reason(tokens[payload_index]) is not None
+                ):
+                    return "nested_detachment_command"
+                break
+            option_index += 1
+    return None
 
 
 def _hard_deny_reason(command: str) -> str | None:

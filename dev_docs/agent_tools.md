@@ -194,6 +194,8 @@ Route-scoped supervision owns detached bash monitoring outside the model loop. A
 
 Progress pacing combines immediate signal-driven updates with fallback heartbeats. Notices are batched and deduplicated by owner so multiple job updates coalesce into one revival.
 
+An unchanged background-job heartbeat updates the durable job/supervisor status only; it is not appended to semantic transcript history and does not consume a model turn. Terminal notices include process exit/signal/runtime, command and output hashes, launch revision, bounded output tails, and durable stdout/stderr log paths. Exit status is process evidence, not semantic readiness evidence; record the actual acceptance check before reporting completion.
+
 Route-level `/stop` preempts foreground tool awaits. Foreground bash gets best-effort process-group/job cancellation when its active await is cancelled. Already-detached bash jobs are different: `/stop` suppresses their auto-followups until the next user message, but it does not cancel those jobs.
 
 `/new` is destructive: it closes the route follow-up gate immediately, cancels every detached job still owned by the route through the configured bash runtime, marks terminal notice state as finalized, clears retained notices, and only then creates the fresh main session. Old job metadata and logs remain as archive artifacts, but the supervisor cannot recover them into a later turn.
@@ -203,6 +205,8 @@ Route-level `/stop` preempts foreground tool awaits. Foreground bash gets best-e
 ### `bash`
 
 Runs shell commands in `tool_runtime` with `/workspace` as the durable boundary. Foreground and background calls may provide `cwd` as a relative path or `/workspace`-absolute path; it must resolve to an existing directory inside the workspace, applies only to that call, and defaults to `/workspace`. Job-control calls do not accept `cwd`. The tool also supports status, tail, cancellation, output truncation, log retention, approval-gated installs/builds/destructive commands, and route-level background supervision.
+
+The command shell starts with `set -e -o pipefail`, so a failing verification command cannot be hidden by a later successful command in the same invocation. Shell-managed backgrounding (`&`, `nohup`, `disown`, `setsid`, nested shell/eval payloads, and equivalent detach wrappers) is rejected. Use `mode="background"` for supervised jobs or `mode="service"` for a long-lived process with allocated/preflighted loopback port, PID/PGID ownership, readiness URL, command/revision provenance, logs, status, and cancellation. When another actor has a workspace lease, every mutable bash call must provide non-empty `write_paths` plus the observed `expected_lease_generation`. Read-only shell commands take an exclusive workspace snapshot barrier because their accessed paths cannot be inferred safely.
 
 ### `file_patch`
 
@@ -218,9 +222,21 @@ Writes are atomic. Non-write operations require exact single matches.
 
 Every operation has the same required shape: `type`, `match`, and `replacement`. `write` uses an empty `match` and full-file `replacement`; `delete` uses an empty `replacement`; the other operations apply their documented literal semantics. This avoids provider-incompatible operation unions and reduces malformed model calls.
 
-Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application. Successful results return the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
+Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application, or `expected_file_absent=true` when inspection established a new target. While any workspace lease is active, file writes require one of those content-state preconditions plus `expected_lease_generation`. Successful results return artifact provenance and the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
 
-The tool description includes a minimal valid replace payload because nested patch operations are a common model-shape failure; runtime schema errors also point to paths such as `$.operations[0].type`.
+The tool description includes a minimal valid replace payload because nested patch operations are a common model-shape failure; runtime schema errors use stable error codes, canonical examples, and a bounded retry budget without reflecting malformed raw payloads into the transcript.
+
+### `file_write` and `file_replace`
+
+Use `file_write(path, content)` for a whole-file create or rewrite, and `file_replace(path, match, replacement)` for one exact unique replacement. These flat shapes cover the common edit cases that previously caused malformed nested `file_patch` calls. All three file-edit tools are atomic, support `expected_sha256`, and participate in route-level path coordination.
+
+### `acceptance_run` and `acceptance_record`
+
+`acceptance_run` executes each required gate independently, rejecting top-level shell chaining/pipes and nested shell command wrappers so one successful command cannot mask another failure. Its ledger records exact commands, exit status, duration, bounded output plus hash, and content-derived workspace revision before/after each gate. `acceptance_record` then records the durable issue/acceptance ledger with statuses such as `open`, `fixed`, `not_a_bug`, `deferred`, and `user_waived`; it requires the still-current final workspace revision and cites a passing gate call from the current mutation epoch. Items accumulate by stable `item_id`, so a later partial ledger cannot hide an older required open item. Required unresolved items prevent a completion claim. A passing process exit alone is not sufficient evidence of an externally observable requirement.
+
+## Workspace Coordination
+
+Route actors share `/workspace`, but no longer share one global tool mutex. The route coordinator permits concurrent exact-path reads and disjoint declared writes, while persistent `owned_paths` assigned to a subagent remain write leases until the child is disposed. Direct file edits and file-consuming tools acquire the precise target path automatically; whole-workspace snapshots use an exclusive barrier. Directory/file overlap is recognized, unknown mutation tools use the global write barrier, and stale lease generations or content hashes are rejected rather than racing silently.
 
 ### `view_image`
 

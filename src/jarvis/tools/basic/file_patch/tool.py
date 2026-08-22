@@ -6,8 +6,9 @@ import difflib
 import hashlib
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from jarvis.llm import ToolDefinition
 
@@ -35,53 +36,68 @@ class FilePatchToolExecutor:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
-        raw_path = str(arguments["path"]).strip()
-        file_path = _resolve_workspace_relative_path(raw_path, context)
-
-        try:
-            operations = _normalize_operations(arguments.get("operations"))
-            expected_sha256 = _normalize_expected_sha256(
-                arguments.get("expected_sha256")
-            )
-            outcome = _apply_file_patch(
-                file_path=file_path,
-                operations=operations,
-                expected_sha256=expected_sha256,
-            )
-        except FilePatchError as exc:
-            return _file_patch_error(
-                call_id=call_id,
-                raw_path=raw_path,
-                file_path=file_path,
-                reason=str(exc),
-            )
-
-        content_lines = [
-            "File patch applied",
-            f"path: {file_path}",
-            f"status: {outcome['status']}",
-            f"operations_applied: {outcome['operations_applied']}",
-            "operation_types: " + ", ".join(outcome["operation_types"]),
-            f"changed: {str(outcome['changed']).lower()}",
-            f"bytes_written: {outcome['bytes_written']}",
-            f"content_sha256: {outcome['content_sha256']}",
-        ]
-
-        return ToolExecutionResult(
+        return _execute_file_edit(
             call_id=call_id,
-            name="file_patch",
-            ok=True,
-            content="\n".join(content_lines),
-            metadata={
-                "path": str(file_path),
-                "status": outcome["status"],
-                "file_created": outcome["file_created"],
-                "changed": outcome["changed"],
-                "operations_applied": outcome["operations_applied"],
-                "operation_types": list(outcome["operation_types"]),
-                "bytes_written": outcome["bytes_written"],
-                "content_sha256": outcome["content_sha256"],
-            },
+            tool_name="file_patch",
+            raw_path=str(arguments["path"]).strip(),
+            operations=arguments.get("operations"),
+            expected_sha256=arguments.get("expected_sha256"),
+            expected_file_absent=arguments.get("expected_file_absent", False),
+            context=context,
+        )
+
+
+class FileWriteToolExecutor:
+    """Writes one complete UTF-8 file with a minimal flat argument shape."""
+
+    async def __call__(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        return _execute_file_edit(
+            call_id=call_id,
+            tool_name="file_write",
+            raw_path=str(arguments["path"]).strip(),
+            operations=[
+                {
+                    "type": "write",
+                    "match": "",
+                    "replacement": arguments["content"],
+                }
+            ],
+            expected_sha256=arguments.get("expected_sha256"),
+            expected_file_absent=arguments.get("expected_file_absent", False),
+            context=context,
+        )
+
+
+class FileReplaceToolExecutor:
+    """Replaces one exact text occurrence with a minimal flat argument shape."""
+
+    async def __call__(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        return _execute_file_edit(
+            call_id=call_id,
+            tool_name="file_replace",
+            raw_path=str(arguments["path"]).strip(),
+            operations=[
+                {
+                    "type": "replace",
+                    "match": arguments["match"],
+                    "replacement": arguments["replacement"],
+                }
+            ],
+            expected_sha256=arguments.get("expected_sha256"),
+            expected_file_absent=arguments.get("expected_file_absent", False),
+            context=context,
         )
 
 
@@ -113,6 +129,8 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                             "The patch fails if the current file differs."
                         ),
                     },
+                    "expected_file_absent": _expected_file_absent_schema(),
+                    "expected_lease_generation": _expected_lease_generation_schema(),
                     "operations": {
                         "type": "array",
                         "minItems": 1,
@@ -165,6 +183,117 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
     )
 
 
+def build_file_write_tool(settings: ToolSettings) -> RegisteredTool:
+    """Build the flat whole-file writing tool."""
+
+    return RegisteredTool(
+        name="file_write",
+        exposure="basic",
+        definition=ToolDefinition(
+            name="file_write",
+            description=(
+                "Write the complete UTF-8 content of one workspace file atomically. "
+                f"Only files inside {settings.workspace_dir} are allowed. Use this for "
+                "new files or broad rewrites."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": _path_schema(),
+                    "content": {
+                        "type": "string",
+                        "maxLength": _MAX_OPERATION_TEXT_CHARS,
+                    },
+                    "expected_sha256": _expected_sha256_schema(),
+                    "expected_file_absent": _expected_file_absent_schema(),
+                    "expected_lease_generation": _expected_lease_generation_schema(),
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        ),
+        executor=FileWriteToolExecutor(),
+    )
+
+
+def build_file_replace_tool(settings: ToolSettings) -> RegisteredTool:
+    """Build the flat one-replacement editing tool."""
+
+    return RegisteredTool(
+        name="file_replace",
+        exposure="basic",
+        definition=ToolDefinition(
+            name="file_replace",
+            description=(
+                "Replace one unique exact text match in one workspace UTF-8 file. "
+                f"Only files inside {settings.workspace_dir} are allowed. Use this for "
+                "simple targeted edits."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": _path_schema(),
+                    "match": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": _MAX_OPERATION_TEXT_CHARS,
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "maxLength": _MAX_OPERATION_TEXT_CHARS,
+                    },
+                    "expected_sha256": _expected_sha256_schema(),
+                    "expected_file_absent": _expected_file_absent_schema(),
+                    "expected_lease_generation": _expected_lease_generation_schema(),
+                },
+                "required": ["path", "match", "replacement"],
+                "additionalProperties": False,
+            },
+        ),
+        executor=FileReplaceToolExecutor(),
+    )
+
+
+def _path_schema() -> dict[str, object]:
+    return {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": _MAX_PATH_CHARS,
+        "description": "Workspace file to edit.",
+    }
+
+
+def _expected_sha256_schema() -> dict[str, object]:
+    return {
+        "type": "string",
+        "minLength": 64,
+        "maxLength": 64,
+        "pattern": "^[0-9a-fA-F]{64}$",
+        "description": "Optional SHA-256 observed before this edit.",
+    }
+
+
+def _expected_lease_generation_schema() -> dict[str, object]:
+    return {
+        "type": "integer",
+        "minimum": 0,
+        "description": (
+            "Optional workspace lease generation observed during inspection. The write fails "
+            "if path ownership changed before execution."
+        ),
+    }
+
+
+def _expected_file_absent_schema() -> dict[str, object]:
+    return {
+        "type": "boolean",
+        "description": (
+            "Set true only when inspection established that the target does not exist. "
+            "The write fails if a file appeared before execution."
+        ),
+    }
+
+
 def _build_file_patch_tool_description(settings: ToolSettings) -> str:
     return (
         "Apply structured text edits to exactly one workspace file. "
@@ -180,6 +309,77 @@ def _build_file_patch_tool_description(settings: ToolSettings) -> str:
         "missing or ambiguous. Example: "
         '{"path":"src/app.py","operations":[{"type":"replace",'
         '"match":"x = 1","replacement":"x = 2"}]}.'
+    )
+
+
+def _execute_file_edit(
+    *,
+    call_id: str,
+    tool_name: str,
+    raw_path: str,
+    operations: object,
+    expected_sha256: object,
+    expected_file_absent: object,
+    context: ToolExecutionContext,
+) -> ToolExecutionResult:
+    file_path = context.workspace_dir.resolve(strict=False)
+    try:
+        file_path = _resolve_workspace_relative_path(raw_path, context)
+        normalized_operations = _normalize_operations(operations)
+        normalized_expected_sha256 = _normalize_expected_sha256(expected_sha256)
+        if not isinstance(expected_file_absent, bool):
+            raise FilePatchError("expected_file_absent must be a boolean when supplied.")
+        outcome = _apply_file_patch(
+            file_path=file_path,
+            operations=normalized_operations,
+            expected_sha256=normalized_expected_sha256,
+            expected_file_absent=expected_file_absent,
+        )
+    except FilePatchError as exc:
+        return _file_patch_error(
+            call_id=call_id,
+            tool_name=tool_name,
+            raw_path=raw_path,
+            file_path=file_path,
+            reason=str(exc),
+        )
+
+    content_lines = [
+        "File patch applied" if tool_name == "file_patch" else "File edit applied",
+        f"path: {file_path}",
+        f"status: {outcome['status']}",
+        f"operations_applied: {outcome['operations_applied']}",
+        "operation_types: " + ", ".join(cast(list[str], outcome["operation_types"])),
+        f"changed: {str(outcome['changed']).lower()}",
+        f"bytes_written: {outcome['bytes_written']}",
+        f"content_sha256: {outcome['content_sha256']}",
+    ]
+    return ToolExecutionResult(
+        call_id=call_id,
+        name=tool_name,
+        ok=True,
+        content="\n".join(content_lines),
+        metadata={
+            "path": str(file_path),
+            "status": outcome["status"],
+            "file_created": outcome["file_created"],
+            "changed": outcome["changed"],
+            "operations_applied": outcome["operations_applied"],
+            "operation_types": list(cast(list[str], outcome["operation_types"])),
+            "bytes_written": outcome["bytes_written"],
+            "content_sha256": outcome["content_sha256"],
+            "artifact_provenance": {
+                "path": str(file_path),
+                "tool_name": tool_name,
+                "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                "origin_session_id": context.session_id,
+                "origin_turn_id": context.turn_id,
+                "actor_kind": context.agent_kind,
+                "actor_name": context.agent_name,
+                "subagent_id": context.subagent_id,
+                "content_sha256": outcome["content_sha256"],
+            },
+        },
     )
 
 
@@ -280,6 +480,7 @@ def _apply_file_patch(
     file_path: Path,
     operations: list[dict[str, str]],
     expected_sha256: str | None,
+    expected_file_absent: bool,
 ) -> dict[str, object]:
     parent_dir = file_path.parent
     if not parent_dir.exists():
@@ -294,6 +495,14 @@ def _apply_file_patch(
         raise FilePatchError("path must point to a regular file.")
 
     file_existed = file_path.exists()
+    if expected_file_absent and file_existed:
+        raise FilePatchError(
+            "expected_file_absent precondition failed; a file now exists. Reread before retrying."
+        )
+    if expected_file_absent and expected_sha256 is not None:
+        raise FilePatchError(
+            "expected_file_absent and expected_sha256 are mutually exclusive preconditions."
+        )
     operation_types = tuple(operation["type"] for operation in operations)
 
     existing_content = ""
@@ -556,14 +765,22 @@ def _write_text_atomically(
 
 def _resolve_workspace_relative_path(raw_path: str, context: ToolExecutionContext) -> Path:
     candidate = Path(raw_path)
-    if not candidate.is_absolute():
-        candidate = context.workspace_dir / candidate
-    return candidate.resolve(strict=False)
+    workspace = context.workspace_dir.resolve(strict=False)
+    if candidate.is_absolute():
+        if candidate == Path("/workspace") or candidate.is_relative_to(Path("/workspace")):
+            candidate = workspace / candidate.relative_to("/workspace")
+    else:
+        candidate = workspace / candidate
+    resolved = candidate.resolve(strict=False)
+    if resolved != workspace and not resolved.is_relative_to(workspace):
+        raise FilePatchError("path must stay inside /workspace.")
+    return resolved
 
 
 def _file_patch_error(
     *,
     call_id: str,
+    tool_name: str,
     raw_path: str,
     file_path: Path,
     reason: str,
@@ -571,7 +788,7 @@ def _file_patch_error(
     current_sha256 = _current_file_sha256(file_path)
     return ToolExecutionResult(
         call_id=call_id,
-        name="file_patch",
+        name=tool_name,
         ok=False,
         content=(
             "File patch failed\n"
@@ -583,6 +800,7 @@ def _file_patch_error(
         ),
         metadata={
             "path": raw_path,
+            "error_code": "file_edit_failed",
             "error": reason,
             "current_sha256": current_sha256,
         },

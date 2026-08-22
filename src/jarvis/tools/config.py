@@ -40,7 +40,8 @@ from jarvis.tools.discoverable.email.configs import (
 
 _DEFAULT_TOOL_RUNTIME_TIMEOUT_SECONDS = 135.0
 _DEFAULT_TOOL_RUNTIME_HEALTHCHECK_TIMEOUT_SECONDS = 5.0
-_DEFAULT_MAX_TOOL_ROUNDS_PER_TURN = 500
+_DEFAULT_MAX_TOOL_ROUNDS_PER_TURN = 64
+_DEFAULT_MAX_TOOL_ROUNDS_PER_TASK = 256
 
 
 def _optional_env(name: str) -> str | None:
@@ -97,6 +98,7 @@ class ToolSettings:
     central_python_venv: Path
     central_python_starter_packages: tuple[str, ...]
     max_tool_rounds_per_turn: int
+    max_tool_rounds_per_task: int
     web_search_result_count: int
     web_search_timeout_seconds: float
     web_fetch_timeout_seconds: float
@@ -146,6 +148,10 @@ class ToolSettings:
             raise ValueError("central_python_venv cannot be empty.")
         if self.max_tool_rounds_per_turn <= 0:
             raise ValueError("max_tool_rounds_per_turn must be > 0.")
+        if self.max_tool_rounds_per_task < self.max_tool_rounds_per_turn:
+            raise ValueError(
+                "max_tool_rounds_per_task cannot be less than max_tool_rounds_per_turn."
+            )
         if self.web_search_result_count <= 0:
             raise ValueError("web_search_result_count must be > 0.")
         if self.web_search_result_count > 20:
@@ -247,6 +253,10 @@ class ToolSettings:
             max_tool_rounds_per_turn=_parse_int_env(
                 "JARVIS_TOOL_MAX_ROUNDS_PER_TURN",
                 _DEFAULT_MAX_TOOL_ROUNDS_PER_TURN,
+            ),
+            max_tool_rounds_per_task=_parse_int_env(
+                "JARVIS_TOOL_MAX_ROUNDS_PER_TASK",
+                _DEFAULT_MAX_TOOL_ROUNDS_PER_TASK,
             ),
             web_search_result_count=_parse_int_env(
                 "JARVIS_TOOL_WEB_SEARCH_RESULT_COUNT",

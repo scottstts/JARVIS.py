@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from jarvis.llm.config import EmbeddingSettings, LLMSettings
 from jarvis.llm.errors import (
@@ -436,6 +437,36 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.metadata["last_provider_event_type"],
             "reasoning.delta",
         )
+        self.assertTrue(provider.stream_closed)
+
+    async def test_stream_activity_without_semantic_output_hits_watchdog(self) -> None:
+        provider = _ContinuouslyActiveStreamProvider("openai")
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openai",
+                retry_attempts=0,
+                embedding=EmbeddingSettings(
+                    provider="openai",
+                    model="text-embedding-test",
+                ),
+            ),
+            providers=(provider,),
+        )
+
+        with (
+            patch("jarvis.llm.service._FIRST_SEMANTIC_OUTPUT_TIMEOUT_SECONDS", 0.03),
+            self.assertRaises(ProviderTimeoutError) as raised,
+        ):
+            async for _event in service.stream_generate(
+                LLMRequest(
+                    model="gpt-5.4-2026-03-05",
+                    messages=(LLMMessage.text("user", "hello"),),
+                )
+            ):
+                pass
+
+        self.assertEqual(raised.exception.metadata["timeout_kind"], "first_semantic_output")
+        self.assertTrue(raised.exception.metadata["retry_safe_after_acceptance"])
         self.assertTrue(provider.stream_closed)
 
     async def test_generate_retries_connect_timeout(self) -> None:

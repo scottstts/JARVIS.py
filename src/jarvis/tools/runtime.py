@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 
 from jarvis.logging_setup import get_application_logger
 from jarvis.llm import ToolCall
@@ -59,6 +60,7 @@ class ToolRuntime:
             tool_call.provider_metadata.get(TOOL_CALL_VALIDATION_ERROR_METADATA_KEY, "")
         ).strip()
         if validation_error:
+            correction = _validation_correction_hint(tool_call)
             return ToolExecutionResult(
                 call_id=tool_call.call_id,
                 name=tool_call.name,
@@ -66,14 +68,19 @@ class ToolRuntime:
                 content=(
                     "Tool execution failed\n"
                     f"tool: {tool_call.name}\n"
-                    "error_type: ToolCallValidationError\n"
+                    "error_code: tool_call_validation_error\n"
                     f"error: {validation_error}\n"
-                    f"raw_arguments: {tool_call.raw_arguments}\n"
-                    "fix: emit a new tool call whose arguments match the tool schema."
+                    f"canonical_example: {correction}\n"
+                    "retry_budget: 2 identical invalid calls are allowed before this exact "
+                    "file edit is blocked for the turn."
                 ),
                 metadata={
                     "tool_call_validation_failed": True,
+                    "error_code": "tool_call_validation_error",
                     "reason": validation_error,
+                    "offending_field": _validation_error_field(validation_error),
+                    "canonical_example": correction,
+                    "retry_budget": 2,
                     "raw_arguments": tool_call.raw_arguments,
                     "arguments": dict(tool_call.arguments),
                 },
@@ -221,6 +228,40 @@ def _is_successful_terminal_bash_result(result: ToolExecutionResult) -> bool:
         ).strip()
         return status == "finished" and result.metadata.get("exit_code") == 0
     return False
+
+
+def _validation_correction_hint(tool_call: ToolCall) -> str:
+    arguments = tool_call.arguments
+    path = str(arguments.get("path", "src/example.py")).strip() or "src/example.py"
+    if tool_call.name == "file_write":
+        return json.dumps({"path": path, "content": "complete file content"})
+    if tool_call.name == "file_replace":
+        return json.dumps(
+            {"path": path, "match": "exact old text", "replacement": "new text"}
+        )
+    if tool_call.name == "file_patch":
+        return json.dumps(
+            {
+                "path": path,
+                "operations": [
+                    {
+                        "type": "replace",
+                        "match": "exact old text",
+                        "replacement": "new text",
+                    }
+                ],
+            }
+        )
+    return "emit a new call matching the declared JSON schema"
+
+
+def _validation_error_field(message: str) -> str | None:
+    marker = "schema validation at "
+    if marker not in message:
+        return None
+    suffix = message.split(marker, 1)[1]
+    field = suffix.split(":", 1)[0].strip()
+    return field or None
 
 
 def _looks_like_skill_install_call(tool_call: ToolCall) -> bool:

@@ -5,10 +5,15 @@ from __future__ import annotations
 import unittest
 
 from jarvis.gateway.protocol import ProtocolError, build_route_event_payload, parse_client_event
-from jarvis.gateway.route_events import RouteAuthRequiredEvent, RouteTaskStatusEvent
+from jarvis.gateway.route_events import (
+    RouteAuthRequiredEvent,
+    RouteTaskStatusEvent,
+    RouteTurnDoneEvent,
+)
 from jarvis.ui.telegram.gateway_client import (
     GatewayAuthRequiredEvent,
     GatewayTaskStatusEvent,
+    GatewayTurnDoneEvent,
     _parse_route_event,
 )
 
@@ -150,3 +155,35 @@ class GatewayProtocolTests(unittest.TestCase):
         self.assertIsInstance(parsed, GatewayTaskStatusEvent)
         self.assertTrue(parsed.active)
         self.assertEqual(parsed.reason, "user_message_queued")
+
+    def test_turn_done_preserves_provenance_and_blocked_completion(self) -> None:
+        payload = build_route_event_payload(
+            RouteTurnDoneEvent(
+                route_id="route_1",
+                agent_kind="subagent",
+                agent_name="Atlas",
+                subagent_id="subagent_1",
+                session_id="child_session",
+                turn_id="child_turn",
+                origin_session_id="main_session",
+                origin_turn_id="main_turn",
+                actor_id="subagent:subagent_1",
+                actor_run_generation=3,
+                actor_sequence=9,
+                sequence=20,
+                response_text="Verification remains open.",
+                completion_blocked=True,
+            )
+        )
+
+        parsed = _parse_route_event(payload)
+
+        self.assertIsInstance(parsed, GatewayTurnDoneEvent)
+        assert isinstance(parsed, GatewayTurnDoneEvent)
+        self.assertEqual(parsed.origin_session_id, "main_session")
+        self.assertEqual(parsed.origin_turn_id, "main_turn")
+        self.assertEqual(parsed.actor_id, "subagent:subagent_1")
+        self.assertEqual(parsed.actor_run_generation, 3)
+        self.assertEqual(parsed.actor_sequence, 9)
+        self.assertEqual(parsed.sequence, 20)
+        self.assertTrue(parsed.completion_blocked)

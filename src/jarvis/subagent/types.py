@@ -59,6 +59,7 @@ class SubagentCatalogEntry:
     shared_context: str | None = None
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
+    skill_selection_reason: str = "none:no_matching_installed_skill"
     deliverable: str | None = None
     current_subagent_session_id: str | None = None
     disposed_at: str | None = None
@@ -66,6 +67,7 @@ class SubagentCatalogEntry:
     last_error: str | None = None
     last_error_metadata: dict[str, Any] = field(default_factory=dict)
     error_log_path: str | None = None
+    run_generation: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +85,7 @@ class SubagentCatalogEntry:
             "shared_context": self.shared_context,
             "owned_paths": list(self.owned_paths),
             "skill_ids": list(self.skill_ids),
+            "skill_selection_reason": self.skill_selection_reason,
             "deliverable": self.deliverable,
             "current_subagent_session_id": self.current_subagent_session_id,
             "disposed_at": self.disposed_at,
@@ -90,6 +93,7 @@ class SubagentCatalogEntry:
             "last_error": self.last_error,
             "last_error_metadata": self.last_error_metadata,
             "error_log_path": self.error_log_path,
+            "run_generation": self.run_generation,
         }
 
     @classmethod
@@ -139,6 +143,12 @@ class SubagentCatalogEntry:
             ),
             owned_paths=tuple(str(item) for item in payload.get("owned_paths", ())),
             skill_ids=tuple(str(item) for item in payload.get("skill_ids", ())),
+            skill_selection_reason=str(
+                payload.get(
+                    "skill_selection_reason",
+                    "none:no_matching_installed_skill",
+                )
+            ),
             deliverable=(
                 str(payload["deliverable"])
                 if payload.get("deliverable") is not None
@@ -170,6 +180,7 @@ class SubagentCatalogEntry:
                 if payload.get("error_log_path") is not None
                 else None
             ),
+            run_generation=_nonnegative_int(payload.get("run_generation", 0)),
         )
 
 
@@ -186,6 +197,7 @@ class SubagentSnapshot:
     shared_context: str | None = None
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
+    skill_selection_reason: str = "none:no_matching_installed_skill"
     deliverable: str | None = None
     current_subagent_session_id: str | None = None
     pause_reason: SubagentPauseReason | None = None
@@ -199,3 +211,13 @@ class SubagentSnapshot:
     pending_background_job_count: int = 0
     pending_background_job_ids: tuple[str, ...] = field(default_factory=tuple)
     notable_events: tuple[SubagentEventNote, ...] = field(default_factory=tuple)
+    run_generation: int = 0
+
+
+def _nonnegative_int(value: object) -> int:
+    if not isinstance(value, (str, int, float)):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0

@@ -6,13 +6,18 @@ import asyncio
 import contextlib
 import os
 import signal
+import socket
 import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import urlopen
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from ...config import ToolSettings
 from ...types import ToolExecutionContext, ToolExecutionResult
+from ...workspace_revision import workspace_revision as _workspace_revision
 from .jobs import (
     BashJobError,
     BashJobPaths,
@@ -70,6 +75,12 @@ class DirectBashToolExecutor:
                 arguments=arguments,
                 context=context,
             )
+        if mode == "service":
+            return await self._start_managed_service(
+                call_id=call_id,
+                arguments=arguments,
+                context=context,
+            )
         if mode == "status":
             return self._background_job_status(
                 call_id=call_id,
@@ -119,7 +130,9 @@ class DirectBashToolExecutor:
                 content=f"Bash execution request failed\nreason: {exc}",
                 metadata={"mode": "foreground", "error": str(exc)},
             )
-        if timeout_seconds < soft_timeout_seconds:
+        if timeout_seconds < soft_timeout_seconds or bool(
+            arguments.get("_disable_auto_promote", False)
+        ):
             return await self._run_plain_foreground(
                 call_id=call_id,
                 command=command,
@@ -156,7 +169,7 @@ class DirectBashToolExecutor:
             "--noprofile",
             "--norc",
             "-lc",
-            f"set -o pipefail\n{command}",
+            f"set -e -o pipefail\n{command}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(execution_cwd),
@@ -486,6 +499,157 @@ class DirectBashToolExecutor:
             },
         )
 
+    async def _start_managed_service(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        raw_command = str(arguments.get("command", "")).strip()
+        requested_port = _optional_port(arguments.get("service_port"))
+        if requested_port is None:
+            return _service_failure(call_id, "service_port must be an integer from 0 to 65535.")
+        if requested_port == 0:
+            if "{port}" not in raw_command:
+                return _service_failure(
+                    call_id,
+                    "auto-allocated services must include {port} in command.",
+                )
+            port = _allocate_loopback_port()
+        else:
+            port = requested_port
+            if _loopback_port_is_owned(port):
+                return _service_failure(
+                    call_id,
+                    f"service_port {port} is already owned; refusing a false-positive readiness check.",
+                )
+        command = raw_command.replace("{port}", str(port))
+        readiness_url = str(
+            arguments.get("readiness_url") or f"http://127.0.0.1:{port}/"
+        ).replace("{port}", str(port))
+        readiness_error = _validate_loopback_readiness_url(readiness_url, port=port)
+        if readiness_error is not None:
+            return _service_failure(call_id, readiness_error)
+        readiness_timeout = _bounded_float(
+            arguments.get("readiness_timeout_seconds", 30.0),
+            minimum=1.0,
+            maximum=300.0,
+        )
+        if readiness_timeout is None:
+            return _service_failure(
+                call_id,
+                "readiness_timeout_seconds must be between 1 and 300.",
+            )
+        try:
+            working_directory = resolve_bash_working_directory(arguments, context)
+            job, _process, pid, pgid = await self._launch_background_process(
+                workspace_dir=context.workspace_dir,
+                execution_cwd=working_directory.resolved,
+                display_cwd=working_directory.display,
+                command=command,
+            )
+        except (BashJobError, OSError) as exc:
+            return _service_failure(call_id, str(exc))
+
+        deadline = asyncio.get_running_loop().time() + readiness_timeout
+        readiness_verified = False
+        failure_reason = "readiness deadline expired"
+        while asyncio.get_running_loop().time() < deadline:
+            _, record = load_job(context.workspace_dir, job.job_id)
+            status = job_status(job, record)
+            if status["status"] != "running":
+                failure_reason = (
+                    "service process exited before readiness "
+                    f"(exit_code={status['exit_code']})"
+                )
+                break
+            if await asyncio.to_thread(_readiness_probe_succeeds, readiness_url):
+                ownership = _listening_port_owned_by_process_group(port=port, pgid=pgid)
+                if ownership is False:
+                    failure_reason = "readiness port is not owned by the launched process group"
+                    break
+                readiness_verified = True
+                break
+            await asyncio.sleep(0.1)
+
+        _, record = load_job(context.workspace_dir, job.job_id)
+        write_job_metadata(
+            paths=job,
+            pid=record.pid,
+            pgid=record.pgid,
+            runner_pid=record.runner_pid,
+            runner_pgid=record.runner_pgid,
+            command=record.command,
+            launched_at=record.launched_at,
+            cwd=record.cwd,
+            workspace_revision=record.workspace_revision,
+            service_port=port,
+            readiness_url=readiness_url,
+            readiness_verified=readiness_verified,
+        )
+        if not readiness_verified:
+            with contextlib.suppress(BashJobError):
+                _, refreshed = load_job(context.workspace_dir, job.job_id)
+                cancel_job(job, refreshed)
+            return _service_failure(
+                call_id,
+                failure_reason,
+                metadata={
+                    "job_id": job.job_id,
+                    "pid": pid,
+                    "pgid": pgid,
+                    "service_port": port,
+                    "readiness_url": readiness_url,
+                    "readiness_verified": False,
+                },
+            )
+        _, ready_record = load_job(context.workspace_dir, job.job_id)
+        status = job_status(job, ready_record)
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content=(
+                "Managed service ready\n"
+                f"job_id: {job.job_id}\n"
+                f"pid: {pid}\npgid: {pgid}\n"
+                f"service_port: {port}\nreadiness_url: {readiness_url}\n"
+                "readiness_verified: true"
+            ),
+            metadata={
+                "mode": "service",
+                "job_id": job.job_id,
+                "pid": pid,
+                "pgid": pgid,
+                "status": "running",
+                "state": "running",
+                "command": command,
+                "command_sha256": ready_record.command_sha256,
+                "workspace_revision": ready_record.workspace_revision,
+                "cwd": working_directory.display,
+                "service_port": port,
+                "readiness_url": readiness_url,
+                "readiness_verified": True,
+                "readiness_timeout_seconds": readiness_timeout,
+                "stdout_path": str(job.stdout_path),
+                "stderr_path": str(job.stderr_path),
+                "started_at": status["started_at"],
+                "last_update_at": status["last_update_at"],
+                "owner_route_id": status["owner_route_id"],
+                "owner_session_id": status["owner_session_id"],
+                "owner_turn_id": status["owner_turn_id"],
+                "owner_agent_kind": status["owner_agent_kind"],
+                "owner_agent_name": status["owner_agent_name"],
+                "owner_subagent_id": status["owner_subagent_id"],
+                "runtime_location": self._runtime_location,
+                "runtime_transport": self._runtime_transport,
+                "target_runtime": self._target_runtime,
+                "filesystem_scope": "container_direct",
+                "container_mutation_boundary": self._container_mutation_boundary,
+            },
+        )
+
     async def _launch_background_process(
         self,
         *,
@@ -531,6 +695,7 @@ class DirectBashToolExecutor:
                 command=command,
                 launched_at=_utc_now(),
                 cwd=display_cwd,
+                workspace_revision=_workspace_revision(workspace_dir),
             )
         except Exception:
             remove_job_artifacts(job)
@@ -757,6 +922,124 @@ class DirectBashToolExecutor:
             total_storage_budget_bytes=self._settings.bash_job_total_storage_budget_bytes,
             protected_job_ids=protected_job_ids,
         )
+
+
+def _optional_port(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if value is None:
+        value = 0
+    if not isinstance(value, (str, int, float)):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 0 <= port <= 65535 else None
+
+
+def _bounded_float(value: object, *, minimum: float, maximum: float) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        resolved = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return resolved if minimum <= resolved <= maximum else None
+
+
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
+        candidate.bind(("127.0.0.1", 0))
+        return int(candidate.getsockname()[1])
+
+
+def _loopback_port_is_owned(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+    return False
+
+
+def _validate_loopback_readiness_url(value: str, *, port: int) -> str | None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        return "readiness_url must use http or https."
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return "readiness_url must target the managed loopback service."
+    resolved_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if resolved_port != port:
+        return "readiness_url port must equal service_port."
+    return None
+
+
+def _readiness_probe_succeeds(url: str) -> bool:
+    try:
+        with urlopen(url, timeout=0.5) as response:  # noqa: S310 - loopback validated above
+            response.read(1)
+        return True
+    except HTTPError:
+        return True
+    except (OSError, URLError):
+        return False
+
+
+def _listening_port_owned_by_process_group(*, port: int, pgid: int) -> bool | None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    socket_inodes: set[str] = set()
+    port_hex = f"{port:04X}"
+    for table in (proc / "net/tcp", proc / "net/tcp6"):
+        try:
+            lines = table.read_text(encoding="utf-8", errors="replace").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 9 and fields[1].rsplit(":", 1)[-1] == port_hex and fields[3] == "0A":
+                socket_inodes.add(fields[9])
+    if not socket_inodes:
+        return False
+    for process_dir in proc.iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        try:
+            stat = (process_dir / "stat").read_text(encoding="utf-8")
+            suffix = stat[stat.rfind(")") + 2 :].split()
+            process_group = int(suffix[2])
+            if process_group != pgid:
+                continue
+            for fd in (process_dir / "fd").iterdir():
+                target = os.readlink(fd)
+                if target.startswith("socket:[") and target[8:-1] in socket_inodes:
+                    return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
+
+
+def _service_failure(
+    call_id: str,
+    reason: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        call_id=call_id,
+        name="bash",
+        ok=False,
+        content=f"Managed service failed\nreason: {reason}",
+        metadata={
+            "mode": "service",
+            "execution_failed": True,
+            "error_code": "managed_service_failed",
+            "reason": reason,
+            **(metadata or {}),
+        },
+    )
 
 
 def _build_scrubbed_environment(settings: ToolSettings) -> dict[str, str]:

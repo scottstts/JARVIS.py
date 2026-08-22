@@ -190,6 +190,7 @@ def build_turn_done_event(
     command: str | None,
     compaction_performed: bool,
     interrupted: bool,
+    completion_blocked: bool = False,
     interruption_reason: str | None = None,
 ) -> dict[str, Any]:
     return {
@@ -202,6 +203,7 @@ def build_turn_done_event(
         "command": command,
         "compaction_performed": compaction_performed,
         "interrupted": interrupted,
+        "completion_blocked": completion_blocked,
         "interruption_reason": interruption_reason,
     }
 
@@ -241,6 +243,12 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
         "agent_kind": event.agent_kind,
         "agent_name": event.agent_name,
         "subagent_id": event.subagent_id,
+        "origin_session_id": event.origin_session_id,
+        "origin_turn_id": event.origin_turn_id,
+        "actor_id": event.actor_id,
+        "actor_run_generation": event.actor_run_generation,
+        "actor_sequence": event.actor_sequence,
+        "sequence": event.sequence,
     }
     if isinstance(event, RouteTurnStartedEvent):
         return payload
@@ -285,6 +293,7 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
                 "compaction_performed": event.compaction_performed,
                 "interrupted": event.interrupted,
                 "approval_rejected": event.approval_rejected,
+                "completion_blocked": event.completion_blocked,
                 "interruption_reason": event.interruption_reason,
             }
         )

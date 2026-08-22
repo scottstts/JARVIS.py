@@ -115,18 +115,25 @@ def parse_and_validate_tool_call(
         name=name,
         raw_arguments=raw_arguments,
     )
+    normalized_arguments, normalization = _normalize_legacy_tool_arguments(
+        name=name,
+        arguments=parsed,
+    )
     validate_tool_call_arguments(
         call_id=call_id,
         name=name,
-        arguments=parsed,
+        arguments=normalized_arguments,
         schema=schema,
     )
 
     return ToolCall(
         call_id=call_id,
         name=name,
-        arguments=parsed,
+        arguments=normalized_arguments,
         raw_arguments=raw_arguments,
+        provider_metadata=(
+            {"tool_call_normalized": normalization} if normalization is not None else {}
+        ),
     )
 
 
@@ -195,6 +202,72 @@ def _best_effort_load_tool_call_arguments(raw_arguments: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return {}
     return parsed
+
+
+def _normalize_legacy_tool_arguments(
+    *,
+    name: str,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Apply only unambiguous compatibility normalization for legacy file patches."""
+
+    if name != "file_patch":
+        return arguments, None
+    raw_operations = arguments.get("operations")
+    if not isinstance(raw_operations, list) or not raw_operations:
+        return arguments, None
+    if not all(isinstance(item, dict) for item in raw_operations):
+        return arguments, None
+
+    normalized = dict(arguments)
+    operations = [dict(item) for item in raw_operations]
+    changes: list[str] = []
+    root_path = normalized.get("path")
+    nested_paths = [
+        str(operation["path"]).strip()
+        for operation in operations
+        if isinstance(operation.get("path"), str) and str(operation["path"]).strip()
+    ]
+    if (
+        root_path is None
+        and len(nested_paths) == len(operations)
+        and len(set(nested_paths)) == 1
+    ):
+        root_path = nested_paths[0]
+        normalized["path"] = root_path
+        changes.append("hoisted identical operation paths")
+
+    for operation in operations:
+        if root_path is not None and operation.get("path") == root_path:
+            operation.pop("path", None)
+            changes.append("removed duplicated operation path")
+        if "type" in operation:
+            continue
+        aliases = [
+            alias
+            for alias in ("write", "replace", "insert_before", "insert_after", "delete")
+            if isinstance(operation.get(alias), str)
+        ]
+        if len(aliases) != 1:
+            continue
+        alias = aliases[0]
+        if "match" in operation:
+            continue
+        operation["type"] = alias
+        alias_value = operation.pop(alias)
+        if alias == "write":
+            operation["match"] = ""
+            operation.setdefault("replacement", alias_value)
+        else:
+            operation["match"] = alias_value
+            if alias == "delete":
+                operation.setdefault("replacement", "")
+        changes.append(f"inferred operation type '{alias}'")
+
+    if not changes:
+        return arguments, None
+    normalized["operations"] = operations
+    return normalized, {"kind": "legacy_file_patch", "changes": sorted(set(changes))}
 
 
 def _format_json_path(path: Sequence[object], *, root: str = "$") -> str:

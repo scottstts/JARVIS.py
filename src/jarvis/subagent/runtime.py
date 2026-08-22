@@ -34,6 +34,7 @@ class SubagentRuntime:
     shared_context: str | None = None
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
+    skill_selection_reason: str = "none:no_matching_installed_skill"
     deliverable: str | None = None
     task: asyncio.Task[None] | None = None
     pause_reason: SubagentPauseReason | None = None
@@ -47,6 +48,8 @@ class SubagentRuntime:
     notable_events: deque[SubagentEventNote] = field(default_factory=deque)
     pending_pause_reason: SubagentPauseReason | None = None
     pending_background_job_ids: set[str] = field(default_factory=set)
+    run_generation: int = 0
+    provider_recovery_attempts: int = 0
 
     def snapshot(self) -> SubagentSnapshot:
         return SubagentSnapshot(
@@ -61,6 +64,7 @@ class SubagentRuntime:
             shared_context=self.shared_context,
             owned_paths=self.owned_paths,
             skill_ids=self.skill_ids,
+            skill_selection_reason=self.skill_selection_reason,
             deliverable=self.deliverable,
             current_subagent_session_id=self.loop.active_session_id(),
             pause_reason=self.pause_reason,
@@ -74,4 +78,5 @@ class SubagentRuntime:
             pending_background_job_count=len(self.pending_background_job_ids),
             pending_background_job_ids=tuple(sorted(self.pending_background_job_ids)),
             notable_events=tuple(self.notable_events),
+            run_generation=self.run_generation,
         )

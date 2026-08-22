@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 from typing import Awaitable, Callable
 
 from jarvis.logging_setup import get_application_logger
@@ -62,6 +63,15 @@ class BashJobNotice:
     stdout_bytes_dropped: int
     stderr_bytes_dropped: int
     progress_hint: str | None
+    stdout_log_path: str = ""
+    stderr_log_path: str = ""
+    command_sha256: str = ""
+    workspace_revision: str | None = None
+    runtime_seconds: float | None = None
+    termination_signal: int | None = None
+    process_exit_success: bool = False
+    stdout_sha256: str = ""
+    stderr_sha256: str = ""
     skill_import_notice: str | None = None
 
 
@@ -405,11 +415,24 @@ class BashJobSupervisor:
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
+            stdout_log_path=str(status_result.metadata.get("stdout_path", record.stdout_path)),
+            stderr_log_path=str(status_result.metadata.get("stderr_path", record.stderr_path)),
             stdout_bytes_seen=_optional_int(status_result.metadata.get("stdout_bytes_seen")) or 0,
             stderr_bytes_seen=_optional_int(status_result.metadata.get("stderr_bytes_seen")) or 0,
             stdout_bytes_dropped=stdout_bytes_dropped,
             stderr_bytes_dropped=stderr_bytes_dropped,
             progress_hint=progress_hint,
+            command_sha256=record.command_sha256,
+            workspace_revision=record.workspace_revision,
+            runtime_seconds=_runtime_seconds(
+                started_at=str(status_result.metadata.get("started_at", record.launched_at)),
+                finished_at=_optional_string(status_result.metadata.get("finished_at")),
+                cancelled_at=_optional_string(status_result.metadata.get("cancelled_at")),
+            ),
+            termination_signal=_termination_signal(exit_code),
+            process_exit_success=status == "finished" and exit_code == 0,
+            stdout_sha256=hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            stderr_sha256=hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
             skill_import_notice=self._skill_import_notice_for_terminal_success(
                 status=status,
                 exit_code=exit_code,
@@ -600,6 +623,31 @@ def _promote_notice_kind_for_attention(
     if normalized_hint and (len(normalized_hint) <= 4 or _looks_repetitive_hint(normalized_hint)):
         return "bash_job_needs_attention"
     return notice_kind
+
+
+def _runtime_seconds(
+    *,
+    started_at: str,
+    finished_at: str | None,
+    cancelled_at: str | None,
+) -> float | None:
+    try:
+        started = datetime.fromisoformat(started_at)
+        ended_raw = finished_at or cancelled_at
+        ended = datetime.fromisoformat(ended_raw) if ended_raw else datetime.now(UTC)
+        return round(max(0.0, (ended - started).total_seconds()), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _termination_signal(exit_code: int | None) -> int | None:
+    if exit_code is None or exit_code == 0:
+        return None
+    if exit_code < 0:
+        return -exit_code
+    if 128 < exit_code <= 255:
+        return exit_code - 128
+    return None
 
 
 def _derive_progress_hint(*, stdout_text: str, stderr_text: str) -> str | None:

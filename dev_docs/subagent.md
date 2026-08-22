@@ -10,7 +10,7 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 
 - Only the main agent can invoke subagents.
 - Nested subagents are forbidden.
-- Maximum active subagents is `7`.
+- Maximum active subagents is `7` by default (`JARVIS_SUBAGENT_MAX_ACTIVE` can lower or raise the operator-selected limit). Provider/model generation is independently bulkheaded at three concurrent requests.
 - Active codenames are unique and come from: `Friday`, `Edith`, `Karen`, `Jocasta`, `Tadashi`, `Homer`, `Ultron`.
 - A codename can be reused after the previous holder is disposed.
 - Subagents use the same underlying `AgentLoop` engine as the main agent.
@@ -76,7 +76,7 @@ The dynamic assignment includes:
 - optional selected skill ids, whose full `SKILL.md` documents are embedded into bootstrap
 - optional deliverable or success criteria
 
-The assignment is injected after the static subagent prompts.
+The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited (up to four total, with explicit `skill_ids` taking precedence); when none were selected, the manager may attach a conservatively matched installed skill. Every child records `skill_selection_reason`, including the short no-match reason when no skill applies.
 
 The main agent receives high-level subagent usage guidance through `PROGRAM.md` and detailed primitive docs from `src/jarvis/subagent/primitives.py`.
 
@@ -165,6 +165,7 @@ Important metadata:
 - `owner_main_session_id`
 - `owner_main_turn_id`
 - `current_subagent_session_id`
+- `run_generation`
 - `pending_background_job_ids`
 
 ## Tool Access
@@ -187,9 +188,9 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 ## Tool Execution Coordination
 
-Route-level tool execution is serialized across the main agent and subagents through a shared coordinator. LLM generation can run concurrently, but actual tool execution is guarded so actors do not race shared workspace state.
+Route-level tool execution uses a workspace coordinator rather than one global tool mutex. Exact-path reads and disjoint declared writes can run concurrently, while broad snapshot reads take an exclusive barrier. A child’s `owned_paths` are exclusive persistent write leases until disposal; direct file producers/consumers acquire exact paths automatically, while mutable `bash` must declare all `write_paths` whenever another actor holds a lease. Overlapping access is serialized or rejected with ownership guidance instead of racing shared state.
 
-Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and later revive the owning child loop through persisted child-system notes and runtime turns.
+Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and later revive the owning child loop through persisted child-system notes and runtime turns. Unchanged heartbeats update durable status without spending a child model turn; terminal notices carry bounded output plus stdout/stderr log paths for later inspection.
 
 ## Storage
 
@@ -217,6 +218,7 @@ The route-level catalog stores:
 - owner main session and turn ids
 - durable task label and structured assignment fields
 - current subagent session id
+- current run generation
 - pause reason
 - last error, structured provider metadata, and error-log path
 
@@ -224,7 +226,7 @@ Each subagent has its own `SessionStorage` root and normal session compaction li
 
 ## Route And UI Events
 
-The unified route websocket carries main and subagent events.
+The unified route websocket carries main and subagent events. Every event carries route ordering plus origin session/turn provenance; child lifecycle, tool, and approval events also carry the child run generation. The runtime discards stale generations after stop, disposal, restart, `/new`, or a newer session lineage.
 
 Public Telegram notices are intentionally minimal:
 

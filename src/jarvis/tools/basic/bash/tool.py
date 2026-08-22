@@ -60,10 +60,18 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["foreground", "background", "status", "tail", "cancel"],
+                        "enum": [
+                            "foreground",
+                            "background",
+                            "service",
+                            "status",
+                            "tail",
+                            "cancel",
+                        ],
                         "description": (
                             "Optional mode. Defaults to 'foreground'. Use 'background' to start "
-                            "a detached job; use 'status', 'tail', or 'cancel' with a job id."
+                            "a detached job; use 'service' for an owned long-lived process with "
+                            "readiness verification; use 'status', 'tail', or 'cancel' with a job id."
                         ),
                     },
                     "command": {
@@ -81,6 +89,23 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                             "from /workspace. Defaults to /workspace."
                         ),
                     },
+                    "write_paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1},
+                        "description": (
+                            "Every workspace path this command will modify. Required for "
+                            "mutable bash work while another actor owns workspace paths."
+                        ),
+                    },
+                    "expected_lease_generation": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Optional lease generation observed before a declared workspace "
+                            "write. The command is rejected if ownership changed."
+                        ),
+                    },
                     "job_id": {
                         "type": "string",
                         "description": "Background job id for 'status', 'tail', or 'cancel'.",
@@ -90,6 +115,27 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                         "minimum": 1,
                         "maximum": settings.bash_max_timeout_seconds,
                         "description": "Optional foreground timeout in seconds.",
+                    },
+                    "service_port": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "description": (
+                            "Managed-service port. Use 0 with a {port} command placeholder to "
+                            "allocate a free loopback port."
+                        ),
+                    },
+                    "readiness_url": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Loopback HTTP(S) readiness URL for service mode; may contain {port}."
+                        ),
+                    },
+                    "readiness_timeout_seconds": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": 300,
                     },
                     "tail_lines": {
                         "type": "integer",

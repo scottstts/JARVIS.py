@@ -51,7 +51,11 @@ The service deadline never resets when a stream event arrives. Provider transpor
 
 Provider adapters may yield internal `ProviderActivityEvent` values for lifecycle, keepalive, reasoning, empty-signature, response-header, and other non-user-visible stream activity. `LLMService` consumes these values for acceptance state and diagnostics, but never forwards them to `AgentLoop` or transcript persistence. Anthropic and Gemini use their native streaming APIs; OpenAI/Grok Responses lifecycle events, OpenRouter SSE comments, and LM Studio Responses lifecycle events follow the same internal activity contract.
 
+Internal provider activity is not meaningful progress. A stream must produce normalized semantic output within the fixed 300-second first-semantic-output watchdog or it fails as a typed `ProviderTimeoutError`; after output begins, a separate 120-second idle watchdog applies while the absolute request deadline remains authoritative. Keepalives and reasoning/lifecycle traffic do not satisfy semantic progress. Generation uses a per-provider/model bulkhead (three concurrent requests), capped backoff, and a transient-failure circuit breaker, so child fan-out cannot stampede an unhealthy provider.
+
 Automatic stream retry is normally allowed only before provider acceptance or normalized output. A response header or provider lifecycle event marks the request accepted, so ambiguous later failures propagate instead of replaying a possibly active generation. A provider adapter may explicitly mark a structured terminal failure as retry-safe after acceptance; `LLMService` still forbids that retry after any normalized output was exposed. Transport read/write timeouts remain ambiguous and are not blindly retried; only classified connection and pre-request pool-acquisition timeouts, plus explicitly terminal provider failures, are automatically retry-safe.
+
+After service-local retries are exhausted, the route may start up to three fresh checkpoint-based recovery turns. Partial visible output is persisted before recovery, completed tools are not replayed, and every recovery turn retains the original `client_message_id` so synchronous and websocket consumers follow one logical task. Exhaustion persists the paused recovery state, suppresses automatic follow-ups until a new user message, and emits a blocked terminal event instead of leaving the client waiting indefinitely.
 
 OpenRouter treats a terminal chat response with neither visible text nor a usable tool call as invalid. The adapter performs at most two provider-local retries when the failed attempt exposed no text or tool-call delta. Each retry preserves the request and sticky `session_id`, sends both `X-OpenRouter-Cache: true` and `X-OpenRouter-Cache-Clear: true`, and remains inside the original absolute request deadline. Empty attempts log generation id, raw finish reason, usage, response-cache status, reasoning activity, terminal signal, attempt number, and whether semantic output was exposed. Exhaustion raises `ProviderResponseError`; it never produces an empty successful turn.
 
@@ -109,7 +113,7 @@ Replay expects unresolved assistant tool calls to be normalized by explicit tran
 
 If a stream or process interruption leaves assistant tool calls without matching tool results, the loop appends an explicit unexecuted-tool-call notice. Replay raises if it encounters unresolved tool calls without either matching results or that persisted notice.
 
-Tool execution is divided into bounded internal slices so a pathological tool loop cannot monopolize one counter indefinitely. `JARVIS_TOOL_MAX_ROUNDS_PER_TURN` defaults to `500`. Reaching that boundary is not a successful or terminal user turn and does not require the user to send “Continue.”
+Tool execution is bounded at two levels: `JARVIS_TOOL_MAX_ROUNDS_PER_TURN` defaults to `64` and `JARVIS_TOOL_MAX_ROUNDS_PER_TASK` defaults to `256`. The loop also stops repeated malformed edit calls and repeated identical no-progress calls before either cap. Hitting a safety boundary is a truthful blocked result, never a successful completion or a reason to ask the user to send “Continue.”
 
 Slice rollover follows the same unresolved-call normalization rule:
 
@@ -172,6 +176,8 @@ The route protocol carries first-class turn identity:
 Clients submit `user_message` events with a non-empty `client_message_id`.
 
 The gateway emits `turn_started` when the route worker actually starts a queued request. Turn-scoped route events include turn identity so the Telegram bridge can attribute output correctly even when multiple user turns are queued.
+
+Every emitted route event also has a route-local monotonic `sequence`, a per-actor monotonic `actor_sequence`, an `actor_id`, and provenance (`origin_session_id`, `origin_turn_id`, and actor `run_generation` where applicable). Consumers discard events that do not belong to the actor’s current run generation, preventing superseded sessions, compacted lineages, and disposed/restarted children from updating current UI state.
 
 Turn-scoped events include:
 
@@ -309,7 +315,7 @@ Replay records use `type="compaction_replay"` metadata with bundle/generation ID
 
 The old session receives one `kind="compaction"` audit record containing the explicit manual instruction, provider/model, canonical bundle, accepted semantic submission, deterministic validation report, repair count, per-call traces, aggregate usage, and replay items. The old session remains active until the bundle has passed validation.
 
-Mid-turn compaction excludes active in-progress turn records from compaction source. Active-turn carry-forward records remain separate so the same content is not duplicated into replacement history.
+Mid-turn compaction excludes active in-progress turn records from compaction source. Active-turn carry-forward records remain separate, preserve their original record IDs/session/timestamps, and coalesce repeated identical tool-call/result cycles into one truthful system handover note so the same material is neither duplicated nor amplified into replacement history.
 
 Codex-backed actors use the same bundle, provider selection, validation, persistence, and replay compiler. Because Codex thread input is text-only rather than native transcript replay, the Codex adapter renders the fixed history boundary, exact prior user/assistant labels, and assistant historical context deterministically, then seeds the new thread exactly once.
 
@@ -340,3 +346,5 @@ When changing the agent loop:
 - never treat an ordinary user message as child input or a child interruption request
 - keep `/new` on its distinct hard-reset path and never let the command itself open the runtime-follow-up gate
 - ensure subagent prompt-visible behavior follows the same shared-loop persistence rules
+- preserve canonical tool arguments once; retain raw provider arguments only when they differ, and never echo malformed raw payloads back into model-visible errors
+- preserve the intentionally lightweight 4-characters-per-token context estimate. The configured context window is an operator safety budget, not a claim about a provider tokenizer or physical model limit.

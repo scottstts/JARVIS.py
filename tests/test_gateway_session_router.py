@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from jarvis.codex_backend.types import CodexConnectionError
 from jarvis.core import (
@@ -131,6 +131,115 @@ class _TrackingLoop:
 
 
 class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_route_events_sequence_valid_generation_and_drop_stale_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            snapshot = SubagentSnapshot(
+                subagent_id="subagent_1",
+                codename="Atlas",
+                status="running",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                run_generation=2,
+            )
+            try:
+                with patch.object(
+                    runtime._subagent_manager,
+                    "snapshot_for",
+                    return_value=snapshot,
+                ):
+                    await runtime.publish_event(
+                        RouteSystemNoticeEvent(
+                            route_id="route_1",
+                            agent_kind="subagent",
+                            agent_name="Atlas",
+                            subagent_id="subagent_1",
+                            origin_session_id="main_session",
+                            origin_turn_id="main_turn",
+                            actor_run_generation=2,
+                            notice_kind="checkpoint",
+                            text="checkpointed",
+                        )
+                    )
+                    published = queue.get_nowait()
+                    self.assertEqual(published.actor_id, "subagent:subagent_1")
+                    self.assertEqual(published.actor_sequence, 1)
+                    self.assertEqual(published.sequence, 1)
+
+                    await runtime.publish_event(
+                        RouteSystemNoticeEvent(
+                            route_id="route_1",
+                            agent_kind="subagent",
+                            agent_name="Atlas",
+                            subagent_id="subagent_1",
+                            actor_run_generation=1,
+                            notice_kind="late_checkpoint",
+                            text="stale",
+                        )
+                    )
+                    self.assertTrue(queue.empty())
+            finally:
+                runtime.unsubscribe(subscriber_id)
+
+    async def test_provider_recovery_preserves_client_task_and_exhaustion_terminates_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            request = _RouteTurnRequest(
+                force_session_id=session_id,
+                user_initiated=True,
+                client_message_id="msg_1",
+                provider_recovery_task_id="task_1",
+            )
+            recovered = await runtime._enqueue_main_provider_recovery(
+                request=request,
+                exc=ProviderTimeoutError("temporary timeout"),
+                error_log_path=Path(tmp) / "provider-error.jsonl",
+            )
+            self.assertTrue(recovered)
+            queued = runtime._message_queue.get_nowait()
+            runtime._message_queue.task_done()
+            self.assertEqual(queued.client_message_id, "msg_1")
+            self.assertEqual(queued.provider_recovery_task_id, "task_1")
+
+            subscriber_id, queue = runtime.subscribe()
+            runtime._provider_recovery_turn_ids["task_1"] = "retry_turn_3"
+            try:
+                exhausted = await runtime._enqueue_main_provider_recovery(
+                    request=replace(request, provider_recovery_attempt=3),
+                    exc=ProviderTimeoutError("still unavailable"),
+                    error_log_path=Path(tmp) / "provider-error-3.jsonl",
+                )
+                self.assertTrue(exhausted)
+                assistant = queue.get_nowait()
+                done = queue.get_nowait()
+                self.assertIsInstance(assistant, RouteAssistantMessageEvent)
+                self.assertIsInstance(done, RouteTurnDoneEvent)
+                assert isinstance(done, RouteTurnDoneEvent)
+                self.assertEqual(done.client_message_id, "msg_1")
+                self.assertEqual(done.turn_id, "retry_turn_3")
+                self.assertTrue(done.completion_blocked)
+                self.assertEqual(
+                    done.interruption_reason,
+                    "provider_recovery_exhausted",
+                )
+                self.assertTrue(runtime._main_resume_requires_user_message)
+            finally:
+                runtime.unsubscribe(subscriber_id)
+
     async def test_reuses_same_loop_for_same_route(self) -> None:
         created_routes: list[str] = []
         loops: dict[str, _TrackingLoop] = {}
@@ -881,7 +990,15 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
 
             runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
 
-            with patch.object(runtime, "_print_runtime_error_notice") as print_notice:
+            with (
+                patch.object(runtime, "_print_runtime_error_notice") as print_notice,
+                patch.object(
+                    runtime,
+                    "_enqueue_main_provider_recovery",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                ) as enqueue_recovery,
+            ):
                 await runtime._user_message_queue.put(
                     _RouteTurnRequest(
                         user_text="hello",
@@ -894,11 +1011,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 runtime._ensure_message_worker()
                 await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
 
-            event = await asyncio.wait_for(queue.get(), timeout=1)
-            self.assertIsInstance(event, RouteErrorEvent)
-            if not isinstance(event, RouteErrorEvent):
-                self.fail("Expected provider timeout to publish a route error event.")
-            self.assertEqual(event.code, "provider_timeout")
+            enqueue_recovery.assert_awaited_once()
 
             session_id = session_id_holder["session_id"]
             error_log_path = (

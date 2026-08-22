@@ -29,7 +29,14 @@ class ViewImageToolExecutor:
     ) -> ToolExecutionResult:
         raw_path = str(arguments["path"]).strip()
         raw_detail = str(arguments.get("detail", "auto")).strip() or "auto"
-        image_path = _resolve_workspace_relative_path(raw_path, context)
+        try:
+            image_path = _resolve_workspace_relative_path(raw_path, context)
+        except ValueError as exc:
+            return _view_image_error(
+                call_id=call_id,
+                raw_path=raw_path,
+                reason=str(exc),
+            )
 
         if not image_path.exists():
             return _view_image_error(
@@ -132,9 +139,16 @@ def _build_view_image_tool_description(settings: ToolSettings) -> str:
 
 def _resolve_workspace_relative_path(raw_path: str, context: ToolExecutionContext) -> Path:
     candidate = Path(raw_path)
-    if not candidate.is_absolute():
+    workspace = context.workspace_dir.resolve(strict=False)
+    if candidate.is_absolute():
+        if candidate == Path("/workspace") or candidate.is_relative_to(Path("/workspace")):
+            candidate = workspace / candidate.relative_to("/workspace")
+    else:
         candidate = context.workspace_dir / candidate
-    return candidate.resolve(strict=False)
+    resolved = candidate.resolve(strict=False)
+    if resolved != workspace and not resolved.is_relative_to(workspace):
+        raise ValueError("path must stay inside /workspace.")
+    return resolved
 
 
 def _detect_supported_image_media_type(path: Path) -> str | None:

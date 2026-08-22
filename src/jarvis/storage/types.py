@@ -8,7 +8,7 @@ from typing import Any, Literal
 RecordKind = Literal["message", "compaction", "provider_context"]
 RecordRole = Literal["system", "user", "assistant", "tool"]
 SessionStatus = Literal["active", "archived"]
-TurnStatus = Literal["in_progress", "completed", "interrupted", "superseded"]
+TurnStatus = Literal["in_progress", "completed", "blocked", "interrupted", "superseded"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -174,7 +174,7 @@ def _normalize_turn_states(value: Any) -> dict[str, TurnStatus]:
         if not turn_id:
             continue
         status = str(raw_status).strip()
-        if status not in {"in_progress", "completed", "interrupted", "superseded"}:
+        if status not in {"in_progress", "completed", "blocked", "interrupted", "superseded"}:
             continue
         normalized[turn_id] = status
     return normalized

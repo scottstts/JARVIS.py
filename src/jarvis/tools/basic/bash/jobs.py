@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import signal
@@ -69,6 +70,11 @@ class BashJobRecord:
     stdout_path: str
     stderr_path: str
     job_dir: str
+    command_sha256: str = ""
+    workspace_revision: str | None = None
+    service_port: int | None = None
+    readiness_url: str | None = None
+    readiness_verified: bool = False
     owner_route_id: str | None = None
     owner_session_id: str | None = None
     owner_turn_id: str | None = None
@@ -147,7 +153,7 @@ def create_background_job(
     )
 
     paths.command_path.write_text(
-        "set -o pipefail\n" + command + "\n",
+        "set -e -o pipefail\n" + command + "\n",
         encoding="utf-8",
     )
     paths.logger_path.write_text(_build_log_sink_script(), encoding="utf-8")
@@ -213,10 +219,31 @@ def write_job_metadata(
     progress_notice_count: int | None = None,
     terminal_notice_kind: str | None = None,
     terminal_notice_dispatched_at: str | None = None,
+    workspace_revision: str | None = None,
+    service_port: int | None = None,
+    readiness_url: str | None = None,
+    readiness_verified: bool | None = None,
 ) -> None:
+    prior_payload: dict[str, Any] = {}
+    if paths.metadata_path.exists():
+        try:
+            prior_payload = _load_metadata_payload(paths)
+        except (OSError, json.JSONDecodeError):
+            prior_payload = {}
+    if workspace_revision is None:
+        workspace_revision = _optional_non_empty_string(
+            prior_payload.get("workspace_revision")
+        )
+    if service_port is None:
+        service_port = _optional_int(prior_payload.get("service_port"))
+    if readiness_url is None:
+        readiness_url = _optional_non_empty_string(prior_payload.get("readiness_url"))
+    if readiness_verified is None:
+        readiness_verified = bool(prior_payload.get("readiness_verified", False))
     payload = {
         "job_id": paths.job_id,
         "command": command,
+        "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
         "pid": pid,
         "pgid": pgid,
         "runner_pid": runner_pid,
@@ -227,6 +254,14 @@ def write_job_metadata(
         "stderr_path": str(paths.stderr_path),
         "job_dir": str(paths.job_dir),
     }
+    if workspace_revision is not None:
+        payload["workspace_revision"] = workspace_revision
+    if service_port is not None:
+        payload["service_port"] = service_port
+    if readiness_url is not None:
+        payload["readiness_url"] = readiness_url
+    if readiness_verified:
+        payload["readiness_verified"] = True
     if owner_route_id is not None:
         payload["owner_route_id"] = owner_route_id
     if owner_session_id is not None:
@@ -294,6 +329,14 @@ def load_job(workspace_dir: Path, job_id: str) -> tuple[BashJobPaths, BashJobRec
         stdout_path=str(payload["stdout_path"]),
         stderr_path=str(payload["stderr_path"]),
         job_dir=str(payload["job_dir"]),
+        command_sha256=str(
+            payload.get("command_sha256")
+            or hashlib.sha256(str(payload["command"]).encode("utf-8")).hexdigest()
+        ),
+        workspace_revision=_optional_non_empty_string(payload.get("workspace_revision")),
+        service_port=_optional_int(payload.get("service_port")),
+        readiness_url=_optional_non_empty_string(payload.get("readiness_url")),
+        readiness_verified=bool(payload.get("readiness_verified", False)),
         owner_route_id=_optional_non_empty_string(payload.get("owner_route_id")),
         owner_session_id=_optional_non_empty_string(payload.get("owner_session_id")),
         owner_turn_id=_optional_non_empty_string(payload.get("owner_turn_id")),
@@ -565,6 +608,11 @@ def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
         "stdout_bytes_dropped": stdout_stats.bytes_dropped,
         "stderr_bytes_dropped": stderr_stats.bytes_dropped,
         "command": record.command,
+        "command_sha256": record.command_sha256,
+        "workspace_revision": record.workspace_revision,
+        "service_port": record.service_port,
+        "readiness_url": record.readiness_url,
+        "readiness_verified": record.readiness_verified,
         "cwd": record.cwd,
         "owner_route_id": record.owner_route_id,
         "owner_session_id": record.owner_session_id,

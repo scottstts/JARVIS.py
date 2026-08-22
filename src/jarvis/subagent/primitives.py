@@ -21,7 +21,8 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                 "Start a background subagent for bounded side work that can run independently "
                 "while you supervise. Supply a stable task label and only the context the child "
                 "needs: explicit user constraints, shared interfaces/environment, owned paths, "
-                "and selected skill ids."
+                "and selected skill ids. Skills opened by Jarvis in this turn are inherited "
+                "automatically; use skill_ids only to add relevant installed skills."
             ),
             input_schema={
                 "type": "object",

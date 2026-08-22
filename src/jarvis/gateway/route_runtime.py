@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import traceback
@@ -37,7 +37,15 @@ from jarvis.core import (
 )
 from jarvis.core.commands import parse_user_command
 from jarvis.core.identities import IdentityBootstrapLoader
-from jarvis.llm import LLMMessage, LLMService, ProviderTimeoutError, ToolCall, ToolDefinition
+from jarvis.llm import (
+    LLMMessage,
+    LLMService,
+    ProviderRateLimitError,
+    ProviderTemporaryError,
+    ProviderTimeoutError,
+    ToolCall,
+    ToolDefinition,
+)
 from jarvis.logging_setup import get_application_logger
 from jarvis.storage import SessionStorage
 from jarvis.storage.layout import transcript_archive_root_from_runtime_path
@@ -48,7 +56,15 @@ from jarvis.subagent import (
     render_subagent_primitive_docs,
 )
 from jarvis.subagent.types import SubagentSnapshot
-from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
+from jarvis.tools import (
+    ToolExecutionContext,
+    ToolExecutionResult,
+    ToolRegistry,
+    ToolRuntime,
+    ToolSettings,
+    WorkspaceAccessCoordinator,
+    WorkspaceLeaseError,
+)
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
     mark_job_progress_notified,
@@ -90,6 +106,8 @@ _MAIN_BASH_PROGRESS_RUNTIME_KIND = "main_bash_progress"
 _MAIN_BASH_PROGRESS_NOTICE_KIND = "bash_job_progress_update"
 _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND = "main_subagent_progress"
 _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND = "subagent_progress_update"
+_MAIN_PROVIDER_RECOVERY_RUNTIME_KIND = "main_provider_recovery"
+_MAX_MAIN_PROVIDER_RECOVERY_ATTEMPTS = 3
 LOGGER = get_application_logger(__name__)
 
 
@@ -103,6 +121,8 @@ class _RouteTurnRequest:
     client_message_id: str | None = None
     internal_generation: int | None = None
     runtime_turn_kind: str | None = None
+    provider_recovery_attempt: int = 0
+    provider_recovery_task_id: str | None = None
 
 
 class RouteEventBus:
@@ -176,8 +196,17 @@ class RouteRuntime:
         self._core_settings = core_settings
         tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
         self._tool_registry = tool_registry or ToolRegistry.default(tool_settings)
+        self._main_storage = SessionStorage(core_settings.transcript_archive_dir)
+        self._selected_skills_by_main_turn: dict[tuple[str, str], tuple[str, ...]] = {}
         self._tool_execution_guard = asyncio.Semaphore(1)
+        self._workspace_access = WorkspaceAccessCoordinator(
+            workspace_dir=core_settings.workspace_dir
+        )
         self._event_bus = RouteEventBus()
+        self._event_sequence = 0
+        self._actor_event_sequences: dict[str, int] = {}
+        self._main_backend_state_fallback: dict[str, Any] = {}
+        self._provider_recovery_turn_ids: dict[str, str] = {}
         self._approval_registry = RouteApprovalRegistry()
         self._user_message_queue: asyncio.Queue[_RouteTurnRequest] = asyncio.Queue()
         self._message_queue: asyncio.Queue[_RouteTurnRequest] = asyncio.Queue()
@@ -212,6 +241,7 @@ class RouteRuntime:
             core_settings=core_settings,
             tool_registry=self._tool_registry,
             tool_execution_guard=self._tool_execution_guard,
+            workspace_access=self._workspace_access,
             publish_event=self.publish_event,
             register_approval_target=self._approval_registry.register,
             tool_result_observer=self._bash_job_supervisor.observe_tool_result,
@@ -401,6 +431,7 @@ class RouteRuntime:
                 parse_commands=True,
                 user_initiated=True,
                 client_message_id=client_message_id,
+                provider_recovery_task_id=client_message_id or uuid4().hex,
             )
         )
         self._queue_wakeup.set()
@@ -418,6 +449,38 @@ class RouteRuntime:
     async def publish_event(self, event: RouteEvent) -> None:
         if self._should_suppress_event_during_subagent_reset(event):
             return
+        if (
+            event.agent_kind == "subagent"
+            and event.subagent_id is not None
+            and event.actor_run_generation is not None
+        ):
+            snapshot = self._subagent_manager.snapshot_for(event.subagent_id)
+            if snapshot is None or snapshot.run_generation != event.actor_run_generation:
+                LOGGER.debug(
+                    "Discarded stale route event route=%s subagent=%s generation=%s.",
+                    self._route_id,
+                    event.subagent_id,
+                    event.actor_run_generation,
+                )
+                return
+        actor_id = event.actor_id or _route_event_actor_id(event)
+        actor_sequence = self._actor_event_sequences.get(actor_id, 0) + 1
+        self._actor_event_sequences[actor_id] = actor_sequence
+        self._event_sequence += 1
+        event = replace(
+            event,
+            origin_session_id=(
+                event.origin_session_id
+                or (event.session_id if event.agent_kind == "main" else None)
+            ),
+            origin_turn_id=(
+                event.origin_turn_id
+                or (event.turn_id if event.agent_kind == "main" else None)
+            ),
+            actor_id=actor_id,
+            actor_sequence=actor_sequence,
+            sequence=self._event_sequence,
+        )
         await self._event_bus.publish(event)
         await self._maybe_enqueue_subagent_supervisor_followup(event)
         await self._publish_task_status_if_changed(reason=f"route_event:{event.type}")
@@ -427,15 +490,26 @@ class RouteRuntime:
         if active == self._published_task_active:
             return
         self._published_task_active = active
+        actor_id = "main"
+        actor_sequence = self._actor_event_sequences.get(actor_id, 0) + 1
+        self._actor_event_sequences[actor_id] = actor_sequence
+        self._event_sequence += 1
+        active_session_id = self._main_loop.active_session_id()
+        active_turn_id = self._main_loop.active_turn_id()
         await self._event_bus.publish(
             RouteTaskStatusEvent(
                 route_id=self._route_id,
                 agent_kind="main",
                 agent_name="Jarvis",
-                session_id=self._main_loop.active_session_id(),
-                turn_id=self._main_loop.active_turn_id(),
+                session_id=active_session_id,
+                turn_id=active_turn_id,
+                origin_session_id=active_session_id,
+                origin_turn_id=active_turn_id,
                 active=active,
                 reason=reason,
+                actor_id=actor_id,
+                actor_sequence=actor_sequence,
+                sequence=self._event_sequence,
             )
         )
 
@@ -637,6 +711,9 @@ class RouteRuntime:
                     force_session_id, system_message, notices = runtime_message
                     if self._internal_request_is_blocked(request):
                         continue
+                    if str(system_message.metadata.get("recommended_action", "")) == "wait":
+                        self._record_bash_notice_delivery(notices)
+                        continue
                     published = await self._publish_main_system_message(
                         session_id=force_session_id,
                         message=system_message,
@@ -708,7 +785,11 @@ class RouteRuntime:
                         message=str(exc),
                     )
                 )
-            except ProviderTimeoutError as exc:
+            except (
+                ProviderTimeoutError,
+                ProviderTemporaryError,
+                ProviderRateLimitError,
+            ) as exc:
                 error_log_path = self._write_runtime_error_log(
                     request=request,
                     session_id=self._main_loop.active_session_id() or request.force_session_id,
@@ -719,9 +800,15 @@ class RouteRuntime:
                         parsed_command.kind if parsed_command is not None else None
                     ),
                     exc=exc,
-                    error_code="provider_timeout",
+                    error_code=_provider_error_code(exc),
                 )
                 self._print_runtime_error_notice(error_log_path=error_log_path)
+                if await self._enqueue_main_provider_recovery(
+                    request=request,
+                    exc=exc,
+                    error_log_path=error_log_path,
+                ):
+                    continue
                 await self.publish_event(
                     RouteErrorEvent(
                         route_id=self._route_id,
@@ -731,7 +818,7 @@ class RouteRuntime:
                         turn_id=self._main_loop.active_turn_id(),
                         turn_kind="user" if request.user_initiated else "runtime",
                         client_message_id=request.client_message_id,
-                        code="provider_timeout",
+                        code=_provider_error_code(exc),
                         message=_PROVIDER_TIMEOUT_MESSAGE,
                     )
                 )
@@ -806,11 +893,159 @@ class RouteRuntime:
             return
         if event.agent_kind != "subagent" or event.subagent_id is None:
             return
+        if event.actor_run_generation is not None:
+            snapshot = self._subagent_manager.snapshot_for(event.subagent_id)
+            if snapshot is None or snapshot.run_generation != event.actor_run_generation:
+                LOGGER.debug(
+                    "Discarded stale subagent notice route=%s subagent=%s event_generation=%s.",
+                    self._route_id,
+                    event.subagent_id,
+                    event.actor_run_generation,
+                )
+                return
         if event.notice_kind not in _SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS:
             return
         if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return
         await self._enqueue_main_subagent_followup(event)
+
+    async def _enqueue_main_provider_recovery(
+        self,
+        *,
+        request: _RouteTurnRequest,
+        exc: Exception,
+        error_log_path: Path,
+    ) -> bool:
+        """Queue a fresh checkpoint-based turn after a recoverable provider failure."""
+
+        if self._new_session_boundary_pending or self._main_resume_requires_user_message:
+            return False
+        session_id = self._main_loop.active_session_id() or request.force_session_id
+        if session_id is None:
+            return False
+        task_id = (
+            request.provider_recovery_task_id
+            or request.client_message_id
+            or self._main_loop.active_turn_id()
+            or uuid4().hex
+        )
+        recovery_state = self._main_backend_state(session_id=session_id).get(
+            "provider_recovery"
+        )
+        persisted_attempt = 0
+        if isinstance(recovery_state, Mapping) and recovery_state.get("task_id") == task_id:
+            persisted_attempt = _nonnegative_int(recovery_state.get("attempt"))
+        attempt = max(request.provider_recovery_attempt, persisted_attempt) + 1
+        if attempt > _MAX_MAIN_PROVIDER_RECOVERY_ATTEMPTS:
+            pause_text = (
+                "I paused this task after repeated model-provider failures. The durable "
+                "checkpoint is preserved, so a later user message can resume without "
+                "replaying completed work."
+            )
+            pause_metadata = {
+                "provider_recovery_exhausted": True,
+                "attempts": attempt - 1,
+                "task_id": task_id,
+                "error_type": type(exc).__name__,
+                "error_log_path": str(error_log_path),
+            }
+            self._update_main_backend_state(
+                session_id=session_id,
+                key="provider_recovery",
+                value={**pause_metadata, "status": "paused"},
+            )
+            self._main_resume_requires_user_message = True
+            self._invalidate_stale_internal_followups()
+            self._append_main_assistant_note(
+                pause_text,
+                session_id=session_id,
+                metadata=pause_metadata,
+            )
+            await self.publish_event(
+                RouteAssistantMessageEvent(
+                    route_id=self._route_id,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    session_id=session_id,
+                    turn_id=self._main_loop.active_turn_id(),
+                    turn_kind="runtime",
+                    text=pause_text,
+                )
+            )
+            await self.publish_event(
+                RouteTurnDoneEvent(
+                    route_id=self._route_id,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    session_id=session_id,
+                    turn_id=self._provider_recovery_turn_ids.pop(task_id, None),
+                    turn_kind="runtime" if not request.user_initiated else "user",
+                    client_message_id=request.client_message_id,
+                    origin_session_id=session_id,
+                    response_text=pause_text,
+                    completion_blocked=True,
+                    interruption_reason="provider_recovery_exhausted",
+                )
+            )
+            return True
+
+        exception_metadata = _exception_metadata(exc)
+        emitted_output = bool(exception_metadata.get("emitted_output"))
+        self._update_main_backend_state(
+            session_id=session_id,
+            key="provider_recovery",
+            value={
+                "task_id": task_id,
+                "attempt": attempt,
+                "status": "queued",
+                "partial_output_persisted": emitted_output,
+                "error_log_path": str(error_log_path),
+            },
+        )
+        message = AgentRuntimeMessage(
+            role="system",
+            metadata={
+                "provider_recovery": True,
+                "provider_recovery_attempt": attempt,
+                "provider_error_type": type(exc).__name__,
+                "provider_error_log_path": str(error_log_path),
+                "provider_recovery_task_id": task_id,
+                "partial_output_persisted": emitted_output,
+            },
+            content=(
+                (
+                    "The previous provider attempt ended after partial output, which was "
+                    "checkpointed. Continue from that durable fragment without repeating it. "
+                    if emitted_output
+                    else "The previous provider attempt produced no semantic output. Start a "
+                    "fresh generation from the durable checkpoint. "
+                )
+                + "Do not replay completed tool calls or claim partial work as finished."
+            ),
+        )
+        await self._message_queue.put(
+            _RouteTurnRequest(
+                user_text=None,
+                force_session_id=session_id,
+                pre_turn_messages=(message,),
+                parse_commands=False,
+                user_initiated=False,
+                client_message_id=request.client_message_id,
+                internal_generation=self._internal_followup_generation,
+                runtime_turn_kind=_MAIN_PROVIDER_RECOVERY_RUNTIME_KIND,
+                provider_recovery_attempt=attempt,
+                provider_recovery_task_id=task_id,
+            )
+        )
+        self._queue_wakeup.set()
+        LOGGER.warning(
+            "Queued provider recovery route=%s session=%s attempt=%s error=%s.",
+            self._route_id,
+            session_id,
+            attempt,
+            type(exc).__name__,
+        )
+        return True
 
     async def _publish_main_loop_event(
         self,
@@ -827,8 +1062,14 @@ class RouteRuntime:
             "turn_id": getattr(event, "turn_id", None) or None,
             "turn_kind": turn_kind,
             "client_message_id": request.client_message_id,
+            "origin_session_id": event.session_id,
+            "origin_turn_id": getattr(event, "turn_id", None) or None,
         }
         if isinstance(event, AgentTurnStartedEvent):
+            if request.provider_recovery_task_id and event.turn_id:
+                self._provider_recovery_turn_ids[
+                    request.provider_recovery_task_id
+                ] = event.turn_id
             await self.publish_event(RouteTurnStartedEvent(**route_event_kwargs))
             return
         if isinstance(event, AgentTextDeltaEvent):
@@ -871,6 +1112,18 @@ class RouteRuntime:
             )
             return
         if isinstance(event, AgentTurnDoneEvent):
+            self._update_main_backend_state(
+                session_id=event.session_id,
+                key="provider_recovery",
+                value=None,
+            )
+            if event.session_id and event.turn_id:
+                self._selected_skills_by_main_turn.pop((event.session_id, event.turn_id), None)
+            if request.provider_recovery_task_id:
+                self._provider_recovery_turn_ids.pop(
+                    request.provider_recovery_task_id,
+                    None,
+                )
             await self.publish_event(
                 RouteTurnDoneEvent(
                     **route_event_kwargs,
@@ -879,9 +1132,46 @@ class RouteRuntime:
                     compaction_performed=event.compaction_performed,
                     interrupted=event.interrupted,
                     approval_rejected=event.approval_rejected,
+                    completion_blocked=event.completion_blocked,
                     interruption_reason=event.interruption_reason,
                 )
             )
+
+    def _main_backend_state(self, *, session_id: str) -> dict[str, Any]:
+        loader = getattr(self._main_loop, "backend_state", None)
+        if callable(loader):
+            value = loader(session_id=session_id)
+            if isinstance(value, dict):
+                return value
+        return dict(self._main_backend_state_fallback)
+
+    def _update_main_backend_state(
+        self,
+        *,
+        session_id: str,
+        key: str,
+        value: Any | None,
+    ) -> bool:
+        updater = getattr(self._main_loop, "update_backend_state", None)
+        if callable(updater):
+            return bool(updater(session_id=session_id, key=key, value=value))
+        if value is None:
+            self._main_backend_state_fallback.pop(key, None)
+        else:
+            self._main_backend_state_fallback[key] = value
+        return True
+
+    def _append_main_assistant_note(
+        self,
+        content: str,
+        *,
+        session_id: str,
+        metadata: dict[str, Any],
+    ) -> bool:
+        appender = getattr(self._main_loop, "append_assistant_note", None)
+        if callable(appender):
+            return bool(appender(content, session_id=session_id, metadata=metadata))
+        return False
 
     def _build_main_tool_definitions(
         self,
@@ -910,13 +1200,50 @@ class RouteRuntime:
     ) -> ToolExecutionResult:
         if tool_call.name in SUBAGENT_PRIMITIVE_NAMES:
             return await self._execute_subagent_primitive(tool_call, context)
-        async with self._tool_execution_guard:
-            result = await self._main_tool_runtime.execute(
+        try:
+            async with self._workspace_access.execute(
                 tool_call=tool_call,
                 context=context,
-            )
+            ):
+                result = await self._main_tool_runtime.execute(
+                    tool_call=tool_call,
+                    context=context,
+                )
+                result = _with_workspace_lease_generation(
+                    result,
+                    await self._workspace_access.lease_generation(),
+                )
+        except WorkspaceLeaseError as exc:
+            result = _workspace_lease_error_result(tool_call, exc)
+        self._remember_main_turn_skill(context=context, result=result)
         await self._bash_job_supervisor.observe_tool_result(result=result, context=context)
         return result
+
+    def _remember_main_turn_skill(
+        self,
+        *,
+        context: ToolExecutionContext,
+        result: ToolExecutionResult,
+    ) -> None:
+        if (
+            context.agent_kind != "main"
+            or result.name != "get_skills"
+            or not result.ok
+            or context.session_id is None
+            or context.turn_id is None
+        ):
+            return
+        skill = result.metadata.get("skill")
+        if not isinstance(skill, Mapping):
+            return
+        skill_id = str(skill.get("skill_id", "")).strip()
+        if not skill_id:
+            return
+        key = (context.session_id, context.turn_id)
+        prior = self._selected_skills_by_main_turn.get(key, ())
+        self._selected_skills_by_main_turn[key] = tuple(
+            dict.fromkeys((*prior, skill_id))
+        )[:4]
 
     async def _execute_subagent_primitive(
         self,
@@ -934,6 +1261,16 @@ class RouteRuntime:
                 turn_id = context.turn_id
                 if session_id is None or turn_id is None:
                     raise ValueError("Subagent invocation requires a main session and turn id.")
+                requested_skill_ids = _optional_string_tuple(
+                    tool_call.arguments.get("skill_ids")
+                )
+                inherited_skill_ids = self._selected_skills_by_main_turn.get(
+                    (session_id, turn_id),
+                    (),
+                )
+                skill_ids = tuple(
+                    dict.fromkeys((*requested_skill_ids, *inherited_skill_ids))
+                )[:4]
                 payload = await self._subagent_manager.invoke(
                     requester_kind=context.agent_kind,
                     task_label=task_label,
@@ -947,7 +1284,7 @@ class RouteRuntime:
                     owned_paths=_optional_string_tuple(
                         tool_call.arguments.get("owned_paths")
                     ),
-                    skill_ids=_optional_string_tuple(tool_call.arguments.get("skill_ids")),
+                    skill_ids=skill_ids,
                     deliverable=_optional_string(tool_call.arguments.get("deliverable")),
                     owner_main_session_id=session_id,
                     owner_main_turn_id=turn_id,
@@ -1272,6 +1609,16 @@ class RouteRuntime:
         subagent_id = notice.subagent_id or ""
         if not subagent_id:
             return
+        if notice.actor_run_generation is not None:
+            snapshot = self._subagent_manager.snapshot_for(subagent_id)
+            if snapshot is None or snapshot.run_generation != notice.actor_run_generation:
+                LOGGER.debug(
+                    "Ignored stale queued subagent notice route=%s subagent=%s event_generation=%s.",
+                    self._route_id,
+                    subagent_id,
+                    notice.actor_run_generation,
+                )
+                return
         self._pending_main_subagent_notices[subagent_id] = notice
 
     def _clear_pending_main_subagent_notices(self) -> None:
@@ -1287,26 +1634,38 @@ class RouteRuntime:
         self,
         notices: Sequence[BashJobNotice],
     ) -> str | None:
-        active_session_id = self._main_loop.active_session_id()
-        if active_session_id is not None:
-            return active_session_id
         for notice in notices:
             if notice.owner_session_id:
-                return notice.owner_session_id
-        return None
+                return self._resolve_session_lineage(notice.owner_session_id)
+        return self._main_loop.active_session_id()
 
     def _resolve_main_subagent_notice_session_id(
         self,
         notice: RouteSystemNoticeEvent,
     ) -> str | None:
-        active_session_id = self._main_loop.active_session_id()
-        if active_session_id is not None:
-            return active_session_id
+        if notice.origin_session_id:
+            return self._resolve_session_lineage(notice.origin_session_id)
         if notice.subagent_id:
             snapshot = self._subagent_manager.snapshot_for(notice.subagent_id)
             if snapshot is not None and snapshot.owner_main_session_id:
-                return snapshot.owner_main_session_id
-        return None
+                return self._resolve_session_lineage(snapshot.owner_main_session_id)
+        return self._main_loop.active_session_id()
+
+    def _resolve_session_lineage(self, owner_session_id: str) -> str | None:
+        """Map only an explicit compaction descendant to the active session."""
+
+        owner = owner_session_id.strip()
+        if not owner:
+            return None
+        active_session_id = self._main_loop.active_session_id()
+        if active_session_id is None or active_session_id == owner:
+            return owner
+        cursor = self._main_storage.get_session(active_session_id)
+        while cursor is not None and cursor.parent_session_id is not None:
+            if cursor.parent_session_id == owner:
+                return active_session_id
+            cursor = self._main_storage.get_session(cursor.parent_session_id)
+        return owner
 
     def _drain_main_bash_progress_message(
         self,
@@ -1413,6 +1772,8 @@ class RouteRuntime:
         lines = ["Detached bash update."]
         for notice in notices:
             lines.append(f"- {self._format_main_bash_job_notice_line(notice)}")
+            if notice.status != "running":
+                lines.extend(self._format_terminal_bash_evidence(notice))
             if notice.skill_import_notice:
                 lines.extend(notice.skill_import_notice.splitlines())
         lines.append(f"recommendation={recommendation}")
@@ -1505,6 +1866,11 @@ class RouteRuntime:
             for notice in notices
         ):
             return "inspect"
+        if any(
+            notice.notice_kind in {"bash_job_output_started", "bash_job_output_grew"}
+            for notice in notices
+        ):
+            return "continue"
         if any(notice.status == "running" for notice in notices):
             return "wait"
         return "finalize"
@@ -1563,6 +1929,24 @@ class RouteRuntime:
             f"stderr={self._format_notice_bytes(notice.stderr_bytes_seen)}"
         )
 
+    def _format_terminal_bash_evidence(self, notice: BashJobNotice) -> list[str]:
+        return [
+            f"  process_exited=true process_exit_success={str(notice.process_exit_success).lower()}",
+            f"  termination_signal={notice.termination_signal}",
+            f"  runtime_seconds={notice.runtime_seconds}",
+            f"  command_sha256={notice.command_sha256}",
+            f"  workspace_revision={notice.workspace_revision or 'unavailable'}",
+            "  verification_passed=unknown; process exit never implies semantic success.",
+            f"  stdout_log_path={notice.stdout_log_path}",
+            f"  stderr_log_path={notice.stderr_log_path}",
+            f"  stdout_tail_sha256={notice.stdout_sha256}",
+            f"  stderr_tail_sha256={notice.stderr_sha256}",
+            "  stdout_tail:",
+            _bounded_terminal_tail(notice.stdout),
+            "  stderr_tail:",
+            _bounded_terminal_tail(notice.stderr),
+        ]
+
     def _truncate_for_notice(self, value: str | None, *, max_length: int) -> str | None:
         if value is None:
             return None
@@ -1617,6 +2001,72 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _nonnegative_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+def _route_event_actor_id(event: RouteEvent) -> str:
+    if event.agent_kind == "subagent" and event.subagent_id:
+        return f"subagent:{event.subagent_id}"
+    return "main"
+
+
+def _provider_error_code(exc: Exception) -> str:
+    if isinstance(exc, ProviderTimeoutError):
+        return "provider_timeout"
+    if isinstance(exc, ProviderRateLimitError):
+        return "provider_rate_limited"
+    return "provider_temporary_error"
+
+
+def _bounded_terminal_tail(value: str, *, limit: int = 2_000) -> str:
+    if not value.strip():
+        return "  (empty)"
+    if len(value) <= limit:
+        return "  " + value
+    head = limit // 2
+    tail = limit - head
+    return "  " + value[:head] + "\n  ...[terminal tail truncated]...\n  " + value[-tail:]
+
+
+def _workspace_lease_error_result(
+    tool_call: ToolCall,
+    error: WorkspaceLeaseError,
+) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        call_id=tool_call.call_id,
+        name=tool_call.name,
+        ok=False,
+        content=(
+            "Tool execution denied\n"
+            f"tool: {tool_call.name}\n"
+            "error_code: workspace_lease_conflict\n"
+            f"reason: {error}"
+        ),
+        metadata={
+            "execution_failed": True,
+            "error_code": "workspace_lease_conflict",
+            "reason": str(error),
+            "arguments": dict(tool_call.arguments),
+        },
+    )
+
+
+def _with_workspace_lease_generation(
+    result: ToolExecutionResult,
+    generation: int,
+) -> ToolExecutionResult:
+    metadata = dict(result.metadata)
+    metadata["workspace_lease_generation"] = generation
+    return replace(result, metadata=metadata)
 
 
 def _optional_string_tuple(value: Any) -> tuple[str, ...]:
@@ -1714,6 +2164,7 @@ def _map_route_event_to_agent_event(event: RouteEvent) -> AgentTurnStreamEvent |
             compaction_performed=event.compaction_performed,
             interrupted=event.interrupted,
             approval_rejected=event.approval_rejected,
+            completion_blocked=event.completion_blocked,
             interruption_reason=event.interruption_reason,
         )
     return None

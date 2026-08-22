@@ -18,7 +18,9 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Iterable,
     Literal,
+    Mapping,
     Protocol,
     Sequence,
     TypeVar,
@@ -80,6 +82,7 @@ from .config import CoreSettings
 from .errors import ContextBudgetError
 from .identities import IdentityBootstrapLoader
 from .token_estimator import estimate_request_input_tokens
+from .tool_safety import ToolSafetyTracker, build_blocked_invalid_result
 
 _OVERFLOW_ERROR_HINTS = (
     "context window",
@@ -104,6 +107,7 @@ _GROK_PROVIDER_MEDIA_DIR_NAME = "provider_media"
 _GROK_IMAGE_TRANSCODE_MIN_BYTES = 512 * 1024
 _GROK_IMAGE_MAX_EDGE_PIXELS = 1_600
 _GROK_IMAGE_JPEG_QUALITY = 82
+_INLINE_TOOL_RESULT_MAX_CHARS = 12_000
 _TURN_CONTEXT_METADATA_KEY = "turn_context"
 _TURN_ID_METADATA_KEY = "turn_id"
 _INTERRUPTION_NOTICE_METADATA_KEY = "interruption_notice"
@@ -114,6 +118,20 @@ _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _SKILLS_BOOTSTRAP_METADATA_KEY = "skills_bootstrap"
 _TOOL_ROUND_CONTINUATION_EMPTY_TEXT = (
     "I could not produce a continuation after the tool execution slice boundary."
+)
+_TOOL_SAFETY_STOP_TEXT = (
+    "Tool execution stopped safely because repeated calls were no longer making progress. "
+    "Do not repeat the blocked action automatically; resume only after a materially new "
+    "user instruction or orchestrator update."
+)
+_TOOL_SAFETY_STOP_RESPONSE_TEXT = (
+    "I stopped this turn because repeated tool activity was no longer making progress. "
+    "The completed evidence is preserved; I will not repeat the blocked action automatically."
+)
+_UNVERIFIED_MUTATION_HANDOFF_TEXT = (
+    "I changed workspace state but cannot mark this task complete because no acceptance "
+    "ledger was recorded. The changes remain in place; run the required checks and record "
+    "their evidence before treating the work as complete."
 )
 _FOLLOWUP_COMPACTION_FAILED_TEXT = (
     "Follow-up request overflow occurred and compaction could not proceed."
@@ -201,6 +219,7 @@ class AgentTurnResult:
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    completion_blocked: bool = False
     interruption_reason: InterruptionReason | None = None
 
 
@@ -258,6 +277,7 @@ class AgentTurnDoneEvent:
     compaction_performed: bool = False
     interrupted: bool = False
     approval_rejected: bool = False
+    completion_blocked: bool = False
     interruption_reason: InterruptionReason | None = None
     type: Literal["done"] = "done"
 
@@ -270,6 +290,7 @@ class AgentTurnDoneEvent:
             compaction_performed=self.compaction_performed,
             interrupted=self.interrupted,
             approval_rejected=self.approval_rejected,
+            completion_blocked=self.completion_blocked,
             interruption_reason=self.interruption_reason,
         )
 
@@ -319,6 +340,8 @@ class _ToolExecutionOutcome:
     pending_subagent_ids: frozenset[str] = frozenset()
     deferred_tool_successes: tuple["_DeferredToolSuccess", ...] = ()
     unexecuted_tool_names: tuple[str, ...] = ()
+    safety_stop: bool = False
+    safety_stop_reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -542,6 +565,47 @@ class AgentLoop:
             content=normalized_content,
             metadata=metadata,
         )
+        return True
+
+    def append_assistant_note(
+        self,
+        content: str,
+        *,
+        session_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Persist an orchestrator-authored assistant status message."""
+
+        if self._storage.get_session(session_id) is None or not content.strip():
+            return False
+        self._append_message(
+            session_id=session_id,
+            role="assistant",
+            content=content.strip(),
+            metadata=metadata,
+        )
+        return True
+
+    def backend_state(self, *, session_id: str) -> dict[str, Any]:
+        session = self._storage.get_session(session_id)
+        return dict(session.backend_state) if session is not None else {}
+
+    def update_backend_state(
+        self,
+        *,
+        session_id: str,
+        key: str,
+        value: Any | None,
+    ) -> bool:
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return False
+        state = dict(session.backend_state)
+        if value is None:
+            state.pop(key, None)
+        else:
+            state[key] = value
+        self._storage.update_session(session_id, backend_state=state)
         return True
 
     async def prepare_session(self, *, start_reason: str = "initial") -> str:
@@ -770,6 +834,15 @@ class AgentLoop:
             if overflow_compacted:
                 did_compaction = True
 
+            if not response.tool_calls:
+                _rounds, persisted_tool_safety = self._load_tool_task_state(
+                    session.session_id
+                )
+                response = _enforce_acceptance_handoff(
+                    response,
+                    tool_safety=persisted_tool_safety,
+                )
+
             assistant_record = self._build_assistant_record(
                 session.session_id,
                 response,
@@ -829,16 +902,18 @@ class AgentLoop:
                     unexecuted_tool_names=interrupted_unexecuted_tool_names,
                 )
 
+            completion_blocked = _response_completion_blocked(final_response)
             self._persist_successful_turn(
                 session_id=session.session_id,
                 turn_id=turn_id,
                 response=final_response,
                 estimated_input_tokens=final_estimated_input_tokens,
             )
-            await self._reflect_completed_turn(
-                session_id=session.session_id,
-                turn_id=turn_id,
-            )
+            if not completion_blocked:
+                await self._reflect_completed_turn(
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                )
 
             refreshed = self._storage.get_session(session.session_id)
             threshold_observed = (
@@ -863,6 +938,7 @@ class AgentLoop:
                 command=command_override,
                 compaction_performed=did_compaction,
                 approval_rejected=approval_rejected,
+                completion_blocked=completion_blocked,
             )
         except _TurnStopRequested:
             return self._interrupt_turn(
@@ -890,12 +966,17 @@ class AgentLoop:
         turn_id: str,
         pending_detached_job_ids: frozenset[str] = frozenset(),
         pending_subagent_ids: frozenset[str] = frozenset(),
+        tool_safety: ToolSafetyTracker | None = None,
     ) -> _ToolExecutionOutcome:
         ephemeral_image_records: list[ConversationRecord] = []
         deferred_tool_successes: list[_DeferredToolSuccess] = []
         current_pending_detached_job_ids = set(pending_detached_job_ids)
         current_pending_subagent_ids = set(pending_subagent_ids)
         tool_calls = tuple(current_response.tool_calls)
+        safety_stop = False
+        safety_stop_reason: str | None = None
+        safety_stop_unexecuted_tool_names: tuple[str, ...] = ()
+        safety_stop_unexecuted_tool_calls: tuple[ToolCall, ...] = ()
         for tool_index, tool_call in enumerate(tool_calls):
             tool_context = replace(
                 self._tool_context,
@@ -903,21 +984,24 @@ class AgentLoop:
                 turn_id=turn_id,
             )
             while True:
-                try:
-                    tool_result = await self._await_with_stop(
-                        self._tool_executor(tool_call, tool_context),
-                        turn_id=turn_id,
-                        operation=f"tool_{tool_call.name}",
-                    )
-                except _TurnStopRequested:
-                    pending_records.extend(ephemeral_image_records)
-                    return _ToolExecutionOutcome(
-                        interrupted=True,
-                        pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
-                        pending_subagent_ids=frozenset(current_pending_subagent_ids),
-                        deferred_tool_successes=tuple(deferred_tool_successes),
-                        unexecuted_tool_names=tuple(call.name for call in tool_calls[tool_index:]),
-                    )
+                if tool_safety is not None and tool_safety.invalid_call_is_blocked(tool_call):
+                    tool_result = build_blocked_invalid_result(tool_call=tool_call)
+                else:
+                    try:
+                        tool_result = await self._await_with_stop(
+                            self._tool_executor(tool_call, tool_context),
+                            turn_id=turn_id,
+                            operation=f"tool_{tool_call.name}",
+                        )
+                    except _TurnStopRequested:
+                        pending_records.extend(ephemeral_image_records)
+                        return _ToolExecutionOutcome(
+                            interrupted=True,
+                            pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
+                            pending_subagent_ids=frozenset(current_pending_subagent_ids),
+                            deferred_tool_successes=tuple(deferred_tool_successes),
+                            unexecuted_tool_names=tuple(call.name for call in tool_calls[tool_index:]),
+                        )
                 pending_approval = self._build_pending_approval(
                     tool_result=tool_result,
                     tool_name=tool_call.name,
@@ -961,6 +1045,32 @@ class AgentLoop:
                         current_pending_subagent_ids,
                         tool_result,
                     )
+                    if tool_safety is not None:
+                        observation = tool_safety.record(tool_call, tool_result)
+                        if bool(tool_result.metadata.get("tool_safety_blocked")):
+                            safety_stop = True
+                            safety_stop_reason = "disabled_file_edit_tool_reused"
+                            safety_stop_unexecuted_tool_names = tuple(
+                                call.name for call in tool_calls[tool_index + 1:]
+                            )
+                            safety_stop_unexecuted_tool_calls = tool_calls[tool_index + 1:]
+                        elif (
+                            observation.repeated_invalid_call
+                            and not observation.blocked_invalid_signature
+                        ):
+                            safety_stop = True
+                            safety_stop_reason = "two_identical_tool_failures"
+                            safety_stop_unexecuted_tool_names = tuple(
+                                call.name for call in tool_calls[tool_index + 1:]
+                            )
+                            safety_stop_unexecuted_tool_calls = tool_calls[tool_index + 1:]
+                        elif observation.repeated_no_progress:
+                            safety_stop = True
+                            safety_stop_reason = "three_identical_no_progress_results"
+                            safety_stop_unexecuted_tool_names = tuple(
+                                call.name for call in tool_calls[tool_index + 1:]
+                            )
+                            safety_stop_unexecuted_tool_calls = tool_calls[tool_index + 1:]
                     break
 
                 self._append_turn_record(
@@ -1007,11 +1117,25 @@ class AgentLoop:
                     )
                 tool_context = replace(tool_context, approved_action=pending_approval)
 
+            if safety_stop:
+                break
+
         pending_records.extend(ephemeral_image_records)
+        if safety_stop_unexecuted_tool_calls:
+            self._append_tool_safety_skips(
+                session_id=session_id,
+                pending_records=pending_records,
+                tool_calls=safety_stop_unexecuted_tool_calls,
+                reason=safety_stop_reason or "repeated_tool_result",
+                turn_id=turn_id,
+            )
         return _ToolExecutionOutcome(
             pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
             pending_subagent_ids=frozenset(current_pending_subagent_ids),
             deferred_tool_successes=tuple(deferred_tool_successes),
+            safety_stop=safety_stop,
+            safety_stop_reason=safety_stop_reason,
+            unexecuted_tool_names=safety_stop_unexecuted_tool_names,
         )
 
     def _build_followup_attempt_request(
@@ -1210,6 +1334,8 @@ class AgentLoop:
         pending_subagent_ids: Sequence[str],
         turn_id: str,
     ) -> ConversationRecord | None:
+        if not pending_detached_job_ids and not pending_subagent_ids:
+            return None
         if any(record.metadata.get("orchestrator_monitored_waiting") for record in pending_records):
             return None
 
@@ -1248,8 +1374,9 @@ class AgentLoop:
             content=(
                 f"Tool execution slice completed {max_rounds} rounds. Pending round "
                 f"{attempted_round} was not executed. "
-                "Continue the same task now, avoid repeating completed work, and use tools "
-                "as needed. Do not ask the user to continue merely because of this boundary."
+                "A continuation is allowed only after a prior round made observable progress. "
+                "Avoid repeating completed work and use tools only when they can produce new "
+                "evidence or change."
             ),
             metadata={
                 _TOOL_ROUND_LIMIT_METADATA_KEY: True,
@@ -1259,6 +1386,107 @@ class AgentLoop:
             },
             turn_id=turn_id,
         )
+
+    def _build_tool_safety_stop_record(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        reason: str,
+        pending_detached_job_ids: Iterable[str] = (),
+        pending_subagent_ids: Iterable[str] = (),
+    ) -> ConversationRecord:
+        details = [
+            _TOOL_SAFETY_STOP_TEXT,
+            f"reason: {reason}",
+        ]
+        if pending_detached_job_ids:
+            details.append(
+                "pending_detached_bash_jobs: " + ", ".join(sorted(pending_detached_job_ids))
+            )
+        if pending_subagent_ids:
+            details.append(
+                "pending_subagents: " + ", ".join(sorted(pending_subagent_ids))
+            )
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content="\n".join(details),
+            metadata={
+                "tool_safety_stop": True,
+                "reason": reason,
+                "pending_detached_job_ids": list(pending_detached_job_ids),
+                "pending_subagent_ids": list(pending_subagent_ids),
+            },
+            turn_id=turn_id,
+        )
+
+    def _append_tool_safety_skips(
+        self,
+        *,
+        session_id: str,
+        pending_records: list[ConversationRecord],
+        tool_calls: Sequence[ToolCall],
+        reason: str,
+        turn_id: str,
+    ) -> None:
+        for tool_call in tool_calls:
+            result = ToolExecutionResult(
+                call_id=tool_call.call_id,
+                name=tool_call.name,
+                ok=False,
+                content=(
+                    "Tool call skipped\n"
+                    f"tool: {tool_call.name}\n"
+                    "error_code: tool_safety_stop\n"
+                    f"reason: {reason}"
+                ),
+                metadata={
+                    "tool_safety_skipped": True,
+                    "error_code": "tool_safety_stop",
+                    "reason": reason,
+                    "arguments": dict(tool_call.arguments),
+                },
+            )
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=self._build_tool_record(session_id, result, turn_id=turn_id),
+            )
+
+    def _append_tool_safety_stop_response(
+        self,
+        *,
+        session_id: str,
+        pending_records: list[ConversationRecord],
+        turn_id: str,
+        reason: str,
+        response: LLMResponse,
+    ) -> LLMResponse:
+        stopped_response = replace(
+            response,
+            text=_TOOL_SAFETY_STOP_RESPONSE_TEXT,
+            tool_calls=[],
+            finish_reason="stop",
+            provider_metadata={
+                **response.provider_metadata,
+                "completion_blocked": True,
+                "tool_safety_parked": True,
+                "tool_safety_stop_reason": reason,
+            },
+        )
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=self._build_message_record(
+                session_id=session_id,
+                role="assistant",
+                content=stopped_response.text,
+                metadata={"tool_safety_stop": True, "reason": reason},
+                turn_id=turn_id,
+            ),
+        )
+        return stopped_response
 
     def _build_request(
         self,
@@ -1625,7 +1853,7 @@ class AgentLoop:
             )
         return recovery_events, normalized, estimated_input_tokens
 
-    async def _stream_message_turn(
+    async def _stream_message_turn(  # pyright: ignore[reportGeneralTypeIssues] - orchestration state machine
         self,
         user_text: str | None,
         *,
@@ -1809,6 +2037,15 @@ class AgentLoop:
             if overflow_compacted:
                 did_compaction = True
 
+            if not initial_response.tool_calls:
+                _rounds, persisted_tool_safety = self._load_tool_task_state(
+                    session.session_id
+                )
+                initial_response = _enforce_acceptance_handoff(
+                    initial_response,
+                    tool_safety=persisted_tool_safety,
+                )
+
             final_initial_record = self._build_final_stream_assistant_record(
                 session_id=session.session_id,
                 response=initial_response,
@@ -1872,6 +2109,9 @@ class AgentLoop:
                 call.name for call in current_response.tool_calls
             )
             tool_rounds = 0
+            task_tool_rounds, tool_safety = self._load_tool_task_state(
+                session.session_id
+            )
             turn_approval_rejected = False
             pending_detached_job_ids = _collect_pending_detached_job_ids(turn_runtime_messages)
             pending_subagent_ids = _collect_pending_subagent_ids(turn_runtime_messages)
@@ -1899,7 +2139,77 @@ class AgentLoop:
                     return
 
                 tool_rounds += 1
+                task_tool_rounds += 1
+                self._persist_tool_task_state(
+                    session.session_id,
+                    rounds=task_tool_rounds,
+                    tracker=tool_safety,
+                )
+                if task_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
+                    self._append_tool_safety_skips(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        tool_calls=current_response.tool_calls,
+                        reason="task_tool_round_budget_exhausted",
+                        turn_id=turn_id,
+                    )
+                    self._append_turn_record(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        record=self._build_tool_safety_stop_record(
+                            session_id=session.session_id,
+                            turn_id=turn_id,
+                            reason="task_tool_round_budget_exhausted",
+                            pending_detached_job_ids=pending_detached_job_ids,
+                            pending_subagent_ids=pending_subagent_ids,
+                        ),
+                    )
+                    current_response = self._append_tool_safety_stop_response(
+                        session_id=session.session_id,
+                        pending_records=pending_records,
+                        turn_id=turn_id,
+                        reason="task_tool_round_budget_exhausted",
+                        response=current_response,
+                    )
+                    yield AgentAssistantMessageEvent(
+                        session_id=session.session_id,
+                        text=current_response.text,
+                        turn_id=turn_id,
+                    )
+                    break
                 if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
+                    if not tool_safety.consume_slice_progress():
+                        self._append_tool_safety_skips(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            tool_calls=current_response.tool_calls,
+                            reason="tool_slice_without_progress",
+                            turn_id=turn_id,
+                        )
+                        self._append_turn_record(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            record=self._build_tool_safety_stop_record(
+                                session_id=session.session_id,
+                                turn_id=turn_id,
+                                reason="tool_slice_without_progress",
+                                pending_detached_job_ids=pending_detached_job_ids,
+                                pending_subagent_ids=pending_subagent_ids,
+                            ),
+                        )
+                        current_response = self._append_tool_safety_stop_response(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            turn_id=turn_id,
+                            reason="tool_slice_without_progress",
+                            response=current_response,
+                        )
+                        yield AgentAssistantMessageEvent(
+                            session_id=session.session_id,
+                            text=current_response.text,
+                            turn_id=turn_id,
+                        )
+                        break
                     (
                         recovery_events,
                         final_response,
@@ -1931,6 +2241,9 @@ class AgentLoop:
                     ephemeral_image_records: list[ConversationRecord] = []
                     staged_image_tool_successes: list[_DeferredToolSuccess] = []
                     approval_rejected = False
+                    safety_stop = False
+                    safety_stop_reason: str | None = None
+                    safety_stop_unexecuted_tool_calls: tuple[ToolCall, ...] = ()
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
                     current_pending_subagent_ids = set(pending_subagent_ids)
                     tool_calls = tuple(current_response.tool_calls)
@@ -1941,41 +2254,44 @@ class AgentLoop:
                             turn_id=turn_id,
                         )
                         while True:
-                            try:
-                                tool_result = await self._await_with_stop(
-                                    self._tool_executor(tool_call, tool_context),
-                                    turn_id=turn_id,
-                                    operation=f"tool_{tool_call.name}",
-                                )
-                            except _TurnStopRequested:
-                                pending_records.extend(ephemeral_image_records)
-                                deferred_tool_successes = tuple(staged_image_tool_successes)
-                                if deferred_tool_successes:
-                                    self._commit_deferred_tool_successes(
-                                        session_id=session.session_id,
-                                        pending_records=pending_records,
-                                        deferred_tool_successes=deferred_tool_successes,
+                            if tool_safety.invalid_call_is_blocked(tool_call):
+                                tool_result = build_blocked_invalid_result(tool_call=tool_call)
+                            else:
+                                try:
+                                    tool_result = await self._await_with_stop(
+                                        self._tool_executor(tool_call, tool_context),
+                                        turn_id=turn_id,
+                                        operation=f"tool_{tool_call.name}",
                                     )
-                                interrupted = self._interrupt_turn(
-                                    session_id=session.session_id,
-                                    turn_id=turn_id,
-                                    command=command_override,
-                                    compaction_performed=did_compaction,
-                                    response_text=current_response.text,
-                                    unexecuted_tool_names=tuple(
-                                        call.name for call in tool_calls[tool_index:]
-                                    ),
-                                )
-                                yield AgentTurnDoneEvent(
-                                    session_id=interrupted.session_id,
-                                    response_text=interrupted.response_text,
-                                    turn_id=turn_id,
-                                    command=interrupted.command,
-                                    compaction_performed=interrupted.compaction_performed,
-                                    interrupted=True,
-                                    interruption_reason=interrupted.interruption_reason,
-                                )
-                                return
+                                except _TurnStopRequested:
+                                    pending_records.extend(ephemeral_image_records)
+                                    deferred_tool_successes = tuple(staged_image_tool_successes)
+                                    if deferred_tool_successes:
+                                        self._commit_deferred_tool_successes(
+                                            session_id=session.session_id,
+                                            pending_records=pending_records,
+                                            deferred_tool_successes=deferred_tool_successes,
+                                        )
+                                    interrupted = self._interrupt_turn(
+                                        session_id=session.session_id,
+                                        turn_id=turn_id,
+                                        command=command_override,
+                                        compaction_performed=did_compaction,
+                                        response_text=current_response.text,
+                                        unexecuted_tool_names=tuple(
+                                            call.name for call in tool_calls[tool_index:]
+                                        ),
+                                    )
+                                    yield AgentTurnDoneEvent(
+                                        session_id=interrupted.session_id,
+                                        response_text=interrupted.response_text,
+                                        turn_id=turn_id,
+                                        command=interrupted.command,
+                                        compaction_performed=interrupted.compaction_performed,
+                                        interrupted=True,
+                                        interruption_reason=interrupted.interruption_reason,
+                                    )
+                                    return
                             pending_approval = self._build_pending_approval(
                                 tool_result=tool_result,
                                 tool_name=tool_call.name,
@@ -2019,6 +2335,28 @@ class AgentLoop:
                                     current_pending_subagent_ids,
                                     tool_result,
                                 )
+                                observation = tool_safety.record(tool_call, tool_result)
+                                if bool(tool_result.metadata.get("tool_safety_blocked")):
+                                    safety_stop = True
+                                    safety_stop_reason = "disabled_file_edit_tool_reused"
+                                    safety_stop_unexecuted_tool_calls = tool_calls[
+                                        tool_index + 1:
+                                    ]
+                                elif (
+                                    observation.repeated_invalid_call
+                                    and not observation.blocked_invalid_signature
+                                ):
+                                    safety_stop = True
+                                    safety_stop_reason = "two_identical_tool_failures"
+                                    safety_stop_unexecuted_tool_calls = tool_calls[
+                                        tool_index + 1:
+                                    ]
+                                elif observation.repeated_no_progress:
+                                    safety_stop = True
+                                    safety_stop_reason = "three_identical_no_progress_results"
+                                    safety_stop_unexecuted_tool_calls = tool_calls[
+                                        tool_index + 1:
+                                    ]
                                 break
 
                             self._append_turn_record(
@@ -2108,11 +2446,18 @@ class AgentLoop:
 
                         if approval_rejected:
                             break
+                        if safety_stop:
+                            break
 
                     pending_records.extend(ephemeral_image_records)
                     deferred_tool_successes = tuple(staged_image_tool_successes)
                     pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
                     pending_subagent_ids = frozenset(current_pending_subagent_ids)
+                    self._persist_tool_task_state(
+                        session.session_id,
+                        rounds=task_tool_rounds,
+                        tracker=tool_safety,
+                    )
                     if approval_rejected:
                         if deferred_tool_successes:
                             self._commit_deferred_tool_successes(
@@ -2120,6 +2465,44 @@ class AgentLoop:
                                 pending_records=pending_records,
                                 deferred_tool_successes=deferred_tool_successes,
                             )
+                        break
+                    if safety_stop:
+                        if deferred_tool_successes:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
+                        self._append_tool_safety_skips(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            tool_calls=safety_stop_unexecuted_tool_calls,
+                            reason=safety_stop_reason or "repeated_tool_result",
+                            turn_id=turn_id,
+                        )
+                        self._append_turn_record(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            record=self._build_tool_safety_stop_record(
+                                session_id=session.session_id,
+                                turn_id=turn_id,
+                                reason=safety_stop_reason or "repeated_tool_result",
+                                pending_detached_job_ids=pending_detached_job_ids,
+                                pending_subagent_ids=pending_subagent_ids,
+                            ),
+                        )
+                        current_response = self._append_tool_safety_stop_response(
+                            session_id=session.session_id,
+                            pending_records=pending_records,
+                            turn_id=turn_id,
+                            reason=safety_stop_reason or "repeated_tool_result",
+                            response=current_response,
+                        )
+                        yield AgentAssistantMessageEvent(
+                            session_id=session.session_id,
+                            text=current_response.text,
+                            turn_id=turn_id,
+                        )
                         break
                     if self._stop_requested(turn_id):
                         if deferred_tool_successes:
@@ -2449,6 +2832,11 @@ class AgentLoop:
                     )
 
                 current_response = streamed_response
+                if not current_response.tool_calls:
+                    current_response = _enforce_acceptance_handoff(
+                        current_response,
+                        tool_safety=tool_safety,
+                    )
                 interrupted_response_text = current_response.text
                 interrupted_unexecuted_tool_names = tuple(
                     call.name for call in current_response.tool_calls
@@ -2521,6 +2909,7 @@ class AgentLoop:
 
             final_response = current_response
 
+            completion_blocked = _response_completion_blocked(final_response)
             self._persist_successful_turn(
                 session_id=session.session_id,
                 turn_id=turn_id,
@@ -2551,6 +2940,7 @@ class AgentLoop:
                 command=command_override,
                 compaction_performed=did_compaction,
                 approval_rejected=turn_approval_rejected,
+                completion_blocked=completion_blocked,
             )
         except _TurnStopRequested:
             if interrupted_stream_fragment_text:
@@ -2752,12 +3142,17 @@ class AgentLoop:
         response: LLMResponse,
         estimated_input_tokens: int,
     ) -> None:
+        completion_blocked = _response_completion_blocked(response)
         self._finish_turn(
             session_id=session_id,
             turn_id=turn_id,
-            status="completed",
+            status="blocked" if completion_blocked else "completed",
         )
         usage = response.usage
+        session = self._storage.get_session(session_id)
+        backend_state = dict(session.backend_state) if session is not None else {}
+        if not completion_blocked:
+            backend_state.pop("tool_task_state", None)
         self._storage.update_session(
             session_id,
             pending_interruption_notice=False,
@@ -2766,6 +3161,31 @@ class AgentLoop:
             last_output_tokens=usage.output_tokens if usage is not None else None,
             last_total_tokens=usage.total_tokens if usage is not None else None,
             last_estimated_input_tokens=estimated_input_tokens,
+            backend_state=backend_state,
+        )
+
+    def _load_tool_task_state(self, session_id: str) -> tuple[int, ToolSafetyTracker]:
+        session = self._storage.get_session(session_id)
+        raw = session.backend_state.get("tool_task_state") if session is not None else None
+        if not isinstance(raw, dict):
+            return 0, ToolSafetyTracker()
+        try:
+            rounds = max(0, int(raw.get("rounds", 0)))
+        except (TypeError, ValueError):
+            rounds = 0
+        return rounds, ToolSafetyTracker.from_state(raw.get("tracker"))
+
+    def _persist_tool_task_state(
+        self,
+        session_id: str,
+        *,
+        rounds: int,
+        tracker: ToolSafetyTracker,
+    ) -> None:
+        self.update_backend_state(
+            session_id=session_id,
+            key="tool_task_state",
+            value={"rounds": max(0, rounds), "tracker": tracker.to_state()},
         )
 
     def _persist_provider_session_state_from_response(
@@ -2990,6 +3410,7 @@ class AgentLoop:
         pending_subagent_ids: frozenset[str] = frozenset(),
     ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool, tuple[str, ...]]:
         tool_rounds = 0
+        task_tool_rounds, tool_safety = self._load_tool_task_state(session.session_id)
         did_compaction = False
         approval_rejected = False
         current_session = session
@@ -3007,7 +3428,67 @@ class AgentLoop:
                     tuple(call.name for call in current_response.tool_calls),
                 )
             tool_rounds += 1
+            task_tool_rounds += 1
+            self._persist_tool_task_state(
+                current_session.session_id,
+                rounds=task_tool_rounds,
+                tracker=tool_safety,
+            )
+            if task_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
+                self._append_tool_safety_skips(
+                    session_id=current_session.session_id,
+                    pending_records=pending_records,
+                    tool_calls=current_response.tool_calls,
+                    reason="task_tool_round_budget_exhausted",
+                    turn_id=turn_id,
+                )
+                self._append_turn_record(
+                    session_id=current_session.session_id,
+                    pending_records=pending_records,
+                    record=self._build_tool_safety_stop_record(
+                        session_id=current_session.session_id,
+                        turn_id=turn_id,
+                        reason="task_tool_round_budget_exhausted",
+                        pending_detached_job_ids=pending_detached_job_ids,
+                        pending_subagent_ids=pending_subagent_ids,
+                    ),
+                )
+                current_response = self._append_tool_safety_stop_response(
+                    session_id=current_session.session_id,
+                    pending_records=pending_records,
+                    turn_id=turn_id,
+                    reason="task_tool_round_budget_exhausted",
+                    response=current_response,
+                )
+                break
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
+                if not tool_safety.consume_slice_progress():
+                    self._append_tool_safety_skips(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        tool_calls=current_response.tool_calls,
+                        reason="tool_slice_without_progress",
+                        turn_id=turn_id,
+                    )
+                    self._append_turn_record(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        record=self._build_tool_safety_stop_record(
+                            session_id=current_session.session_id,
+                            turn_id=turn_id,
+                            reason="tool_slice_without_progress",
+                            pending_detached_job_ids=pending_detached_job_ids,
+                            pending_subagent_ids=pending_subagent_ids,
+                        ),
+                    )
+                    current_response = self._append_tool_safety_stop_response(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        turn_id=turn_id,
+                        reason="tool_slice_without_progress",
+                        response=current_response,
+                    )
+                    break
                 try:
                     (
                         current_response,
@@ -3046,10 +3527,16 @@ class AgentLoop:
                     turn_id=turn_id,
                     pending_detached_job_ids=pending_detached_job_ids,
                     pending_subagent_ids=pending_subagent_ids,
+                    tool_safety=tool_safety,
                 )
                 pending_detached_job_ids = tool_execution_outcome.pending_detached_job_ids
                 pending_subagent_ids = tool_execution_outcome.pending_subagent_ids
                 deferred_tool_successes = tool_execution_outcome.deferred_tool_successes
+                self._persist_tool_task_state(
+                    current_session.session_id,
+                    rounds=task_tool_rounds,
+                    tracker=tool_safety,
+                )
                 if tool_execution_outcome.interrupted:
                     if deferred_tool_successes:
                         self._commit_deferred_tool_successes(
@@ -3090,6 +3577,38 @@ class AgentLoop:
                             metadata={"approval_rejected": True},
                             turn_id=turn_id,
                         ),
+                    )
+                    break
+                if tool_execution_outcome.safety_stop:
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
+                    self._append_turn_record(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        record=self._build_tool_safety_stop_record(
+                            session_id=current_session.session_id,
+                            turn_id=turn_id,
+                            reason=(
+                                tool_execution_outcome.safety_stop_reason
+                                or "repeated_tool_result"
+                            ),
+                            pending_detached_job_ids=pending_detached_job_ids,
+                            pending_subagent_ids=pending_subagent_ids,
+                        ),
+                    )
+                    current_response = self._append_tool_safety_stop_response(
+                        session_id=current_session.session_id,
+                        pending_records=pending_records,
+                        turn_id=turn_id,
+                        reason=(
+                            tool_execution_outcome.safety_stop_reason
+                            or "repeated_tool_result"
+                        ),
+                        response=current_response,
                     )
                     break
                 if self._stop_requested(turn_id):
@@ -3283,6 +3802,11 @@ class AgentLoop:
                 did_compaction = True
                 followup_compaction_attempted = True
 
+            if not current_response.tool_calls:
+                current_response = _enforce_acceptance_handoff(
+                    current_response,
+                    tool_safety=tool_safety,
+                )
             assistant_record = self._build_assistant_record(
                 current_session.session_id,
                 current_response,
@@ -3352,10 +3876,10 @@ class AgentLoop:
             turn_id=turn_id,
             status="in_progress",
         )
-        rebound_pending_records = [
-            self._clone_carry_forward_record_for_session(compacted.session_id, record)
-            for record in pending_records
-        ]
+        rebound_pending_records = self._coalesce_carry_forward_records(
+            session_id=compacted.session_id,
+            records=pending_records,
+        )
         base_records = self._storage.load_records(compacted.session_id)
         activated_discoverable_tool_names = _collect_activated_discoverable_tool_names(
             rebound_pending_records
@@ -3537,6 +4061,7 @@ class AgentLoop:
                     pending_reactive_compaction=False,
                     pending_interruption_notice=session.pending_interruption_notice,
                     pending_interruption_notice_reason=session.pending_interruption_notice_reason,
+                    backend_state=_carry_compaction_backend_state(session.backend_state),
                 )
                 await self._emit_local_notice(
                     notice_kind="compaction_completed",
@@ -3593,6 +4118,11 @@ class AgentLoop:
                 compaction_operation_id=compaction_operation_id,
                 operation="llm_compaction",
             )
+            _assert_compaction_effective(
+                source_records=source_records,
+                outcome=outcome,
+                previous_bundle=previous_bundle,
+            )
         except (_TurnStopRequested, _CompactionStopRequested):
             LOGGER.info(
                 "Compaction interrupted for session %s (reason=%s, turn_id=%s).",
@@ -3643,6 +4173,7 @@ class AgentLoop:
             pending_reactive_compaction=False,
             pending_interruption_notice=session.pending_interruption_notice,
             pending_interruption_notice_reason=session.pending_interruption_notice_reason,
+            backend_state=_carry_compaction_backend_state(session.backend_state),
         )
         if not excluded_turn_id_set:
             self._cleanup_grok_provider_media(session.session_id)
@@ -3810,16 +4341,7 @@ class AgentLoop:
             "response_id": response.response_id,
             "finish_reason": response.finish_reason,
             "provider_metadata": deepcopy(response.provider_metadata),
-            "tool_calls": [
-                {
-                    "call_id": call.call_id,
-                    "name": call.name,
-                    "arguments": call.arguments,
-                    "raw_arguments": call.raw_arguments,
-                    "provider_metadata": dict(call.provider_metadata),
-                }
-                for call in response.tool_calls
-            ],
+            "tool_calls": [_serialize_transcript_tool_call(call) for call in response.tool_calls],
         }
         return self._build_message_record(
             session_id=session_id,
@@ -3872,7 +4394,12 @@ class AgentLoop:
         metadata_overrides: dict[str, Any] | None = None,
         turn_id: str | None = None,
     ) -> ConversationRecord:
-        metadata = dict(result.metadata)
+        content, content_metadata = _archive_large_tool_result(
+            result.content,
+            workspace_dir=self._tool_context.workspace_dir,
+        )
+        metadata = _canonical_tool_result_metadata(result.metadata)
+        metadata.update(content_metadata)
         if metadata_overrides is not None:
             metadata.update(metadata_overrides)
         metadata.update(
@@ -3885,7 +4412,7 @@ class AgentLoop:
         return self._build_message_record(
             session_id=session_id,
             role="tool",
-            content=result.content,
+            content=content,
             metadata=metadata,
             turn_id=turn_id,
         )
@@ -4387,7 +4914,7 @@ class AgentLoop:
         *,
         session_id: str,
         turn_id: str,
-        status: Literal["completed", "interrupted", "superseded"],
+        status: Literal["completed", "blocked", "interrupted", "superseded"],
     ) -> None:
         self._storage.set_turn_status(
             session_id,
@@ -4814,13 +5341,18 @@ class AgentLoop:
         record: ConversationRecord,
     ) -> ConversationRecord:
         cloned = ConversationRecord(
-            record_id=uuid4().hex,
+            record_id=record.record_id,
             session_id=session_id,
-            created_at=_utc_now_iso(),
+            created_at=record.created_at,
             role=record.role,
             content=record.content,
             kind=record.kind,
-            metadata=deepcopy(record.metadata),
+            metadata={
+                **deepcopy(record.metadata),
+                "source_record_id": record.record_id,
+                "source_session_id": record.session_id,
+                "source_created_at": record.created_at,
+            },
         )
         attachment = cloned.metadata.get(_IMAGE_INPUT_METADATA_KEY)
         if not isinstance(attachment, dict):
@@ -4861,6 +5393,77 @@ class AgentLoop:
     ) -> ConversationRecord:
         cloned = self._clone_record_for_session(session_id, record)
         return self._compact_carry_forward_record(cloned)
+
+    def _coalesce_carry_forward_records(
+        self,
+        *,
+        session_id: str,
+        records: Sequence[ConversationRecord],
+    ) -> list[ConversationRecord]:
+        """Carry one causal copy of identical repeated tool cycles across compaction."""
+
+        output: list[ConversationRecord] = []
+        index = 0
+        while index < len(records):
+            cycle = _carry_forward_tool_cycle(records, index)
+            if cycle is None:
+                output.append(self._clone_carry_forward_record_for_session(session_id, records[index]))
+                index += 1
+                continue
+            end_index, signature = cycle
+            repeated_ends = [end_index]
+            cursor = end_index
+            while cursor < len(records):
+                next_cycle = _carry_forward_tool_cycle(records, cursor)
+                if next_cycle is None or next_cycle[1] != signature:
+                    break
+                repeated_ends.append(next_cycle[0])
+                cursor = next_cycle[0]
+            for record in records[index:end_index]:
+                output.append(self._clone_carry_forward_record_for_session(session_id, record))
+            if len(repeated_ends) > 1:
+                repeated_records = records[index:cursor]
+                output.append(
+                    self._build_carry_forward_repetition_record(
+                        session_id=session_id,
+                        records=repeated_records,
+                        repeat_count=len(repeated_ends),
+                        signature=signature,
+                    )
+                )
+            index = cursor
+        return output
+
+    def _build_carry_forward_repetition_record(
+        self,
+        *,
+        session_id: str,
+        records: Sequence[ConversationRecord],
+        repeat_count: int,
+        signature: str,
+    ) -> ConversationRecord:
+        first = records[0]
+        last = records[-1]
+        source_ids = [record.record_id for record in records]
+        return self._build_message_record(
+            session_id=session_id,
+            role="system",
+            content=(
+                "Repeated tool cycle compacted during active-turn carry-forward.\n"
+                f"repeat_count: {repeat_count}\n"
+                "outcome: identical call arguments and result repeated without new evidence.\n"
+                "Do not repeat this cycle; inspect current state before choosing another action."
+            ),
+            metadata={
+                "carry_forward_repetition_summary": True,
+                "repeat_count": repeat_count,
+                "cycle_signature": signature,
+                "source_record_ids": source_ids,
+                "source_session_ids": sorted({record.session_id for record in records}),
+                "source_created_at_first": first.created_at,
+                "source_created_at_last": last.created_at,
+            },
+        )
 
     def _compact_carry_forward_record(
         self,
@@ -4917,8 +5520,153 @@ class AgentLoop:
         )
 
 
+def _carry_forward_tool_cycle(
+    records: Sequence[ConversationRecord],
+    start: int,
+) -> tuple[int, str] | None:
+    """Return the exclusive end/signature for one completed assistant-tool cycle."""
+
+    if start >= len(records):
+        return None
+    assistant = records[start]
+    tool_calls = assistant.metadata.get("tool_calls")
+    if assistant.role != "assistant" or not isinstance(tool_calls, list) or not tool_calls:
+        return None
+    end = start + 1 + len(tool_calls)
+    if end > len(records):
+        return None
+    tool_records = records[start + 1:end]
+    call_ids = [str(call.get("call_id", "")).strip() for call in tool_calls if isinstance(call, dict)]
+    if len(call_ids) != len(tool_calls) or any(not call_id for call_id in call_ids):
+        return None
+    if any(record.role != "tool" for record in tool_records):
+        return None
+    if [str(record.metadata.get("call_id", "")).strip() for record in tool_records] != call_ids:
+        return None
+    payload = {
+        "tool_calls": [
+            {
+                "name": call.get("name"),
+                "arguments": call.get("arguments"),
+            }
+            for call in tool_calls
+            if isinstance(call, dict)
+        ],
+        "tool_results": [
+            {
+                "name": record.metadata.get("tool_name"),
+                "ok": record.metadata.get("ok"),
+                "content": record.content,
+                "metadata": _stable_carry_forward_metadata(record.metadata),
+            }
+            for record in tool_records
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return end, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stable_carry_forward_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    volatile = {
+        "call_id",
+        "turn_id",
+        "job_id",
+        "launched_at",
+        "started_at",
+        "finished_at",
+        "last_update_at",
+        "stdout_path",
+        "stderr_path",
+        "error_log_path",
+        "duration_seconds",
+        "observed_at",
+    }
+    return _stable_carry_forward_mapping(metadata, volatile=volatile)
+
+
+def _stable_carry_forward_mapping(
+    value: Mapping[str, Any],
+    *,
+    volatile: set[str],
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        if key in volatile:
+            continue
+        if isinstance(raw_value, Mapping):
+            output[key] = _stable_carry_forward_mapping(raw_value, volatile=volatile)
+        elif isinstance(raw_value, list):
+            output[key] = [
+                _stable_carry_forward_mapping(item, volatile=volatile)
+                if isinstance(item, Mapping)
+                else item
+                for item in raw_value
+            ]
+        else:
+            output[key] = raw_value
+    return output
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _carry_compaction_backend_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Carry only task-recovery state that must survive a session migration."""
+
+    return {
+        key: deepcopy(state[key])
+        for key in ("provider_recovery", "tool_task_state")
+        if key in state
+    }
+
+
+def _assert_compaction_effective(
+    *,
+    source_records: Sequence[ConversationRecord],
+    outcome: CompactionOutcome,
+    previous_bundle: CompactionBundle | None,
+) -> None:
+    source_payload = [
+        {
+            "role": record.role,
+            "content": record.content,
+            "metadata": record.metadata,
+        }
+        for record in source_records
+    ]
+    source_bytes = len(
+        json.dumps(source_payload, ensure_ascii=False, sort_keys=True, default=str).encode(
+            "utf-8"
+        )
+    )
+    replay_bytes = len(
+        json.dumps(
+            [item.to_dict() for item in outcome.items],
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    )
+    if source_bytes >= 20_000 and replay_bytes >= int(source_bytes * 0.9):
+        raise ContextBudgetError(
+            "Compaction was parked because the verified replay did not materially reduce "
+            "the source history. Repeated cycles must be resolved before retrying."
+        )
+    if previous_bundle is None or not source_records:
+        return
+    prior = previous_bundle.to_dict()
+    current = outcome.bundle.to_dict()
+    for payload in (prior, current):
+        payload.pop("bundle_id", None)
+        payload.pop("created_at", None)
+        payload.pop("source_manifest", None)
+    if prior == current:
+        raise ContextBudgetError(
+            "Compaction was parked because it reproduced the prior semantic bundle despite "
+            "new source records. Inspect the unresolved repetition before retrying."
+        )
 
 
 def _collect_pending_detached_job_ids(
@@ -5287,6 +6035,32 @@ def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
     return normalized or None
 
 
+def _enforce_acceptance_handoff(
+    response: LLMResponse,
+    *,
+    tool_safety: ToolSafetyTracker,
+) -> LLMResponse:
+    if not tool_safety.unverified_workspace_mutation:
+        return response
+    text = response.text.rstrip()
+    if _UNVERIFIED_MUTATION_HANDOFF_TEXT not in text:
+        text = f"{text}\n\n{_UNVERIFIED_MUTATION_HANDOFF_TEXT}" if text else _UNVERIFIED_MUTATION_HANDOFF_TEXT
+    return replace(
+        response,
+        text=text,
+        finish_reason="stop",
+        provider_metadata={
+            **response.provider_metadata,
+            "acceptance_required": True,
+            "completion_blocked": True,
+        },
+    )
+
+
+def _response_completion_blocked(response: LLMResponse) -> bool:
+    return bool(response.provider_metadata.get("completion_blocked", False))
+
+
 def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
     value = metadata.get(key)
     if not isinstance(value, int):
@@ -5304,6 +6078,78 @@ def _metadata_string_tuple(metadata: dict[str, Any], key: str) -> tuple[str, ...
         if normalized:
             items.append(normalized)
     return tuple(items)
+
+
+def _serialize_transcript_tool_call(call: ToolCall) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "call_id": call.call_id,
+        "name": call.name,
+        "arguments": dict(call.arguments),
+        "provider_metadata": dict(call.provider_metadata),
+    }
+    if _raw_arguments_materially_differ(call.raw_arguments, call.arguments):
+        payload["raw_arguments"] = call.raw_arguments
+    return payload
+
+
+def _canonical_tool_result_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep tool arguments canonical in the paired assistant tool-call record."""
+
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in {"arguments", "raw_arguments", "command", "stdout", "stderr"}
+    }
+
+
+def _raw_arguments_materially_differ(
+    raw_arguments: str,
+    arguments: dict[str, Any],
+) -> bool:
+    raw = raw_arguments.strip()
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    return parsed != arguments
+
+
+def _archive_large_tool_result(
+    content: str,
+    *,
+    workspace_dir: Path,
+) -> tuple[str, dict[str, Any]]:
+    if len(content) <= _INLINE_TOOL_RESULT_MAX_CHARS:
+        return content, {}
+    encoded = content.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    archive_dir = workspace_dir / ".jarvis_internal" / "tool_outputs"
+    archive_path = archive_dir / f"{digest}.txt"
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        if not archive_path.exists():
+            temporary_path = archive_dir / f".{digest}.{uuid4().hex}.tmp"
+            temporary_path.write_bytes(encoded)
+            temporary_path.replace(archive_path)
+    except OSError:
+        LOGGER.warning("Could not archive large tool result %s.", digest, exc_info=True)
+        return content, {}
+    half = _INLINE_TOOL_RESULT_MAX_CHARS // 2
+    preview = (
+        content[:half]
+        + "\n...[tool result archived; inline preview truncated]...\n"
+        + content[-half:]
+    )
+    display_path = Path("/workspace") / archive_path.relative_to(workspace_dir)
+    return preview, {
+        "content_archived": True,
+        "content_sha256": digest,
+        "content_bytes": len(encoded),
+        "content_archive_path": str(display_path),
+        "inline_preview_chars": len(preview),
+    }
 
 
 def _record_to_llm_message(
@@ -5340,8 +6186,15 @@ def _record_to_llm_message(
                     continue
                 call_id = str(tool_call.get("call_id", "")).strip()
                 name = str(tool_call.get("name", "")).strip()
-                raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
                 arguments = tool_call.get("arguments", {})
+                raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
+                if not raw_arguments and isinstance(arguments, dict):
+                    raw_arguments = json.dumps(
+                        arguments,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
                 provider_metadata = tool_call.get("provider_metadata", {})
                 if not call_id or not name or not raw_arguments or not isinstance(arguments, dict):
                     continue
@@ -5397,8 +6250,15 @@ def _assistant_tool_call_specs(
             continue
         call_id = str(tool_call.get("call_id", "")).strip()
         name = str(tool_call.get("name", "")).strip()
-        raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
         arguments = tool_call.get("arguments", {})
+        raw_arguments = str(tool_call.get("raw_arguments", "")).strip()
+        if not raw_arguments and isinstance(arguments, dict):
+            raw_arguments = json.dumps(
+                arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         if not call_id or not name or not raw_arguments or not isinstance(arguments, dict):
             continue
         specs.append((call_id, name))
@@ -5623,14 +6483,13 @@ def _compact_carry_forward_tool_call_metadata(
                 ),
             }
             tool_call["arguments"] = compacted_arguments
-            tool_call["raw_arguments"] = json.dumps(
-                compacted_arguments,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            tool_call.pop("raw_arguments", None)
             did_change = True
-        elif canonical_raw_arguments != original_raw_arguments:
-            tool_call["raw_arguments"] = canonical_raw_arguments
+        elif original_raw_arguments and not _raw_arguments_materially_differ(
+            original_raw_arguments,
+            arguments,
+        ):
+            tool_call.pop("raw_arguments", None)
             did_change = True
         compacted_tool_calls.append(tool_call)
 

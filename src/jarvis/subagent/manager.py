@@ -31,13 +31,31 @@ from jarvis.gateway.route_events import (
     RouteSystemNoticeEvent,
     RouteToolCallEvent,
 )
-from jarvis.llm import LLMError, LLMService
+from jarvis.llm import (
+    LLMError,
+    LLMService,
+    ProviderRateLimitError,
+    ProviderTemporaryError,
+)
 from jarvis.logging_setup import get_application_logger
-from jarvis.skills import SkillsSettings, get_skill
+from jarvis.skills import (
+    SkillHeader,
+    SkillsSettings,
+    get_skill,
+    load_skill_catalog,
+    search_skills,
+)
 from jarvis.skills.catalog import read_skill_markdown
 from jarvis.storage import SessionStorage
 from jarvis.storage.layout import transcript_archive_root_from_runtime_path
-from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolRuntime
+from jarvis.tools import (
+    ToolExecutionContext,
+    ToolExecutionResult,
+    ToolRegistry,
+    ToolRuntime,
+    WorkspaceAccessCoordinator,
+    WorkspaceLeaseError,
+)
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
     cancel_job,
@@ -66,6 +84,7 @@ from .types import (
 
 
 LOGGER = get_application_logger(__name__)
+_MAX_SUBAGENT_PROVIDER_RECOVERY_ATTEMPTS = 3
 
 
 class SubagentManager:
@@ -79,6 +98,7 @@ class SubagentManager:
         core_settings: CoreSettings,
         tool_registry: ToolRegistry,
         tool_execution_guard: asyncio.Semaphore,
+        workspace_access: WorkspaceAccessCoordinator | None = None,
         publish_event: Callable[[object], Awaitable[None]],
         register_approval_target: Callable[[str, ActorRuntime], None],
         tool_result_observer: Callable[[ToolExecutionResult, ToolExecutionContext], Awaitable[None]]
@@ -99,6 +119,7 @@ class SubagentManager:
         )
         self._tool_registry = tool_registry
         self._tool_execution_guard = tool_execution_guard
+        self._workspace_access = workspace_access
         self._publish_event = publish_event
         self._register_approval_target = register_approval_target
         self._tool_result_observer = tool_result_observer
@@ -136,6 +157,16 @@ class SubagentManager:
             raise ValueError("Subagent instructions cannot be empty.")
         normalized_owned_paths = _normalize_unique_strings(owned_paths)
         normalized_skill_ids = _normalize_unique_strings(skill_ids)
+        skill_selection_reason = "explicit_or_inherited"
+        if not normalized_skill_ids:
+            normalized_skill_ids = self._auto_select_skill_ids(
+                f"{normalized_task_label}\n{normalized_instructions}"
+            )
+            skill_selection_reason = (
+                "auto_matched:" + ",".join(normalized_skill_ids)
+                if normalized_skill_ids
+                else "none:no_matching_installed_skill"
+            )
         skill_documents = self._load_skill_documents(normalized_skill_ids)
         active = self._non_disposed_runtimes()
         if len(active) >= self._settings.max_active:
@@ -187,39 +218,69 @@ class SubagentManager:
             shared_context=shared_context,
             owned_paths=normalized_owned_paths,
             skill_ids=normalized_skill_ids,
+            skill_selection_reason=skill_selection_reason,
             deliverable=deliverable,
             notable_events=deque(),
         )
+        # Reserve the first run generation before publishing the lifecycle event so
+        # consumers never observe an invocation from generation 0 followed by work
+        # from generation 1, and the child cannot race ahead of its invocation notice.
+        runtime.run_generation = 1
         session_id = await runtime.loop.prepare_session(start_reason="subagent_initial")
-        self._subagents[subagent_id] = runtime
-        self._catalog.create_entry(
-            SubagentCatalogEntry(
-                subagent_id=subagent_id,
-                codename=codename,
-                status="running",
-                created_at=created_at,
-                updated_at=created_at,
-                route_id=self._route_id,
-                owner_main_session_id=owner_main_session_id,
-                owner_main_turn_id=owner_main_turn_id,
-                task_label=normalized_task_label,
-                instructions=normalized_instructions,
-                user_constraints=user_constraints,
-                shared_context=shared_context,
-                owned_paths=normalized_owned_paths,
-                skill_ids=normalized_skill_ids,
-                deliverable=deliverable,
-                current_subagent_session_id=session_id,
+        lease_claimed = False
+        lease_generation: int | None = None
+        if self._workspace_access is not None:
+            await self._workspace_access.claim_paths(
+                owner=f"subagent:{subagent_id}",
+                paths=normalized_owned_paths,
             )
-        )
+            lease_claimed = True
+            lease_generation = await self._workspace_access.lease_generation()
+            runtime.loop.append_system_note(
+                (
+                    "Workspace lease established. Before every declared write, inspect the "
+                    "target and provide expected_lease_generation="
+                    f"{lease_generation} plus expected_sha256 for an existing file or "
+                    "expected_file_absent=true for a new file."
+                ),
+                session_id=session_id,
+                metadata={
+                    "workspace_lease": True,
+                    "workspace_lease_generation": lease_generation,
+                    "owned_paths": list(normalized_owned_paths),
+                },
+            )
+        self._subagents[subagent_id] = runtime
+        try:
+            self._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id=subagent_id,
+                    codename=codename,
+                    status="running",
+                    created_at=created_at,
+                    updated_at=created_at,
+                    route_id=self._route_id,
+                    owner_main_session_id=owner_main_session_id,
+                    owner_main_turn_id=owner_main_turn_id,
+                    task_label=normalized_task_label,
+                    instructions=normalized_instructions,
+                    user_constraints=user_constraints,
+                    shared_context=shared_context,
+                    owned_paths=normalized_owned_paths,
+                    skill_ids=normalized_skill_ids,
+                    skill_selection_reason=skill_selection_reason,
+                    deliverable=deliverable,
+                    current_subagent_session_id=session_id,
+                    run_generation=runtime.run_generation,
+                )
+            )
+        except BaseException:
+            self._subagents.pop(subagent_id, None)
+            if lease_claimed and self._workspace_access is not None:
+                await self._workspace_access.release_owner(owner=f"subagent:{subagent_id}")
+            await runtime.loop.aclose()
+            raise
         self._append_notable_event(runtime, kind="spawned", summary=f"Spawned {codename}.")
-        self._launch_runtime_task(
-            runtime,
-            user_text=build_subagent_kickoff_text(),
-            force_session_id=session_id,
-            pre_turn_messages=(),
-            name=f"jarvis-subagent-{codename}-{subagent_id}",
-        )
         await self._publish_event(
             RouteSystemNoticeEvent(
                 route_id=self._route_id,
@@ -227,10 +288,21 @@ class SubagentManager:
                 agent_name=codename,
                 subagent_id=subagent_id,
                 session_id=session_id,
+                origin_session_id=owner_main_session_id,
+                origin_turn_id=owner_main_turn_id,
+                actor_run_generation=runtime.run_generation,
                 notice_kind="subagent_invoked",
                 text="came online.",
                 public=True,
             )
+        )
+        self._launch_runtime_task(
+            runtime,
+            user_text=build_subagent_kickoff_text(),
+            force_session_id=session_id,
+            pre_turn_messages=(),
+            name=f"jarvis-subagent-{codename}-{subagent_id}",
+            run_generation=runtime.run_generation,
         )
         return {
             "subagent_id": subagent_id,
@@ -239,7 +311,9 @@ class SubagentManager:
             "status": runtime.status,
             "session_id": session_id,
             "skill_ids": list(normalized_skill_ids),
+            "skill_selection_reason": skill_selection_reason,
             "owned_paths": list(normalized_owned_paths),
+            "workspace_lease_generation": lease_generation,
             "active_count": len(self._non_disposed_runtimes()),
         }
 
@@ -717,6 +791,7 @@ class SubagentManager:
         self,
         runtime: SubagentRuntime,
         *,
+        run_generation: int,
         user_text: str | None,
         force_session_id: str | None,
         pre_turn_messages: tuple[AgentRuntimeMessage, ...],
@@ -742,6 +817,8 @@ class SubagentManager:
                     pre_turn_messages=pre_turn_messages,
                 )
             async for event in event_stream:
+                if run_generation != runtime.run_generation:
+                    return
                 runtime.last_activity_at = _utc_now_iso()
                 self._sync_catalog(runtime)
                 if runtime.status == "awaiting_approval" and isinstance(
@@ -785,6 +862,9 @@ class SubagentManager:
                             session_id=event.session_id,
                             turn_id=event.turn_id or None,
                             subagent_id=runtime.subagent_id,
+                            origin_session_id=runtime.owner_main_session_id,
+                            origin_turn_id=runtime.owner_main_turn_id,
+                            actor_run_generation=runtime.run_generation,
                             tool_names=event.tool_names,
                         )
                     )
@@ -805,6 +885,9 @@ class SubagentManager:
                             agent_name=runtime.codename,
                             session_id=event.session_id,
                             subagent_id=runtime.subagent_id,
+                            origin_session_id=runtime.owner_main_session_id,
+                            origin_turn_id=runtime.owner_main_turn_id,
+                            actor_run_generation=runtime.run_generation,
                             approval_id=event.approval_id,
                             kind=event.kind,
                             summary=event.summary,
@@ -830,6 +913,21 @@ class SubagentManager:
                             runtime,
                             notice_kind="subagent_paused",
                             text=f"paused ({runtime.pause_reason}).",
+                            session_id=event.session_id,
+                        )
+                    elif event.completion_blocked:
+                        runtime.status = "paused"
+                        runtime.pause_reason = None
+                        runtime.report_complete = False
+                        self._append_notable_event(
+                            runtime,
+                            kind="acceptance_blocked",
+                            summary="Completion blocked by unresolved acceptance evidence.",
+                        )
+                        await self._publish_lifecycle_notice(
+                            runtime,
+                            notice_kind="subagent_needs_attention",
+                            text="needs acceptance verification before completion.",
                             session_id=event.session_id,
                         )
                     elif event.approval_rejected:
@@ -885,9 +983,66 @@ class SubagentManager:
                                 session_id=event.session_id,
                             )
                     runtime.pending_pause_reason = None
+                    runtime.provider_recovery_attempts = 0
                     self._sync_catalog(runtime)
                     return
         except Exception as exc:
+            if run_generation != runtime.run_generation:
+                return
+            if (
+                isinstance(
+                    exc,
+                    (ProviderTemporaryError, ProviderRateLimitError),
+                )
+                and runtime.provider_recovery_attempts
+                < _MAX_SUBAGENT_PROVIDER_RECOVERY_ATTEMPTS
+                and runtime.pending_pause_reason is None
+            ):
+                runtime.provider_recovery_attempts += 1
+                runtime.status = "running"
+                runtime.last_error = f"{type(exc).__name__}: {exc}"
+                runtime.last_error_metadata = _exception_metadata(exc)
+                runtime.error_log_path = self._record_subagent_error(runtime, exc)
+                runtime.report_complete = False
+                self._append_notable_event(
+                    runtime,
+                    kind="provider_recovery",
+                    summary=(
+                        f"Recovering from {type(exc).__name__} "
+                        f"(attempt {runtime.provider_recovery_attempts}/"
+                        f"{_MAX_SUBAGENT_PROVIDER_RECOVERY_ATTEMPTS})."
+                    ),
+                )
+                self._sync_catalog(runtime)
+                await self._publish_lifecycle_notice(
+                    runtime,
+                    notice_kind="subagent_recovering",
+                    text="recovering automatically from a transient provider failure.",
+                )
+                self._launch_runtime_task(
+                    runtime,
+                    user_text=None,
+                    force_session_id=runtime.loop.active_session_id(),
+                    pre_turn_messages=(
+                        AgentRuntimeMessage(
+                            role="system",
+                            metadata={
+                                "subagent_provider_recovery": True,
+                                "attempt": runtime.provider_recovery_attempts,
+                            },
+                            content=(
+                                "The previous provider attempt failed. Continue from the durable "
+                                "checkpoint without replaying completed tools."
+                            ),
+                        ),
+                    ),
+                    runtime_turn=True,
+                    name=(
+                        f"jarvis-subagent-provider-recovery-"
+                        f"{runtime.codename}-{runtime.subagent_id}"
+                    ),
+                )
+                return
             runtime.status = "failed"
             runtime.last_error = f"{type(exc).__name__}: {exc}"
             runtime.last_error_metadata = _exception_metadata(exc)
@@ -926,11 +1081,28 @@ class SubagentManager:
         tool_runtime = ToolRuntime(registry=filtered_registry)
 
         async def _execute(tool_call, context):
-            async with self._tool_execution_guard:
-                result = await tool_runtime.execute(
-                    tool_call=tool_call,
-                    context=context,
-                )
+            if self._workspace_access is None:
+                async with self._tool_execution_guard:
+                    result = await tool_runtime.execute(
+                        tool_call=tool_call,
+                        context=context,
+                    )
+            else:
+                try:
+                    async with self._workspace_access.execute(
+                        tool_call=tool_call,
+                        context=context,
+                    ):
+                        result = await tool_runtime.execute(
+                            tool_call=tool_call,
+                            context=context,
+                        )
+                        result = _with_workspace_lease_generation(
+                            result,
+                            await self._workspace_access.lease_generation(),
+                        )
+                except WorkspaceLeaseError as exc:
+                    result = _workspace_lease_error_result(tool_call, exc)
             await self._observe_tool_result(
                 subagent_id=subagent_id,
                 result=result,
@@ -1066,10 +1238,17 @@ class SubagentManager:
         pre_turn_messages: tuple[AgentRuntimeMessage, ...],
         runtime_turn: bool = False,
         name: str,
+        run_generation: int | None = None,
     ) -> None:
+        if run_generation is None:
+            runtime.run_generation += 1
+            run_generation = runtime.run_generation
+        elif run_generation != runtime.run_generation or run_generation <= 0:
+            raise ValueError("Reserved subagent run generation is no longer current.")
         task = asyncio.create_task(
             self._run_turn(
                 runtime,
+                run_generation=run_generation,
                 user_text=user_text,
                 force_session_id=force_session_id,
                 pre_turn_messages=pre_turn_messages,
@@ -1122,6 +1301,24 @@ class SubagentManager:
             notices,
             recommendation=recommendation,
         )
+        for notice in notices:
+            if notice.status in {"finished", "cancelled"}:
+                runtime.pending_background_job_ids.discard(notice.job_id)
+            else:
+                runtime.pending_background_job_ids.add(notice.job_id)
+        if recommendation == "wait":
+            queue.clear()
+            runtime.pause_reason = None
+            runtime.status = "waiting_background"
+            runtime.report_complete = False
+            self._append_notable_event(
+                runtime,
+                kind="bash_job_waiting",
+                summary="Recorded unchanged detached bash progress without an LLM follow-up.",
+            )
+            self._sync_catalog(runtime)
+            self._record_bash_notice_delivery(notices)
+            return True
         if not self._append_bash_job_system_message(
             runtime,
             session_id=session_id,
@@ -1129,11 +1326,6 @@ class SubagentManager:
         ):
             return False
         queue.clear()
-        for notice in notices:
-            if notice.status in {"finished", "cancelled"}:
-                runtime.pending_background_job_ids.discard(notice.job_id)
-            else:
-                runtime.pending_background_job_ids.add(notice.job_id)
         runtime.pause_reason = None
         runtime.status = "running"
         self._append_notable_event(
@@ -1196,6 +1388,8 @@ class SubagentManager:
         lines = ["Detached bash update."]
         for notice in notices:
             lines.append(f"- {self._format_bash_job_notice_line(notice)}")
+            if notice.status != "running":
+                lines.extend(_format_terminal_bash_evidence(notice))
             if notice.skill_import_notice:
                 lines.extend(notice.skill_import_notice.splitlines())
         lines.append(f"recommendation={recommendation}")
@@ -1246,6 +1440,11 @@ class SubagentManager:
             for notice in notices
         ):
             return "inspect"
+        if any(
+            notice.notice_kind in {"bash_job_output_started", "bash_job_output_grew"}
+            for notice in notices
+        ):
+            return "continue"
         if any(notice.status == "running" for notice in notices):
             return "wait"
         return "finalize"
@@ -1409,6 +1608,10 @@ class SubagentManager:
                     active_session_id,
                 )
         await runtime.loop.aclose()
+        if self._workspace_access is not None:
+            await self._workspace_access.release_owner(
+                owner=f"subagent:{runtime.subagent_id}"
+            )
         self._sync_catalog(runtime, disposed_at=disposed_at)
         self._pending_bash_job_notices.pop(runtime.subagent_id, None)
         self._append_notable_event(runtime, kind="disposed", summary=f"Disposed {runtime.codename}.")
@@ -1420,6 +1623,9 @@ class SubagentManager:
                     agent_name=runtime.codename,
                     subagent_id=runtime.subagent_id,
                     session_id=runtime.loop.active_session_id(),
+                    origin_session_id=runtime.owner_main_session_id,
+                    origin_turn_id=runtime.owner_main_turn_id,
+                    actor_run_generation=runtime.run_generation,
                     notice_kind="subagent_disposed",
                     text="came offline.",
                     public=True,
@@ -1544,6 +1750,17 @@ class SubagentManager:
             documents.append((skill_id, read_skill_markdown(settings, skill)))
         return tuple(documents)
 
+    def _auto_select_skill_ids(self, assignment: str) -> tuple[str, ...]:
+        settings = SkillsSettings.from_workspace_dir(self._core_settings.workspace_dir)
+        catalog = load_skill_catalog(settings)
+        matches: list[str] = []
+        for skill in search_skills(catalog, assignment):
+            if _skill_matches_assignment(skill, assignment):
+                matches.append(skill.skill_id)
+            if len(matches) >= 2:
+                break
+        return tuple(matches)
+
     def _record_subagent_error(self, runtime: SubagentRuntime, exc: Exception) -> str:
         error_log_path = runtime.storage.root_dir / "errors.jsonl"
         entry = {
@@ -1577,6 +1794,9 @@ class SubagentManager:
                 agent_name=runtime.codename,
                 subagent_id=runtime.subagent_id,
                 session_id=session_id or runtime.loop.active_session_id(),
+                origin_session_id=runtime.owner_main_session_id,
+                origin_turn_id=runtime.owner_main_turn_id,
+                actor_run_generation=runtime.run_generation,
                 notice_kind=notice_kind,
                 text=text,
                 public=_subagent_notice_is_public(notice_kind),
@@ -1592,6 +1812,7 @@ class SubagentManager:
             last_error=runtime.last_error,
             last_error_metadata=runtime.last_error_metadata,
             error_log_path=runtime.error_log_path,
+            run_generation=runtime.run_generation,
             disposed_at=disposed_at,
         )
 
@@ -1616,6 +1837,8 @@ class SubagentManager:
             "report_complete": snapshot.report_complete,
             "pending_background_job_count": snapshot.pending_background_job_count,
             "pending_background_job_ids": list(snapshot.pending_background_job_ids),
+            "run_generation": snapshot.run_generation,
+            "skill_selection_reason": snapshot.skill_selection_reason,
         }
         if detail == "full":
             payload.update(
@@ -1625,6 +1848,7 @@ class SubagentManager:
                     "shared_context": snapshot.shared_context,
                     "owned_paths": list(snapshot.owned_paths),
                     "skill_ids": list(snapshot.skill_ids),
+                    "skill_selection_reason": snapshot.skill_selection_reason,
                     "deliverable": snapshot.deliverable,
                     "latest_report": snapshot.latest_report,
                     "transcript_path": self._transcript_path(runtime),
@@ -1757,3 +1981,113 @@ def _terminal_notice_kind_for_status(*, status: str, exit_code: object) -> str:
 
 def _subagent_notice_is_public(notice_kind: str) -> bool:
     return notice_kind in {"subagent_invoked", "subagent_disposed"}
+
+
+_SKILL_MATCH_STOP_WORDS = frozenset(
+    {
+        "about",
+        "after",
+        "build",
+        "create",
+        "from",
+        "implement",
+        "into",
+        "should",
+        "skill",
+        "that",
+        "their",
+        "these",
+        "this",
+        "using",
+        "with",
+    }
+)
+
+
+def _skill_matches_assignment(skill: SkillHeader, assignment: str) -> bool:
+    normalized = " ".join(assignment.lower().split())
+    skill_id = skill.skill_id.lower()
+    name = skill.name.lower()
+    if skill_id in normalized or (len(name) >= 5 and name in normalized):
+        return True
+    assignment_tokens = {
+        token.strip(".,:;()[]{}!?/\\")
+        for token in normalized.split()
+        if len(token.strip(".,:;()[]{}!?/\\")) >= 5
+    } - _SKILL_MATCH_STOP_WORDS
+    description_tokens = {
+        token.strip(".,:;()[]{}!?/\\")
+        for token in skill.description.lower().split()
+        if len(token.strip(".,:;()[]{}!?/\\")) >= 5
+    } - _SKILL_MATCH_STOP_WORDS
+    return len(assignment_tokens & description_tokens) >= 2
+
+
+def _format_terminal_bash_evidence(notice: BashJobNotice) -> list[str]:
+    return [
+        f"  process_exited=true process_exit_success={str(notice.process_exit_success).lower()}",
+        f"  termination_signal={notice.termination_signal}",
+        f"  runtime_seconds={notice.runtime_seconds}",
+        f"  command_sha256={notice.command_sha256}",
+        f"  workspace_revision={notice.workspace_revision or 'unavailable'}",
+        "  verification_passed=unknown; process exit never implies semantic success.",
+        f"  stdout_log_path={notice.stdout_log_path}",
+        f"  stderr_log_path={notice.stderr_log_path}",
+        f"  stdout_tail_sha256={notice.stdout_sha256}",
+        f"  stderr_tail_sha256={notice.stderr_sha256}",
+        "  stdout_tail:",
+        _bounded_terminal_tail(notice.stdout),
+        "  stderr_tail:",
+        _bounded_terminal_tail(notice.stderr),
+    ]
+
+
+def _bounded_terminal_tail(value: str, *, limit: int = 2_000) -> str:
+    if not value.strip():
+        return "  (empty)"
+    if len(value) <= limit:
+        return "  " + value
+    head = limit // 2
+    tail = limit - head
+    return "  " + value[:head] + "\n  ...[terminal tail truncated]...\n  " + value[-tail:]
+
+
+def _workspace_lease_error_result(
+    tool_call: object,
+    error: WorkspaceLeaseError,
+) -> ToolExecutionResult:
+    call_id = str(getattr(tool_call, "call_id", ""))
+    name = str(getattr(tool_call, "name", "bash"))
+    arguments = getattr(tool_call, "arguments", {})
+    return ToolExecutionResult(
+        call_id=call_id,
+        name=name,
+        ok=False,
+        content=(
+            "Tool execution denied\n"
+            f"tool: {name}\n"
+            "error_code: workspace_lease_conflict\n"
+            f"reason: {error}"
+        ),
+        metadata={
+            "execution_failed": True,
+            "error_code": "workspace_lease_conflict",
+            "reason": str(error),
+            "arguments": dict(arguments) if isinstance(arguments, dict) else {},
+        },
+    )
+
+
+def _with_workspace_lease_generation(
+    result: ToolExecutionResult,
+    generation: int,
+) -> ToolExecutionResult:
+    metadata = dict(result.metadata)
+    metadata["workspace_lease_generation"] = generation
+    return ToolExecutionResult(
+        call_id=result.call_id,
+        name=result.name,
+        ok=result.ok,
+        content=result.content,
+        metadata=metadata,
+    )

@@ -24,7 +24,14 @@ class SendFileToolExecutor:
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
         raw_path = str(arguments["path"]).strip()
-        file_path = _resolve_workspace_relative_path(raw_path, context)
+        try:
+            file_path = _resolve_workspace_relative_path(raw_path, context)
+        except ValueError as exc:
+            return _send_file_error(
+                call_id=call_id,
+                raw_path=raw_path,
+                reason=str(exc),
+            )
         caption = _normalize_optional_string(arguments.get("caption"))
         filename = _normalize_optional_string(arguments.get("filename"))
 
@@ -134,9 +141,16 @@ def _build_send_file_tool_description(settings: ToolSettings) -> str:
 
 def _resolve_workspace_relative_path(raw_path: str, context: ToolExecutionContext) -> Path:
     candidate = Path(raw_path)
-    if not candidate.is_absolute():
+    workspace = context.workspace_dir.resolve(strict=False)
+    if candidate.is_absolute():
+        if candidate == Path("/workspace") or candidate.is_relative_to(Path("/workspace")):
+            candidate = workspace / candidate.relative_to("/workspace")
+    else:
         candidate = context.workspace_dir / candidate
-    return candidate.resolve(strict=False)
+    resolved = candidate.resolve(strict=False)
+    if resolved != workspace and not resolved.is_relative_to(workspace):
+        raise ValueError("path must stay inside /workspace.")
+    return resolved
 
 
 def _normalize_optional_string(value: Any) -> str | None:
