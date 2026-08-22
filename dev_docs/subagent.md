@@ -110,6 +110,8 @@ Returns:
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
 
+When the user explicitly requires delegation, task acceptance is coupled to an observed successful `subagent_invoke`; merely claiming delegation in `acceptance_record` is insufficient. Semantic edits to test artifacts additionally create a changed-test-review obligation that requires an independent subagent review and cited artifact evidence before completion.
+
 ### `subagent_monitor`
 
 Inspects current subagent state without side effects.

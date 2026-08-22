@@ -14,10 +14,57 @@ from ...config import ToolSettings
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
 from ...workspace_revision import workspace_revision
 from ..bash import BashCommandPolicy
+from ..bash.shell_syntax import shell_control_operators
 from ..bash.tool import BashToolExecutor
 
 _MAX_GATES = 24
 _MAX_GATE_OUTPUT_CHARS = 2_000
+_SOURCE_EXTENSIONS = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".css",
+        ".go",
+        ".h",
+        ".hpp",
+        ".html",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".m",
+        ".mm",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".scss",
+        ".sh",
+        ".swift",
+        ".ts",
+        ".tsx",
+        ".vue",
+    }
+)
+_DEFAULT_SOURCE_EXCLUDES = frozenset(
+    {
+        ".git",
+        ".jarvis_internal",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "generated",
+        "node_modules",
+        "probe",
+        "probes",
+        "test",
+        "tests",
+        "vendor",
+    }
+)
 
 
 class AcceptanceRunToolExecutor:
@@ -49,8 +96,49 @@ class AcceptanceRunToolExecutor:
                 return _failure(call_id, f"gates[{index}] must be an object.")
             gate_id = str(raw_gate.get("gate_id", "")).strip()
             command = str(raw_gate.get("command", "")).strip()
-            if not gate_id or not command:
-                return _failure(call_id, f"gates[{index}] needs gate_id and command.")
+            source_line_count = raw_gate.get("source_line_count")
+            has_source_line_count = source_line_count is not None
+            if not gate_id or bool(command) == has_source_line_count:
+                return _failure(
+                    call_id,
+                    f"gates[{index}] needs gate_id and exactly one of command or "
+                    "source_line_count.",
+                )
+            if has_source_line_count:
+                if not isinstance(source_line_count, dict):
+                    return _failure(
+                        call_id,
+                        f"gates[{index}].source_line_count must be an object.",
+                    )
+                metric, reason = _source_line_count_gate(
+                    source_line_count,
+                    workspace_dir=context.workspace_dir,
+                )
+                if reason is not None:
+                    return _failure(call_id, f"gates[{index}]: {reason}")
+                metric_revision = workspace_revision(context.workspace_dir)
+                gate_results.append(
+                    {
+                        "gate_id": gate_id,
+                        "gate_kind": "source_line_count",
+                        "command": "",
+                        "command_sha256": "",
+                        "cwd": "/workspace",
+                        "passed": bool(metric["passed"]),
+                        "exit_code": None,
+                        "duration_seconds": 0.0,
+                        "workspace_revision_before": metric_revision,
+                        "workspace_revision_after": metric_revision,
+                        "timed_out": False,
+                        "output_tail": (
+                            f"authored_source_lines={metric['line_count']} "
+                            f"minimum={metric['minimum']} files={metric['file_count']}"
+                        ),
+                        "output_sha256": str(metric["evidence_sha256"]),
+                        "source_line_count": metric,
+                    }
+                )
+                continue
             operator = _top_level_compound_operator(command)
             if operator is not None:
                 return _failure(
@@ -163,6 +251,25 @@ def build_acceptance_run_tool(settings: ToolSettings) -> RegisteredTool:
                             "properties": {
                                 "gate_id": {"type": "string", "minLength": 1, "maxLength": 120},
                                 "command": {"type": "string", "minLength": 1},
+                                "source_line_count": {
+                                    "type": "object",
+                                    "properties": {
+                                        "include_paths": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "maxItems": 32,
+                                            "items": {"type": "string", "minLength": 1},
+                                        },
+                                        "exclude_names": {
+                                            "type": "array",
+                                            "maxItems": 32,
+                                            "items": {"type": "string", "minLength": 1},
+                                        },
+                                        "minimum": {"type": "integer", "minimum": 1},
+                                    },
+                                    "required": ["include_paths", "minimum"],
+                                    "additionalProperties": False,
+                                },
                                 "cwd": {"type": "string", "minLength": 1},
                                 "timeout_seconds": {
                                     "type": "number",
@@ -170,7 +277,7 @@ def build_acceptance_run_tool(settings: ToolSettings) -> RegisteredTool:
                                     "maximum": settings.bash_max_timeout_seconds,
                                 },
                             },
-                            "required": ["gate_id", "command"],
+                            "required": ["gate_id"],
                             "additionalProperties": False,
                         },
                     },
@@ -200,29 +307,8 @@ def _tail(value: str, limit: int) -> str:
 
 
 def _top_level_compound_operator(command: str) -> str | None:
-    quote: str | None = None
-    escaped = False
-    for index, char in enumerate(command):
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and quote != "'":
-            escaped = True
-            continue
-        if quote is not None:
-            if char == quote:
-                quote = None
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            continue
-        if char == "\n":
-            return "newline"
-        if char in {";", "|", "&"}:
-            if char in {"|", "&"} and index + 1 < len(command) and command[index + 1] == char:
-                return char * 2
-            return char
-    return None
+    operator = next(iter(shell_control_operators(command)), None)
+    return operator.value if operator is not None else None
 
 
 def _uses_shell_command_wrapper(command: str) -> bool:
@@ -251,3 +337,90 @@ def _uses_shell_command_wrapper(command: str) -> bool:
             )
         return False
     return False
+
+
+def _source_line_count_gate(
+    value: dict[str, Any],
+    *,
+    workspace_dir: Path,
+) -> tuple[dict[str, object], str | None]:
+    raw_include_paths = value.get("include_paths")
+    raw_exclude_names = value.get("exclude_names", [])
+    raw_minimum = value.get("minimum")
+    if not isinstance(raw_include_paths, list) or not raw_include_paths:
+        return {}, "source_line_count.include_paths must be a non-empty list."
+    if not isinstance(raw_exclude_names, list):
+        return {}, "source_line_count.exclude_names must be a list when supplied."
+    if not isinstance(raw_minimum, (int, str)):
+        return {}, "source_line_count.minimum must be a positive integer."
+    try:
+        minimum = int(raw_minimum)
+    except (TypeError, ValueError):
+        return {}, "source_line_count.minimum must be a positive integer."
+    if minimum <= 0:
+        return {}, "source_line_count.minimum must be a positive integer."
+
+    root = workspace_dir.resolve(strict=False)
+    include_paths: list[Path] = []
+    for raw_path in raw_include_paths:
+        candidate = Path(str(raw_path).strip())
+        if candidate.is_absolute():
+            if candidate == Path("/workspace") or candidate.is_relative_to(Path("/workspace")):
+                candidate = root / candidate.relative_to("/workspace")
+        else:
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved != root and not resolved.is_relative_to(root):
+            return {}, "source_line_count paths must stay inside /workspace."
+        if not resolved.exists():
+            return {}, f"source_line_count path does not exist: {raw_path}."
+        include_paths.append(resolved)
+
+    exclude_names = {
+        str(item).strip().casefold()
+        for item in raw_exclude_names
+        if str(item).strip()
+    } | set(_DEFAULT_SOURCE_EXCLUDES)
+    files: set[Path] = set()
+    for include_path in include_paths:
+        candidates = (include_path,) if include_path.is_file() else include_path.rglob("*")
+        for candidate in candidates:
+            if not candidate.is_file() or candidate.suffix.casefold() not in _SOURCE_EXTENSIONS:
+                continue
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError:
+                return {}, "source_line_count paths must stay inside /workspace."
+            if any(part.casefold() in exclude_names for part in relative.parts):
+                continue
+            resolved_candidate = candidate.resolve(strict=False)
+            if resolved_candidate != root and not resolved_candidate.is_relative_to(root):
+                return {}, "source_line_count source files must stay inside /workspace."
+            files.add(resolved_candidate)
+
+    line_count = 0
+    evidence = sha256()
+    for path in sorted(files):
+        relative = path.relative_to(root)
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            return {}, f"could not read {relative}: {type(exc).__name__}."
+        lines = content.count(b"\n") + (1 if content and not content.endswith(b"\n") else 0)
+        line_count += lines
+        evidence.update(str(relative).encode("utf-8", errors="surrogateescape"))
+        evidence.update(b"\0")
+        evidence.update(sha256(content).digest())
+        evidence.update(b"\n")
+    return (
+        {
+            "line_count": line_count,
+            "minimum": minimum,
+            "file_count": len(files),
+            "passed": line_count >= minimum,
+            "include_paths": [str(path.relative_to(root)) or "." for path in include_paths],
+            "exclude_names": sorted(exclude_names),
+            "evidence_sha256": evidence.hexdigest(),
+        },
+        None,
+    )

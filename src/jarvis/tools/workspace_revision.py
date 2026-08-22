@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, Iterable
 
 _IGNORED_REVISION_PARTS = frozenset(
     {
@@ -60,6 +61,57 @@ def workspace_revision(workspace_dir: Path) -> str:
             fingerprint.update(type(exc).__name__.encode("ascii"))
             fingerprint.update(b"\n")
     return f"{revision}:{fingerprint.hexdigest()}"
+
+
+def workspace_paths_revision(workspace_dir: Path, paths: Iterable[Path]) -> str:
+    """Return a content fingerprint for a bounded set of workspace paths."""
+
+    root = workspace_dir.resolve(strict=False)
+    fingerprint = sha256()
+    resolved_paths = tuple(sorted({path.resolve(strict=False) for path in paths}))
+    for path in resolved_paths:
+        if path != root and not path.is_relative_to(root):
+            raise ValueError("workspace revision paths must stay inside the workspace.")
+        relative = path.relative_to(root)
+        fingerprint.update(str(relative).encode("utf-8", errors="surrogateescape"))
+        fingerprint.update(b"\0")
+        if not path.exists() and not path.is_symlink():
+            fingerprint.update(b"missing\n")
+            continue
+        candidates = (path,) if not path.is_dir() else tuple(sorted(path.rglob("*")))
+        for candidate in candidates:
+            candidate_relative = candidate.relative_to(root)
+            if _revision_path_is_ignored(candidate_relative):
+                continue
+            _update_path_fingerprint(
+                fingerprint,
+                path=candidate,
+                relative=candidate_relative,
+            )
+    return fingerprint.hexdigest()
+
+
+def _update_path_fingerprint(fingerprint: Any, *, path: Path, relative: Path) -> None:
+    try:
+        if path.is_symlink():
+            fingerprint.update(str(relative).encode("utf-8", errors="surrogateescape"))
+            fingerprint.update(b"\0symlink\0")
+            fingerprint.update(str(path.readlink()).encode("utf-8", errors="surrogateescape"))
+            fingerprint.update(b"\n")
+            return
+        if not path.is_file():
+            return
+        fingerprint.update(str(relative).encode("utf-8", errors="surrogateescape"))
+        fingerprint.update(b"\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                fingerprint.update(chunk)
+        fingerprint.update(b"\n")
+    except OSError as exc:
+        fingerprint.update(str(relative).encode("utf-8", errors="surrogateescape"))
+        fingerprint.update(b"\0unreadable\0")
+        fingerprint.update(type(exc).__name__.encode("ascii"))
+        fingerprint.update(b"\n")
 
 
 def _revision_path_is_ignored(relative: Path) -> bool:

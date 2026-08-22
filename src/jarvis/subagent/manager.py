@@ -55,6 +55,7 @@ from jarvis.tools import (
     ToolRuntime,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    with_workspace_observation,
 )
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
@@ -1092,15 +1093,16 @@ class SubagentManager:
                     async with self._workspace_access.execute(
                         tool_call=tool_call,
                         context=context,
-                    ):
+                    ) as workspace_observation:
                         result = await tool_runtime.execute(
                             tool_call=tool_call,
                             context=context,
                         )
-                        result = _with_workspace_lease_generation(
-                            result,
-                            await self._workspace_access.lease_generation(),
-                        )
+                    result = with_workspace_observation(result, workspace_observation)
+                    result = _with_workspace_lease_generation(
+                        result,
+                        await self._workspace_access.lease_generation(),
+                    )
                 except WorkspaceLeaseError as exc:
                     result = _workspace_lease_error_result(tool_call, exc)
             await self._observe_tool_result(

@@ -19,6 +19,7 @@ from jarvis.core import (
     AgentAssistantMessageEvent,
     AgentLoop,
     AgentRuntimeMessage,
+    AgentTextDeltaEvent,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
 )
@@ -3615,8 +3616,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             result = await loop.handle_user_input("Create notes/todo.txt with hello.")
 
-            self.assertTrue(result.response_text.startswith("Patched file."))
-            self.assertIn("no acceptance ledger was recorded", result.response_text)
+            self.assertEqual(result.response_text, "")
             self.assertTrue(result.completion_blocked)
             session = storage.get_session(result.session_id)
             self.assertIsNotNone(session)
@@ -3927,8 +3927,14 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             final_event = events[-1]
             if not isinstance(final_event, AgentTurnDoneEvent):
                 self.fail("Expected streamed turn to finish with AgentTurnDoneEvent.")
-            self.assertTrue(final_event.response_text.startswith("Registered runtime tool."))
-            self.assertIn("no acceptance ledger was recorded", final_event.response_text)
+            self.assertEqual(final_event.response_text, "")
+            self.assertTrue(final_event.completion_blocked)
+            self.assertFalse(
+                any(
+                    isinstance(event, (AgentTextDeltaEvent, AgentAssistantMessageEvent))
+                    for event in events
+                )
+            )
             self.assertTrue(
                 (
                     settings.workspace_dir

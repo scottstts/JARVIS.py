@@ -23,6 +23,8 @@ from jarvis.tools import (
 from jarvis.tools.basic.bash.local_executor import DirectBashToolExecutor
 from jarvis.tools.basic.acceptance_run.tool import (
     AcceptanceRunToolExecutor,
+    _source_line_count_gate,
+    _top_level_compound_operator,
     workspace_revision,
 )
 
@@ -280,6 +282,26 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     pass
 
+    async def test_workspace_access_observes_undeclared_bash_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            coordinator = WorkspaceAccessCoordinator(workspace_dir=workspace_dir)
+            call = _tool_call("bash", {"command": "custom-generator"})
+
+            async with coordinator.execute(
+                tool_call=call,
+                context=ToolExecutionContext(workspace_dir=workspace_dir),
+            ) as observation:
+                (workspace_dir / "generated.txt").write_text("created before failure")
+
+            self.assertEqual(observation.mode, "global_write")
+            self.assertTrue(observation.changed)
+            self.assertNotEqual(
+                observation.revision_before,
+                observation.revision_after,
+            )
+
     async def test_compound_bash_failure_cannot_be_masked_by_a_later_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -324,6 +346,29 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.ok)
             self.assertIn("shell command wrapper", result.content)
 
+    async def test_acceptance_gate_allows_descriptor_redirection(self) -> None:
+        self.assertIsNone(_top_level_compound_operator("printf passed 2>&1"))
+        self.assertIsNone(_top_level_compound_operator("printf passed >| result.txt"))
+
+    async def test_source_line_count_excludes_vendor_generated_tests_and_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            for relative in ("src", "vendor", "generated", "tests", "probes"):
+                (workspace_dir / relative).mkdir(parents=True)
+            (workspace_dir / "src" / "main.ts").write_text("one\ntwo\nthree\n")
+            for relative in ("vendor", "generated", "tests", "probes"):
+                (workspace_dir / relative / "ignored.ts").write_text("ignored\n" * 20)
+
+            metric, reason = _source_line_count_gate(
+                {"include_paths": ["."], "minimum": 3},
+                workspace_dir=workspace_dir,
+            )
+
+            self.assertIsNone(reason)
+            self.assertTrue(metric["passed"])
+            self.assertEqual(metric["line_count"], 3)
+            self.assertEqual(metric["file_count"], 1)
+
     async def test_tool_safety_stops_third_identical_no_progress_result(self) -> None:
         tracker = ToolSafetyTracker()
         tool_call = _tool_call("bash", {"command": "true"})
@@ -339,7 +384,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(tracker.record(tool_call, result).repeated_no_progress)
         self.assertTrue(tracker.record(tool_call, result).repeated_no_progress)
 
-    async def test_tool_safety_stops_second_identical_failure(self) -> None:
+    async def test_tool_safety_blocks_exact_call_after_second_identical_failure(self) -> None:
         tracker = ToolSafetyTracker()
         tool_call = _tool_call("bash", {"command": "false"})
         result = ToolExecutionResult(
@@ -351,6 +396,43 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(tracker.record(tool_call, result).repeated_invalid_call)
         self.assertTrue(tracker.record(tool_call, result).repeated_invalid_call)
+        self.assertEqual(tracker.blocked_call_reason(tool_call), "repeated_invalid_result")
+        self.assertIsNone(
+            tracker.blocked_call_reason(_tool_call("bash", {"command": "false --different"}))
+        )
+
+    async def test_tool_safety_forgets_stale_failure_after_workspace_mutation(self) -> None:
+        tracker = ToolSafetyTracker()
+        failed_call = _tool_call("bash", {"command": "npx vitest run 2>&1"})
+        failed_result = ToolExecutionResult(
+            call_id="failed_1",
+            name="bash",
+            ok=False,
+            content="policy denied",
+            metadata={"policy_denied": True, "reason": "denied"},
+        )
+        tracker.record(failed_call, failed_result)
+        tracker.record(
+            _tool_call("bash", {"command": "generate files"}),
+            ToolExecutionResult(
+                call_id="mutation",
+                name="bash",
+                ok=False,
+                content="command failed after writing files",
+                metadata={
+                    "execution_failed": True,
+                    "workspace_changed": True,
+                    "workspace_revision_before": "before",
+                    "workspace_revision_after": "after",
+                },
+            ),
+        )
+
+        observation = tracker.record(failed_call, failed_result)
+
+        self.assertFalse(observation.repeated_invalid_call)
+        self.assertEqual(observation.progress_epoch, 1)
+        self.assertIsNone(tracker.blocked_call_reason(failed_call))
 
     async def test_completion_requires_a_revision_bound_gate_ledger(self) -> None:
         tracker = ToolSafetyTracker()
@@ -569,3 +651,52 @@ class BashPolicyReliabilityTests(unittest.TestCase):
 
             self.assertFalse(decision.allowed)
             self.assertIn("mode='background'", decision.reason or "")
+
+    def test_policy_allows_shell_operators_that_are_not_backgrounding(self) -> None:
+        commands = (
+            "npx vitest run 2>&1 | tail -5",
+            "printf error >&2",
+            "read value <&3",
+            "printf output &>result.log",
+            "printf output &>>result.log",
+            "printf output |& sed -n '1p'",
+            "case x in x) printf yes ;& esac",
+            "value=$((3 & 1)); printf '%s' \"$value\"",
+            "(( value = 3 & 1 )); printf '%s' \"$value\"",
+            "cat <<'EOF'\nbackground data & is not syntax\nEOF",
+            "cat <<-EOF\n\tbackground data & is not syntax\n\tEOF",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            for command in commands:
+                with self.subTest(command=command):
+                    decision = ToolPolicy().authorize(
+                        tool_name="bash",
+                        arguments={"command": command},
+                        context=ToolExecutionContext(workspace_dir=workspace_dir),
+                    )
+                    self.assertTrue(decision.allowed, decision.reason)
+
+    def test_policy_rejects_backgrounding_across_shell_contexts(self) -> None:
+        commands = (
+            "sleep 10 & wait",
+            "printf ready; sleep 10 &",
+            "cat <<EOF\ndata\nEOF\nsleep 10 &",
+            "bash -lc 'printf ready; sleep 10 &'",
+            "eval 'sleep 10 &'",
+            "nohup sleep 10",
+            "command setsid sleep 10",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            for command in commands:
+                with self.subTest(command=command):
+                    decision = ToolPolicy().authorize(
+                        tool_name="bash",
+                        arguments={"command": command},
+                        context=ToolExecutionContext(workspace_dir=workspace_dir),
+                    )
+                    self.assertFalse(decision.allowed)
+                    self.assertIn("mode='background'", decision.reason or "")

@@ -268,7 +268,7 @@ Includes:
 
 ### `src/jarvis/storage/`
 
-Conversation/session persistence and related storage types.
+Conversation/session persistence and related storage types. Session JSONL and the session index remain the conversation boundary; task-scoped tool contracts, round counts, and safety state live in atomic, change-deduplicated `tool_tasks/<task_id>.json` sidecars so long tool runs do not rewrite the full session index for every call.
 
 ### `src/jarvis/subagent/`
 

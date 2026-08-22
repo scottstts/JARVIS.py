@@ -201,3 +201,4 @@
 - Reliability review follow-up: independent acceptance gates produce revision-bound evidence, unresolved required ledger items block completion claims, subagent skill decisions are recorded, and transcript tool payloads use canonical/content-addressed storage.
 - Diff audit follow-up: acceptance gate IDs are invalidated by later mutations, ledger items accumulate by stable ID, nested shell background/failure masking is rejected, route provenance survives websocket serialization, and exact workspace reads now coordinate with overlapping writes.
 - Provider recovery turns retain the original client message identity; recovery exhaustion pauses automatic follow-ups and emits a blocked terminal event so route consumers cannot hang.
+- Tool repetition state must be task-scoped and progress-epoch-aware; observed workspace revisions outrank tool-declared mutation metadata, and blocked runtime diagnostics stay persisted/logged rather than appearing in Telegram.

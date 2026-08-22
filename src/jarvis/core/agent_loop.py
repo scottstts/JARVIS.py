@@ -82,7 +82,16 @@ from .config import CoreSettings
 from .errors import ContextBudgetError
 from .identities import IdentityBootstrapLoader
 from .token_estimator import estimate_request_input_tokens
-from .tool_safety import ToolSafetyTracker, build_blocked_invalid_result
+from .task_contract import (
+    TaskContract,
+    build_task_contract,
+    user_message_explicitly_resumes_task,
+)
+from .tool_safety import (
+    ToolSafetyObservation,
+    ToolSafetyTracker,
+    build_blocked_repetition_result,
+)
 
 _OVERFLOW_ERROR_HINTS = (
     "context window",
@@ -123,15 +132,6 @@ _TOOL_SAFETY_STOP_TEXT = (
     "Tool execution stopped safely because repeated calls were no longer making progress. "
     "Do not repeat the blocked action automatically; resume only after a materially new "
     "user instruction or orchestrator update."
-)
-_TOOL_SAFETY_STOP_RESPONSE_TEXT = (
-    "I stopped this turn because repeated tool activity was no longer making progress. "
-    "The completed evidence is preserved; I will not repeat the blocked action automatically."
-)
-_UNVERIFIED_MUTATION_HANDOFF_TEXT = (
-    "I changed workspace state but cannot mark this task complete because no acceptance "
-    "ledger was recorded. The changes remain in place; run the required checks and record "
-    "their evidence before treating the work as complete."
 )
 _FOLLOWUP_COMPACTION_FAILED_TEXT = (
     "Follow-up request overflow occurred and compaction could not proceed."
@@ -605,6 +605,8 @@ class AgentLoop:
             state.pop(key, None)
         else:
             state[key] = value
+        if state == session.backend_state:
+            return False
         self._storage.update_session(session_id, backend_state=state)
         return True
 
@@ -766,6 +768,7 @@ class AgentLoop:
         command_override: str | None = None,
         pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> AgentTurnResult:
+        turn_id = uuid4().hex
         try:
             (
                 session,
@@ -780,6 +783,7 @@ class AgentLoop:
                 user_text=user_text,
                 force_session_id=force_session_id,
                 pre_turn_messages=pre_turn_messages,
+                task_id=turn_id,
             )
         except _CompactionStopRequested as exc:
             return AgentTurnResult(
@@ -789,7 +793,6 @@ class AgentLoop:
                 interrupted=True,
                 interruption_reason=exc.interruption_reason,
             )
-        turn_id = uuid4().hex
         pending_records = self._build_pending_turn_records(
             session_id=session.session_id,
             turn_context_text=turn_context_text,
@@ -984,8 +987,21 @@ class AgentLoop:
                 turn_id=turn_id,
             )
             while True:
-                if tool_safety is not None and tool_safety.invalid_call_is_blocked(tool_call):
-                    tool_result = build_blocked_invalid_result(tool_call=tool_call)
+                blocked_reason = (
+                    tool_safety.blocked_call_reason(tool_call)
+                    if tool_safety is not None
+                    else None
+                )
+                if blocked_reason is not None:
+                    tool_result = build_blocked_repetition_result(
+                        tool_call=tool_call,
+                        reason=blocked_reason,
+                        diagnostics=(
+                            tool_safety.blocked_call_details(tool_call)
+                            if tool_safety is not None
+                            else {}
+                        ),
+                    )
                 else:
                     try:
                         tool_result = await self._await_with_stop(
@@ -1007,6 +1023,13 @@ class AgentLoop:
                     tool_name=tool_call.name,
                 )
                 if pending_approval is None:
+                    observation = None
+                    if tool_safety is not None:
+                        observation = tool_safety.record(tool_call, tool_result)
+                        tool_result = _with_tool_safety_replan_notice(
+                            tool_result,
+                            observation=observation,
+                        )
                     tool_record = self._build_tool_record(
                         session_id,
                         tool_result,
@@ -1046,27 +1069,9 @@ class AgentLoop:
                         tool_result,
                     )
                     if tool_safety is not None:
-                        observation = tool_safety.record(tool_call, tool_result)
                         if bool(tool_result.metadata.get("tool_safety_blocked")):
                             safety_stop = True
-                            safety_stop_reason = "disabled_file_edit_tool_reused"
-                            safety_stop_unexecuted_tool_names = tuple(
-                                call.name for call in tool_calls[tool_index + 1:]
-                            )
-                            safety_stop_unexecuted_tool_calls = tool_calls[tool_index + 1:]
-                        elif (
-                            observation.repeated_invalid_call
-                            and not observation.blocked_invalid_signature
-                        ):
-                            safety_stop = True
-                            safety_stop_reason = "two_identical_tool_failures"
-                            safety_stop_unexecuted_tool_names = tuple(
-                                call.name for call in tool_calls[tool_index + 1:]
-                            )
-                            safety_stop_unexecuted_tool_calls = tool_calls[tool_index + 1:]
-                        elif observation.repeated_no_progress:
-                            safety_stop = True
-                            safety_stop_reason = "three_identical_no_progress_results"
+                            safety_stop_reason = "blocked_tool_signature_reused"
                             safety_stop_unexecuted_tool_names = tuple(
                                 call.name for call in tool_calls[tool_index + 1:]
                             )
@@ -1368,6 +1373,7 @@ class AgentLoop:
         turn_id: str,
     ) -> ConversationRecord:
         max_rounds = self._tool_settings.max_tool_rounds_per_turn
+        _rounds, tool_safety = self._load_tool_task_state(session_id)
         return self._build_message_record(
             session_id=session_id,
             role="system",
@@ -1376,7 +1382,8 @@ class AgentLoop:
                 f"{attempted_round} was not executed. "
                 "A continuation is allowed only after a prior round made observable progress. "
                 "Avoid repeating completed work and use tools only when they can produce new "
-                "evidence or change."
+                "evidence or change.\n"
+                + "\n".join(tool_safety.checkpoint_lines())
             ),
             metadata={
                 _TOOL_ROUND_LIMIT_METADATA_KEY: True,
@@ -1463,9 +1470,15 @@ class AgentLoop:
         reason: str,
         response: LLMResponse,
     ) -> LLMResponse:
+        LOGGER.warning(
+            "Tool safety parked task session_id=%s turn_id=%s reason=%s",
+            session_id,
+            turn_id,
+            reason,
+        )
         stopped_response = replace(
             response,
-            text=_TOOL_SAFETY_STOP_RESPONSE_TEXT,
+            text="",
             tool_calls=[],
             finish_reason="stop",
             provider_metadata={
@@ -1474,17 +1487,6 @@ class AgentLoop:
                 "tool_safety_parked": True,
                 "tool_safety_stop_reason": reason,
             },
-        )
-        self._append_turn_record(
-            session_id=session_id,
-            pending_records=pending_records,
-            record=self._build_message_record(
-                session_id=session_id,
-                role="assistant",
-                content=stopped_response.text,
-                metadata={"tool_safety_stop": True, "reason": reason},
-                turn_id=turn_id,
-            ),
         )
         return stopped_response
 
@@ -1710,6 +1712,7 @@ class AgentLoop:
                     session_id=session_id,
                     tool_names=unexecuted_tool_names,
                     turn_id=turn_id,
+                    boundary="tool_slice",
                 ),
             )
         self._append_turn_record(
@@ -1861,6 +1864,7 @@ class AgentLoop:
         command_override: str | None = None,
         pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> AsyncIterator[AgentTurnStreamEvent]:
+        turn_id = uuid4().hex
         try:
             (
                 session,
@@ -1875,6 +1879,7 @@ class AgentLoop:
                 user_text=user_text,
                 force_session_id=force_session_id,
                 pre_turn_messages=pre_turn_messages,
+                task_id=turn_id,
             )
         except _CompactionStopRequested as exc:
             yield AgentTurnDoneEvent(
@@ -1885,7 +1890,6 @@ class AgentLoop:
                 interruption_reason=exc.interruption_reason,
             )
             return
-        turn_id = uuid4().hex
         pending_records = self._build_pending_turn_records(
             session_id=session.session_id,
             turn_context_text=turn_context_text,
@@ -1918,6 +1922,12 @@ class AgentLoop:
         interrupted_response_text = ""
         interrupted_stream_fragment_text = ""
         interrupted_unexecuted_tool_names: tuple[str, ...] = ()
+        _initial_rounds, initial_tool_safety = self._load_tool_task_state(
+            session.session_id
+        )
+        suppress_initial_text_stream = (
+            initial_tool_safety.unverified_workspace_mutation
+        )
         try:
             overflow_compacted = False
             overflow_retry_attempted = False
@@ -1939,11 +1949,12 @@ class AgentLoop:
                                 streamed_initial_text += event.delta
                                 interrupted_response_text = streamed_initial_text
                                 interrupted_stream_fragment_text = streamed_initial_text
-                                yield AgentTextDeltaEvent(
-                                    session_id=session.session_id,
-                                    delta=event.delta,
-                                    turn_id=turn_id,
-                                )
+                                if not suppress_initial_text_stream:
+                                    yield AgentTextDeltaEvent(
+                                        session_id=session.session_id,
+                                        delta=event.delta,
+                                        turn_id=turn_id,
+                                    )
                         elif event.type == "tool_call_delta":
                             emitted_any = True
                             tool_name = str(event.tool_name or "").strip()
@@ -2140,12 +2151,12 @@ class AgentLoop:
 
                 tool_rounds += 1
                 task_tool_rounds += 1
-                self._persist_tool_task_state(
-                    session.session_id,
-                    rounds=task_tool_rounds,
-                    tracker=tool_safety,
-                )
                 if task_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
+                    self._persist_tool_task_state(
+                        session.session_id,
+                        rounds=task_tool_rounds,
+                        tracker=tool_safety,
+                    )
                     self._append_tool_safety_skips(
                         session_id=session.session_id,
                         pending_records=pending_records,
@@ -2170,11 +2181,6 @@ class AgentLoop:
                         turn_id=turn_id,
                         reason="task_tool_round_budget_exhausted",
                         response=current_response,
-                    )
-                    yield AgentAssistantMessageEvent(
-                        session_id=session.session_id,
-                        text=current_response.text,
-                        turn_id=turn_id,
                     )
                     break
                 if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
@@ -2203,11 +2209,6 @@ class AgentLoop:
                             turn_id=turn_id,
                             reason="tool_slice_without_progress",
                             response=current_response,
-                        )
-                        yield AgentAssistantMessageEvent(
-                            session_id=session.session_id,
-                            text=current_response.text,
-                            turn_id=turn_id,
                         )
                         break
                     (
@@ -2254,8 +2255,13 @@ class AgentLoop:
                             turn_id=turn_id,
                         )
                         while True:
-                            if tool_safety.invalid_call_is_blocked(tool_call):
-                                tool_result = build_blocked_invalid_result(tool_call=tool_call)
+                            blocked_reason = tool_safety.blocked_call_reason(tool_call)
+                            if blocked_reason is not None:
+                                tool_result = build_blocked_repetition_result(
+                                    tool_call=tool_call,
+                                    reason=blocked_reason,
+                                    diagnostics=tool_safety.blocked_call_details(tool_call),
+                                )
                             else:
                                 try:
                                     tool_result = await self._await_with_stop(
@@ -2297,6 +2303,11 @@ class AgentLoop:
                                 tool_name=tool_call.name,
                             )
                             if pending_approval is None:
+                                observation = tool_safety.record(tool_call, tool_result)
+                                tool_result = _with_tool_safety_replan_notice(
+                                    tool_result,
+                                    observation=observation,
+                                )
                                 tool_record = self._build_tool_record(
                                     session.session_id,
                                     tool_result,
@@ -2335,25 +2346,9 @@ class AgentLoop:
                                     current_pending_subagent_ids,
                                     tool_result,
                                 )
-                                observation = tool_safety.record(tool_call, tool_result)
                                 if bool(tool_result.metadata.get("tool_safety_blocked")):
                                     safety_stop = True
-                                    safety_stop_reason = "disabled_file_edit_tool_reused"
-                                    safety_stop_unexecuted_tool_calls = tool_calls[
-                                        tool_index + 1:
-                                    ]
-                                elif (
-                                    observation.repeated_invalid_call
-                                    and not observation.blocked_invalid_signature
-                                ):
-                                    safety_stop = True
-                                    safety_stop_reason = "two_identical_tool_failures"
-                                    safety_stop_unexecuted_tool_calls = tool_calls[
-                                        tool_index + 1:
-                                    ]
-                                elif observation.repeated_no_progress:
-                                    safety_stop = True
-                                    safety_stop_reason = "three_identical_no_progress_results"
+                                    safety_stop_reason = "blocked_tool_signature_reused"
                                     safety_stop_unexecuted_tool_calls = tool_calls[
                                         tool_index + 1:
                                     ]
@@ -2498,11 +2493,6 @@ class AgentLoop:
                             reason=safety_stop_reason or "repeated_tool_result",
                             response=current_response,
                         )
-                        yield AgentAssistantMessageEvent(
-                            session_id=session.session_id,
-                            text=current_response.text,
-                            turn_id=turn_id,
-                        )
                         break
                     if self._stop_requested(turn_id):
                         if deferred_tool_successes:
@@ -2593,6 +2583,9 @@ class AgentLoop:
                     emitted_any = False
                     streamed_followup_text = ""
                     deferred_committed = False
+                    suppress_followup_text_stream = (
+                        tool_safety.unverified_workspace_mutation
+                    )
                     try:
                         async for event in self._stream_generate_with_stop(
                             request, turn_id=turn_id
@@ -2619,11 +2612,12 @@ class AgentLoop:
                                     streamed_followup_text += event.delta
                                     interrupted_response_text = streamed_followup_text
                                     interrupted_stream_fragment_text = streamed_followup_text
-                                    yield AgentTextDeltaEvent(
-                                        session_id=session.session_id,
-                                        delta=event.delta,
-                                        turn_id=turn_id,
-                                    )
+                                    if not suppress_followup_text_stream:
+                                        yield AgentTextDeltaEvent(
+                                            session_id=session.session_id,
+                                            delta=event.delta,
+                                            turn_id=turn_id,
+                                        )
                             elif event.type == "tool_call_delta":
                                 emitted_any = True
                                 tool_name = str(event.tool_name or "").strip()
@@ -2998,6 +2992,7 @@ class AgentLoop:
         self,
         *,
         user_text: str | None,
+        task_id: str,
         force_session_id: str | None = None,
         pre_turn_messages: Sequence[AgentRuntimeMessage] = (),
     ) -> tuple[
@@ -3031,6 +3026,24 @@ class AgentLoop:
             session_id=session.session_id,
             pre_turn_messages=pre_turn_messages,
         )
+        task_contract = self._prepare_tool_task(
+            session_id=session.session_id,
+            proposed_task_id=task_id,
+            user_text=user_text,
+        )
+        if task_contract is not None:
+            turn_runtime_messages = (
+                *turn_runtime_messages,
+                AgentRuntimeMessage(
+                    role="system",
+                    content=task_contract.render(),
+                    metadata={
+                        "task_contract": True,
+                        "task_id": task_contract.task_id,
+                        "user_message_sha256": task_contract.user_message_sha256,
+                    },
+                ),
+            )
         allow_tools_for_initial_request = not _turn_requires_no_tools(
             runtime_messages=turn_runtime_messages,
             user_text=user_text,
@@ -3152,6 +3165,7 @@ class AgentLoop:
         session = self._storage.get_session(session_id)
         backend_state = dict(session.backend_state) if session is not None else {}
         if not completion_blocked:
+            backend_state.pop("active_tool_task_id", None)
             backend_state.pop("tool_task_state", None)
         self._storage.update_session(
             session_id,
@@ -3164,16 +3178,105 @@ class AgentLoop:
             backend_state=backend_state,
         )
 
+    def _prepare_tool_task(
+        self,
+        *,
+        session_id: str,
+        proposed_task_id: str,
+        user_text: str | None,
+    ) -> TaskContract | None:
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return None
+        backend_state = dict(session.backend_state)
+        active_task_id = str(backend_state.get("active_tool_task_id", "")).strip()
+        active_state = (
+            self._storage.load_tool_task_state(active_task_id)
+            if active_task_id
+            else None
+        )
+        active_contract = TaskContract.from_state(
+            active_state.get("contract") if isinstance(active_state, dict) else None
+        )
+
+        if user_text is None:
+            return active_contract
+        if (
+            active_contract is not None
+            and isinstance(active_state, dict)
+            and user_message_explicitly_resumes_task(user_text)
+        ):
+            supplemental = build_task_contract(
+                task_id=active_contract.task_id,
+                origin_turn_id=active_contract.origin_turn_id,
+                user_text=user_text,
+            )
+            merged_requirements = {
+                item.item_id: item for item in active_contract.requirements
+            }
+            merged_requirements.update(
+                {item.item_id: item for item in supplemental.requirements}
+            )
+            contract = replace(
+                active_contract,
+                requirements=tuple(merged_requirements.values()),
+            )
+            tracker = ToolSafetyTracker.from_state(active_state.get("tracker"))
+            tracker.seed_contract_requirements(contract.requirements)
+            self._storage.write_tool_task_state(
+                contract.task_id,
+                {
+                    **active_state,
+                    "contract": contract.to_state(),
+                    "tracker": tracker.to_state(),
+                },
+            )
+            return contract
+
+        contract = build_task_contract(
+            task_id=proposed_task_id,
+            origin_turn_id=proposed_task_id,
+            user_text=user_text,
+        )
+        tracker = ToolSafetyTracker()
+        tracker.seed_contract_requirements(contract.requirements)
+        self._storage.write_tool_task_state(
+            contract.task_id,
+            {
+                "schema_version": 1,
+                "task_id": contract.task_id,
+                "origin_session_id": session_id,
+                "contract": contract.to_state(),
+                "rounds": 0,
+                "tracker": tracker.to_state(),
+            },
+        )
+        backend_state["active_tool_task_id"] = contract.task_id
+        backend_state.pop("tool_task_state", None)
+        if backend_state != session.backend_state:
+            self._storage.update_session(session_id, backend_state=backend_state)
+        return contract
+
     def _load_tool_task_state(self, session_id: str) -> tuple[int, ToolSafetyTracker]:
         session = self._storage.get_session(session_id)
-        raw = session.backend_state.get("tool_task_state") if session is not None else None
+        if session is None:
+            return 0, ToolSafetyTracker()
+        task_id = str(session.backend_state.get("active_tool_task_id", "")).strip()
+        raw = self._storage.load_tool_task_state(task_id) if task_id else None
+        if not isinstance(raw, dict):
+            # Read the old inline shape during rolling upgrades, but never persist it again.
+            raw = session.backend_state.get("tool_task_state")
         if not isinstance(raw, dict):
             return 0, ToolSafetyTracker()
         try:
             rounds = max(0, int(raw.get("rounds", 0)))
         except (TypeError, ValueError):
             rounds = 0
-        return rounds, ToolSafetyTracker.from_state(raw.get("tracker"))
+        tracker = ToolSafetyTracker.from_state(raw.get("tracker"))
+        contract = TaskContract.from_state(raw.get("contract"))
+        if contract is not None:
+            tracker.seed_contract_requirements(contract.requirements)
+        return rounds, tracker
 
     def _persist_tool_task_state(
         self,
@@ -3182,10 +3285,22 @@ class AgentLoop:
         rounds: int,
         tracker: ToolSafetyTracker,
     ) -> None:
-        self.update_backend_state(
-            session_id=session_id,
-            key="tool_task_state",
-            value={"rounds": max(0, rounds), "tracker": tracker.to_state()},
+        session = self._storage.get_session(session_id)
+        if session is None:
+            return
+        task_id = str(session.backend_state.get("active_tool_task_id", "")).strip()
+        if not task_id:
+            return
+        existing = self._storage.load_tool_task_state(task_id) or {}
+        self._storage.write_tool_task_state(
+            task_id,
+            {
+                **existing,
+                "schema_version": 1,
+                "task_id": task_id,
+                "rounds": max(0, rounds),
+                "tracker": tracker.to_state(),
+            },
         )
 
     def _persist_provider_session_state_from_response(
@@ -3429,12 +3544,12 @@ class AgentLoop:
                 )
             tool_rounds += 1
             task_tool_rounds += 1
-            self._persist_tool_task_state(
-                current_session.session_id,
-                rounds=task_tool_rounds,
-                tracker=tool_safety,
-            )
             if task_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
+                self._persist_tool_task_state(
+                    current_session.session_id,
+                    rounds=task_tool_rounds,
+                    tracker=tool_safety,
+                )
                 self._append_tool_safety_skips(
                     session_id=current_session.session_id,
                     pending_records=pending_records,
@@ -4743,15 +4858,20 @@ class AgentLoop:
         session_id: str,
         tool_names: Sequence[str],
         turn_id: str,
+        boundary: Literal["turn_interruption", "tool_slice"] = "turn_interruption",
     ) -> ConversationRecord:
         ordered_tool_names = list(_ordered_unique_names(tool_names))
         return self._build_message_record(
             session_id=session_id,
             role="system",
-            content=_unexecuted_tool_call_note_text(ordered_tool_names),
+            content=_unexecuted_tool_call_note_text(
+                ordered_tool_names,
+                boundary=boundary,
+            ),
             metadata={
                 _UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY: True,
                 "tool_names": ordered_tool_names,
+                "boundary": boundary,
             },
             turn_id=turn_id,
         )
@@ -5617,7 +5737,7 @@ def _carry_compaction_backend_state(state: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         key: deepcopy(state[key])
-        for key in ("provider_recovery", "tool_task_state")
+        for key in ("provider_recovery", "active_tool_task_id")
         if key in state
     }
 
@@ -6042,12 +6162,9 @@ def _enforce_acceptance_handoff(
 ) -> LLMResponse:
     if not tool_safety.unverified_workspace_mutation:
         return response
-    text = response.text.rstrip()
-    if _UNVERIFIED_MUTATION_HANDOFF_TEXT not in text:
-        text = f"{text}\n\n{_UNVERIFIED_MUTATION_HANDOFF_TEXT}" if text else _UNVERIFIED_MUTATION_HANDOFF_TEXT
     return replace(
         response,
-        text=text,
+        text="",
         finish_reason="stop",
         provider_metadata={
             **response.provider_metadata,
@@ -6059,6 +6176,37 @@ def _enforce_acceptance_handoff(
 
 def _response_completion_blocked(response: LLMResponse) -> bool:
     return bool(response.provider_metadata.get("completion_blocked", False))
+
+
+def _with_tool_safety_replan_notice(
+    result: ToolExecutionResult,
+    *,
+    observation: ToolSafetyObservation,
+) -> ToolExecutionResult:
+    if not (
+        observation.repeated_invalid_call or observation.repeated_no_progress
+    ) or bool(result.metadata.get("tool_safety_blocked")):
+        return result
+    metadata = dict(result.metadata)
+    metadata.update(
+        {
+            "tool_safety_replan_required": True,
+            "tool_safety_signature_id": observation.signature_id,
+            "tool_safety_occurrence_count": observation.occurrence_count,
+            "tool_safety_progress_epoch": observation.progress_epoch,
+            "tool_safety_first_call_id": observation.first_call_id,
+        }
+    )
+    return replace(
+        result,
+        content=(
+            result.content.rstrip()
+            + "\n\nTool safety checkpoint\n"
+            + "This exact action is now blocked in the current unchanged workspace epoch. "
+            + "Do not repeat it; replan with different arguments or make material progress."
+        ),
+        metadata=metadata,
+    )
 
 
 def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
@@ -6546,16 +6694,25 @@ def _completed_after_interrupt_metadata(
     }
 
 
-def _unexecuted_tool_call_note_text(tool_names: Sequence[str]) -> str:
+def _unexecuted_tool_call_note_text(
+    tool_names: Sequence[str],
+    *,
+    boundary: Literal["turn_interruption", "tool_slice"] = "turn_interruption",
+) -> str:
     ordered_tool_names = _ordered_unique_names(tool_names)
+    subject = (
+        "The previous tool slice ended"
+        if boundary == "tool_slice"
+        else "The turn was interrupted"
+    )
     if ordered_tool_names:
         names_text = ", ".join(ordered_tool_names)
         return (
-            "The previous turn was interrupted before these proposed tool calls were executed: "
+            f"{subject} before these proposed tool calls were executed: "
             f"{names_text}. Treat them as not run."
         )
     return (
-        "The previous turn was interrupted before the assistant's proposed tool calls were executed. "
+        f"{subject} before the assistant's proposed tool calls were executed. "
         "Treat them as not run."
     )
 

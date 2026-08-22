@@ -788,6 +788,30 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_messages, [])
         self.assertEqual(telegram.sent_drafts, [])
 
+    async def test_handle_message_suppresses_internal_blocked_turn_fallback(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayTurnDoneEvent(
+                    session_id="session",
+                    response_text="internal tool safety fallback",
+                    completion_blocked=True,
+                ),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(telegram.sent_drafts, [])
+
     async def test_handle_message_preserves_multiple_assistant_segments(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
@@ -1309,6 +1333,9 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 reason="turn_worker_idle",
             )
         )
+        # `emit` queues the event; let the bridge consume it before taking the
+        # post-cancellation baseline.
+        await asyncio.sleep(0.02)
         actions_after_task_done = len(telegram.sent_chat_actions)
         await asyncio.sleep(0.08)
         self.assertEqual(len(telegram.sent_chat_actions), actions_after_task_done)

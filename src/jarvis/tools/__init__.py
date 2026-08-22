@@ -11,7 +11,11 @@ from .basic.memory_write import MemoryWritePolicy
 from .policy import ToolPolicy
 from .registry import ToolRegistry
 from .runtime import ToolRuntime
-from .workspace_access import WorkspaceAccessCoordinator, WorkspaceLeaseError
+from .workspace_access import (
+    WorkspaceAccessCoordinator,
+    WorkspaceLeaseError,
+    with_workspace_observation,
+)
 from .basic.send_file import SendFilePolicy
 from .basic.tool_register import ToolRegisterPolicy
 from .basic.tool_search import ToolSearchPolicy
@@ -54,6 +58,7 @@ __all__ = [
     "ToolRuntime",
     "WorkspaceAccessCoordinator",
     "WorkspaceLeaseError",
+    "with_workspace_observation",
     "ToolSettings",
     "ToolSearchPolicy",
     "WebFetchPolicy",

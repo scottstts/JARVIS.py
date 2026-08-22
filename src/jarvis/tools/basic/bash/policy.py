@@ -10,6 +10,7 @@ from typing import Any
 
 from ...config import ToolSettings
 from ...types import ToolExecutionContext, ToolPolicyDecision
+from .shell_syntax import background_operator, masked_shell_syntax
 
 _INSTALL_KEYWORDS = (
     "apt install",
@@ -350,46 +351,10 @@ def _normalize_mode(value: object) -> str:
 def _unmanaged_background_reason(command: str) -> str | None:
     """Detect process detachment syntax while ignoring quoted text and comments."""
 
-    visible: list[str] = []
-    quote: str | None = None
-    escaped = False
-    comment = False
-    for index, char in enumerate(command):
-        if comment:
-            visible.append("\n" if char == "\n" else " ")
-            if char == "\n":
-                comment = False
-            continue
-        if escaped:
-            visible.append(" ")
-            escaped = False
-            continue
-        if char == "\\" and quote != "'":
-            visible.append(" ")
-            escaped = True
-            continue
-        if quote is not None:
-            visible.append(" ")
-            if char == quote:
-                quote = None
-            continue
-        if char in {"'", '"'}:
-            visible.append(" ")
-            quote = char
-            continue
-        if char == "#" and (index == 0 or command[index - 1].isspace()):
-            visible.append(" ")
-            comment = True
-            continue
-        visible.append(char)
-    masked = "".join(visible)
-    for index, char in enumerate(masked):
-        if char != "&":
-            continue
-        before = masked[index - 1] if index > 0 else ""
-        after = masked[index + 1] if index + 1 < len(masked) else ""
-        if before != "&" and after != "&":
-            return "ampersand"
+    operator = background_operator(command)
+    if operator is not None:
+        return f"background_operator@{operator.offset}"
+    masked = masked_shell_syntax(command)
     if _UNMANAGED_PROCESS_COMMAND_PATTERN.search(masked) or _DETACH_WRAPPER_PATTERN.search(
         masked
     ):

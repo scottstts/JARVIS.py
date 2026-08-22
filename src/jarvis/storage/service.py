@@ -17,6 +17,7 @@ class SessionStorage:
     def __init__(self, root_dir: Path) -> None:
         self.root_dir = root_dir.expanduser()
         self._sessions_dir = self.root_dir / "sessions"
+        self._tool_tasks_dir = self.root_dir / "tool_tasks"
         self._index_path = self.root_dir / "sessions_index.json"
         self._ensure_layout()
 
@@ -157,11 +158,47 @@ class SessionStorage:
                 records.append(record)
         return records
 
+    def load_tool_task_state(self, task_id: str) -> dict[str, Any] | None:
+        """Load one task-scoped tool-safety sidecar."""
+
+        path = self._tool_task_path(task_id)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def write_tool_task_state(self, task_id: str, state: dict[str, Any]) -> bool:
+        """Atomically persist changed task state without rewriting the session index."""
+
+        path = self._tool_task_path(task_id)
+        encoded = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        try:
+            if path.read_text(encoding="utf-8") == encoded:
+                return False
+        except OSError:
+            pass
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(encoded, encoding="utf-8")
+        tmp_path.replace(path)
+        return True
+
     def _session_path(self, session_id: str) -> Path:
         return self._sessions_dir / f"{session_id}.jsonl"
 
+    def _tool_task_path(self, task_id: str) -> Path:
+        normalized = task_id.strip()
+        if (
+            not normalized
+            or len(normalized) > 128
+            or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in normalized)
+        ):
+            raise ValueError("Invalid tool task id.")
+        return self._tool_tasks_dir / f"{normalized}.json"
+
     def _ensure_layout(self) -> None:
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
+        self._tool_tasks_dir.mkdir(parents=True, exist_ok=True)
         if not self._index_path.exists():
             self._write_index({"active_session_id": None, "sessions": {}})
 

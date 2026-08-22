@@ -842,6 +842,7 @@ class TelegramGatewayBridge:
             if (
                 not output_paused
                 and not event.interrupted
+                and not event.completion_blocked
                 and not active_turn.delivered_any_segment
             ):
                 final_text = _coalesce_visible_text(

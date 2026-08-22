@@ -115,6 +115,12 @@ If a stream or process interruption leaves assistant tool calls without matching
 
 Tool execution is bounded at two levels: `JARVIS_TOOL_MAX_ROUNDS_PER_TURN` defaults to `64` and `JARVIS_TOOL_MAX_ROUNDS_PER_TASK` defaults to `256`. The loop also stops repeated malformed edit calls and repeated identical no-progress calls before either cap. Hitting a safety boundary is a truthful blocked result, never a successful completion or a reason to ask the user to send “Continue.”
 
+Tool safety is task-scoped rather than session-scoped. Each user task has a compact sidecar under the transcript archive's `tool_tasks/` directory containing its immutable task contract, cumulative round count, and bounded safety tracker. The session index stores only `active_tool_task_id`; unchanged sidecars and unchanged session metadata are not rewritten. An explicit resume continues the active task, while an unrelated request or a requirement waiver/replacement creates a fresh task so stale failures cannot poison later work. Compaction carries the active task pointer without copying the sidecar into every session record.
+
+Repeated-result limits are evaluated inside progress epochs. A real workspace mutation or other material orchestration progress starts a new epoch and clears stale call/result signatures. The second identical invalid result or third identical no-progress result blocks only that exact tool-and-arguments signature. The threshold result remains visible with deterministic call/result signatures, call IDs, count, and epoch; only a later attempt to reuse the blocked signature parks the task. Alternative actions remain available.
+
+At task creation Jarvis deterministically extracts explicit user requirements into a prompt-visible, persisted contract with stable item IDs. The contract is re-injected on continuations and cannot be silently reduced by the model's acceptance ledger. Delegation, verification-gate, authored-source-line, visual-inspection, and changed-test-review requirements need matching runtime-observed evidence before a mutation can be marked accepted. Slice rollover notices include the current progress epoch and outstanding contract items.
+
 Slice rollover follows the same unresolved-call normalization rule:
 
 1. persist the unexecuted-tool-call notice
@@ -124,6 +130,8 @@ Slice rollover follows the same unresolved-call normalization rule:
 5. reset the internal slice counter and continue executing any newly returned tool calls
 
 A completely empty continuation response is normalized to an explicit failure message. A text or tool-call continuation is preserved as returned. Streaming additionally emits the continued tool-call event so UI state remains accurate.
+
+Safety parks and unverified-mutation handoffs set `completion_blocked` and retain their detailed internal records for replay and logs, but expose no placeholder assistant text. While a mutation remains unverified, streaming text is buffered until the terminal response proves it is a tool continuation; an unverified completion claim is discarded before any delta reaches the UI. Telegram also suppresses its generic empty-response fallback for these blocked turns, keeping runtime diagnostics out of the functional chat surface.
 
 ## Crash And Restart Recovery
 

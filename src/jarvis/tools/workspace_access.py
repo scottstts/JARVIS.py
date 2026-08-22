@@ -4,18 +4,60 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from typing import AsyncIterator
 
 from jarvis.llm import ToolCall
 
-from .types import ToolExecutionContext
+from .types import ToolExecutionContext, ToolExecutionResult
+from .workspace_revision import workspace_paths_revision, workspace_revision
 
 
 class WorkspaceLeaseError(RuntimeError):
     """Raised when an actor attempts to write a path leased by another actor."""
+
+
+@dataclass(slots=True)
+class WorkspaceAccessObservation:
+    """Runtime evidence about workspace state surrounding one tool execution."""
+
+    mode: str
+    scope: str | None = None
+    revision_before: str | None = None
+    revision_after: str | None = None
+
+    @property
+    def may_mutate(self) -> bool:
+        return self.mode in {"path_write", "global_write"}
+
+    @property
+    def changed(self) -> bool:
+        return (
+            self.revision_before is not None
+            and self.revision_after is not None
+            and self.revision_before != self.revision_after
+        )
+
+
+def with_workspace_observation(
+    result: ToolExecutionResult,
+    observation: WorkspaceAccessObservation,
+) -> ToolExecutionResult:
+    """Attach runtime-owned access and mutation evidence to a tool result."""
+
+    metadata = dict(result.metadata)
+    metadata["workspace_access_mode"] = observation.mode
+    if observation.scope is not None:
+        metadata["workspace_revision_scope"] = observation.scope
+    if observation.revision_before is not None:
+        metadata["workspace_revision_before"] = observation.revision_before
+    if observation.revision_after is not None:
+        metadata["workspace_revision_after"] = observation.revision_after
+    if observation.may_mutate:
+        metadata["workspace_changed"] = observation.changed
+    return replace(result, metadata=metadata)
 
 
 @dataclass(slots=True, frozen=True)
@@ -124,7 +166,7 @@ class WorkspaceAccessCoordinator:
         *,
         tool_call: ToolCall,
         context: ToolExecutionContext,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[WorkspaceAccessObservation]:
         request = _access_request(
             tool_call=tool_call,
             context=context,
@@ -132,24 +174,28 @@ class WorkspaceAccessCoordinator:
         )
         if request.mode == "read":
             async with self._global_access.read():
-                yield
+                yield WorkspaceAccessObservation(mode=request.mode)
             return
         if request.mode == "exclusive_read":
             async with self._global_access.write():
-                yield
+                yield WorkspaceAccessObservation(mode=request.mode)
             return
         if request.mode == "path_read":
             async with self._global_access.read():
                 read_id = await self._acquire_path_read(request.read_paths)
                 try:
-                    yield
+                    yield WorkspaceAccessObservation(mode=request.mode)
                 finally:
                     await self._release_path_read(read_id)
             return
         if request.mode == "global_write":
             async with self._global_access.write():
                 await self._assert_global_write_allowed(owner=_context_owner(context))
-                yield
+                observation = self._begin_observation(request)
+                try:
+                    yield observation
+                finally:
+                    self._finish_observation(observation, request)
             return
 
         async with self._global_access.read():
@@ -167,10 +213,43 @@ class WorkspaceAccessCoordinator:
                 ),
             )
             write_id = await self._acquire_path_write(request.write_paths)
+            observation = self._begin_observation(request)
             try:
-                yield
+                yield observation
             finally:
+                self._finish_observation(observation, request)
                 await self._release_path_write(write_id)
+
+    def _begin_observation(self, request: _AccessRequest) -> WorkspaceAccessObservation:
+        if request.mode == "global_write":
+            return WorkspaceAccessObservation(
+                mode=request.mode,
+                scope="workspace",
+                revision_before=workspace_revision(self._workspace_dir),
+            )
+        if request.mode == "path_write":
+            return WorkspaceAccessObservation(
+                mode=request.mode,
+                scope="declared_paths",
+                revision_before=workspace_paths_revision(
+                    self._workspace_dir,
+                    request.write_paths,
+                ),
+            )
+        return WorkspaceAccessObservation(mode=request.mode)
+
+    def _finish_observation(
+        self,
+        observation: WorkspaceAccessObservation,
+        request: _AccessRequest,
+    ) -> None:
+        if request.mode == "global_write":
+            observation.revision_after = workspace_revision(self._workspace_dir)
+        elif request.mode == "path_write":
+            observation.revision_after = workspace_paths_revision(
+                self._workspace_dir,
+                request.write_paths,
+            )
 
     async def _assert_write_leases(
         self,

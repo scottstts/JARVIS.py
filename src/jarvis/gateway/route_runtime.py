@@ -64,6 +64,7 @@ from jarvis.tools import (
     ToolSettings,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    with_workspace_observation,
 )
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
@@ -1204,15 +1205,16 @@ class RouteRuntime:
             async with self._workspace_access.execute(
                 tool_call=tool_call,
                 context=context,
-            ):
+            ) as workspace_observation:
                 result = await self._main_tool_runtime.execute(
                     tool_call=tool_call,
                     context=context,
                 )
-                result = _with_workspace_lease_generation(
-                    result,
-                    await self._workspace_access.lease_generation(),
-                )
+            result = with_workspace_observation(result, workspace_observation)
+            result = _with_workspace_lease_generation(
+                result,
+                await self._workspace_access.lease_generation(),
+            )
         except WorkspaceLeaseError as exc:
             result = _workspace_lease_error_result(tool_call, exc)
         self._remember_main_turn_skill(context=context, result=result)
