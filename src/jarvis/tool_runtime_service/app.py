@@ -11,6 +11,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from jarvis.tool_runtime_protocol import (
+    TOOL_RUNTIME_PROTOCOL_VERSION,
+    tool_runtime_capabilities_payload,
+)
 from jarvis.tools.config import ToolSettings
 from jarvis.tools.basic.web_fetch.tool import build_service_web_fetch_executor
 from jarvis.tools.types import ToolExecutionContext
@@ -33,6 +37,8 @@ def create_app(settings: ToolSettings | None = None) -> Starlette:
             {
                 "status": "ok",
                 "workspace_dir": str(resolved_settings.workspace_dir),
+                "protocol_version": TOOL_RUNTIME_PROTOCOL_VERSION,
+                "capabilities": tool_runtime_capabilities_payload(),
             }
         )
 

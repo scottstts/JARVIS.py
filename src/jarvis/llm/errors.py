@@ -47,6 +47,10 @@ class ProviderTemporaryError(LLMError):
     """Raised for retryable upstream/service failures."""
 
 
+class ProviderEmptyResponseError(ProviderTemporaryError):
+    """Raised when a provider accepts a request but returns no semantic output."""
+
+
 class ProviderTimeoutError(ProviderTemporaryError):
     """Raised when upstream request times out."""
 

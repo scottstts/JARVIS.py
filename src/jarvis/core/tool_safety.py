@@ -56,6 +56,7 @@ class ToolSafetyTracker:
     _completed_test_review_subagent_ids: set[str] = field(default_factory=set)
     _passed_acceptance_gates: dict[str, str] = field(default_factory=dict)
     _visual_inspection_paths: set[str] = field(default_factory=set)
+    _runtime_progress_signatures: list[str] = field(default_factory=list)
 
     def seed_contract_requirements(
         self,
@@ -212,6 +213,53 @@ class ToolSafetyTracker:
             self._passed_acceptance_run_call_ids.clear()
             self._passed_acceptance_gates.clear()
 
+    @property
+    def progress_epoch(self) -> int:
+        return self._progress_epoch
+
+    def record_runtime_progress(
+        self,
+        *,
+        content: str,
+        metadata: dict[str, Any],
+    ) -> bool:
+        """Advance progress once for each materially distinct orchestrator update."""
+
+        signature_payload: dict[str, Any]
+        if metadata.get("bash_job_progress_update"):
+            signature_payload = {
+                "kind": "bash",
+                "job_ids": metadata.get("detached_bash_job_ids", []),
+                "notice_kinds": metadata.get("bash_job_notice_kinds", []),
+                "running_ids": metadata.get("bash_job_running_ids", []),
+                "terminal_ids": metadata.get("bash_job_terminal_ids", []),
+                "recommended_action": metadata.get("recommended_action"),
+                "progress_fingerprints": metadata.get(
+                    "bash_job_progress_fingerprints",
+                    [],
+                ),
+            }
+        elif metadata.get("subagent_progress_update"):
+            signature_payload = {
+                "kind": "subagent",
+                "subagent_id": metadata.get("subagent_id"),
+                "notice_kind": metadata.get("subagent_notice_kind"),
+                "pending_ids": metadata.get("pending_subagent_ids", []),
+                "recommended_action": metadata.get("recommended_action"),
+                "report_complete": metadata.get("latest_subagent_report_complete"),
+                "content": content,
+            }
+        else:
+            return False
+
+        signature = _digest(signature_payload)
+        if signature in self._runtime_progress_signatures:
+            return False
+        self._runtime_progress_signatures.append(signature)
+        del self._runtime_progress_signatures[:-256]
+        self._advance_progress_epoch(invalidate_acceptance=False)
+        return True
+
     def consume_slice_progress(self) -> bool:
         made_progress = self._progress_since_slice
         self._progress_since_slice = False
@@ -318,6 +366,7 @@ class ToolSafetyTracker:
             ),
             "passed_acceptance_gates": dict(self._passed_acceptance_gates),
             "visual_inspection_paths": sorted(self._visual_inspection_paths),
+            "runtime_progress_signatures": list(self._runtime_progress_signatures),
         }
 
     @classmethod
@@ -375,6 +424,10 @@ class ToolSafetyTracker:
             _visual_inspection_paths=_bounded_string_set(
                 value.get("visual_inspection_paths"),
                 limit=64,
+            ),
+            _runtime_progress_signatures=_bounded_string_list(
+                value.get("runtime_progress_signatures"),
+                limit=256,
             ),
         )
 
@@ -664,6 +717,12 @@ def _bounded_string_set(value: object, *, limit: int = 64) -> set[str]:
     if not isinstance(value, list):
         return set()
     return {str(item).strip() for item in value[-limit:] if str(item).strip()}
+
+
+def _bounded_string_list(value: object, *, limit: int = 64) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value[-limit:] if str(item).strip()]
 
 
 def _bounded_acceptance_items(

@@ -178,12 +178,15 @@ Important boundaries:
 
 Files written outside `/workspace` stay local to the long-lived `tool_runtime` container and are not durable Jarvis artifacts.
 
+The app and isolated service share a versioned compatibility contract from `src/jarvis/tool_runtime_protocol.py`. `/health` declares the protocol version and supported tool capabilities; app startup fails with an actionable rebuild/restart error when the service is stale or missing a required mode. Remote status returned by `tool_runtime` is authoritative because app and tool containers do not share a PID namespace. Routine internal `httpx` request INFO records are context-locally suppressed, while warnings and failures remain logged.
+
 ## Detached Bash Jobs
 
 `bash` supports:
 
 - `foreground`
 - `background`
+- `service`
 - `status`
 - `tail`
 - `cancel`
@@ -192,9 +195,11 @@ Foreground jobs that exceed the soft timeout are promoted to background and retu
 
 Route-scoped supervision owns detached bash monitoring outside the model loop. After a detached start or promotion, the current turn parks. Later progress notices enqueue runtime turns for the owning main agent or subagent.
 
-Progress pacing combines immediate signal-driven updates with fallback heartbeats. Notices are batched and deduplicated by owner so multiple job updates coalesce into one revival.
+Notices are batched and deduplicated by owner so multiple job updates coalesce into one revival. Accepted notices have an in-memory delivery latch until the owner queue records them, preventing a terminal or unchanged update from being redispatched on every supervisor poll. Deferred running notices are rechecked after 30 seconds so terminal transition is still discovered; deferred terminal notices remain latched until owner state changes.
 
-An unchanged background-job heartbeat updates the durable job/supervisor status only; it is not appended to semantic transcript history and does not consume a model turn. Terminal notices include process exit/signal/runtime, command and output hashes, launch revision, bounded output tails, and durable stdout/stderr log paths. Exit status is process evidence, not semantic readiness evidence; record the actual acceptance check before reporting completion.
+Unchanged running jobs do not emit model-facing heartbeats. A no-output job emits at most one needs-attention notice after five minutes; output growth and terminal transitions remain noteworthy. Terminal notices include process exit/signal/runtime, command and output hashes, launch revision, bounded output tails, and durable stdout/stderr log paths. Exit status is process evidence, not semantic readiness evidence; record the actual acceptance check before reporting completion.
+
+Readiness-verified `service` jobs are route-managed resources rather than pending task work. Healthy services do not keep task activity open or wake the model, and their health status is polled at a lower cadence. `/new` still cancels them through the same isolated-runtime path. The shared route supervisor is the only process-cancellation authority; subagent reset/disposal never inspects or signals tool-runtime PIDs locally, and route cancellation still runs if child disposal fails.
 
 Route-level `/stop` preempts foreground tool awaits. Foreground bash gets best-effort process-group/job cancellation when its active await is cancelled. Already-detached bash jobs are different: `/stop` suppresses their auto-followups until the next user message, but it does not cancel those jobs.
 

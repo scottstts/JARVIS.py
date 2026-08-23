@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from jarvis.llm.config import OpenRouterProviderSettings
 from jarvis.llm.errors import (
+    ProviderEmptyResponseError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderTemporaryError,
@@ -844,11 +845,12 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
                 with self.assertLogs(
                     "llm.providers.openrouter_provider", level="WARNING"
                 ):
-                    with self.assertRaises(ProviderResponseError) as caught:
+                    with self.assertRaises(ProviderEmptyResponseError) as caught:
                         asyncio.run(self._collect_events(provider, request))
 
         self.assertEqual(post.call_count, 3)
         self.assertEqual(caught.exception.metadata["failure_kind"], "empty_response")
+        self.assertTrue(caught.exception.metadata["retry_safe_after_acceptance"])
         self.assertEqual(caught.exception.metadata["attempt"], 3)
         self.assertEqual(caught.exception.metadata["max_attempts"], 3)
         self.assertEqual(caught.exception.metadata["generation_id"], "header_empty_2")
@@ -865,6 +867,74 @@ class OpenRouterProviderStreamingTests(unittest.TestCase):
             ],
             [None, "true", "true"],
         )
+
+    def test_stream_empty_error_is_not_retry_safe_after_partial_tool_delta(self) -> None:
+        provider = OpenRouterProvider(
+            settings=OpenRouterProviderSettings(),
+            read_timeout_seconds=60.0,
+        )
+        request = LLMRequest(
+            model="stealth/ox-alpha",
+            messages=(LLMMessage.text("user", "continue"),),
+        )
+        response = _FakeStreamingResponse(
+            lines=[
+                self._sse_chunk(
+                    {
+                        "id": "gen_partial_tool",
+                        "model": "stealth/ox-alpha",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_partial",
+                                            "function": {
+                                                "arguments": '{"command":"pwd"}'
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        captured_events: list[object] = []
+
+        async def collect_until_error() -> ProviderResponseError:
+            try:
+                async for event in provider.stream_generate(request):
+                    captured_events.append(event)
+            except ProviderResponseError as exc:
+                return exc
+            raise AssertionError("Expected ProviderResponseError.")
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            with patch(
+                "jarvis.llm.providers.openrouter_provider.requests.post",
+                return_value=response,
+            ) as post:
+                with self.assertLogs(
+                    "llm.providers.openrouter_provider",
+                    level="WARNING",
+                ):
+                    caught = asyncio.run(collect_until_error())
+
+        self.assertEqual(post.call_count, 1)
+        self.assertTrue(
+            any(isinstance(event, ToolCallDeltaEvent) for event in captured_events)
+        )
+        self.assertTrue(caught.metadata["semantic_output_emitted"])
+        self.assertFalse(caught.metadata["retry_safe_after_acceptance"])
+        self.assertNotIsInstance(caught, ProviderEmptyResponseError)
 
     def test_stream_generate_preserves_structured_error_metadata(self) -> None:
         provider = OpenRouterProvider(

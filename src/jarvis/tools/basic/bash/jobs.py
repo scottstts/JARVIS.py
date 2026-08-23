@@ -88,6 +88,7 @@ class BashJobRecord:
     last_progress_notice_stderr_bytes_seen: int | None = None
     last_progress_notice_last_update_at: str | None = None
     progress_notice_count: int | None = None
+    attention_notice_dispatched_at: str | None = None
     terminal_notice_kind: str | None = None
     terminal_notice_dispatched_at: str | None = None
 
@@ -217,6 +218,7 @@ def write_job_metadata(
     last_progress_notice_stderr_bytes_seen: int | None = None,
     last_progress_notice_last_update_at: str | None = None,
     progress_notice_count: int | None = None,
+    attention_notice_dispatched_at: str | None = None,
     terminal_notice_kind: str | None = None,
     terminal_notice_dispatched_at: str | None = None,
     workspace_revision: str | None = None,
@@ -240,6 +242,10 @@ def write_job_metadata(
         readiness_url = _optional_non_empty_string(prior_payload.get("readiness_url"))
     if readiness_verified is None:
         readiness_verified = bool(prior_payload.get("readiness_verified", False))
+    if attention_notice_dispatched_at is None:
+        attention_notice_dispatched_at = _optional_non_empty_string(
+            prior_payload.get("attention_notice_dispatched_at")
+        )
     payload = {
         "job_id": paths.job_id,
         "command": command,
@@ -294,6 +300,8 @@ def write_job_metadata(
         )
     if progress_notice_count is not None:
         payload["progress_notice_count"] = int(progress_notice_count)
+    if attention_notice_dispatched_at is not None:
+        payload["attention_notice_dispatched_at"] = attention_notice_dispatched_at
     if terminal_notice_kind is not None:
         payload["terminal_notice_kind"] = terminal_notice_kind
     if terminal_notice_dispatched_at is not None:
@@ -362,6 +370,9 @@ def load_job(workspace_dir: Path, job_id: str) -> tuple[BashJobPaths, BashJobRec
             payload.get("last_progress_notice_last_update_at")
         ),
         progress_notice_count=_optional_int(payload.get("progress_notice_count")),
+        attention_notice_dispatched_at=_optional_non_empty_string(
+            payload.get("attention_notice_dispatched_at")
+        ),
         terminal_notice_kind=_optional_non_empty_string(payload.get("terminal_notice_kind")),
         terminal_notice_dispatched_at=_optional_non_empty_string(
             payload.get("terminal_notice_dispatched_at")
@@ -470,6 +481,7 @@ def claim_job_owner(
         last_progress_notice_stderr_bytes_seen=record.last_progress_notice_stderr_bytes_seen,
         last_progress_notice_last_update_at=record.last_progress_notice_last_update_at,
         progress_notice_count=record.progress_notice_count,
+        attention_notice_dispatched_at=record.attention_notice_dispatched_at,
         terminal_notice_kind=record.terminal_notice_kind,
         terminal_notice_dispatched_at=record.terminal_notice_dispatched_at,
     )
@@ -508,6 +520,7 @@ def mark_job_terminal_notice_dispatched(
         last_progress_notice_stderr_bytes_seen=record.last_progress_notice_stderr_bytes_seen,
         last_progress_notice_last_update_at=record.last_progress_notice_last_update_at,
         progress_notice_count=record.progress_notice_count,
+        attention_notice_dispatched_at=record.attention_notice_dispatched_at,
         terminal_notice_kind=notice_kind,
         terminal_notice_dispatched_at=timestamp,
     )
@@ -553,6 +566,10 @@ def mark_job_progress_notified(
         last_progress_notice_stderr_bytes_seen=int(stderr_bytes_seen),
         last_progress_notice_last_update_at=last_update_at,
         progress_notice_count=progress_notice_count,
+        attention_notice_dispatched_at=(
+            record.attention_notice_dispatched_at
+            or (timestamp if notice_kind == "bash_job_needs_attention" else None)
+        ),
         terminal_notice_kind=record.terminal_notice_kind,
         terminal_notice_dispatched_at=record.terminal_notice_dispatched_at,
     )
@@ -631,6 +648,7 @@ def job_status(paths: BashJobPaths, record: BashJobRecord) -> dict[str, Any]:
         ),
         "last_progress_notice_last_update_at": record.last_progress_notice_last_update_at,
         "progress_notice_count": record.progress_notice_count,
+        "attention_notice_dispatched_at": record.attention_notice_dispatched_at,
         "terminal_notice_kind": record.terminal_notice_kind,
         "terminal_notice_dispatched_at": record.terminal_notice_dispatched_at,
     }

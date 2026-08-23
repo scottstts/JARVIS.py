@@ -18,7 +18,6 @@ from jarvis.tools.basic.bash.jobs import (
     BashJobError,
     BashJobRecord,
     claim_job_owner,
-    job_status,
     list_jobs,
     load_job,
     mark_job_progress_notified,
@@ -31,9 +30,10 @@ from jarvis.tools.types import ToolExecutionContext, ToolExecutionResult
 LOGGER = get_application_logger(__name__)
 
 _POLL_INTERVAL_SECONDS = 2.0
-_HEARTBEAT_NOTICE_BACKOFF_SECONDS = (30.0, 60.0, 180.0, 300.0)
+_MANAGED_SERVICE_POLL_INTERVAL_SECONDS = 30.0
+_DEFERRED_RUNNING_NOTICE_RECHECK_SECONDS = 30.0
 _SIGNIFICANT_OUTPUT_GROWTH_BYTES = 4096
-_NEEDS_ATTENTION_NO_OUTPUT_HEARTBEAT_COUNT = 2
+_NEEDS_ATTENTION_NO_OUTPUT_SECONDS = 300.0
 _NEEDS_ATTENTION_DROPPED_BYTES = 65536
 _TAIL_LINES = 80
 _TAIL_BYTES = 8192
@@ -83,6 +83,17 @@ class BashJobResetResult:
     cancellation_requested_job_ids: tuple[str, ...] = ()
 
 
+@dataclass(slots=True, frozen=True)
+class _NoticeDeliveryMarker:
+    last_progress_notice_kind: str | None
+    last_progress_notice_at: str | None
+    last_progress_notice_status: str | None
+    last_progress_notice_stdout_bytes_seen: int | None
+    last_progress_notice_stderr_bytes_seen: int | None
+    last_progress_notice_last_update_at: str | None
+    terminal_notice_dispatched_at: str | None
+
+
 class BashJobSupervisor:
     """Observes route-owned detached bash jobs and dispatches owner follow-ups."""
 
@@ -94,8 +105,8 @@ class BashJobSupervisor:
         followups_allowed: Callable[[], bool],
         main_turn_active: Callable[[], bool],
         subagent_turn_active: Callable[[str], bool],
-        handle_main_notices: Callable[[tuple[BashJobNotice, ...]], Awaitable[None]],
-        handle_subagent_notices: Callable[[tuple[BashJobNotice, ...]], Awaitable[None]],
+        handle_main_notices: Callable[[tuple[BashJobNotice, ...]], Awaitable[bool]],
+        handle_subagent_notices: Callable[[tuple[BashJobNotice, ...]], Awaitable[bool]],
     ) -> None:
         self._route_id = route_id
         self._workspace_dir = settings.workspace_dir
@@ -106,6 +117,9 @@ class BashJobSupervisor:
         self._handle_main_notices = handle_main_notices
         self._handle_subagent_notices = handle_subagent_notices
         self._tracked_job_ids: set[str] = set()
+        self._deferred_notice_markers: dict[str, _NoticeDeliveryMarker] = {}
+        self._deferred_notice_recheck_at: dict[str, float] = {}
+        self._next_service_poll_at: dict[str, float] = {}
         self._loop_task: asyncio.Task[None] | None = None
         self._wake_event = asyncio.Event()
         self._job_operation_lock = asyncio.Lock()
@@ -120,11 +134,10 @@ class BashJobSupervisor:
         )
         self._wake_event.set()
 
-    def has_pending_jobs(self) -> bool:
-        self._recover_tracked_jobs()
-        return bool(self._tracked_job_ids)
+    def has_pending_jobs(self, *, include_services: bool = False) -> bool:
+        return bool(self.pending_jobs(include_services=include_services))
 
-    def pending_jobs(self) -> tuple[BashJobRecord, ...]:
+    def pending_jobs(self, *, include_services: bool = False) -> tuple[BashJobRecord, ...]:
         self._recover_tracked_jobs()
         records: list[BashJobRecord] = []
         for job_id in tuple(self._tracked_job_ids):
@@ -132,6 +145,9 @@ class BashJobSupervisor:
                 _, record = load_job(self._workspace_dir, job_id)
             except BashJobError:
                 self._tracked_job_ids.discard(job_id)
+                self._forget_job(job_id)
+                continue
+            if not include_services and _is_managed_service(record):
                 continue
             records.append(record)
         return tuple(records)
@@ -194,6 +210,7 @@ class BashJobSupervisor:
                         f"{record.job_id}: {exc}"
                     ) from exc
                 self._tracked_job_ids.discard(record.job_id)
+                self._forget_job(record.job_id)
                 finalized_job_ids.append(record.job_id)
         return BashJobResetResult(
             finalized_job_ids=tuple(finalized_job_ids),
@@ -215,7 +232,9 @@ class BashJobSupervisor:
 
         status = str(result.metadata.get("status") or result.metadata.get("state") or "").strip()
         mode = str(result.metadata.get("mode", "")).strip()
-        is_detached_start = mode == "background" or bool(result.metadata.get("promoted_to_background"))
+        is_detached_start = mode in {"background", "service"} or bool(
+            result.metadata.get("promoted_to_background")
+        )
         if is_detached_start and status == "running":
             if context.session_id is None or context.turn_id is None:
                 return
@@ -230,16 +249,20 @@ class BashJobSupervisor:
                     agent_name=context.agent_name,
                     subagent_id=context.subagent_id,
                 )
-                paths, record = load_job(self._workspace_dir, job_id)
-                status_payload = job_status(paths, record)
                 mark_job_progress_notified(
                     workspace_dir=self._workspace_dir,
                     job_id=job_id,
                     notice_kind="bash_job_started",
-                    status=str(status_payload["status"]),
-                    stdout_bytes_seen=int(status_payload["stdout_bytes_seen"]),
-                    stderr_bytes_seen=int(status_payload["stderr_bytes_seen"]),
-                    last_update_at=_optional_string(status_payload.get("last_update_at")),
+                    status=status,
+                    stdout_bytes_seen=(
+                        _optional_int(result.metadata.get("stdout_bytes_seen")) or 0
+                    ),
+                    stderr_bytes_seen=(
+                        _optional_int(result.metadata.get("stderr_bytes_seen")) or 0
+                    ),
+                    last_update_at=_optional_string(
+                        result.metadata.get("last_update_at")
+                    ),
                     count_as_progress_update=False,
                 )
             except BashJobError:
@@ -249,6 +272,9 @@ class BashJobSupervisor:
                 )
                 return
             self._tracked_job_ids.add(job_id)
+            self._deferred_notice_markers.pop(job_id, None)
+            self._deferred_notice_recheck_at.pop(job_id, None)
+            self._next_service_poll_at.pop(job_id, None)
             self.ensure_running()
             return
 
@@ -256,36 +282,46 @@ class BashJobSupervisor:
             return
 
         try:
-            paths, record = load_job(self._workspace_dir, job_id)
+            _, record = load_job(self._workspace_dir, job_id)
         except BashJobError:
             return
         if not self._owner_matches_context(record=record, context=context):
             return
+        if not result.ok:
+            return
 
-        status_payload = job_status(paths, record)
+        status_payload = result.metadata
+        observed_status = str(status_payload.get("status", "")).strip()
+        if not observed_status:
+            return
         try:
             mark_job_progress_notified(
                 workspace_dir=self._workspace_dir,
                 job_id=job_id,
                 notice_kind=_manual_observation_notice_kind(
                     mode=mode,
-                    status=str(status_payload["status"]),
+                    status=observed_status,
                 ),
-                status=str(status_payload["status"]),
-                stdout_bytes_seen=int(status_payload["stdout_bytes_seen"]),
-                stderr_bytes_seen=int(status_payload["stderr_bytes_seen"]),
+                status=observed_status,
+                stdout_bytes_seen=(
+                    _optional_int(status_payload.get("stdout_bytes_seen")) or 0
+                ),
+                stderr_bytes_seen=(
+                    _optional_int(status_payload.get("stderr_bytes_seen")) or 0
+                ),
                 last_update_at=_optional_string(status_payload.get("last_update_at")),
             )
-            if str(status_payload["status"]) in {"finished", "cancelled"}:
+            if observed_status in {"finished", "cancelled"}:
                 mark_job_terminal_notice_dispatched(
                     workspace_dir=self._workspace_dir,
                     job_id=job_id,
                     notice_kind=_notice_kind_for_status(
-                        status=str(status_payload["status"]),
+                        status=observed_status,
                         exit_code=status_payload.get("exit_code"),
                     ),
                 )
                 self._tracked_job_ids.discard(job_id)
+                self._forget_job(job_id)
         except BashJobError:
             LOGGER.exception(
                 "Failed to record manual detached bash observation for job %s.",
@@ -334,14 +370,28 @@ class BashJobSupervisor:
             _, record = load_job(self._workspace_dir, job_id)
         except BashJobError:
             self._tracked_job_ids.discard(job_id)
+            self._forget_job(job_id)
             return None
 
         if record.owner_route_id != self._route_id:
             self._tracked_job_ids.discard(job_id)
+            self._forget_job(job_id)
             return None
         if record.terminal_notice_dispatched_at is not None:
             self._tracked_job_ids.discard(job_id)
+            self._forget_job(job_id)
             return None
+        deferred_marker = self._deferred_notice_markers.get(job_id)
+        if deferred_marker is not None:
+            if deferred_marker == _notice_delivery_marker(record):
+                recheck_at = self._deferred_notice_recheck_at.get(job_id)
+                if (
+                    recheck_at is None
+                    or asyncio.get_running_loop().time() < recheck_at
+                ):
+                    return None
+            self._deferred_notice_markers.pop(job_id, None)
+            self._deferred_notice_recheck_at.pop(job_id, None)
         if not self._followups_allowed():
             return None
         if record.owner_agent_kind == "subagent" and record.owner_subagent_id:
@@ -349,6 +399,14 @@ class BashJobSupervisor:
                 return None
         elif self._main_turn_active():
             return None
+
+        if _is_managed_service(record):
+            now = asyncio.get_running_loop().time()
+            if now < self._next_service_poll_at.get(job_id, 0.0):
+                return None
+            self._next_service_poll_at[job_id] = (
+                now + _MANAGED_SERVICE_POLL_INTERVAL_SECONDS
+            )
 
         status_result = await self._execute_internal_bash(
             record=record,
@@ -388,10 +446,7 @@ class BashJobSupervisor:
         progress_hint = _derive_progress_hint(stdout_text=stdout, stderr_text=stderr)
         notice_kind = _promote_notice_kind_for_attention(
             notice_kind=notice_kind,
-            record=record,
             status=status,
-            stdout_bytes_seen=_optional_int(status_result.metadata.get("stdout_bytes_seen")) or 0,
-            stderr_bytes_seen=_optional_int(status_result.metadata.get("stderr_bytes_seen")) or 0,
             stdout_bytes_dropped=stdout_bytes_dropped,
             stderr_bytes_dropped=stderr_bytes_dropped,
             progress_hint=progress_hint,
@@ -441,21 +496,49 @@ class BashJobSupervisor:
 
     async def _dispatch_main_notices(self, notices: tuple[BashJobNotice, ...]) -> None:
         try:
-            await self._handle_main_notices(notices)
+            accepted = await self._handle_main_notices(notices)
         except Exception:
             LOGGER.exception("Detached bash follow-up dispatch failed for main notices.")
-        return
+            return
+        if accepted:
+            self._defer_unrecorded_notices(notices)
 
     async def _dispatch_subagent_notices(self, notices: tuple[BashJobNotice, ...]) -> None:
         try:
-            await self._handle_subagent_notices(notices)
+            accepted = await self._handle_subagent_notices(notices)
         except Exception:
             subagent_id = notices[0].owner_subagent_id if notices else None
             LOGGER.exception(
                 "Detached bash follow-up dispatch failed for subagent %s.",
                 subagent_id or "unknown",
             )
-        return
+            return
+        if accepted:
+            self._defer_unrecorded_notices(notices)
+
+    def _defer_unrecorded_notices(self, notices: tuple[BashJobNotice, ...]) -> None:
+        """Avoid redispatching a notice while its owner queue has not consumed it yet."""
+        for notice in notices:
+            try:
+                _, record = load_job(self._workspace_dir, notice.job_id)
+            except BashJobError:
+                self._forget_job(notice.job_id)
+                continue
+            if _notice_was_recorded(record=record, notice=notice):
+                continue
+            self._deferred_notice_markers[notice.job_id] = _notice_delivery_marker(record)
+            if notice.status == "running":
+                self._deferred_notice_recheck_at[notice.job_id] = (
+                    asyncio.get_running_loop().time()
+                    + _DEFERRED_RUNNING_NOTICE_RECHECK_SECONDS
+                )
+            else:
+                self._deferred_notice_recheck_at.pop(notice.job_id, None)
+
+    def _forget_job(self, job_id: str) -> None:
+        self._deferred_notice_markers.pop(job_id, None)
+        self._deferred_notice_recheck_at.pop(job_id, None)
+        self._next_service_poll_at.pop(job_id, None)
 
     async def _execute_internal_bash(
         self,
@@ -525,6 +608,11 @@ def _classify_notice_kind(
         )
     if status != "running":
         return None
+    if _is_managed_service(record):
+        # A readiness-verified service is a managed route resource, not pending task work.
+        # Keep polling it for terminal failure, but never wake the model just because it is
+        # still serving normally.
+        return None
 
     stdout_bytes_seen = _optional_int(status_metadata.get("stdout_bytes_seen")) or 0
     stderr_bytes_seen = _optional_int(status_metadata.get("stderr_bytes_seen")) or 0
@@ -537,36 +625,17 @@ def _classify_notice_kind(
         return "bash_job_output_started"
     if total_bytes_seen - previous_total_bytes_seen >= _SIGNIFICANT_OUTPUT_GROWTH_BYTES:
         return "bash_job_output_grew"
-    if (
-        total_bytes_seen == 0
-        and previous_total_bytes_seen == 0
-        and (record.progress_notice_count or 0) >= _NEEDS_ATTENTION_NO_OUTPUT_HEARTBEAT_COUNT
-    ):
-        baseline = _parse_optional_iso(record.last_progress_notice_at) or _parse_optional_iso(
-            record.launched_at
-        )
-        if baseline is None:
+    if total_bytes_seen == 0 and previous_total_bytes_seen == 0:
+        if record.attention_notice_dispatched_at is not None:
             return None
-        heartbeat_notice_seconds = _heartbeat_notice_interval_seconds(record=record)
-        if (datetime.now(UTC) - baseline).total_seconds() >= heartbeat_notice_seconds:
+        launched_at = _parse_optional_iso(record.launched_at)
+        if (
+            launched_at is not None
+            and (datetime.now(UTC) - launched_at).total_seconds()
+            >= _NEEDS_ATTENTION_NO_OUTPUT_SECONDS
+        ):
             return "bash_job_needs_attention"
-
-    baseline = _parse_optional_iso(record.last_progress_notice_at) or _parse_optional_iso(
-        record.launched_at
-    )
-    if baseline is None:
-        return None
-    heartbeat_notice_seconds = _heartbeat_notice_interval_seconds(record=record)
-    if (datetime.now(UTC) - baseline).total_seconds() >= heartbeat_notice_seconds:
-        return "bash_job_heartbeat"
     return None
-
-
-def _heartbeat_notice_interval_seconds(*, record: BashJobRecord) -> float:
-    progress_notice_count = max(record.progress_notice_count or 0, 0)
-    if progress_notice_count < len(_HEARTBEAT_NOTICE_BACKOFF_SECONDS):
-        return _HEARTBEAT_NOTICE_BACKOFF_SECONDS[progress_notice_count]
-    return _HEARTBEAT_NOTICE_BACKOFF_SECONDS[-1]
 
 
 def _manual_observation_notice_kind(*, mode: str, status: str) -> str:
@@ -591,10 +660,7 @@ def _notice_kind_for_status(*, status: str, exit_code: object) -> str:
 def _promote_notice_kind_for_attention(
     *,
     notice_kind: str,
-    record: BashJobRecord,
     status: str,
-    stdout_bytes_seen: int,
-    stderr_bytes_seen: int,
     stdout_bytes_dropped: int,
     stderr_bytes_dropped: int,
     progress_hint: str | None,
@@ -603,19 +669,8 @@ def _promote_notice_kind_for_attention(
         return notice_kind
     if notice_kind == "bash_job_needs_attention":
         return notice_kind
-    if notice_kind not in {"bash_job_output_grew", "bash_job_heartbeat"}:
+    if notice_kind != "bash_job_output_grew":
         return notice_kind
-    total_bytes_seen = stdout_bytes_seen + stderr_bytes_seen
-    previous_total_bytes_seen = (
-        (record.last_progress_notice_stdout_bytes_seen or 0)
-        + (record.last_progress_notice_stderr_bytes_seen or 0)
-    )
-    if (
-        total_bytes_seen == 0
-        and previous_total_bytes_seen == 0
-        and (record.progress_notice_count or 0) >= _NEEDS_ATTENTION_NO_OUTPUT_HEARTBEAT_COUNT
-    ):
-        return "bash_job_needs_attention"
     dropped_bytes = max(stdout_bytes_dropped, stderr_bytes_dropped)
     if dropped_bytes < _NEEDS_ATTENTION_DROPPED_BYTES:
         return notice_kind
@@ -679,6 +734,43 @@ def _parse_optional_iso(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _is_managed_service(record: BashJobRecord) -> bool:
+    return record.readiness_verified and (
+        record.service_port is not None or record.readiness_url is not None
+    )
+
+
+def _notice_delivery_marker(record: BashJobRecord) -> _NoticeDeliveryMarker:
+    return _NoticeDeliveryMarker(
+        last_progress_notice_kind=record.last_progress_notice_kind,
+        last_progress_notice_at=record.last_progress_notice_at,
+        last_progress_notice_status=record.last_progress_notice_status,
+        last_progress_notice_stdout_bytes_seen=(
+            record.last_progress_notice_stdout_bytes_seen
+        ),
+        last_progress_notice_stderr_bytes_seen=(
+            record.last_progress_notice_stderr_bytes_seen
+        ),
+        last_progress_notice_last_update_at=(
+            record.last_progress_notice_last_update_at
+        ),
+        terminal_notice_dispatched_at=record.terminal_notice_dispatched_at,
+    )
+
+
+def _notice_was_recorded(*, record: BashJobRecord, notice: BashJobNotice) -> bool:
+    if notice.status in {"finished", "cancelled"}:
+        return record.terminal_notice_dispatched_at is not None
+    return (
+        record.last_progress_notice_kind == notice.notice_kind
+        and record.last_progress_notice_status == notice.status
+        and (record.last_progress_notice_stdout_bytes_seen or 0)
+        >= notice.stdout_bytes_seen
+        and (record.last_progress_notice_stderr_bytes_seen or 0)
+        >= notice.stderr_bytes_seen
+    )
 
 
 def _optional_string(value: object) -> str | None:

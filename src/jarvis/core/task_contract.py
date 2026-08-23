@@ -23,6 +23,19 @@ _REQUIREMENT_REPLACEMENT_PATTERN = re.compile(
     r"\b(?:waive|drop|remove)\b.*\brequirement\b|\b(?:no longer|do not|don't)\s+need\b",
     re.IGNORECASE,
 )
+_TASK_REPLACEMENT_PATTERN = re.compile(
+    r"\b(?:forget|cancel|stop|discard)\b.*\b(?:previous|prior|current|old)\b.*\btask\b|"
+    r"^\s*(?:new task|instead[, :]|start over\b)",
+    re.IGNORECASE,
+)
+_SIDE_QUERY_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:give\s+me\s+)?(?:a\s+)?(?:quick\s+)?(?:status|progress)"
+    r"(?:\s+update|\s+report)?\b|"
+    r"^\s*(?:what\s+time\s+is\s+it\??\s*$|"
+    r"what(?:'s|\s+is)\s+the\s+(?:current\s+)?(?:status|progress|time)|"
+    r"how\s+(?:is|are)\b.*\bgoing\??\s*$)",
+    re.IGNORECASE,
+)
 _MAX_REQUIREMENTS = 64
 _MAX_CRITERION_CHARS = 1_000
 
@@ -116,7 +129,11 @@ def build_task_contract(*, task_id: str, origin_turn_id: str, user_text: str) ->
     for raw_fragment in _SENTENCE_BOUNDARY.split(normalized_text):
         fragment = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw_fragment).strip()
         fragment = re.sub(r"\s+", " ", fragment)
-        if not fragment or not _REQUIREMENT_MARKER.search(fragment):
+        if (
+            not fragment
+            or _REQUIREMENT_REPLACEMENT_PATTERN.search(fragment)
+            or not _REQUIREMENT_MARKER.search(fragment)
+        ):
             continue
         criterion = fragment[:_MAX_CRITERION_CHARS].rstrip()
         normalized_criterion = criterion.casefold()
@@ -144,6 +161,48 @@ def build_task_contract(*, task_id: str, origin_turn_id: str, user_text: str) ->
 def user_message_explicitly_resumes_task(user_text: str) -> bool:
     return bool(_RESUME_PATTERN.search(user_text)) and not bool(
         _REQUIREMENT_REPLACEMENT_PATTERN.search(user_text)
+    )
+
+
+def user_message_explicitly_replaces_task(user_text: str) -> bool:
+    return bool(_TASK_REPLACEMENT_PATTERN.search(user_text))
+
+
+def user_message_explicitly_replaces_requirements(user_text: str) -> bool:
+    return bool(_REQUIREMENT_REPLACEMENT_PATTERN.search(user_text))
+
+
+def user_message_is_side_query(user_text: str) -> bool:
+    """Return whether a user message asks about, rather than changes, active work."""
+
+    if not _SIDE_QUERY_PATTERN.search(user_text):
+        return False
+    return not bool(
+        re.search(
+            r"\b(?:then|and)\s+(?:continue|resume|keep|fix|implement|build|change|edit|run)\b",
+            user_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def merge_task_contract(
+    contract: TaskContract,
+    *,
+    user_text: str,
+) -> TaskContract:
+    supplemental = build_task_contract(
+        task_id=contract.task_id,
+        origin_turn_id=contract.origin_turn_id,
+        user_text=user_text,
+    )
+    merged_requirements = {item.item_id: item for item in contract.requirements}
+    merged_requirements.update({item.item_id: item for item in supplemental.requirements})
+    return TaskContract(
+        task_id=contract.task_id,
+        origin_turn_id=contract.origin_turn_id,
+        user_message_sha256=contract.user_message_sha256,
+        requirements=tuple(merged_requirements.values()),
     )
 
 

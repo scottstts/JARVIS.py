@@ -530,7 +530,7 @@ class RouteRuntime:
         if self._bash_job_supervisor.has_pending_jobs():
             return True
         return any(
-            snapshot.status in {"running", "waiting_background"}
+            snapshot.status in {"running", "waiting_background", "awaiting_approval"}
             for snapshot in self._subagent_manager.active_snapshots()
         )
 
@@ -1473,14 +1473,14 @@ class RouteRuntime:
     async def _enqueue_main_bash_job_followup(
         self,
         notices: tuple[BashJobNotice, ...],
-    ) -> None:
+    ) -> bool:
         if not notices:
-            return
+            return False
         if self._main_resume_requires_user_message or self._new_session_boundary_pending:
-            return
+            return False
         self._merge_main_bash_notices(notices)
         if self._main_bash_runtime_turn_queued:
-            return
+            return True
         self._main_bash_runtime_turn_queued = True
         await self._message_queue.put(
             _RouteTurnRequest(
@@ -1494,16 +1494,17 @@ class RouteRuntime:
         )
         self._queue_wakeup.set()
         self._ensure_message_worker()
+        return True
 
     async def _enqueue_subagent_bash_job_followup(
         self,
         notices: tuple[BashJobNotice, ...],
-    ) -> None:
+    ) -> bool:
         if self._subagent_reset_in_progress:
-            return
+            return False
         if self._main_resume_requires_user_message or self._new_session_boundary_pending:
-            return
-        await self._subagent_manager.enqueue_bash_job_followup(notices)
+            return False
+        return await self._subagent_manager.enqueue_bash_job_followup(notices)
 
     async def _enqueue_main_subagent_followup(
         self,
@@ -1544,10 +1545,14 @@ class RouteRuntime:
         bash_reset = BashJobResetResult()
         subagent_reset: dict[str, Any] = {}
         try:
-            subagent_reset = await self._subagent_manager.reset_for_new_session(
-                cancel_owned_bash_jobs=False,
-            )
-            bash_reset = await self._bash_job_supervisor.terminate_route_jobs_for_new_session()
+            try:
+                subagent_reset = await self._subagent_manager.reset_for_new_session()
+            finally:
+                # The isolated runtime owns process state. Always reach its route-wide
+                # cancellation path even if child shutdown or disposal fails first.
+                bash_reset = (
+                    await self._bash_job_supervisor.terminate_route_jobs_for_new_session()
+                )
             self._append_new_session_reset_note(
                 previous_session_id=previous_session_id,
                 bash_reset=bash_reset,
@@ -1797,6 +1802,9 @@ class RouteRuntime:
                 "bash_job_notice_kinds": [notice.notice_kind for notice in notices],
                 "bash_job_running_ids": [notice.job_id for notice in running_notices],
                 "bash_job_terminal_ids": [notice.job_id for notice in terminal_notices],
+                "bash_job_progress_fingerprints": [
+                    _bash_job_progress_fingerprint(notice) for notice in notices
+                ],
             },
             content="\n".join(lines),
         )
@@ -2003,6 +2011,21 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _bash_job_progress_fingerprint(notice: BashJobNotice) -> str:
+    return ":".join(
+        (
+            notice.job_id,
+            notice.notice_kind,
+            notice.status,
+            str(notice.stdout_bytes_seen),
+            str(notice.stderr_bytes_seen),
+            str(notice.stdout_bytes_dropped),
+            str(notice.stderr_bytes_dropped),
+            "" if notice.exit_code is None else str(notice.exit_code),
+        )
+    )
 
 
 def _nonnegative_int(value: object) -> int:

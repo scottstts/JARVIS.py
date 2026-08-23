@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from jarvis.core import (
     AgentApprovalRequestEvent,
@@ -37,7 +38,7 @@ from jarvis.subagent.storage import SubagentCatalogStorage
 from jarvis.subagent.types import SubagentCatalogEntry
 from tests.helpers import build_core_settings
 from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolSettings
-from jarvis.tools.basic.bash.jobs import claim_job_owner, create_background_job
+from jarvis.tools.basic.bash.jobs import claim_job_owner, create_background_job, load_job
 
 
 def _build_response(text: str) -> LLMResponse:
@@ -507,6 +508,45 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry.skill_selection_reason, "explicit_or_inherited")
             self.assertEqual(entry.owned_paths, ("tests/test_storage.py",))
 
+    async def test_auto_skill_selection_requires_assignment_domain_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            skill_dir = core_settings.workspace_dir / "skills" / "threejs-procedural-fields"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                "name: threejs-procedural-fields\n"
+                "description: Build coherent procedural scalar and vector fields for Three.js "
+                "materials, terrain, and geometry.\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            self.assertEqual(
+                manager._auto_select_skill_ids(
+                    "Implement a Python HTTP status server with JSON responses, pytest tests, "
+                    "environment-variable configuration, and clean signal shutdown."
+                ),
+                (),
+            )
+            self.assertEqual(
+                manager._auto_select_skill_ids(
+                    "Build a Three.js procedural terrain whose height fields drive geometry."
+                ),
+                ("threejs-procedural-fields",),
+            )
+
     async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))
@@ -871,12 +911,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 "_wait_for_turn_settle",
                 side_effect=_wait_for_turn_settle,
             ):
-                with patch.object(
-                    manager,
-                    "_cancel_owned_bash_jobs",
-                    return_value=[],
-                ):
-                    result = await manager.reset_for_new_session()
+                result = await manager.reset_for_new_session()
 
             self.assertCountEqual(
                 result["disposed_subagent_ids"],
@@ -906,7 +941,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(dispose_notices, [])
 
-    async def test_reset_for_new_session_cancels_owned_waiting_background_jobs_before_dispose(
+    async def test_reset_for_new_session_leaves_job_cancellation_to_route_supervisor(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -962,7 +997,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             job = create_background_job(
                 workspace_dir=tool_settings.workspace_dir,
                 bash_executable="/bin/bash",
-                command="sleep 5",
+                command="true",
                 cwd="/workspace",
                 log_max_bytes=tool_settings.bash_job_log_max_bytes,
                 total_storage_budget_bytes=tool_settings.bash_job_total_storage_budget_bytes,
@@ -979,29 +1014,14 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 subagent_id="sub_waiting",
             )
 
-            with patch(
-                "jarvis.subagent.manager.job_status",
-                return_value={"status": "running", "exit_code": None},
-            ):
-                with patch(
-                    "jarvis.subagent.manager.cancel_job",
-                    return_value={"status": "cancelled", "exit_code": None},
-                ) as cancel_job_mock:
-                    with patch(
-                        "jarvis.subagent.manager.mark_job_terminal_notice_dispatched",
-                    ) as mark_terminal_notice:
-                        result = await manager.reset_for_new_session()
+            result = await manager.reset_for_new_session()
 
-            self.assertEqual(result["cancelled_job_ids"], [job.job_id])
-            self.assertEqual(result["cancelled_job_count"], 1)
+            self.assertEqual(result["cancelled_job_ids"], [])
+            self.assertEqual(result["cancelled_job_count"], 0)
             self.assertEqual(manager._subagents["sub_waiting"].status, "disposed")
             self.assertEqual(manager._subagents["sub_waiting"].pending_background_job_ids, set())
-            cancel_job_mock.assert_called_once()
-            mark_terminal_notice.assert_called_once_with(
-                workspace_dir=core_settings.workspace_dir,
-                job_id=job.job_id,
-                notice_kind="bash_job_cancelled",
-            )
+            _, retained_job = load_job(tool_settings.workspace_dir, job.job_id)
+            self.assertIsNone(retained_job.terminal_notice_dispatched_at)
 
             catalog_entry = manager._catalog.get_entry("sub_waiting")
             self.assertIsNotNone(catalog_entry)
@@ -1309,6 +1329,32 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(note_metadata["notice_kind"], "bash_job_progress_update")
             self.assertEqual(note_metadata["recommended_action"], "finalize")
 
+            runtime.status = "paused"
+            runtime.pause_reason = None
+            paused_job_id = "feedbeeffeedbeeffeedbeeffeedbeef"
+            runtime.pending_background_job_ids.add(paused_job_id)
+            paused_notice = replace(notice, job_id=paused_job_id)
+            with patch.object(manager, "_launch_runtime_task", side_effect=fake_launch_runtime_task):
+                accepted = await manager.enqueue_bash_job_followup((paused_notice,))
+
+            self.assertTrue(accepted)
+            self.assertEqual(runtime.status, "running")
+            self.assertNotIn(paused_job_id, runtime.pending_background_job_ids)
+
+            runtime.status = "paused"
+            runtime.pause_reason = "main_stop"
+            stopped_job_id = "cafebabecafebabecafebabecafebabe"
+            runtime.pending_background_job_ids.add(stopped_job_id)
+            stopped_notice = replace(notice, job_id=stopped_job_id)
+            launched.clear()
+            with patch.object(manager, "_launch_runtime_task", side_effect=fake_launch_runtime_task):
+                accepted = await manager.enqueue_bash_job_followup((stopped_notice,))
+
+            self.assertTrue(accepted)
+            self.assertEqual(runtime.status, "paused")
+            self.assertNotIn(stopped_job_id, runtime.pending_background_job_ids)
+            self.assertEqual(launched, {})
+
     async def test_running_bash_job_followup_keeps_pending_job_until_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))
@@ -1371,7 +1417,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             notice = BashJobNotice(
                 job_id="deadbeefdeadbeefdeadbeefdeadbeef",
-                notice_kind="bash_job_heartbeat",
+                notice_kind="bash_job_output_grew",
                 owner_route_id="route_1",
                 owner_session_id="subagent_session",
                 owner_turn_id="turn_1",

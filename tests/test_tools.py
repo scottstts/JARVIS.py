@@ -18,6 +18,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from jsonschema import Draft202012Validator
 from jarvis.llm import ToolCall, ToolDefinition
+from jarvis.tool_runtime_protocol import (
+    TOOL_RUNTIME_PROTOCOL_VERSION,
+    tool_runtime_capabilities_payload,
+)
 from jarvis.memory import MemoryService, MemorySettings
 from jarvis.tools import (
     DiscoverableTool,
@@ -46,7 +50,12 @@ from jarvis.tools.basic.bash.local_executor import (
     DirectBashToolExecutor,
     format_bash_tool_description,
 )
-from jarvis.tools.basic.bash.jobs import load_job, sweep_job_artifacts
+from jarvis.tools.basic.bash.jobs import (
+    create_background_job,
+    load_job,
+    mark_job_progress_notified,
+    sweep_job_artifacts,
+)
 from jarvis.tools.basic.web_fetch.tool import (
     BrowserRenderResult,
     DirectWebFetchToolExecutor,
@@ -1050,7 +1059,89 @@ class DirectBashToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(paths.job_dir.exists())
 
 
+class BashJobMetadataTests(unittest.TestCase):
+    def test_attention_latch_survives_later_manual_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp)
+            job = create_background_job(
+                workspace_dir=workspace_dir,
+                bash_executable="/bin/bash",
+                command="true",
+                cwd=str(workspace_dir),
+                log_max_bytes=1_024,
+                total_storage_budget_bytes=100_000,
+                retention_seconds=60.0,
+            )
+
+            attention = mark_job_progress_notified(
+                workspace_dir=workspace_dir,
+                job_id=job.job_id,
+                notice_kind="bash_job_needs_attention",
+                status="running",
+                stdout_bytes_seen=0,
+                stderr_bytes_seen=0,
+                last_update_at=None,
+            )
+            observed = mark_job_progress_notified(
+                workspace_dir=workspace_dir,
+                job_id=job.job_id,
+                notice_kind="bash_job_observed_status",
+                status="running",
+                stdout_bytes_seen=0,
+                stderr_bytes_seen=0,
+                last_update_at=None,
+            )
+
+            self.assertIsNotNone(attention.attention_notice_dispatched_at)
+            self.assertEqual(
+                observed.attention_notice_dispatched_at,
+                attention.attention_notice_dispatched_at,
+            )
+            self.assertEqual(observed.last_progress_notice_kind, "bash_job_observed_status")
+
+
 class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_healthcheck_requires_matching_protocol_and_capabilities(self) -> None:
+        payloads = [
+            {"status": "ok", "workspace_dir": "/workspace"},
+            {
+                "status": "ok",
+                "workspace_dir": "/workspace",
+                "protocol_version": TOOL_RUNTIME_PROTOCOL_VERSION,
+                "capabilities": tool_runtime_capabilities_payload(),
+            },
+        ]
+
+        class _FakeAsyncClient:
+            def __init__(self, *, base_url: str, timeout: float) -> None:
+                _ = base_url, timeout
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                _ = exc_type, exc, tb
+
+            async def get(self, url: str) -> _FakeAsyncHTTPResponse:
+                self_url = url
+                _ = self_url
+                return _FakeAsyncHTTPResponse(status_code=200, payload=payloads.pop(0))
+
+        with patch.dict(
+            os.environ,
+            {"JARVIS_TOOL_RUNTIME_BASE_URL": "http://tool_runtime:8081"},
+            clear=False,
+        ):
+            settings = ToolSettings.from_workspace_dir(Path("/workspace"))
+        client = RemoteToolRuntimeClient(settings)
+
+        with patch("jarvis.tools.remote_runtime_client.httpx.AsyncClient", _FakeAsyncClient):
+            with self.assertRaisesRegex(RemoteToolRuntimeError, "Rebuild and restart"):
+                await client.healthcheck()
+            health = await client.healthcheck()
+
+        self.assertEqual(health["protocol_version"], TOOL_RUNTIME_PROTOCOL_VERSION)
+
     async def test_execute_serializes_request_and_parses_result(self) -> None:
         captured_requests: list[tuple[str, str, dict[str, object] | None]] = []
         captured_timeouts: list[float] = []

@@ -6,6 +6,9 @@ from typing import Any
 
 import httpx
 
+from jarvis.logging_setup import suppress_internal_httpx_request_logs
+from jarvis.tool_runtime_protocol import validate_tool_runtime_health_payload
+
 from .config import ToolSettings
 from .types import ToolExecutionContext, ToolExecutionResult
 
@@ -32,11 +35,12 @@ class RemoteToolRuntimeClient:
             return {"configured": False}
 
         try:
-            async with httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=self._healthcheck_timeout_seconds,
-            ) as client:
-                response = await client.get("/health")
+            with suppress_internal_httpx_request_logs():
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._healthcheck_timeout_seconds,
+                ) as client:
+                    response = await client.get("/health")
         except httpx.HTTPError as exc:
             raise RemoteToolRuntimeError(
                 f"tool_runtime healthcheck failed: {exc}"
@@ -57,6 +61,12 @@ class RemoteToolRuntimeClient:
 
         if not isinstance(payload, dict):
             raise RemoteToolRuntimeError("tool_runtime healthcheck payload must be an object.")
+        incompatibility = validate_tool_runtime_health_payload(payload)
+        if incompatibility is not None:
+            raise RemoteToolRuntimeError(
+                "tool_runtime is incompatible with this Jarvis build: "
+                f"{incompatibility}. Rebuild and restart the tool_runtime container."
+            )
         return payload
 
     async def execute(
@@ -88,11 +98,12 @@ class RemoteToolRuntimeClient:
             base_timeout_seconds=self._timeout_seconds,
         )
         try:
-            async with httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=request_timeout,
-            ) as client:
-                response = await client.post(endpoint, json=payload)
+            with suppress_internal_httpx_request_logs():
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=request_timeout,
+                ) as client:
+                    response = await client.post(endpoint, json=payload)
         except httpx.HTTPError as exc:
             raise RemoteToolRuntimeError(
                 f"tool_runtime request failed for '{tool_name}': {exc}"

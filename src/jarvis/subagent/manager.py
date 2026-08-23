@@ -59,9 +59,6 @@ from jarvis.tools import (
 )
 from jarvis.tools.basic.bash.jobs import (
     BashJobError,
-    cancel_job,
-    job_status,
-    list_jobs,
     mark_job_progress_notified,
     mark_job_terminal_notice_dispatched,
 )
@@ -443,24 +440,17 @@ class SubagentManager:
             raise ValueError("Cannot dispose a running subagent. Stop it first.")
         return await self._dispose_runtime(runtime, public_notice=True)
 
-    async def reset_for_new_session(
-        self,
-        *,
-        cancel_owned_bash_jobs: bool = True,
-    ) -> dict[str, Any]:
+    async def reset_for_new_session(self) -> dict[str, Any]:
         self.request_hard_stop_all_for_new_session()
         for runtime in tuple(self._non_disposed_runtimes()):
             await self._wait_for_turn_settle(runtime)
 
         disposed_subagent_ids: list[str] = []
-        cancelled_job_ids: list[str] = []
         live_subagent_ids = set(self._subagents)
 
         for runtime in tuple(self._subagents.values()):
             if runtime.status == "disposed":
                 continue
-            if cancel_owned_bash_jobs:
-                cancelled_job_ids.extend(self._cancel_owned_bash_jobs(runtime.subagent_id))
             runtime.pending_background_job_ids.clear()
             self._pending_bash_job_notices.pop(runtime.subagent_id, None)
             payload = await self._dispose_runtime(runtime, public_notice=False)
@@ -470,8 +460,6 @@ class SubagentManager:
         for entry in self._catalog.list_entries():
             if entry.status == "disposed" or entry.subagent_id in live_subagent_ids:
                 continue
-            if cancel_owned_bash_jobs:
-                cancelled_job_ids.extend(self._cancel_owned_bash_jobs(entry.subagent_id))
             self._pending_bash_job_notices.pop(entry.subagent_id, None)
             disposed_at = _utc_now_iso()
             self._catalog.update_entry(
@@ -486,9 +474,9 @@ class SubagentManager:
         self._last_main_context_signature = None
         return {
             "disposed_subagent_ids": disposed_subagent_ids,
-            "cancelled_job_ids": cancelled_job_ids,
+            "cancelled_job_ids": [],
             "disposed_count": len(disposed_subagent_ids),
-            "cancelled_job_count": len(cancelled_job_ids),
+            "cancelled_job_count": 0,
         }
 
     def main_turn_runtime_messages(self, *, session_id: str) -> tuple[AgentRuntimeMessage, ...]:
@@ -770,9 +758,9 @@ class SubagentManager:
             ),
         )
 
-    async def enqueue_bash_job_followup(self, notices: tuple[BashJobNotice, ...]) -> None:
+    async def enqueue_bash_job_followup(self, notices: tuple[BashJobNotice, ...]) -> bool:
         if not notices:
-            return
+            return False
         runtime = self._require_runtime(notices[0].owner_subagent_id or "")
         queue = self._pending_bash_job_notices.setdefault(runtime.subagent_id, {})
         for notice in notices:
@@ -787,6 +775,7 @@ class SubagentManager:
         )
         self._sync_catalog(runtime)
         await self._maybe_start_next_bash_job_followup(runtime)
+        return True
 
     async def _run_turn(
         self,
@@ -1287,14 +1276,21 @@ class SubagentManager:
         await self._maybe_start_next_bash_job_followup(runtime)
 
     async def _maybe_start_next_bash_job_followup(self, runtime: SubagentRuntime) -> bool:
-        if runtime.task is not None and not runtime.task.done():
-            return False
-        if runtime.status in {"paused", "awaiting_approval", "failed", "disposed"}:
-            return False
         queue = self._pending_bash_job_notices.get(runtime.subagent_id)
         if not queue:
             return False
         notices = tuple(queue.values())
+        for notice in notices:
+            if notice.status in {"finished", "cancelled"}:
+                runtime.pending_background_job_ids.discard(notice.job_id)
+            else:
+                runtime.pending_background_job_ids.add(notice.job_id)
+        if runtime.task is not None and not runtime.task.done():
+            return False
+        if runtime.status in {"awaiting_approval", "failed", "disposed"}:
+            return False
+        if runtime.status == "paused" and runtime.pause_reason is not None:
+            return False
         session_id = notices[0].owner_session_id or runtime.loop.active_session_id()
         if session_id is None:
             return False
@@ -1303,11 +1299,6 @@ class SubagentManager:
             notices,
             recommendation=recommendation,
         )
-        for notice in notices:
-            if notice.status in {"finished", "cancelled"}:
-                runtime.pending_background_job_ids.discard(notice.job_id)
-            else:
-                runtime.pending_background_job_ids.add(notice.job_id)
         if recommendation == "wait":
             queue.clear()
             runtime.pause_reason = None
@@ -1427,6 +1418,9 @@ class SubagentManager:
                 "bash_job_notice_kinds": [notice.notice_kind for notice in notices],
                 "bash_job_running_ids": [notice.job_id for notice in running_notices],
                 "bash_job_terminal_ids": [notice.job_id for notice in terminal_notices],
+                "bash_job_progress_fingerprints": [
+                    _bash_job_progress_fingerprint(notice) for notice in notices
+                ],
             },
             content="\n".join(lines),
         )
@@ -1639,38 +1633,6 @@ class SubagentManager:
             "status": runtime.status,
             "changed": True,
         }
-
-    def _cancel_owned_bash_jobs(self, subagent_id: str) -> list[str]:
-        cancelled_job_ids: list[str] = []
-        for paths, record in list_jobs(self._core_settings.workspace_dir):
-            if record.owner_route_id != self._route_id:
-                continue
-            if record.owner_subagent_id != subagent_id:
-                continue
-            if record.terminal_notice_dispatched_at is not None:
-                continue
-            try:
-                status = job_status(paths, record)
-                if str(status["status"]) == "running":
-                    status = cancel_job(paths, record)
-                if str(status["status"]) == "running":
-                    raise RuntimeError(
-                        f"Detached bash job {record.job_id} is still running after cancellation."
-                    )
-                mark_job_terminal_notice_dispatched(
-                    workspace_dir=self._core_settings.workspace_dir,
-                    job_id=record.job_id,
-                    notice_kind=_terminal_notice_kind_for_status(
-                        status=str(status["status"]),
-                        exit_code=status.get("exit_code"),
-                    ),
-                )
-                cancelled_job_ids.append(record.job_id)
-            except BashJobError as exc:
-                raise RuntimeError(
-                    f"Failed to cancel or finalize detached bash job {record.job_id}: {exc}"
-                ) from exc
-        return cancelled_job_ids
 
     def _append_notable_event(self, runtime: SubagentRuntime, *, kind: str, summary: str) -> None:
         runtime.updated_at = _utc_now_iso()
@@ -1973,14 +1935,6 @@ def _exception_metadata(exc: Exception) -> dict[str, Any]:
     return json.loads(json.dumps(exc.metadata, ensure_ascii=False, default=str))
 
 
-def _terminal_notice_kind_for_status(*, status: str, exit_code: object) -> str:
-    if status == "cancelled":
-        return "bash_job_cancelled"
-    if status == "finished":
-        return "bash_job_completed" if int(exit_code or 0) == 0 else "bash_job_failed"
-    return "bash_job_cancelled"
-
-
 def _subagent_notice_is_public(notice_kind: str) -> bool:
     return notice_kind in {"subagent_invoked", "subagent_disposed"}
 
@@ -2012,17 +1966,36 @@ def _skill_matches_assignment(skill: SkillHeader, assignment: str) -> bool:
     name = skill.name.lower()
     if skill_id in normalized or (len(name) >= 5 and name in normalized):
         return True
-    assignment_tokens = {
-        token.strip(".,:;()[]{}!?/\\")
-        for token in normalized.split()
-        if len(token.strip(".,:;()[]{}!?/\\")) >= 5
-    } - _SKILL_MATCH_STOP_WORDS
-    description_tokens = {
-        token.strip(".,:;()[]{}!?/\\")
-        for token in skill.description.lower().split()
-        if len(token.strip(".,:;()[]{}!?/\\")) >= 5
-    } - _SKILL_MATCH_STOP_WORDS
-    return len(assignment_tokens & description_tokens) >= 2
+    assignment_tokens = _skill_match_tokens(normalized)
+    identity_tokens = _skill_match_tokens(f"{skill_id} {name}")
+    identity_hits = assignment_tokens & identity_tokens
+    if not identity_hits:
+        return False
+    description_hits = assignment_tokens & _skill_match_tokens(skill.description)
+    return len(identity_hits) >= 2 or bool(description_hits - identity_hits)
+
+
+def _skill_match_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.lower())
+        if len(token) >= 5 and token not in _SKILL_MATCH_STOP_WORDS
+    }
+
+
+def _bash_job_progress_fingerprint(notice: BashJobNotice) -> str:
+    return ":".join(
+        (
+            notice.job_id,
+            notice.notice_kind,
+            notice.status,
+            str(notice.stdout_bytes_seen),
+            str(notice.stderr_bytes_seen),
+            str(notice.stdout_bytes_dropped),
+            str(notice.stderr_bytes_dropped),
+            "" if notice.exit_code is None else str(notice.exit_code),
+        )
+    )
 
 
 def _format_terminal_bash_evidence(notice: BashJobNotice) -> list[str]:

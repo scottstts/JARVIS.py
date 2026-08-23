@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 import re
 import threading
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _TELEGRAM_BOT_TOKEN_PATTERN = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
+_SUPPRESS_INTERNAL_HTTPX_REQUEST_LOGS: ContextVar[bool] = ContextVar(
+    "jarvis_suppress_internal_httpx_request_logs",
+    default=False,
+)
 
 
 def _redact_sensitive_text(text: str) -> str:
@@ -55,6 +62,28 @@ class CollapseTelegramDraftRequestFilter(logging.Filter):
             return allow
 
 
+class SuppressInternalHttpxRequestFilter(logging.Filter):
+    """Hide HTTP transport chatter for Jarvis's own container RPC calls."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name == "httpx"
+            and record.levelno <= logging.INFO
+            and _SUPPRESS_INTERNAL_HTTPX_REQUEST_LOGS.get()
+        )
+
+
+@contextmanager
+def suppress_internal_httpx_request_logs() -> Iterator[None]:
+    """Suppress routine httpx INFO records inside an internal RPC operation."""
+
+    token = _SUPPRESS_INTERNAL_HTTPX_REQUEST_LOGS.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_INTERNAL_HTTPX_REQUEST_LOGS.reset(token)
+
+
 def get_application_logger(module_name: str) -> logging.Logger:
     """Preserve pre-refactor logger names after moving into the jarvis package."""
 
@@ -69,6 +98,8 @@ def configure_application_logging() -> None:
 
     root_logger = logging.getLogger()
     draft_filter = CollapseTelegramDraftRequestFilter()
+    internal_httpx_filter = SuppressInternalHttpxRequestFilter()
     for handler in root_logger.handlers:
         handler.setFormatter(SensitiveDataFormatter(_LOG_FORMAT))
         handler.addFilter(draft_filter)
+        handler.addFilter(internal_httpx_filter)

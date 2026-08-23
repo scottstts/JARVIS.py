@@ -22,6 +22,7 @@ from jarvis.llm import DoneEvent, LLMResponse, LLMUsage, ProviderTimeoutError, T
 from jarvis.gateway.bash_job_supervisor import (
     BashJobNotice,
     BashJobResetResult,
+    BashJobSupervisor,
     _classify_notice_kind,
 )
 from jarvis.gateway.route_events import (
@@ -44,12 +45,13 @@ from jarvis.gateway.session_router import SessionRouter, validate_route_id
 from jarvis.subagent.types import SubagentSnapshot
 from jarvis.subagent.primitives import build_subagent_primitive_definitions
 from tests.helpers import build_core_settings
-from jarvis.tools import ToolExecutionResult, ToolSettings
+from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolSettings
 from jarvis.tools.basic.bash.jobs import (
     BashJobRecord,
     claim_job_owner,
     create_background_job,
     load_job,
+    write_job_metadata,
 )
 
 
@@ -421,6 +423,23 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subagent_awaiting_approval_keeps_route_task_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            snapshot = AsyncMock()
+            snapshot.status = "awaiting_approval"
+
+            with patch.object(
+                runtime._subagent_manager,
+                "active_snapshots",
+                return_value=(snapshot,),
+            ):
+                self.assertTrue(runtime._route_task_active())
+
     async def test_user_message_publishes_task_status_until_turn_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
@@ -652,8 +671,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             )
             observed: list[object] = []
 
-            async def _reset(*, cancel_owned_bash_jobs: bool) -> dict[str, object]:
-                self.assertFalse(cancel_owned_bash_jobs)
+            async def _reset() -> dict[str, object]:
                 observed.append("reset")
                 return {
                     "disposed_subagent_ids": [],
@@ -672,21 +690,28 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
 
             with patch.object(
-                runtime._subagent_manager,
-                "reset_for_new_session",
-                side_effect=_reset,
-            ):
-                await runtime._user_message_queue.put(
-                    _RouteTurnRequest(
-                        user_text="/new",
-                        client_message_id="msg_new",
-                        parse_commands=True,
-                        user_initiated=True,
+                runtime._bash_job_supervisor,
+                "terminate_route_jobs_for_new_session",
+                return_value=BashJobResetResult(),
+            ) as reset_bash_jobs:
+                with patch.object(
+                    runtime._subagent_manager,
+                    "reset_for_new_session",
+                    side_effect=_reset,
+                ):
+                    await runtime._user_message_queue.put(
+                        _RouteTurnRequest(
+                            user_text="/new",
+                            client_message_id="msg_new",
+                            parse_commands=True,
+                            user_initiated=True,
+                        )
                     )
-                )
-                runtime._queue_wakeup.set()
-                runtime._ensure_message_worker()
-                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+                    runtime._queue_wakeup.set()
+                    runtime._ensure_message_worker()
+                    await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            reset_bash_jobs.assert_awaited_once_with()
 
             self.assertEqual(observed, ["reset", ("user", "/new")])
 
@@ -733,8 +758,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             runtime._pending_main_bash_notices[notice.job_id] = notice
             runtime._main_resume_requires_user_message = True
 
-            async def _reset(*, cancel_owned_bash_jobs: bool) -> dict[str, object]:
-                self.assertFalse(cancel_owned_bash_jobs)
+            async def _reset() -> dict[str, object]:
                 return {
                     "disposed_subagent_ids": [],
                     "cancelled_job_ids": [],
@@ -851,21 +875,28 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             runtime._main_loop.stream_user_input = _stream_user_input  # type: ignore[method-assign]
 
             with patch.object(
-                runtime._subagent_manager,
-                "reset_for_new_session",
-                side_effect=_reset,
-            ):
-                await runtime._user_message_queue.put(
-                    _RouteTurnRequest(
-                        user_text="/new",
-                        client_message_id="msg_new",
-                        parse_commands=True,
-                        user_initiated=True,
+                runtime._bash_job_supervisor,
+                "terminate_route_jobs_for_new_session",
+                return_value=BashJobResetResult(),
+            ) as reset_bash_jobs:
+                with patch.object(
+                    runtime._subagent_manager,
+                    "reset_for_new_session",
+                    side_effect=_reset,
+                ):
+                    await runtime._user_message_queue.put(
+                        _RouteTurnRequest(
+                            user_text="/new",
+                            client_message_id="msg_new",
+                            parse_commands=True,
+                            user_initiated=True,
+                        )
                     )
-                )
-                runtime._queue_wakeup.set()
-                runtime._ensure_message_worker()
-                await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+                    runtime._queue_wakeup.set()
+                    runtime._ensure_message_worker()
+                    await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
+
+            reset_bash_jobs.assert_awaited_once_with()
 
             event = await asyncio.wait_for(queue.get(), timeout=1)
             self.assertIsInstance(event, RouteErrorEvent)
@@ -1573,6 +1604,68 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("detached bash jobs", stop_notes[0].content)
             self.assertIn(job.job_id, stop_notes[0].content)
 
+    async def test_ready_service_is_owned_but_does_not_keep_task_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            tool_settings = ToolSettings.from_workspace_dir(runtime._core_settings.workspace_dir)
+            paths = create_background_job(
+                workspace_dir=tool_settings.workspace_dir,
+                bash_executable="/bin/bash",
+                command="npm run preview",
+                cwd="/workspace",
+                log_max_bytes=tool_settings.bash_job_log_max_bytes,
+                total_storage_budget_bytes=tool_settings.bash_job_total_storage_budget_bytes,
+                retention_seconds=tool_settings.bash_job_retention_seconds,
+            )
+            _, record = load_job(tool_settings.workspace_dir, paths.job_id)
+            write_job_metadata(
+                paths=paths,
+                pid=record.pid,
+                pgid=record.pgid,
+                runner_pid=record.runner_pid,
+                runner_pgid=record.runner_pgid,
+                command=record.command,
+                launched_at=record.launched_at,
+                cwd=record.cwd,
+                service_port=4173,
+                readiness_url="http://127.0.0.1:4173/",
+                readiness_verified=True,
+            )
+
+            with patch.object(runtime._bash_job_supervisor, "ensure_running"):
+                await runtime._bash_job_supervisor.observe_tool_result(
+                    result=ToolExecutionResult(
+                        call_id="service-start",
+                        name="bash",
+                        ok=True,
+                        content="ready",
+                        metadata={
+                            "mode": "service",
+                            "status": "running",
+                            "job_id": paths.job_id,
+                            "readiness_verified": True,
+                        },
+                    ),
+                    context=ToolExecutionContext(
+                        workspace_dir=tool_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                        turn_id="turn_1",
+                    ),
+                )
+
+            self.assertFalse(runtime._bash_job_supervisor.has_pending_jobs())
+            self.assertEqual(
+                [job.job_id for job in runtime._bash_job_supervisor.pending_jobs(include_services=True)],
+                [paths.job_id],
+            )
+            self.assertFalse(runtime._route_task_active())
+
     async def test_new_session_hard_reset_terminates_and_finalizes_route_bash_jobs(
         self,
     ) -> None:
@@ -1669,7 +1762,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 ) as reset_subagents:
                     await runtime._prepare_new_session_request()
 
-            reset_subagents.assert_awaited_once_with(cancel_owned_bash_jobs=False)
+            reset_subagents.assert_awaited_once_with()
 
             records = runtime._main_loop._storage.load_records(previous_session_id)
             reset_records = [
@@ -1724,8 +1817,9 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with patch.object(runtime, "_ensure_message_worker"):
-                await runtime._enqueue_main_bash_job_followup((notice,))
+                accepted = await runtime._enqueue_main_bash_job_followup((notice,))
 
+            self.assertTrue(accepted)
             queued = runtime._message_queue.get_nowait()
             self.assertIsNone(queued.user_text)
             self.assertFalse(queued.parse_commands)
@@ -1768,8 +1862,9 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 progress_hint="done",
             )
 
-            await runtime._enqueue_main_bash_job_followup((notice,))
+            accepted = await runtime._enqueue_main_bash_job_followup((notice,))
 
+            self.assertFalse(accepted)
             self.assertTrue(runtime._message_queue.empty())
 
     async def test_main_bash_runtime_turn_persists_concise_agent_only_system_notice_and_uses_runtime_turn(
@@ -1852,7 +1947,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await worker
 
-    def test_bash_heartbeat_backoff_uses_progress_notice_count(self) -> None:
+    def test_unchanged_background_job_emits_attention_once_without_heartbeats(self) -> None:
         now = datetime.now(UTC)
         base_record = BashJobRecord(
             job_id="deadbeefdeadbeefdeadbeefdeadbeef",
@@ -1876,8 +1971,9 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             terminal_notice_dispatched_at=None,
         )
 
-        first_heartbeat_record = replace(
+        not_yet_due_record = replace(
             base_record,
+            launched_at=(now - timedelta(minutes=4)).isoformat(),
             last_progress_notice_kind="bash_job_started",
             last_progress_notice_at=(now - timedelta(seconds=31)).isoformat(),
             last_progress_notice_status="running",
@@ -1886,60 +1982,434 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             last_progress_notice_last_update_at=(now - timedelta(seconds=31)).isoformat(),
             progress_notice_count=0,
         )
-        self.assertEqual(
-            _classify_notice_kind(
-                record=first_heartbeat_record,
-                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
-            ),
-            "bash_job_heartbeat",
-        )
-
-        second_heartbeat_not_due = replace(
-            first_heartbeat_record,
-            last_progress_notice_at=(now - timedelta(seconds=45)).isoformat(),
-            progress_notice_count=1,
-        )
         self.assertIsNone(
             _classify_notice_kind(
-                record=second_heartbeat_not_due,
+                record=not_yet_due_record,
                 status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
             )
         )
 
-        second_heartbeat_due = replace(
-            first_heartbeat_record,
-            last_progress_notice_at=(now - timedelta(seconds=61)).isoformat(),
-            progress_notice_count=1,
-        )
         self.assertEqual(
             _classify_notice_kind(
-                record=second_heartbeat_due,
-                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
-            ),
-            "bash_job_heartbeat",
-        )
-
-        third_heartbeat_not_due = replace(
-            first_heartbeat_record,
-            last_progress_notice_at=(now - timedelta(seconds=120)).isoformat(),
-            progress_notice_count=2,
-        )
-        self.assertIsNone(
-            _classify_notice_kind(
-                record=third_heartbeat_not_due,
-                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
-            )
-        )
-
-        third_heartbeat_due = replace(
-            first_heartbeat_record,
-            last_progress_notice_at=(now - timedelta(seconds=181)).isoformat(),
-            progress_notice_count=2,
-        )
-        self.assertEqual(
-            _classify_notice_kind(
-                record=third_heartbeat_due,
+                record=base_record,
                 status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
             ),
             "bash_job_needs_attention",
         )
+
+        latched_record = replace(
+            base_record,
+            last_progress_notice_kind="bash_job_observed_status",
+            last_progress_notice_at=(now - timedelta(hours=1)).isoformat(),
+            attention_notice_dispatched_at=(now - timedelta(hours=1)).isoformat(),
+        )
+        self.assertIsNone(
+            _classify_notice_kind(
+                record=latched_record,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            )
+        )
+
+    def test_ready_managed_service_does_not_emit_running_notices(self) -> None:
+        now = datetime.now(UTC)
+        service_record = BashJobRecord(
+            job_id="feedbeeffeedbeeffeedbeeffeedbeef",
+            command="npm run preview",
+            pid=1,
+            pgid=1,
+            runner_pid=1,
+            runner_pgid=1,
+            launched_at=(now - timedelta(hours=1)).isoformat(),
+            cwd="/workspace",
+            stdout_path="/workspace/stdout.log",
+            stderr_path="/workspace/stderr.log",
+            job_dir="/workspace/job",
+            service_port=4173,
+            readiness_url="http://127.0.0.1:4173/",
+            readiness_verified=True,
+        )
+        self.assertIsNone(
+            _classify_notice_kind(
+                record=service_record,
+                status_metadata={"status": "running", "stdout_bytes_seen": 0, "stderr_bytes_seen": 0},
+            )
+        )
+
+    async def test_supervisor_defers_an_accepted_notice_until_owner_queue_records_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = BashJobRecord(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                command="run verification",
+                pid=1,
+                pgid=1,
+                runner_pid=1,
+                runner_pgid=1,
+                launched_at="2026-08-23T07:51:46Z",
+                cwd="/workspace",
+                stdout_path="/workspace/stdout.log",
+                stderr_path="/workspace/stderr.log",
+                job_dir="/workspace/job",
+                owner_route_id="route_1",
+                owner_session_id="sub_session",
+                owner_turn_id="sub_turn",
+                owner_agent_kind="subagent",
+                owner_agent_name="Edith",
+                owner_subagent_id="sub_1",
+                last_progress_notice_kind="bash_job_started",
+                last_progress_notice_at="2026-08-23T07:52:02Z",
+                last_progress_notice_status="finished",
+                last_progress_notice_stdout_bytes_seen=0,
+                last_progress_notice_stderr_bytes_seen=0,
+                last_progress_notice_last_update_at="2026-08-23T07:51:46Z",
+            )
+            notice = BashJobNotice(
+                job_id=record.job_id,
+                notice_kind="bash_job_completed",
+                owner_route_id="route_1",
+                owner_session_id="sub_session",
+                owner_turn_id="sub_turn",
+                owner_agent_kind="subagent",
+                owner_agent_name="Edith",
+                owner_subagent_id="sub_1",
+                status="finished",
+                command=record.command,
+                started_at=record.launched_at,
+                last_update_at=record.last_progress_notice_last_update_at,
+                finished_at="2026-08-23T07:51:47Z",
+                cancelled_at=None,
+                exit_code=0,
+                stdout="",
+                stderr="",
+                stdout_bytes_seen=0,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint=None,
+            )
+            supervisor = BashJobSupervisor(
+                route_id="route_1",
+                settings=ToolSettings.from_workspace_dir(Path(tmp)),
+                followups_allowed=lambda: True,
+                main_turn_active=lambda: False,
+                subagent_turn_active=lambda _subagent_id: False,
+                handle_main_notices=AsyncMock(return_value=True),
+                handle_subagent_notices=AsyncMock(return_value=True),
+            )
+            execute_internal = AsyncMock()
+            supervisor._execute_internal_bash = execute_internal  # type: ignore[method-assign]
+
+            with patch(
+                "jarvis.gateway.bash_job_supervisor.load_job",
+                return_value=(object(), record),
+            ):
+                await supervisor._dispatch_subagent_notices((notice,))
+                collected = await supervisor._collect_due_notice(record.job_id)
+
+            self.assertIsNone(collected)
+            execute_internal.assert_not_awaited()
+
+    async def test_supervisor_rechecks_a_deferred_running_notice_for_terminal_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = BashJobRecord(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                command="run verification",
+                pid=1,
+                pgid=1,
+                runner_pid=1,
+                runner_pgid=1,
+                launched_at="2026-08-23T07:51:46Z",
+                cwd="/workspace",
+                stdout_path="/workspace/stdout.log",
+                stderr_path="/workspace/stderr.log",
+                job_dir="/workspace/job",
+                owner_route_id="route_1",
+                owner_session_id="sub_session",
+                owner_turn_id="sub_turn",
+                owner_agent_kind="subagent",
+                owner_agent_name="Edith",
+                owner_subagent_id="sub_1",
+                last_progress_notice_kind="bash_job_started",
+                last_progress_notice_at="2026-08-23T07:51:46Z",
+                last_progress_notice_status="running",
+                last_progress_notice_stdout_bytes_seen=0,
+                last_progress_notice_stderr_bytes_seen=0,
+                last_progress_notice_last_update_at="2026-08-23T07:51:46Z",
+            )
+            running_notice = BashJobNotice(
+                job_id=record.job_id,
+                notice_kind="bash_job_output_started",
+                owner_route_id="route_1",
+                owner_session_id="sub_session",
+                owner_turn_id="sub_turn",
+                owner_agent_kind="subagent",
+                owner_agent_name="Edith",
+                owner_subagent_id="sub_1",
+                status="running",
+                command=record.command,
+                started_at=record.launched_at,
+                last_update_at=record.last_progress_notice_last_update_at,
+                finished_at=None,
+                cancelled_at=None,
+                exit_code=None,
+                stdout="started",
+                stderr="",
+                stdout_bytes_seen=7,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint="started",
+            )
+            supervisor = BashJobSupervisor(
+                route_id="route_1",
+                settings=ToolSettings.from_workspace_dir(Path(tmp)),
+                followups_allowed=lambda: True,
+                main_turn_active=lambda: False,
+                subagent_turn_active=lambda _subagent_id: False,
+                handle_main_notices=AsyncMock(return_value=True),
+                handle_subagent_notices=AsyncMock(return_value=True),
+            )
+            execute_internal = AsyncMock(
+                side_effect=[
+                    ToolExecutionResult(
+                        call_id="status",
+                        name="bash",
+                        ok=True,
+                        content="finished",
+                        metadata={
+                            "status": "finished",
+                            "exit_code": 1,
+                            "stdout_bytes_seen": 7,
+                            "stderr_bytes_seen": 3,
+                        },
+                    ),
+                    ToolExecutionResult(
+                        call_id="tail",
+                        name="bash",
+                        ok=True,
+                        content="failed",
+                        metadata={"stdout": "started", "stderr": "failed"},
+                    ),
+                ]
+            )
+            supervisor._execute_internal_bash = execute_internal  # type: ignore[method-assign]
+
+            with patch(
+                "jarvis.gateway.bash_job_supervisor.load_job",
+                return_value=(object(), record),
+            ):
+                await supervisor._dispatch_subagent_notices((running_notice,))
+                self.assertIsNone(await supervisor._collect_due_notice(record.job_id))
+                execute_internal.assert_not_awaited()
+                supervisor._deferred_notice_recheck_at[  # pyright: ignore[reportPrivateUsage]
+                    record.job_id
+                ] = 0.0
+                terminal_notice = await supervisor._collect_due_notice(record.job_id)
+
+            self.assertIsNotNone(terminal_notice)
+            assert terminal_notice is not None
+            self.assertEqual(terminal_notice.notice_kind, "bash_job_failed")
+            self.assertEqual(execute_internal.await_count, 2)
+
+    async def test_supervisor_uses_remote_start_status_instead_of_local_pid_liveness(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = BashJobSupervisor(
+                route_id="route_1",
+                settings=ToolSettings.from_workspace_dir(Path(tmp)),
+                followups_allowed=lambda: True,
+                main_turn_active=lambda: False,
+                subagent_turn_active=lambda _subagent_id: False,
+                handle_main_notices=AsyncMock(return_value=True),
+                handle_subagent_notices=AsyncMock(return_value=True),
+            )
+            result = ToolExecutionResult(
+                call_id="start",
+                name="bash",
+                ok=True,
+                content="started",
+                metadata={
+                    "mode": "background",
+                    "status": "running",
+                    "job_id": "deadbeefdeadbeefdeadbeefdeadbeef",
+                    "stdout_bytes_seen": 3,
+                    "stderr_bytes_seen": 4,
+                    "last_update_at": "2026-08-23T07:51:46Z",
+                },
+            )
+            context = ToolExecutionContext(
+                workspace_dir=Path(tmp),
+                route_id="route_1",
+                session_id="sub_session",
+                turn_id="sub_turn",
+                agent_kind="subagent",
+                agent_name="Edith",
+                subagent_id="sub_1",
+            )
+
+            with (
+                patch("jarvis.gateway.bash_job_supervisor.claim_job_owner"),
+                patch(
+                    "jarvis.gateway.bash_job_supervisor.mark_job_progress_notified"
+                ) as mark_progress,
+                patch.object(supervisor, "ensure_running"),
+            ):
+                await supervisor.observe_tool_result(result=result, context=context)
+
+            self.assertEqual(
+                mark_progress.call_args.kwargs,
+                {
+                    "workspace_dir": Path(tmp),
+                    "job_id": "deadbeefdeadbeefdeadbeefdeadbeef",
+                    "notice_kind": "bash_job_started",
+                    "status": "running",
+                    "stdout_bytes_seen": 3,
+                    "stderr_bytes_seen": 4,
+                    "last_update_at": "2026-08-23T07:51:46Z",
+                    "count_as_progress_update": False,
+                },
+            )
+
+    async def test_supervisor_uses_remote_manual_status_instead_of_local_pid_liveness(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = BashJobRecord(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                command="run verification",
+                pid=99999,
+                pgid=99999,
+                runner_pid=99999,
+                runner_pgid=99999,
+                launched_at="2026-08-23T07:51:46Z",
+                cwd="/workspace",
+                stdout_path="/workspace/stdout.log",
+                stderr_path="/workspace/stderr.log",
+                job_dir="/workspace/job",
+                owner_route_id="route_1",
+                owner_session_id="sub_session",
+                owner_turn_id="sub_turn",
+                owner_agent_kind="subagent",
+                owner_agent_name="Edith",
+                owner_subagent_id="sub_1",
+            )
+            supervisor = BashJobSupervisor(
+                route_id="route_1",
+                settings=ToolSettings.from_workspace_dir(Path(tmp)),
+                followups_allowed=lambda: True,
+                main_turn_active=lambda: False,
+                subagent_turn_active=lambda _subagent_id: False,
+                handle_main_notices=AsyncMock(return_value=True),
+                handle_subagent_notices=AsyncMock(return_value=True),
+            )
+            result = ToolExecutionResult(
+                call_id="status",
+                name="bash",
+                ok=True,
+                content="running",
+                metadata={
+                    "mode": "status",
+                    "status": "running",
+                    "job_id": record.job_id,
+                    "stdout_bytes_seen": 12,
+                    "stderr_bytes_seen": 4,
+                    "last_update_at": "2026-08-23T07:52:46Z",
+                },
+            )
+            context = ToolExecutionContext(
+                workspace_dir=Path(tmp),
+                route_id="route_1",
+                session_id="sub_session",
+                turn_id="sub_turn",
+                agent_kind="subagent",
+                agent_name="Edith",
+                subagent_id="sub_1",
+            )
+
+            with (
+                patch(
+                    "jarvis.gateway.bash_job_supervisor.load_job",
+                    return_value=(object(), record),
+                ),
+                patch(
+                    "jarvis.gateway.bash_job_supervisor.mark_job_progress_notified"
+                ) as mark_progress,
+                patch(
+                    "jarvis.gateway.bash_job_supervisor.mark_job_terminal_notice_dispatched"
+                ) as mark_terminal,
+            ):
+                await supervisor.observe_tool_result(result=result, context=context)
+
+            self.assertEqual(
+                mark_progress.call_args.kwargs,
+                {
+                    "workspace_dir": Path(tmp),
+                    "job_id": record.job_id,
+                    "notice_kind": "bash_job_observed_status",
+                    "status": "running",
+                    "stdout_bytes_seen": 12,
+                    "stderr_bytes_seen": 4,
+                    "last_update_at": "2026-08-23T07:52:46Z",
+                },
+            )
+            mark_terminal.assert_not_called()
+
+    async def test_supervisor_throttles_ready_managed_service_health_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = BashJobRecord(
+                job_id="feedbeeffeedbeeffeedbeeffeedbeef",
+                command="serve",
+                pid=1,
+                pgid=1,
+                runner_pid=1,
+                runner_pgid=1,
+                launched_at="2026-08-23T07:51:46Z",
+                cwd="/workspace",
+                stdout_path="/workspace/stdout.log",
+                stderr_path="/workspace/stderr.log",
+                job_dir="/workspace/job",
+                service_port=8123,
+                readiness_url="http://127.0.0.1:8123/health",
+                readiness_verified=True,
+                owner_route_id="route_1",
+                owner_session_id="main_session",
+                owner_turn_id="main_turn",
+                owner_agent_kind="main",
+                owner_agent_name="Jarvis",
+            )
+            supervisor = BashJobSupervisor(
+                route_id="route_1",
+                settings=ToolSettings.from_workspace_dir(Path(tmp)),
+                followups_allowed=lambda: True,
+                main_turn_active=lambda: False,
+                subagent_turn_active=lambda _subagent_id: False,
+                handle_main_notices=AsyncMock(return_value=True),
+                handle_subagent_notices=AsyncMock(return_value=True),
+            )
+            execute_internal = AsyncMock(
+                return_value=ToolExecutionResult(
+                    call_id="status",
+                    name="bash",
+                    ok=True,
+                    content="running",
+                    metadata={
+                        "status": "running",
+                        "stdout_bytes_seen": 0,
+                        "stderr_bytes_seen": 0,
+                    },
+                )
+            )
+            supervisor._execute_internal_bash = execute_internal  # type: ignore[method-assign]
+
+            with patch(
+                "jarvis.gateway.bash_job_supervisor.load_job",
+                return_value=(object(), record),
+            ):
+                self.assertIsNone(await supervisor._collect_due_notice(record.job_id))
+                self.assertIsNone(await supervisor._collect_due_notice(record.job_id))
+
+            execute_internal.assert_awaited_once()

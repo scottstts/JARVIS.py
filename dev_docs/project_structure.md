@@ -86,6 +86,7 @@ If this document and the code ever disagree, treat the code as source of truth a
 
 - `tests/`
   - automated test suite
+  - `tests/headless/` contains the high-fidelity real-gateway development runner; it is test-only, is not imported by `src/jarvis/`, and is not a packaged script
 - `secrets/`
   - local secret-file inputs for Docker Compose
 - `assets/`
@@ -281,6 +282,10 @@ Packaged prompt resources live under `subagent/prompts/`.
 HTTP service used by the isolated `tool_runtime` container.
 
 This package is launched inside the runtime container via `python -m jarvis.tool_runtime_service`.
+
+Its health response implements the versioned contract in `src/jarvis/tool_runtime_protocol.py`, including required tool capabilities. The app validates that contract before use so a stale isolated image cannot silently run an older bash protocol.
+
+The test-only Ox Alpha runner is launched from the host with `utils/run_dev_headless.sh`. It executes `tests/headless/headless.py` inside `jarvis_runtime`, requires the unchanged `/workspace/settings/settings.yml` routing both main and subagents through `openrouter/stealth/ox-alpha`, uses a unique `/workspace/jarvis-test-headless-*` mutation boundary, audits real websocket events, and performs `/new` plus local artifact cleanup on completion or handled shutdown signals.
 
 Current built-in remote endpoints execute `bash` and `web_fetch`.
 

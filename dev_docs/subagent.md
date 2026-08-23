@@ -76,7 +76,7 @@ The dynamic assignment includes:
 - optional selected skill ids, whose full `SKILL.md` documents are embedded into bootstrap
 - optional deliverable or success criteria
 
-The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited (up to four total, with explicit `skill_ids` taking precedence); when none were selected, the manager may attach a conservatively matched installed skill. Every child records `skill_selection_reason`, including the short no-match reason when no skill applies.
+The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited (up to four total, with explicit `skill_ids` taking precedence); when none were selected, the manager may attach a conservatively matched installed skill. Automatic matching requires assignment overlap with the skill's ID/name identity, not merely two generic words from a long description, so unrelated large skill prompts are not injected. Every child records `skill_selection_reason`, including the short no-match reason when no skill applies.
 
 The main agent receives high-level subagent usage guidance through `PROGRAM.md` and detailed primitive docs from `src/jarvis/subagent/primitives.py`.
 
@@ -192,7 +192,7 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 Route-level tool execution uses a workspace coordinator rather than one global tool mutex. Exact-path reads and disjoint declared writes can run concurrently, while broad snapshot reads take an exclusive barrier. A child’s `owned_paths` are exclusive persistent write leases until disposal; direct file producers/consumers acquire exact paths automatically, while mutable `bash` must declare all `write_paths` whenever another actor holds a lease. Overlapping access is serialized or rejected with ownership guidance instead of racing shared state.
 
-Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and later revive the owning child loop through persisted child-system notes and runtime turns. Unchanged heartbeats update durable status without spending a child model turn; terminal notices carry bounded output plus stdout/stderr log paths for later inspection.
+Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and later revive the owning child loop through persisted child-system notes and runtime turns. Unchanged jobs do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. Explicitly stopped children remain paused while terminal bookkeeping still clears their pending job IDs.
 
 ## Storage
 

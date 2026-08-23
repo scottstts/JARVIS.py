@@ -10,8 +10,10 @@ from unittest.mock import patch
 from jarvis.logging_setup import (
     CollapseTelegramDraftRequestFilter,
     SensitiveDataFormatter,
+    SuppressInternalHttpxRequestFilter,
     _redact_sensitive_text,
     configure_application_logging,
+    suppress_internal_httpx_request_logs,
 )
 
 _FAKE_TELEGRAM_BOT_TOKEN = "1234567890:TEST_TOKEN_VALUE_FOR_REDACTION_ABCDE"
@@ -142,8 +144,41 @@ class LoggingSetupTests(unittest.TestCase):
                     for filter_ in handler.filters
                 )
             )
+            self.assertTrue(
+                any(
+                    isinstance(filter_, SuppressInternalHttpxRequestFilter)
+                    for filter_ in handler.filters
+                )
+            )
         finally:
             root_logger.handlers = original_handlers
+
+    def test_internal_httpx_filter_only_suppresses_scoped_info_records(self) -> None:
+        filter_ = SuppressInternalHttpxRequestFilter()
+        httpx_info = logging.LogRecord(
+            name="httpx",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="HTTP Request: POST http://tool_runtime/tools/bash/execute",
+            args=(),
+            exc_info=None,
+        )
+        httpx_warning = logging.LogRecord(
+            name="httpx",
+            level=logging.WARNING,
+            pathname=__file__,
+            lineno=2,
+            msg="tool runtime warning",
+            args=(),
+            exc_info=None,
+        )
+
+        self.assertTrue(filter_.filter(httpx_info))
+        with suppress_internal_httpx_request_logs():
+            self.assertFalse(filter_.filter(httpx_info))
+            self.assertTrue(filter_.filter(httpx_warning))
+        self.assertTrue(filter_.filter(httpx_info))
 
     def test_redact_sensitive_text_hides_telegram_bot_token(self) -> None:
         text = (

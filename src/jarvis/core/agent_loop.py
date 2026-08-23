@@ -85,7 +85,11 @@ from .token_estimator import estimate_request_input_tokens
 from .task_contract import (
     TaskContract,
     build_task_contract,
+    merge_task_contract,
+    user_message_explicitly_replaces_requirements,
+    user_message_explicitly_replaces_task,
     user_message_explicitly_resumes_task,
+    user_message_is_side_query,
 )
 from .tool_safety import (
     ToolSafetyObservation,
@@ -125,6 +129,7 @@ _UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY = "unexecuted_tool_call_notice"
 _ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _SKILLS_BOOTSTRAP_METADATA_KEY = "skills_bootstrap"
+_TASK_COMPLETION_DEFERRED_METADATA_KEY = "task_completion_deferred"
 _TOOL_ROUND_CONTINUATION_EMPTY_TEXT = (
     "I could not produce a continuation after the tool execution slice boundary."
 )
@@ -565,6 +570,21 @@ class AgentLoop:
             content=normalized_content,
             metadata=metadata,
         )
+        normalized_metadata = dict(metadata or {})
+        if (
+            normalized_metadata.get("bash_job_progress_update")
+            or normalized_metadata.get("subagent_progress_update")
+        ):
+            self._record_tool_task_runtime_progress(
+                session_id=target_session_id,
+                runtime_messages=(
+                    AgentRuntimeMessage(
+                        role="system",
+                        content=normalized_content,
+                        metadata=normalized_metadata,
+                    ),
+                ),
+            )
         return True
 
     def append_assistant_note(
@@ -805,6 +825,12 @@ class AgentLoop:
             session_id=session.session_id,
             records=pending_records,
         )
+        initial_pending_detached_job_ids = _collect_pending_detached_job_ids(
+            turn_runtime_messages
+        )
+        initial_pending_subagent_ids = _collect_pending_subagent_ids(
+            turn_runtime_messages
+        )
         if user_text is not None:
             user_record = self._build_message_record(
                 session_id=session.session_id,
@@ -837,7 +863,11 @@ class AgentLoop:
             if overflow_compacted:
                 did_compaction = True
 
-            if not response.tool_calls:
+            if (
+                not response.tool_calls
+                and not initial_pending_detached_job_ids
+                and not initial_pending_subagent_ids
+            ):
                 _rounds, persisted_tool_safety = self._load_tool_task_state(
                     session.session_id
                 )
@@ -890,8 +920,8 @@ class AgentLoop:
                 current_response=response,
                 current_estimated_input_tokens=final_estimated_input_tokens,
                 turn_id=turn_id,
-                pending_detached_job_ids=_collect_pending_detached_job_ids(turn_runtime_messages),
-                pending_subagent_ids=_collect_pending_subagent_ids(turn_runtime_messages),
+                pending_detached_job_ids=initial_pending_detached_job_ids,
+                pending_subagent_ids=initial_pending_subagent_ids,
             )
             if followup_compacted:
                 did_compaction = True
@@ -912,7 +942,10 @@ class AgentLoop:
                 response=final_response,
                 estimated_input_tokens=final_estimated_input_tokens,
             )
-            if not completion_blocked:
+            if (
+                not completion_blocked
+                and not _response_task_completion_deferred(final_response)
+            ):
                 await self._reflect_completed_turn(
                     session_id=session.session_id,
                     turn_id=turn_id,
@@ -1902,6 +1935,12 @@ class AgentLoop:
             session_id=session.session_id,
             records=pending_records,
         )
+        initial_pending_detached_job_ids = _collect_pending_detached_job_ids(
+            turn_runtime_messages
+        )
+        initial_pending_subagent_ids = _collect_pending_subagent_ids(
+            turn_runtime_messages
+        )
         if user_text is not None:
             user_record = self._build_message_record(
                 session_id=session.session_id,
@@ -1927,6 +1966,8 @@ class AgentLoop:
         )
         suppress_initial_text_stream = (
             initial_tool_safety.unverified_workspace_mutation
+            and not initial_pending_detached_job_ids
+            and not initial_pending_subagent_ids
         )
         try:
             overflow_compacted = False
@@ -2048,7 +2089,11 @@ class AgentLoop:
             if overflow_compacted:
                 did_compaction = True
 
-            if not initial_response.tool_calls:
+            if (
+                not initial_response.tool_calls
+                and not initial_pending_detached_job_ids
+                and not initial_pending_subagent_ids
+            ):
                 _rounds, persisted_tool_safety = self._load_tool_task_state(
                     session.session_id
                 )
@@ -2120,12 +2165,12 @@ class AgentLoop:
                 call.name for call in current_response.tool_calls
             )
             tool_rounds = 0
-            task_tool_rounds, tool_safety = self._load_tool_task_state(
+            stalled_tool_rounds, tool_safety = self._load_tool_task_state(
                 session.session_id
             )
             turn_approval_rejected = False
-            pending_detached_job_ids = _collect_pending_detached_job_ids(turn_runtime_messages)
-            pending_subagent_ids = _collect_pending_subagent_ids(turn_runtime_messages)
+            pending_detached_job_ids = initial_pending_detached_job_ids
+            pending_subagent_ids = initial_pending_subagent_ids
             while current_response.tool_calls:
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
@@ -2150,18 +2195,18 @@ class AgentLoop:
                     return
 
                 tool_rounds += 1
-                task_tool_rounds += 1
-                if task_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
+                stalled_tool_rounds += 1
+                if stalled_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
                     self._persist_tool_task_state(
                         session.session_id,
-                        rounds=task_tool_rounds,
+                        rounds=self._tool_settings.max_tool_rounds_per_task,
                         tracker=tool_safety,
                     )
                     self._append_tool_safety_skips(
                         session_id=session.session_id,
                         pending_records=pending_records,
                         tool_calls=current_response.tool_calls,
-                        reason="task_tool_round_budget_exhausted",
+                        reason="tool_progress_budget_exhausted",
                         turn_id=turn_id,
                     )
                     self._append_turn_record(
@@ -2170,7 +2215,7 @@ class AgentLoop:
                         record=self._build_tool_safety_stop_record(
                             session_id=session.session_id,
                             turn_id=turn_id,
-                            reason="task_tool_round_budget_exhausted",
+                            reason="tool_progress_budget_exhausted",
                             pending_detached_job_ids=pending_detached_job_ids,
                             pending_subagent_ids=pending_subagent_ids,
                         ),
@@ -2179,10 +2224,11 @@ class AgentLoop:
                         session_id=session.session_id,
                         pending_records=pending_records,
                         turn_id=turn_id,
-                        reason="task_tool_round_budget_exhausted",
+                        reason="tool_progress_budget_exhausted",
                         response=current_response,
                     )
                     break
+                round_progress_epoch = tool_safety.progress_epoch
                 if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                     if not tool_safety.consume_slice_progress():
                         self._append_tool_safety_skips(
@@ -2448,9 +2494,11 @@ class AgentLoop:
                     deferred_tool_successes = tuple(staged_image_tool_successes)
                     pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
                     pending_subagent_ids = frozenset(current_pending_subagent_ids)
+                    if tool_safety.progress_epoch != round_progress_epoch:
+                        stalled_tool_rounds = 0
                     self._persist_tool_task_state(
                         session.session_id,
-                        rounds=task_tool_rounds,
+                        rounds=stalled_tool_rounds,
                         tracker=tool_safety,
                     )
                     if approval_rejected:
@@ -2826,7 +2874,11 @@ class AgentLoop:
                     )
 
                 current_response = streamed_response
-                if not current_response.tool_calls:
+                if (
+                    not current_response.tool_calls
+                    and not pending_detached_job_ids
+                    and not pending_subagent_ids
+                ):
                     current_response = _enforce_acceptance_handoff(
                         current_response,
                         tool_safety=tool_safety,
@@ -2902,6 +2954,8 @@ class AgentLoop:
                     break
 
             final_response = current_response
+            if pending_detached_job_ids or pending_subagent_ids:
+                final_response = _mark_task_completion_deferred(final_response)
 
             completion_blocked = _response_completion_blocked(final_response)
             self._persist_successful_turn(
@@ -3044,6 +3098,10 @@ class AgentLoop:
                     },
                 ),
             )
+        self._record_tool_task_runtime_progress(
+            session_id=session.session_id,
+            runtime_messages=turn_runtime_messages,
+        )
         allow_tools_for_initial_request = not _turn_requires_no_tools(
             runtime_messages=turn_runtime_messages,
             user_text=user_text,
@@ -3156,6 +3214,7 @@ class AgentLoop:
         estimated_input_tokens: int,
     ) -> None:
         completion_blocked = _response_completion_blocked(response)
+        completion_deferred = _response_task_completion_deferred(response)
         self._finish_turn(
             session_id=session_id,
             turn_id=turn_id,
@@ -3164,8 +3223,25 @@ class AgentLoop:
         usage = response.usage
         session = self._storage.get_session(session_id)
         backend_state = dict(session.backend_state) if session is not None else {}
-        if not completion_blocked:
-            backend_state.pop("active_tool_task_id", None)
+        if not completion_blocked and not completion_deferred:
+            active_task_id = str(backend_state.get("active_tool_task_id", "")).strip()
+            active_state = (
+                self._storage.load_tool_task_state(active_task_id)
+                if active_task_id
+                else None
+            )
+            restore_parent_task_id = (
+                str(active_state.get("restore_parent_task_id", "")).strip()
+                if isinstance(active_state, dict)
+                else ""
+            )
+            if (
+                restore_parent_task_id
+                and self._storage.load_tool_task_state(restore_parent_task_id) is not None
+            ):
+                backend_state["active_tool_task_id"] = restore_parent_task_id
+            else:
+                backend_state.pop("active_tool_task_id", None)
             backend_state.pop("tool_task_state", None)
         self._storage.update_session(
             session_id,
@@ -3201,25 +3277,39 @@ class AgentLoop:
 
         if user_text is None:
             return active_contract
+        explicit_resume = user_message_explicitly_resumes_task(user_text)
+        if explicit_resume and isinstance(active_state, dict):
+            parent_task_id = str(active_state.get("restore_parent_task_id", "")).strip()
+            parent_state = (
+                self._storage.load_tool_task_state(parent_task_id)
+                if parent_task_id
+                else None
+            )
+            parent_contract = TaskContract.from_state(
+                parent_state.get("contract") if isinstance(parent_state, dict) else None
+            )
+            if parent_contract is not None and isinstance(parent_state, dict):
+                active_task_id = parent_task_id
+                active_state = parent_state
+                active_contract = parent_contract
+                backend_state["active_tool_task_id"] = parent_task_id
         if (
             active_contract is not None
             and isinstance(active_state, dict)
-            and user_message_explicitly_resumes_task(user_text)
+            and (
+                explicit_resume
+                or (
+                    session.pending_interruption_notice_reason
+                    == "superseded_by_user_message"
+                    and not user_message_explicitly_replaces_task(user_text)
+                    and not user_message_explicitly_replaces_requirements(user_text)
+                    and not user_message_is_side_query(user_text)
+                )
+            )
         ):
-            supplemental = build_task_contract(
-                task_id=active_contract.task_id,
-                origin_turn_id=active_contract.origin_turn_id,
-                user_text=user_text,
-            )
-            merged_requirements = {
-                item.item_id: item for item in active_contract.requirements
-            }
-            merged_requirements.update(
-                {item.item_id: item for item in supplemental.requirements}
-            )
-            contract = replace(
+            contract = merge_task_contract(
                 active_contract,
-                requirements=tuple(merged_requirements.values()),
+                user_text=user_text,
             )
             tracker = ToolSafetyTracker.from_state(active_state.get("tracker"))
             tracker.seed_contract_requirements(contract.requirements)
@@ -3227,12 +3317,28 @@ class AgentLoop:
                 contract.task_id,
                 {
                     **active_state,
+                    "schema_version": 2,
                     "contract": contract.to_state(),
+                    "stalled_rounds": 0,
+                    "round_progress_epoch": tracker.progress_epoch,
                     "tracker": tracker.to_state(),
                 },
             )
+            if backend_state != session.backend_state:
+                self._storage.update_session(session_id, backend_state=backend_state)
             return contract
 
+        restore_parent_task_id = ""
+        if (
+            active_contract is not None
+            and isinstance(active_state, dict)
+            and user_message_is_side_query(user_text)
+            and not user_message_explicitly_replaces_task(user_text)
+        ):
+            restore_parent_task_id = (
+                str(active_state.get("restore_parent_task_id", "")).strip()
+                or active_contract.task_id
+            )
         contract = build_task_contract(
             task_id=proposed_task_id,
             origin_turn_id=proposed_task_id,
@@ -3243,11 +3349,17 @@ class AgentLoop:
         self._storage.write_tool_task_state(
             contract.task_id,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "task_id": contract.task_id,
                 "origin_session_id": session_id,
                 "contract": contract.to_state(),
-                "rounds": 0,
+                "stalled_rounds": 0,
+                "round_progress_epoch": tracker.progress_epoch,
+                **(
+                    {"restore_parent_task_id": restore_parent_task_id}
+                    if restore_parent_task_id
+                    else {}
+                ),
                 "tracker": tracker.to_state(),
             },
         )
@@ -3268,11 +3380,13 @@ class AgentLoop:
             raw = session.backend_state.get("tool_task_state")
         if not isinstance(raw, dict):
             return 0, ToolSafetyTracker()
-        try:
-            rounds = max(0, int(raw.get("rounds", 0)))
-        except (TypeError, ValueError):
-            rounds = 0
         tracker = ToolSafetyTracker.from_state(raw.get("tracker"))
+        schema_version = _safe_non_negative_int(raw.get("schema_version"))
+        persisted_epoch = _safe_non_negative_int(raw.get("round_progress_epoch"))
+        if schema_version < 2 or persisted_epoch != tracker.progress_epoch:
+            rounds = 0
+        else:
+            rounds = _safe_non_negative_int(raw.get("stalled_rounds"))
         contract = TaskContract.from_state(raw.get("contract"))
         if contract is not None:
             tracker.seed_contract_requirements(contract.requirements)
@@ -3296,12 +3410,36 @@ class AgentLoop:
             task_id,
             {
                 **existing,
-                "schema_version": 1,
+                "schema_version": 2,
                 "task_id": task_id,
-                "rounds": max(0, rounds),
+                "stalled_rounds": max(0, rounds),
+                "round_progress_epoch": tracker.progress_epoch,
                 "tracker": tracker.to_state(),
             },
         )
+
+    def _record_tool_task_runtime_progress(
+        self,
+        *,
+        session_id: str,
+        runtime_messages: Sequence[AgentRuntimeMessage],
+    ) -> None:
+        _stalled_rounds, tracker = self._load_tool_task_state(session_id)
+        made_progress = False
+        for message in runtime_messages:
+            made_progress = (
+                tracker.record_runtime_progress(
+                    content=message.content,
+                    metadata=message.metadata,
+                )
+                or made_progress
+            )
+        if made_progress:
+            self._persist_tool_task_state(
+                session_id,
+                rounds=0,
+                tracker=tracker,
+            )
 
     def _persist_provider_session_state_from_response(
         self,
@@ -3525,7 +3663,7 @@ class AgentLoop:
         pending_subagent_ids: frozenset[str] = frozenset(),
     ) -> tuple[SessionMetadata, LLMResponse, int, bool, bool, bool, tuple[str, ...]]:
         tool_rounds = 0
-        task_tool_rounds, tool_safety = self._load_tool_task_state(session.session_id)
+        stalled_tool_rounds, tool_safety = self._load_tool_task_state(session.session_id)
         did_compaction = False
         approval_rejected = False
         current_session = session
@@ -3543,18 +3681,18 @@ class AgentLoop:
                     tuple(call.name for call in current_response.tool_calls),
                 )
             tool_rounds += 1
-            task_tool_rounds += 1
-            if task_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
+            stalled_tool_rounds += 1
+            if stalled_tool_rounds > self._tool_settings.max_tool_rounds_per_task:
                 self._persist_tool_task_state(
                     current_session.session_id,
-                    rounds=task_tool_rounds,
+                    rounds=self._tool_settings.max_tool_rounds_per_task,
                     tracker=tool_safety,
                 )
                 self._append_tool_safety_skips(
                     session_id=current_session.session_id,
                     pending_records=pending_records,
                     tool_calls=current_response.tool_calls,
-                    reason="task_tool_round_budget_exhausted",
+                    reason="tool_progress_budget_exhausted",
                     turn_id=turn_id,
                 )
                 self._append_turn_record(
@@ -3563,7 +3701,7 @@ class AgentLoop:
                     record=self._build_tool_safety_stop_record(
                         session_id=current_session.session_id,
                         turn_id=turn_id,
-                        reason="task_tool_round_budget_exhausted",
+                        reason="tool_progress_budget_exhausted",
                         pending_detached_job_ids=pending_detached_job_ids,
                         pending_subagent_ids=pending_subagent_ids,
                     ),
@@ -3572,10 +3710,11 @@ class AgentLoop:
                     session_id=current_session.session_id,
                     pending_records=pending_records,
                     turn_id=turn_id,
-                    reason="task_tool_round_budget_exhausted",
+                    reason="tool_progress_budget_exhausted",
                     response=current_response,
                 )
                 break
+            round_progress_epoch = tool_safety.progress_epoch
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                 if not tool_safety.consume_slice_progress():
                     self._append_tool_safety_skips(
@@ -3647,9 +3786,11 @@ class AgentLoop:
                 pending_detached_job_ids = tool_execution_outcome.pending_detached_job_ids
                 pending_subagent_ids = tool_execution_outcome.pending_subagent_ids
                 deferred_tool_successes = tool_execution_outcome.deferred_tool_successes
+                if tool_safety.progress_epoch != round_progress_epoch:
+                    stalled_tool_rounds = 0
                 self._persist_tool_task_state(
                     current_session.session_id,
-                    rounds=task_tool_rounds,
+                    rounds=stalled_tool_rounds,
                     tracker=tool_safety,
                 )
                 if tool_execution_outcome.interrupted:
@@ -3917,7 +4058,11 @@ class AgentLoop:
                 did_compaction = True
                 followup_compaction_attempted = True
 
-            if not current_response.tool_calls:
+            if (
+                not current_response.tool_calls
+                and not pending_detached_job_ids
+                and not pending_subagent_ids
+            ):
                 current_response = _enforce_acceptance_handoff(
                     current_response,
                     tool_safety=tool_safety,
@@ -3947,6 +4092,9 @@ class AgentLoop:
                     finish_reason="stop",
                 )
                 break
+
+        if pending_detached_job_ids or pending_subagent_ids:
+            current_response = _mark_task_completion_deferred(current_response)
 
         return (
             current_session,
@@ -5794,7 +5942,11 @@ def _collect_pending_detached_job_ids(
 ) -> frozenset[str]:
     job_ids: set[str] = set()
     for message in runtime_messages:
-        raw_ids = message.metadata.get("detached_bash_job_ids")
+        raw_ids = (
+            message.metadata.get("bash_job_running_ids", [])
+            if message.metadata.get("bash_job_progress_update")
+            else message.metadata.get("detached_bash_job_ids")
+        )
         if not isinstance(raw_ids, list):
             continue
         for raw_job_id in raw_ids:
@@ -6176,6 +6328,22 @@ def _enforce_acceptance_handoff(
 
 def _response_completion_blocked(response: LLMResponse) -> bool:
     return bool(response.provider_metadata.get("completion_blocked", False))
+
+
+def _mark_task_completion_deferred(response: LLMResponse) -> LLMResponse:
+    return replace(
+        response,
+        provider_metadata={
+            **response.provider_metadata,
+            _TASK_COMPLETION_DEFERRED_METADATA_KEY: True,
+        },
+    )
+
+
+def _response_task_completion_deferred(response: LLMResponse) -> bool:
+    return bool(
+        response.provider_metadata.get(_TASK_COMPLETION_DEFERRED_METADATA_KEY, False)
+    )
 
 
 def _with_tool_safety_replan_notice(
@@ -6774,3 +6942,10 @@ def _record_is_ephemeral_image_input(record: ConversationRecord) -> bool:
 
 def _record_is_unexecuted_tool_call_notice(record: ConversationRecord) -> bool:
     return bool(record.metadata.get(_UNEXECUTED_TOOL_CALL_NOTICE_METADATA_KEY, False))
+
+
+def _safe_non_negative_int(value: object) -> int:
+    try:
+        return max(0, int(str(value)))
+    except (TypeError, ValueError):
+        return 0

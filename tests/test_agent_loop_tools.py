@@ -23,6 +23,7 @@ from jarvis.core import (
     AgentToolCallEvent,
     AgentTurnDoneEvent,
 )
+from jarvis.core.agent_loop import _collect_pending_detached_job_ids
 from jarvis.llm import (
     DoneEvent,
     ImagePart,
@@ -375,6 +376,96 @@ class _FakeForegroundPromotionLLMService:
 
     async def stream_generate(self, request: LLMRequest):
         raise AssertionError("Streaming is not expected in this test.")
+
+
+class _BackgroundMutationToolExecutor:
+    async def __call__(
+        self,
+        *,
+        call_id: str,
+        arguments: dict[str, object],
+        context,
+    ) -> ToolExecutionResult:
+        _ = arguments, context
+        return ToolExecutionResult(
+            call_id=call_id,
+            name="bash",
+            ok=True,
+            content="Bash background job started\njob_id: job_mutating_background",
+            metadata={
+                "mode": "background",
+                "status": "running",
+                "job_id": "job_mutating_background",
+                "workspace_changed": True,
+            },
+        )
+
+
+class _FakeBackgroundMutationLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+        self.stream_calls = 0
+
+    def _response_for(self, request: LLMRequest, *, call_number: int) -> LLMResponse:
+        if call_number == 1:
+            if [tool.name for tool in request.tools] != ["bash"]:
+                raise AssertionError("Expected bash on the initial request.")
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="bash_background_mutation",
+                        name="bash",
+                        arguments={
+                            "mode": "background",
+                            "command": "run verification",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if request.tools:
+            raise AssertionError("Expected orchestrator waiting follow-up to disable tools.")
+        waiting_message = request.messages[-1]
+        if waiting_message.metadata.get("orchestrator_monitored_waiting") is not True:
+            raise AssertionError("Expected an orchestrator waiting system message.")
+        return _build_response("Waiting for detached verification.")
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        return self._response_for(request, call_number=self.generate_calls)
+
+    async def stream_generate(self, request: LLMRequest):
+        self.stream_calls += 1
+        response = self._response_for(request, call_number=self.stream_calls)
+        if response.text:
+            yield TextDeltaEvent(delta=response.text)
+        yield DoneEvent(response=response)
+
+
+def _build_background_mutation_registry() -> ToolRegistry:
+    return ToolRegistry(
+        tools=[
+            RegisteredTool(
+                name="bash",
+                exposure="basic",
+                definition=ToolDefinition(
+                    name="bash",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "mode": {"type": "string"},
+                            "command": {"type": "string"},
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                    description="Test bash tool.",
+                ),
+                executor=_BackgroundMutationToolExecutor(),
+            )
+        ]
+    )
 
 
 class _FakeViewImageLLMService:
@@ -2113,6 +2204,34 @@ class _FakeInvalidToolCallLLMService:
 
 
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
+    def test_terminal_bash_progress_metadata_is_not_treated_as_pending_work(self) -> None:
+        terminal_update = AgentRuntimeMessage(
+            role="system",
+            content="Detached bash completed.",
+            metadata={
+                "bash_job_progress_update": True,
+                "detached_bash_job_ids": ["finished_job"],
+                "bash_job_running_ids": [],
+                "bash_job_terminal_ids": ["finished_job"],
+            },
+        )
+        mixed_update = AgentRuntimeMessage(
+            role="system",
+            content="Detached bash update.",
+            metadata={
+                "bash_job_progress_update": True,
+                "detached_bash_job_ids": ["running_job", "finished_job"],
+                "bash_job_running_ids": ["running_job"],
+                "bash_job_terminal_ids": ["finished_job"],
+            },
+        )
+
+        self.assertEqual(_collect_pending_detached_job_ids((terminal_update,)), frozenset())
+        self.assertEqual(
+            _collect_pending_detached_job_ids((mixed_update,)),
+            frozenset({"running_job"}),
+        )
+
     async def test_handle_user_input_recovers_when_tool_round_limit_is_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
@@ -2281,6 +2400,84 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     for record in message_records
                 )
             )
+
+    async def test_handle_user_input_does_not_block_acceptance_while_background_job_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            registry = _build_background_mutation_registry()
+            loop = AgentLoop(
+                llm_service=_FakeBackgroundMutationLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            result = await loop.handle_user_input("Start detached verification.")
+
+            self.assertEqual(result.response_text, "Waiting for detached verification.")
+            self.assertFalse(result.completion_blocked)
+            session = storage.get_session(result.session_id)
+            self.assertIsNotNone(session)
+            assert session is not None
+            active_task_id = str(session.backend_state.get("active_tool_task_id", ""))
+            self.assertTrue(active_task_id)
+            self.assertIsNotNone(storage.load_tool_task_state(active_task_id))
+            records = storage.load_records(result.session_id)
+            waiting_record = next(
+                record
+                for record in records
+                if record.metadata.get("orchestrator_monitored_waiting")
+            )
+            self.assertEqual(
+                waiting_record.metadata["detached_bash_job_ids"],
+                ["job_mutating_background"],
+            )
+
+    async def test_stream_user_input_does_not_block_acceptance_while_background_job_pending(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            registry = _build_background_mutation_registry()
+            loop = AgentLoop(
+                llm_service=_FakeBackgroundMutationLLMService(),
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=ToolRuntime(
+                    registry=registry,
+                    policy=_AllowAllToolPolicy(),
+                ),
+            )
+
+            events = [
+                event
+                async for event in loop.stream_user_input("Start detached verification.")
+            ]
+
+            final_event = events[-1]
+            self.assertIsInstance(final_event, AgentTurnDoneEvent)
+            assert isinstance(final_event, AgentTurnDoneEvent)
+            self.assertEqual(
+                final_event.response_text,
+                "Waiting for detached verification.",
+            )
+            self.assertFalse(final_event.completion_blocked)
+            session_id = final_event.session_id
+            session = storage.get_session(session_id)
+            self.assertIsNotNone(session)
+            assert session is not None
+            active_task_id = str(session.backend_state.get("active_tool_task_id", ""))
+            self.assertTrue(active_task_id)
+            self.assertIsNotNone(storage.load_tool_task_state(active_task_id))
 
     async def test_handle_user_input_auto_compacts_when_followup_preflight_budget_is_exceeded(
         self,

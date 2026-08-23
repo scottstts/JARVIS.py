@@ -20,6 +20,7 @@ from ..errors import (
     LLMConfigurationError,
     ProviderAuthenticationError,
     ProviderBadRequestError,
+    ProviderEmptyResponseError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderTemporaryError,
@@ -877,11 +878,24 @@ class OpenRouterProvider:
     def _empty_response_error(
         self,
         diagnostics: dict[str, Any],
-    ) -> ProviderResponseError:
-        return ProviderResponseError(
+    ) -> ProviderEmptyResponseError | ProviderResponseError:
+        semantic_output_emitted = bool(
+            diagnostics.get("semantic_output_emitted", False)
+        )
+        error_metadata = {
+            **diagnostics,
+            "retry_safe_after_acceptance": not semantic_output_emitted,
+        }
+        if semantic_output_emitted:
+            return ProviderResponseError(
+                "OpenRouter returned a terminal response without visible text or usable "
+                "tool calls.",
+                metadata=error_metadata,
+            )
+        return ProviderEmptyResponseError(
             "OpenRouter returned a terminal response without visible text or usable "
             "tool calls.",
-            metadata=diagnostics,
+            metadata=error_metadata,
         )
 
     def _extract_response_header_metadata(

@@ -10,7 +10,7 @@ import unittest
 from jarvis.core import AgentLoop
 from jarvis.core.task_contract import TaskRequirement, build_task_contract
 from jarvis.core.tool_safety import ToolSafetyTracker
-from jarvis.llm import ToolCall
+from jarvis.llm import LLMResponse, ToolCall
 from jarvis.storage import SessionStorage
 from jarvis.tools import ToolExecutionResult
 from tests.helpers import build_core_settings
@@ -48,7 +48,7 @@ class TaskContractTests(unittest.TestCase):
         )
         self.assertIn("user_message_sha256", contract.render())
 
-    def test_unrelated_user_turn_replaces_parked_task_but_resume_reuses_it(self) -> None:
+    def test_superseding_clarification_and_side_query_preserve_active_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
@@ -64,31 +64,56 @@ class TaskContractTests(unittest.TestCase):
                 proposed_task_id="task-one",
                 user_text="You must build the application fully.",
             )
-            second = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+            storage.update_session(
+                session.session_id,
+                pending_interruption_notice=True,
+                pending_interruption_notice_reason="superseded_by_user_message",
+            )
+            clarified = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
                 session_id=session.session_id,
                 proposed_task_id="task-two",
-                user_text="What time is it?",
+                user_text="I want you to decide when and how to use subagents.",
+            )
+            side_query = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="task-three",
+                user_text="Give me a status update.",
+            )
+            loop._begin_turn(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                turn_id="task-three",
+            )
+            loop._persist_successful_turn(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                turn_id="task-three",
+                response=LLMResponse(
+                    provider="fake",
+                    model="fake",
+                    text="Still working.",
+                    tool_calls=[],
+                    finish_reason="stop",
+                    usage=None,
+                ),
+                estimated_input_tokens=1,
             )
             resumed = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
                 session_id=session.session_id,
-                proposed_task_id="task-three",
-                user_text="Continue and make sure all tests pass.",
-            )
-            waived = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
-                session_id=session.session_id,
                 proposed_task_id="task-four",
-                user_text="Continue, but I no longer need the subagent requirement.",
+                user_text="Continue and make sure all tests pass.",
             )
 
             self.assertIsNotNone(first)
-            self.assertIsNotNone(second)
+            self.assertIsNotNone(clarified)
+            self.assertIsNotNone(side_query)
             self.assertIsNotNone(resumed)
-            self.assertIsNotNone(waived)
-            assert first is not None and second is not None and resumed is not None
-            assert waived is not None
-            self.assertNotEqual(first.task_id, second.task_id)
-            self.assertEqual(resumed.task_id, second.task_id)
-            self.assertNotEqual(waived.task_id, resumed.task_id)
+            assert first is not None and clarified is not None and resumed is not None
+            assert side_query is not None
+            self.assertEqual(first.task_id, clarified.task_id)
+            self.assertNotEqual(side_query.task_id, first.task_id)
+            self.assertEqual(resumed.task_id, first.task_id)
+            self.assertTrue(
+                any("subagents" in item.criterion for item in clarified.requirements)
+            )
             self.assertTrue(
                 any("tests pass" in item.criterion for item in resumed.requirements)
             )
@@ -96,9 +121,70 @@ class TaskContractTests(unittest.TestCase):
             assert refreshed is not None
             self.assertEqual(
                 refreshed.backend_state.get("active_tool_task_id"),
-                "task-four",
+                "task-one",
             )
             self.assertIsNotNone(storage.load_tool_task_state("task-one"))
+
+    def test_explicit_task_replacement_does_not_restore_previous_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            session = storage.create_session()
+            loop = AgentLoop(
+                llm_service=SimpleNamespace(),  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+            )
+
+            first = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="task-one",
+                user_text="You must build the application fully.",
+            )
+            replacement = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="task-two",
+                user_text="New task: tell me what time it is.",
+            )
+
+            assert first is not None and replacement is not None
+            self.assertNotEqual(first.task_id, replacement.task_id)
+            state = storage.load_tool_task_state(replacement.task_id)
+            assert state is not None
+            self.assertNotIn("restore_parent_task_id", state)
+
+    def test_explicit_requirement_replacement_does_not_merge_superseded_contract(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            session = storage.create_session()
+            loop = AgentLoop(
+                llm_service=SimpleNamespace(),  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+            )
+
+            first = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="task-one",
+                user_text="You must use subagents and finish the implementation.",
+            )
+            storage.update_session(
+                session.session_id,
+                pending_interruption_notice=True,
+                pending_interruption_notice_reason="superseded_by_user_message",
+            )
+            replacement = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="task-two",
+                user_text="Continue, but I no longer need the subagent requirement.",
+            )
+
+            assert first is not None and replacement is not None
+            self.assertNotEqual(first.task_id, replacement.task_id)
+            self.assertEqual(replacement.requirements, ())
 
     def test_contract_acceptance_requires_runtime_observed_evidence(self) -> None:
         requirements = (
@@ -278,6 +364,168 @@ class TaskContractTests(unittest.TestCase):
             self.assertTrue(storage.write_tool_task_state("task-1", state))
             self.assertFalse(storage.write_tool_task_state("task-1", state))
             self.assertEqual(storage.load_tool_task_state("task-1"), state)
+
+    def test_legacy_cumulative_round_count_migrates_without_poisoning_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            session = storage.create_session()
+            loop = AgentLoop(
+                llm_service=SimpleNamespace(),  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+            )
+            contract = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="legacy-task",
+                user_text="You must finish the project.",
+            )
+            assert contract is not None
+            state = storage.load_tool_task_state(contract.task_id)
+            assert state is not None
+            tracker = ToolSafetyTracker.from_state(state["tracker"])
+            storage.write_tool_task_state(
+                contract.task_id,
+                {
+                    **state,
+                    "schema_version": 1,
+                    "rounds": 338,
+                    "tracker": tracker.to_state(),
+                },
+            )
+
+            rounds, restored_tracker = loop._load_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id
+            )
+            self.assertEqual(rounds, 0)
+            loop._persist_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id,
+                rounds=rounds,
+                tracker=restored_tracker,
+            )
+            migrated = storage.load_tool_task_state(contract.task_id)
+            assert migrated is not None
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(migrated["stalled_rounds"], 0)
+
+    def test_distinct_runtime_progress_resets_rounds_once(self) -> None:
+        tracker = ToolSafetyTracker()
+        metadata = {
+            "bash_job_progress_update": True,
+            "detached_bash_job_ids": ["job-1"],
+            "bash_job_notice_kinds": ["bash_job_needs_attention"],
+            "bash_job_running_ids": ["job-1"],
+            "bash_job_terminal_ids": [],
+            "recommended_action": "inspect",
+            "bash_job_progress_fingerprints": [
+                "job-1:bash_job_needs_attention:running:0:0:0:0:"
+            ],
+        }
+
+        self.assertTrue(
+            tracker.record_runtime_progress(content="runtime=300", metadata=metadata)
+        )
+        epoch = tracker.progress_epoch
+        self.assertFalse(
+            tracker.record_runtime_progress(content="runtime=600", metadata=metadata)
+        )
+        self.assertEqual(tracker.progress_epoch, epoch)
+        self.assertTrue(
+            tracker.record_runtime_progress(
+                content="output grew",
+                metadata={
+                    **metadata,
+                    "bash_job_notice_kinds": ["bash_job_output_grew"],
+                    "recommended_action": "continue",
+                    "bash_job_progress_fingerprints": [
+                        "job-1:bash_job_output_grew:running:8192:0:0:0:"
+                    ],
+                },
+            )
+        )
+        self.assertEqual(tracker.progress_epoch, epoch + 1)
+        self.assertTrue(
+            tracker.record_runtime_progress(
+                content="finished",
+                metadata={
+                    **metadata,
+                    "bash_job_notice_kinds": ["bash_job_completed"],
+                    "bash_job_running_ids": [],
+                    "bash_job_terminal_ids": ["job-1"],
+                    "recommended_action": "finalize",
+                    "bash_job_progress_fingerprints": [
+                        "job-1:bash_job_completed:finished:8192:0:0:0:0"
+                    ],
+                },
+            )
+        )
+        self.assertEqual(tracker.progress_epoch, epoch + 2)
+
+    def test_persisted_orchestrator_note_resets_stalled_rounds_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            session = storage.create_session()
+            loop = AgentLoop(
+                llm_service=SimpleNamespace(),  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+            )
+            contract = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
+                session_id=session.session_id,
+                proposed_task_id="task-one",
+                user_text="You must complete the verification.",
+            )
+            assert contract is not None
+            _rounds, tracker = loop._load_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id
+            )
+            loop._persist_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id,
+                rounds=4,
+                tracker=tracker,
+            )
+            metadata = {
+                "bash_job_progress_update": True,
+                "detached_bash_job_ids": ["job-1"],
+                "bash_job_notice_kinds": ["bash_job_output_grew"],
+                "bash_job_running_ids": ["job-1"],
+                "bash_job_terminal_ids": [],
+                "recommended_action": "continue",
+                "bash_job_progress_fingerprints": [
+                    "job-1:bash_job_output_grew:running:8192:0:0:0:"
+                ],
+            }
+
+            self.assertTrue(
+                loop.append_system_note(
+                    "Detached bash output grew.",
+                    session_id=session.session_id,
+                    metadata=metadata,
+                )
+            )
+            rounds, progressed_tracker = loop._load_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id
+            )
+            self.assertEqual(rounds, 0)
+            self.assertGreater(progressed_tracker.progress_epoch, tracker.progress_epoch)
+
+            loop._persist_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id,
+                rounds=3,
+                tracker=progressed_tracker,
+            )
+            self.assertTrue(
+                loop.append_system_note(
+                    "Duplicate detached bash update.",
+                    session_id=session.session_id,
+                    metadata=metadata,
+                )
+            )
+            duplicate_rounds, _duplicate_tracker = loop._load_tool_task_state(  # pyright: ignore[reportPrivateUsage]
+                session.session_id
+            )
+            self.assertEqual(duplicate_rounds, 3)
 
     def test_changed_test_artifact_adds_independent_review_requirement(self) -> None:
         tracker = ToolSafetyTracker()
