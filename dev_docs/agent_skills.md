@@ -204,7 +204,8 @@ Current behavior:
 - subagents receive the same skill bootstrap mode as configured
 - subagents may read `/workspace/skills`
 - subagents should not install, create, or update skills unless the assignment explicitly asks for it
-- `subagent_invoke.skill_ids` lets Jarvis select up to four canonical installed skills; Jarvis validates those ids and embeds each selected `SKILL.md` into the child assignment bootstrap
+- `subagent_invoke.skill_ids` lets Jarvis explicitly select up to four exact top-level installed skill IDs; Jarvis validates those IDs and embeds each selected `SKILL.md` into the child assignment bootstrap
+- the harness never chooses or fuzzy-resolves a child skill from assignment prose, `SKILL.md`, resource paths, or file/directory names
 - skills that the main agent opened earlier in the current turn are inherited automatically by a newly invoked child, subject to the same four-skill cap; explicit `skill_ids` take precedence
 
 Codex-backed subagents receive skill context through their Codex developer-instructions path.

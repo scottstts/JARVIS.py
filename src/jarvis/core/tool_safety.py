@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Iterable, Literal
 
 from jarvis.llm import ToolCall
 from jarvis.llm.validation import TOOL_CALL_VALIDATION_ERROR_METADATA_KEY
@@ -37,6 +37,7 @@ class ToolActivityObservation:
 class ToolActivityTracker:
     """Track exact repeated calls, material progress, and acceptance evidence."""
 
+    _actor_kind: Literal["main", "subagent"] = "main"
     _invalid_counts: dict[str, int] = field(default_factory=dict)
     _no_progress_counts: dict[str, int] = field(default_factory=dict)
     _seen_activity_signatures: set[str] = field(default_factory=set)
@@ -56,7 +57,9 @@ class ToolActivityTracker:
     _contract_requirements: dict[str, dict[str, str]] = field(default_factory=dict)
     _subagent_invocation_count: int = 0
     _test_review_subagent_ids: set[str] = field(default_factory=set)
+    _test_review_subagent_paths: dict[str, set[str]] = field(default_factory=dict)
     _completed_test_review_subagent_ids: set[str] = field(default_factory=set)
+    _completed_test_review_paths: set[str] = field(default_factory=set)
     _passed_acceptance_gates: dict[str, str] = field(default_factory=dict)
     _visual_inspection_paths: set[str] = field(default_factory=set)
     _runtime_progress_signatures: list[str] = field(default_factory=list)
@@ -81,11 +84,20 @@ class ToolActivityTracker:
         return dict(self._blocked_call_details.get(_tool_call_signature(tool_call), {}))
 
     def record(self, tool_call: ToolCall, result: ToolExecutionResult) -> ToolActivityObservation:
+        delegated_direct_added = self._track_delegated_test_artifacts_from_metadata(
+            result.metadata
+        )
+        delegated_nested_added = self._track_delegated_test_artifacts_from_subagents(
+            result.metadata.get("subagents")
+        )
+        delegated_requirement_added = delegated_direct_added or delegated_nested_added
         workspace_mutated = _result_mutated_workspace(tool_call, result)
         if workspace_mutated:
             self._advance_progress_epoch(invalidate_acceptance=True)
             self._workspace_mutated = True
             self._track_changed_test_artifacts(tool_call, result)
+        elif delegated_requirement_added:
+            self._advance_progress_epoch(invalidate_acceptance=False)
         elif _result_is_material_progress(result):
             self._advance_progress_epoch(invalidate_acceptance=False)
 
@@ -138,6 +150,9 @@ class ToolActivityTracker:
                 subagent_id = str(result.metadata.get("subagent_id", "")).strip()
                 if subagent_id:
                     self._test_review_subagent_ids.add(subagent_id)
+                    self._test_review_subagent_paths[subagent_id] = (
+                        _test_paths_from_requirement(review_requirement)
+                    )
         if result.name == "subagent_monitor" and result.ok:
             self._record_completed_test_reviews(result)
         if result.name == "view_image" and result.ok:
@@ -158,6 +173,7 @@ class ToolActivityTracker:
                 completed_test_review_subagent_ids=(
                     self._completed_test_review_subagent_ids
                 ),
+                completed_test_review_paths=self._completed_test_review_paths,
                 passed_gates=self._passed_acceptance_gates,
                 visual_inspection_paths=self._visual_inspection_paths,
             )
@@ -216,10 +232,13 @@ class ToolActivityTracker:
         self._blocked_call_details.clear()
         self._progress_since_slice = True
         if invalidate_acceptance:
-            self._acceptance_recorded = False
-            self._passed_acceptance_run_call_ids.clear()
-            self._passed_acceptance_run_scopes.clear()
-            self._passed_acceptance_gates.clear()
+            self._invalidate_acceptance_evidence()
+
+    def _invalidate_acceptance_evidence(self) -> None:
+        self._acceptance_recorded = False
+        self._passed_acceptance_run_call_ids.clear()
+        self._passed_acceptance_run_scopes.clear()
+        self._passed_acceptance_gates.clear()
 
     @property
     def progress_epoch(self) -> int:
@@ -233,6 +252,19 @@ class ToolActivityTracker:
     ) -> bool:
         """Advance progress once for each materially distinct orchestrator update."""
 
+        delegated_requirement_added = self._track_delegated_test_artifacts_from_metadata(
+            metadata
+        )
+        delegated_requirement_added = (
+            self._track_delegated_test_artifacts_from_subagents(
+                metadata.get("subagents")
+            )
+            or delegated_requirement_added
+        )
+        self._record_completed_test_review_from_metadata(metadata)
+        self._record_completed_test_reviews_from_subagents(
+            metadata.get("subagents")
+        )
         signature_payload: dict[str, Any]
         if metadata.get("bash_job_progress_update"):
             signature_payload = {
@@ -255,10 +287,14 @@ class ToolActivityTracker:
                 "pending_ids": metadata.get("pending_subagent_ids", []),
                 "recommended_action": metadata.get("recommended_action"),
                 "report_complete": metadata.get("latest_subagent_report_complete"),
+                "changed_test_artifact_paths": metadata.get(
+                    "changed_test_artifact_paths", []
+                ),
+                "subagents": metadata.get("subagents", []),
                 "content": content,
             }
         else:
-            return False
+            return delegated_requirement_added
 
         signature = _digest(signature_payload)
         if signature in self._runtime_progress_signatures:
@@ -312,24 +348,77 @@ class ToolActivityTracker:
             ),
             str(tool_call.arguments.get("path", "")).strip(),
         }
-        test_paths = sorted(path for path in paths if path and _path_is_test_artifact(path))
-        if not test_paths:
+        if self._actor_kind != "main":
             return
-        item_id = "system-test-change-review"
-        self._contract_requirements.setdefault(
-            item_id,
-            {
-                "item_id": item_id,
-                "criterion": (
-                    "Independently review semantic changes to test artifacts: "
-                    + ", ".join(test_paths)
-                ),
-                "evidence_kind": "test_change_review",
-            },
+        self._merge_test_change_review_requirement(
+            path for path in paths if path and _path_is_test_artifact(path)
         )
 
+    def _track_delegated_test_artifacts_from_subagents(
+        self,
+        raw_subagents: object,
+    ) -> bool:
+        if not isinstance(raw_subagents, list):
+            return False
+        paths = {
+            str(path).strip()
+            for raw_subagent in raw_subagents
+            if isinstance(raw_subagent, dict)
+            for path in raw_subagent.get("changed_test_artifact_paths", [])
+            if str(path).strip()
+        }
+        return self._merge_test_change_review_requirement(paths)
+
+    def _track_delegated_test_artifacts_from_metadata(
+        self,
+        metadata: dict[str, Any],
+    ) -> bool:
+        raw_paths = metadata.get("changed_test_artifact_paths")
+        if not isinstance(raw_paths, list):
+            return False
+        return self._merge_test_change_review_requirement(
+            str(path).strip() for path in raw_paths if str(path).strip()
+        )
+
+    def _merge_test_change_review_requirement(self, paths: Iterable[object]) -> bool:
+        if self._actor_kind != "main":
+            return False
+        normalized_paths = {
+            str(path).strip().removeprefix("/workspace/")
+            for path in paths
+            if str(path).strip() and _path_is_test_artifact(str(path))
+        }
+        if not normalized_paths:
+            return False
+        item_id = "system-test-change-review"
+        existing = self._contract_requirements.get(item_id)
+        existing_paths = (
+            _test_paths_from_requirement(existing) if existing is not None else set()
+        )
+        merged_paths = existing_paths | normalized_paths
+        if existing is not None and merged_paths == existing_paths:
+            return False
+        self._contract_requirements[item_id] = {
+            "item_id": item_id,
+            "criterion": (
+                "Independently review semantic changes to test artifacts: "
+                + ", ".join(sorted(merged_paths))
+            ),
+            "evidence_kind": "test_change_review",
+        }
+        self._workspace_mutated = True
+        self._invalidate_acceptance_evidence()
+        return True
+
     def _record_completed_test_reviews(self, result: ToolExecutionResult) -> None:
-        raw_subagents = result.metadata.get("subagents")
+        self._record_completed_test_reviews_from_subagents(
+            result.metadata.get("subagents")
+        )
+
+    def _record_completed_test_reviews_from_subagents(
+        self,
+        raw_subagents: object,
+    ) -> None:
         if not isinstance(raw_subagents, list):
             return
         for raw_subagent in raw_subagents:
@@ -340,8 +429,43 @@ class ToolActivityTracker:
                 subagent_id in self._test_review_subagent_ids
                 and str(raw_subagent.get("status", "")).strip() == "completed"
                 and bool(raw_subagent.get("report_complete", False))
+                and not self._reviewer_changed_required_tests(raw_subagent)
             ):
                 self._completed_test_review_subagent_ids.add(subagent_id)
+                self._completed_test_review_paths.update(
+                    self._test_review_subagent_paths.get(subagent_id, set())
+                )
+
+    def _record_completed_test_review_from_metadata(
+        self,
+        metadata: dict[str, Any],
+    ) -> None:
+        subagent_id = str(metadata.get("subagent_id", "")).strip()
+        if (
+            subagent_id in self._test_review_subagent_ids
+            and str(metadata.get("subagent_status", "")).strip() == "completed"
+            and bool(metadata.get("latest_subagent_report_complete", False))
+            and not self._reviewer_changed_required_tests(metadata)
+        ):
+            self._completed_test_review_subagent_ids.add(subagent_id)
+            self._completed_test_review_paths.update(
+                self._test_review_subagent_paths.get(subagent_id, set())
+            )
+
+    def _reviewer_changed_required_tests(self, payload: dict[str, Any]) -> bool:
+        requirement = self._contract_requirements.get("system-test-change-review")
+        if requirement is None:
+            return False
+        required_paths = _test_paths_from_requirement(requirement)
+        raw_paths = payload.get("changed_test_artifact_paths")
+        if not isinstance(raw_paths, list):
+            return False
+        changed_paths = {
+            str(path).strip().removeprefix("/workspace/")
+            for path in raw_paths
+            if str(path).strip()
+        }
+        return bool(required_paths & changed_paths)
 
     @property
     def unverified_workspace_mutation(self) -> bool:
@@ -372,8 +496,15 @@ class ToolActivityTracker:
             "contract_requirements": dict(self._contract_requirements),
             "subagent_invocation_count": self._subagent_invocation_count,
             "test_review_subagent_ids": sorted(self._test_review_subagent_ids),
+            "test_review_subagent_paths": {
+                subagent_id: sorted(paths)
+                for subagent_id, paths in self._test_review_subagent_paths.items()
+            },
             "completed_test_review_subagent_ids": sorted(
                 self._completed_test_review_subagent_ids
+            ),
+            "completed_test_review_paths": sorted(
+                self._completed_test_review_paths
             ),
             "passed_acceptance_gates": dict(self._passed_acceptance_gates),
             "visual_inspection_paths": sorted(self._visual_inspection_paths),
@@ -381,12 +512,18 @@ class ToolActivityTracker:
         }
 
     @classmethod
-    def from_state(cls, value: object) -> "ToolActivityTracker":
+    def from_state(
+        cls,
+        value: object,
+        *,
+        actor_kind: Literal["main", "subagent"] = "main",
+    ) -> "ToolActivityTracker":
         """Restore validated state; malformed persisted data starts empty."""
 
         if not isinstance(value, dict):
-            return cls()
-        return cls(
+            return cls(_actor_kind=actor_kind)
+        tracker = cls(
+            _actor_kind=actor_kind,
             _invalid_counts=_bounded_count_map(value.get("invalid_counts")),
             _no_progress_counts=_bounded_count_map(value.get("no_progress_counts")),
             _seen_activity_signatures=_bounded_string_set(
@@ -427,9 +564,17 @@ class ToolActivityTracker:
                 value.get("test_review_subagent_ids"),
                 limit=64,
             ),
+            _test_review_subagent_paths=_bounded_string_set_map(
+                value.get("test_review_subagent_paths"),
+                limit=64,
+            ),
             _completed_test_review_subagent_ids=_bounded_string_set(
                 value.get("completed_test_review_subagent_ids"),
                 limit=64,
+            ),
+            _completed_test_review_paths=_bounded_string_set(
+                value.get("completed_test_review_paths"),
+                limit=256,
             ),
             _passed_acceptance_gates=_bounded_string_map(
                 value.get("passed_acceptance_gates"),
@@ -444,6 +589,9 @@ class ToolActivityTracker:
                 limit=256,
             ),
         )
+        if actor_kind == "subagent":
+            tracker._contract_requirements.pop("system-test-change-review", None)
+        return tracker
 
 
 def build_suppressed_repetition_result(
@@ -590,6 +738,8 @@ def _stable_result_content(result: ToolExecutionResult) -> Any:
 def _is_no_progress_result(result: ToolExecutionResult) -> bool:
     if not result.ok:
         return False
+    if result.turn_disposition == "yield_turn":
+        return False
     if result.name in _FILE_EDIT_TOOL_NAMES:
         return not bool(result.metadata.get("changed"))
     if result.name == "bash":
@@ -646,6 +796,7 @@ def _acceptance_ledger_resolved(
     contract_requirements: dict[str, dict[str, str]],
     subagent_invocation_count: int,
     completed_test_review_subagent_ids: set[str],
+    completed_test_review_paths: set[str],
     passed_gates: dict[str, str],
     visual_inspection_paths: set[str],
 ) -> bool:
@@ -679,6 +830,7 @@ def _acceptance_ledger_resolved(
             item=item,
             subagent_invocation_count=subagent_invocation_count,
             completed_test_review_subagent_ids=completed_test_review_subagent_ids,
+            completed_test_review_paths=completed_test_review_paths,
             passed_gates=passed_gates,
             visual_inspection_paths=visual_inspection_paths,
         ):
@@ -817,6 +969,24 @@ def _bounded_string_map(value: object, *, limit: int = 64) -> dict[str, str]:
     return output
 
 
+def _bounded_string_set_map(
+    value: object,
+    *,
+    limit: int = 64,
+) -> dict[str, set[str]]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, set[str]] = {}
+    for raw_key, raw_values in list(value.items())[-limit:]:
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        values = _bounded_string_set(raw_values, limit=256)
+        if values:
+            output[key] = values
+    return output
+
+
 def _bounded_contract_requirements(
     value: object,
     *,
@@ -887,6 +1057,7 @@ def _contract_machine_evidence_resolved(
     item: dict[str, Any],
     subagent_invocation_count: int,
     completed_test_review_subagent_ids: set[str],
+    completed_test_review_paths: set[str],
     passed_gates: dict[str, str],
     visual_inspection_paths: set[str],
 ) -> bool:
@@ -935,6 +1106,7 @@ def _contract_machine_evidence_resolved(
         }
         return (
             bool(completed_test_review_subagent_ids)
+            and required_paths.issubset(completed_test_review_paths)
             and bool(required_paths)
             and required_paths.issubset(cited_paths)
             and item.get("evidence_kind") == "artifact_inspection"
@@ -1001,6 +1173,28 @@ def _path_is_test_artifact(path: str) -> bool:
         or name.startswith("test_")
         or ".test." in name
         or ".spec." in name
+    )
+
+
+def changed_test_artifact_paths_from_result(
+    result: ToolExecutionResult,
+) -> tuple[str, ...]:
+    """Return normalized test artifacts observed as changed by a tool result."""
+
+    candidates = {
+        str(result.metadata.get("path", "")).strip(),
+        *(
+            str(path).strip()
+            for path in result.metadata.get("workspace_changed_paths", [])
+            if str(path).strip()
+        ),
+    }
+    return tuple(
+        sorted(
+            path.removeprefix("/workspace/")
+            for path in candidates
+            if path and _path_is_test_artifact(path)
+        )
     )
 
 

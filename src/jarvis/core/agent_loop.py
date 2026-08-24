@@ -354,6 +354,7 @@ class _ToolExecutionOutcome:
     interrupted: bool = False
     pending_detached_job_ids: frozenset[str] = frozenset()
     pending_subagent_ids: frozenset[str] = frozenset()
+    turn_yielded: bool = False
     deferred_tool_successes: tuple["_DeferredToolSuccess", ...] = ()
     unexecuted_tool_names: tuple[str, ...] = ()
 
@@ -1109,6 +1110,28 @@ class AgentLoop:
                         current_pending_subagent_ids,
                         tool_result,
                     )
+                    if tool_result.turn_disposition == "yield_turn":
+                        for skipped_call in tool_calls[tool_index + 1 :]:
+                            self._append_turn_record(
+                                session_id=session_id,
+                                pending_records=pending_records,
+                                record=self._build_tool_record(
+                                    session_id,
+                                    _build_yield_skipped_tool_result(skipped_call),
+                                    turn_id=turn_id,
+                                ),
+                            )
+                        pending_records.extend(ephemeral_image_records)
+                        return _ToolExecutionOutcome(
+                            pending_detached_job_ids=frozenset(
+                                current_pending_detached_job_ids
+                            ),
+                            pending_subagent_ids=frozenset(
+                                current_pending_subagent_ids
+                            ),
+                            turn_yielded=True,
+                            deferred_tool_successes=tuple(deferred_tool_successes),
+                        )
                     break
 
                 self._append_turn_record(
@@ -2222,6 +2245,7 @@ class AgentLoop:
                 session.session_id
             )
             turn_approval_rejected = False
+            turn_yielded = False
             pending_detached_job_ids = initial_pending_detached_job_ids
             pending_subagent_ids = initial_pending_subagent_ids
             while current_response.tool_calls or _response_requires_acceptance_continuation(
@@ -2326,6 +2350,7 @@ class AgentLoop:
                     ephemeral_image_records: list[ConversationRecord] = []
                     staged_image_tool_successes: list[_DeferredToolSuccess] = []
                     approval_rejected = False
+                    round_yielded = False
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
                     current_pending_subagent_ids = set(pending_subagent_ids)
                     tool_calls = tuple(current_response.tool_calls)
@@ -2432,6 +2457,20 @@ class AgentLoop:
                                     current_pending_subagent_ids,
                                     tool_result,
                                 )
+                                if tool_result.turn_disposition == "yield_turn":
+                                    for skipped_call in tool_calls[tool_index + 1 :]:
+                                        self._append_turn_record(
+                                            session_id=session.session_id,
+                                            pending_records=pending_records,
+                                            record=self._build_tool_record(
+                                                session.session_id,
+                                                _build_yield_skipped_tool_result(
+                                                    skipped_call
+                                                ),
+                                                turn_id=turn_id,
+                                            ),
+                                        )
+                                    round_yielded = True
                                 break
 
                             self._append_turn_record(
@@ -2521,11 +2560,15 @@ class AgentLoop:
 
                         if approval_rejected:
                             break
+                        if round_yielded:
+                            break
 
                     pending_records.extend(ephemeral_image_records)
                     deferred_tool_successes = tuple(staged_image_tool_successes)
                     pending_detached_job_ids = frozenset(current_pending_detached_job_ids)
                     pending_subagent_ids = frozenset(current_pending_subagent_ids)
+                    if round_yielded:
+                        stalled_tool_rounds = max(0, stalled_tool_rounds - 1)
                     if tool_safety.progress_epoch != round_progress_epoch:
                         stalled_tool_rounds = 0
                     self._persist_tool_task_state(
@@ -2540,6 +2583,20 @@ class AgentLoop:
                                 pending_records=pending_records,
                                 deferred_tool_successes=deferred_tool_successes,
                             )
+                        break
+                    if round_yielded:
+                        if deferred_tool_successes:
+                            self._commit_deferred_tool_successes(
+                                session_id=session.session_id,
+                                pending_records=pending_records,
+                                deferred_tool_successes=deferred_tool_successes,
+                            )
+                        turn_yielded = True
+                        current_response = replace(
+                            current_response,
+                            tool_calls=[],
+                            finish_reason="stop",
+                        )
                         break
                     if self._stop_requested(turn_id):
                         if deferred_tool_successes:
@@ -2953,7 +3010,7 @@ class AgentLoop:
                     break
 
             final_response = current_response
-            if pending_detached_job_ids or pending_subagent_ids:
+            if turn_yielded or pending_detached_job_ids or pending_subagent_ids:
                 final_response = _mark_task_completion_deferred(final_response)
 
             completion_blocked = _response_completion_blocked(final_response)
@@ -3322,7 +3379,10 @@ class AgentLoop:
                 active_contract,
                 user_text=user_text,
             )
-            tracker = ToolActivityTracker.from_state(active_state.get("tracker"))
+            tracker = ToolActivityTracker.from_state(
+                active_state.get("tracker"),
+                actor_kind=self._identity.kind,
+            )
             tracker.seed_contract_requirements(contract.requirements)
             self._storage.write_tool_task_state(
                 contract.task_id,
@@ -3355,7 +3415,7 @@ class AgentLoop:
             origin_turn_id=proposed_task_id,
             user_text=user_text,
         )
-        tracker = ToolActivityTracker()
+        tracker = ToolActivityTracker(_actor_kind=self._identity.kind)
         tracker.seed_contract_requirements(contract.requirements)
         self._storage.write_tool_task_state(
             contract.task_id,
@@ -3383,15 +3443,18 @@ class AgentLoop:
     def _load_tool_task_state(self, session_id: str) -> tuple[int, ToolActivityTracker]:
         session = self._storage.get_session(session_id)
         if session is None:
-            return 0, ToolActivityTracker()
+            return 0, ToolActivityTracker(_actor_kind=self._identity.kind)
         task_id = str(session.backend_state.get("active_tool_task_id", "")).strip()
         raw = self._storage.load_tool_task_state(task_id) if task_id else None
         if not isinstance(raw, dict):
             # Read the old inline shape during rolling upgrades, but never persist it again.
             raw = session.backend_state.get("tool_task_state")
         if not isinstance(raw, dict):
-            return 0, ToolActivityTracker()
-        tracker = ToolActivityTracker.from_state(raw.get("tracker"))
+            return 0, ToolActivityTracker(_actor_kind=self._identity.kind)
+        tracker = ToolActivityTracker.from_state(
+            raw.get("tracker"),
+            actor_kind=self._identity.kind,
+        )
         schema_version = _safe_non_negative_int(raw.get("schema_version"))
         persisted_epoch = _safe_non_negative_int(raw.get("round_progress_epoch"))
         if schema_version < 2 or persisted_epoch != tracker.progress_epoch:
@@ -3677,6 +3740,7 @@ class AgentLoop:
         stalled_tool_rounds, tool_safety = self._load_tool_task_state(session.session_id)
         did_compaction = False
         approval_rejected = False
+        turn_yielded = False
         current_session = session
         current_base_records = list(base_records)
 
@@ -3788,6 +3852,8 @@ class AgentLoop:
                 pending_detached_job_ids = tool_execution_outcome.pending_detached_job_ids
                 pending_subagent_ids = tool_execution_outcome.pending_subagent_ids
                 deferred_tool_successes = tool_execution_outcome.deferred_tool_successes
+                if tool_execution_outcome.turn_yielded:
+                    stalled_tool_rounds = max(0, stalled_tool_rounds - 1)
                 if tool_safety.progress_epoch != round_progress_epoch:
                     stalled_tool_rounds = 0
                 self._persist_tool_task_state(
@@ -3835,6 +3901,20 @@ class AgentLoop:
                             metadata={"approval_rejected": True},
                             turn_id=turn_id,
                         ),
+                    )
+                    break
+                if tool_execution_outcome.turn_yielded:
+                    if deferred_tool_successes:
+                        self._commit_deferred_tool_successes(
+                            session_id=current_session.session_id,
+                            pending_records=pending_records,
+                            deferred_tool_successes=deferred_tool_successes,
+                        )
+                    turn_yielded = True
+                    current_response = replace(
+                        current_response,
+                        tool_calls=[],
+                        finish_reason="stop",
                     )
                     break
                 if self._stop_requested(turn_id):
@@ -4063,7 +4143,7 @@ class AgentLoop:
                 )
                 break
 
-        if pending_detached_job_ids or pending_subagent_ids:
+        if turn_yielded or pending_detached_job_ids or pending_subagent_ids:
             current_response = _mark_task_completion_deferred(current_response)
 
         return (
@@ -4750,6 +4830,8 @@ class AgentLoop:
                 "ok": result.ok,
             }
         )
+        if result.turn_disposition != "continue":
+            metadata["turn_disposition"] = result.turn_disposition
         return self._build_message_record(
             session_id=session_id,
             role="tool",
@@ -6132,6 +6214,22 @@ def _update_pending_subagent_ids(
         return
     if status in {"paused", "completed", "failed", "disposed"}:
         pending_subagent_ids.discard(subagent_id)
+
+
+def _build_yield_skipped_tool_result(tool_call: ToolCall) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        call_id=tool_call.call_id,
+        name=tool_call.name,
+        ok=False,
+        content=(
+            "Tool call was not executed because an earlier control tool yielded the turn. "
+            "Issue this action again after the orchestrator wakes if it is still needed."
+        ),
+        metadata={
+            "execution_skipped": True,
+            "error_code": "turn_yielded_before_tool",
+        },
+    )
 
 
 def _is_context_overflow_error(exc: ProviderBadRequestError) -> bool:

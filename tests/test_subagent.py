@@ -497,7 +497,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("--- BEGIN SKILL review-check ---", bootstrap_text)
             self.assertIn("SKILL_FORWARDING_SENTINEL", bootstrap_text)
             self.assertEqual(payload["skill_ids"], ["review-check"])
-            self.assertEqual(payload["skill_selection_reason"], "explicit_or_inherited")
+            self.assertEqual(payload["skill_selection_reason"], "main_selected")
 
             entry = manager._catalog.get_entry(payload["subagent_id"])
             self.assertIsNotNone(entry)
@@ -505,10 +505,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected structured assignment to be persisted.")
             self.assertEqual(entry.task_label, "Review storage contract")
             self.assertEqual(entry.skill_ids, ("review-check",))
-            self.assertEqual(entry.skill_selection_reason, "explicit_or_inherited")
+            self.assertEqual(entry.skill_selection_reason, "main_selected")
             self.assertEqual(entry.owned_paths, ("tests/test_storage.py",))
 
-    async def test_auto_skill_selection_requires_assignment_domain_identity(self) -> None:
+    async def test_invoke_never_infers_skill_from_assignment_text_or_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))
             skill_dir = core_settings.workspace_dir / "skills" / "threejs-procedural-fields"
@@ -533,19 +533,98 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 register_approval_target=lambda _approval_id, _loop: None,
             )
 
-            self.assertEqual(
-                manager._auto_select_skill_ids(
-                    "Implement a Python HTTP status server with JSON responses, pytest tests, "
-                    "environment-variable configuration, and clean signal shutdown."
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Build procedural fields",
+                instructions=(
+                    "Read skills/threejs-procedural-fields/SKILL.md and its references, then "
+                    "build a Three.js procedural terrain."
                 ),
-                (),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
             )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+
+            bootstrap_text = "\n".join(
+                part.text
+                for request in manager._llm_service.requests
+                for message in request.messages
+                for part in message.parts
+                if isinstance(part, TextPart)
+            )
+            self.assertEqual(payload["skill_ids"], [])
             self.assertEqual(
-                manager._auto_select_skill_ids(
-                    "Build a Three.js procedural terrain whose height fields drive geometry."
-                ),
-                ("threejs-procedural-fields",),
+                payload["skill_selection_reason"],
+                "none:not_selected_by_main",
             )
+            self.assertNotIn("--- BEGIN SKILL threejs-procedural-fields ---", bootstrap_text)
+
+    async def test_changed_child_tests_are_exposed_to_main_monitor_and_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Build vehicle tests",
+                instructions="Implement the vehicle subsystem and its tests.",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+
+            await manager._observe_tool_result(
+                subagent_id=runtime.subagent_id,
+                result=ToolExecutionResult(
+                    call_id="write-tests",
+                    name="file_write",
+                    ok=True,
+                    content="changed",
+                    metadata={
+                        "changed": True,
+                        "path": "/workspace/src/vehicles/__tests__/vehicle.test.ts",
+                    },
+                ),
+                context=ToolExecutionContext(
+                    workspace_dir=core_settings.workspace_dir,
+                    agent_kind="subagent",
+                    subagent_id=runtime.subagent_id,
+                ),
+            )
+
+            monitor = await manager.monitor(agent=runtime.subagent_id)
+            snapshot = monitor["subagents"][0]
+            self.assertEqual(
+                snapshot["changed_test_artifact_paths"],
+                ["src/vehicles/__tests__/vehicle.test.ts"],
+            )
+            progress = manager.build_main_progress_message(
+                agent=runtime.subagent_id,
+                notice_kind="subagent_completed",
+                notice_text="completed.",
+            )
+            self.assertIsNotNone(progress)
+            if progress is None:
+                self.fail("Expected a main progress message.")
+            _session_id, message = progress
+            self.assertEqual(
+                message.metadata["changed_test_artifact_paths"],
+                ["src/vehicles/__tests__/vehicle.test.ts"],
+            )
+            self.assertIn("Jarvis-owned acceptance obligation", message.content)
 
     async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1449,6 +1528,91 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 {"deadbeefdeadbeefdeadbeefdeadbeef"},
             )
             self.assertEqual(runtime.loop.system_notes, [])
+
+    async def test_child_silent_job_attention_resumes_child_without_escalating_main(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            published_events: list[object] = []
+
+            async def publish_event(event: object) -> None:
+                published_events.append(event)
+
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            runtime = SubagentRuntime(
+                subagent_id="sub_1",
+                codename="Ultron",
+                loop=_FakeSubagentLoop([], session_id="subagent_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_1",
+                ),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="waiting_background",
+                created_at="2026-03-21T10:00:00+00:00",
+                updated_at="2026-03-21T10:00:00+00:00",
+            )
+            runtime.pending_background_job_ids.add("deadbeefdeadbeefdeadbeefdeadbeef")
+            manager._subagents[runtime.subagent_id] = runtime
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id=runtime.subagent_id,
+                    codename=runtime.codename,
+                    status=runtime.status,
+                    created_at=runtime.created_at,
+                    updated_at=runtime.updated_at,
+                    route_id="route_1",
+                    owner_main_session_id=runtime.owner_main_session_id,
+                    owner_main_turn_id=runtime.owner_main_turn_id,
+                )
+            )
+            notice = BashJobNotice(
+                job_id="deadbeefdeadbeefdeadbeefdeadbeef",
+                notice_kind="bash_job_needs_attention",
+                owner_route_id="route_1",
+                owner_session_id="subagent_session",
+                owner_turn_id="turn_1",
+                owner_agent_kind="subagent",
+                owner_agent_name="Ultron",
+                owner_subagent_id="sub_1",
+                status="running",
+                command="run long stability test",
+                started_at="2026-03-21T10:00:00Z",
+                last_update_at="2026-03-21T10:05:00Z",
+                finished_at=None,
+                cancelled_at=None,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                stdout_bytes_seen=0,
+                stderr_bytes_seen=0,
+                stdout_bytes_dropped=0,
+                stderr_bytes_dropped=0,
+                progress_hint=None,
+            )
+
+            with patch.object(manager, "_launch_runtime_task"):
+                await manager.enqueue_bash_job_followup((notice,))
+
+            lifecycle_notices = [
+                event.notice_kind
+                for event in published_events
+                if isinstance(event, RouteSystemNoticeEvent)
+            ]
+            self.assertEqual(runtime.status, "running")
+            self.assertIn("subagent_resumed_after_bash_update", lifecycle_notices)
+            self.assertNotIn("subagent_needs_attention", lifecycle_notices)
+            self.assertIn("recommendation=inspect", runtime.loop.system_notes[0][0])
 
     async def test_monitor_returns_full_pending_job_ids_and_nudges_on_unchanged_poll(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

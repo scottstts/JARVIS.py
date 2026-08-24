@@ -6,7 +6,6 @@ import asyncio
 from collections import deque
 from datetime import datetime, timezone
 import json
-import re
 import traceback
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -39,13 +38,8 @@ from jarvis.llm import (
     ProviderTemporaryError,
 )
 from jarvis.logging_setup import get_application_logger
-from jarvis.skills import (
-    SkillHeader,
-    SkillsSettings,
-    get_skill,
-    load_skill_catalog,
-    search_skills,
-)
+from jarvis.skills import SkillsSettings, get_skill
+from jarvis.core.tool_safety import changed_test_artifact_paths_from_result
 from jarvis.skills.catalog import read_skill_markdown
 from jarvis.storage import SessionStorage
 from jarvis.storage.layout import transcript_archive_root_from_runtime_path
@@ -157,16 +151,9 @@ class SubagentManager:
             raise ValueError("Subagent instructions cannot be empty.")
         normalized_owned_paths = _normalize_unique_strings(owned_paths)
         normalized_skill_ids = _normalize_unique_strings(skill_ids)
-        skill_selection_reason = "explicit_or_inherited"
-        if not normalized_skill_ids:
-            normalized_skill_ids = self._auto_select_skill_ids(
-                f"{normalized_task_label}\n{normalized_instructions}"
-            )
-            skill_selection_reason = (
-                "auto_matched:" + ",".join(normalized_skill_ids)
-                if normalized_skill_ids
-                else "none:no_matching_installed_skill"
-            )
+        skill_selection_reason = (
+            "main_selected" if normalized_skill_ids else "none:not_selected_by_main"
+        )
         skill_documents = self._load_skill_documents(normalized_skill_ids)
         active = self._non_disposed_runtimes()
         if len(active) >= self._settings.max_active:
@@ -634,6 +621,11 @@ class SubagentManager:
                 "pending_background_job_ids="
                 + ",".join(snapshot.pending_background_job_ids)
             )
+        if snapshot.changed_test_artifact_paths:
+            parts.append(
+                "changed_test_artifacts="
+                + ",".join(snapshot.changed_test_artifact_paths)
+            )
         if notice_text.strip():
             parts.append(f'note="{self._truncate_for_notice(notice_text, max_length=140)}"')
         latest_report = snapshot.latest_report
@@ -645,6 +637,7 @@ class SubagentManager:
                 latest_report=rendered_report,
                 report_complete=snapshot.report_complete,
                 report_truncated=report_truncated,
+                changed_test_artifact_paths=snapshot.changed_test_artifact_paths,
             )
         )
         return (
@@ -656,10 +649,14 @@ class SubagentManager:
                     "notice_kind": "subagent_progress_update",
                     "subagent_id": snapshot.subagent_id,
                     "subagent_notice_kind": notice_kind,
+                    "subagent_status": snapshot.status,
                     "recommended_action": recommendation,
                     "latest_subagent_report_included": bool(latest_report),
                     "latest_subagent_report_complete": snapshot.report_complete,
                     "latest_subagent_report_truncated": report_truncated,
+                    "changed_test_artifact_paths": list(
+                        snapshot.changed_test_artifact_paths
+                    ),
                     "pending_subagent_ids": (
                         [snapshot.subagent_id]
                         if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
@@ -678,12 +675,18 @@ class SubagentManager:
         latest_report: str | None,
         report_complete: bool,
         report_truncated: bool,
+        changed_test_artifact_paths: tuple[str, ...],
     ) -> list[str]:
         lines = [
             "Subagent update.",
             "- " + " ".join(parts),
             f"recommendation={recommendation}",
         ]
+        if changed_test_artifact_paths:
+            lines.append(
+                "Independent test review remains a Jarvis-owned acceptance obligation: "
+                + ",".join(changed_test_artifact_paths)
+            )
         if recommendation in {"finalize", "inspect"} and latest_report is not None:
             report_heading = (
                 "Complete subagent report:"
@@ -1229,6 +1232,9 @@ class SubagentManager:
         if runtime is None:
             return
         runtime.last_tool_name = result.name
+        changed_test_paths = changed_test_artifact_paths_from_result(result)
+        if changed_test_paths:
+            runtime.changed_test_artifact_paths.update(changed_test_paths)
         self._append_notable_event(
             runtime,
             kind="tool_result",
@@ -1389,20 +1395,10 @@ class SubagentManager:
         )
         self._sync_catalog(runtime)
         self._record_bash_notice_delivery(notices)
-        notice_kind = (
-            "subagent_needs_attention"
-            if recommendation == "inspect"
-            else "subagent_resumed_after_bash_update"
-        )
-        notice_text = (
-            "needs attention after detached bash update."
-            if recommendation == "inspect"
-            else "resumed after detached bash update."
-        )
         await self._publish_lifecycle_notice(
             runtime,
-            notice_kind=notice_kind,
-            text=notice_text,
+            notice_kind="subagent_resumed_after_bash_update",
+            text="resumed to handle a detached bash update.",
             session_id=session_id,
         )
         self._launch_runtime_task(
@@ -1767,17 +1763,6 @@ class SubagentManager:
             documents.append((skill_id, read_skill_markdown(settings, skill)))
         return tuple(documents)
 
-    def _auto_select_skill_ids(self, assignment: str) -> tuple[str, ...]:
-        settings = SkillsSettings.from_workspace_dir(self._core_settings.workspace_dir)
-        catalog = load_skill_catalog(settings)
-        matches: list[str] = []
-        for skill in search_skills(catalog, assignment):
-            if _skill_matches_assignment(skill, assignment):
-                matches.append(skill.skill_id)
-            if len(matches) >= 2:
-                break
-        return tuple(matches)
-
     def _record_subagent_error(self, runtime: SubagentRuntime, exc: Exception) -> str:
         error_log_path = runtime.storage.root_dir / "errors.jsonl"
         entry = {
@@ -1830,6 +1815,9 @@ class SubagentManager:
             last_error_metadata=runtime.last_error_metadata,
             error_log_path=runtime.error_log_path,
             run_generation=runtime.run_generation,
+            changed_test_artifact_paths=tuple(
+                sorted(runtime.changed_test_artifact_paths)
+            ),
             disposed_at=disposed_at,
         )
 
@@ -1856,6 +1844,9 @@ class SubagentManager:
             "pending_background_job_ids": list(snapshot.pending_background_job_ids),
             "run_generation": snapshot.run_generation,
             "skill_selection_reason": snapshot.skill_selection_reason,
+            "changed_test_artifact_paths": list(
+                snapshot.changed_test_artifact_paths
+            ),
         }
         if detail == "full":
             payload.update(
@@ -1991,50 +1982,6 @@ def _exception_metadata(exc: Exception) -> dict[str, Any]:
 
 def _subagent_notice_is_public(notice_kind: str) -> bool:
     return notice_kind in {"subagent_invoked", "subagent_disposed"}
-
-
-_SKILL_MATCH_STOP_WORDS = frozenset(
-    {
-        "about",
-        "after",
-        "build",
-        "create",
-        "from",
-        "implement",
-        "into",
-        "should",
-        "skill",
-        "that",
-        "their",
-        "these",
-        "this",
-        "using",
-        "with",
-    }
-)
-
-
-def _skill_matches_assignment(skill: SkillHeader, assignment: str) -> bool:
-    normalized = " ".join(assignment.lower().split())
-    skill_id = skill.skill_id.lower()
-    name = skill.name.lower()
-    if skill_id in normalized or (len(name) >= 5 and name in normalized):
-        return True
-    assignment_tokens = _skill_match_tokens(normalized)
-    identity_tokens = _skill_match_tokens(f"{skill_id} {name}")
-    identity_hits = assignment_tokens & identity_tokens
-    if not identity_hits:
-        return False
-    description_hits = assignment_tokens & _skill_match_tokens(skill.description)
-    return len(identity_hits) >= 2 or bool(description_hits - identity_hits)
-
-
-def _skill_match_tokens(value: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", value.lower())
-        if len(token) >= 5 and token not in _SKILL_MATCH_STOP_WORDS
-    }
 
 
 def _bash_job_progress_fingerprint(notice: BashJobNotice) -> str:

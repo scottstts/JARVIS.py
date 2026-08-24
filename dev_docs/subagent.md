@@ -76,7 +76,7 @@ The dynamic assignment includes:
 - optional selected skill ids, whose full `SKILL.md` documents are embedded into bootstrap
 - optional deliverable or success criteria
 
-The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited (up to four total, with explicit `skill_ids` taking precedence); when none were selected, the manager may attach a conservatively matched installed skill. Automatic matching requires assignment overlap with the skill's ID/name identity, not merely two generic words from a long description, so unrelated large skill prompts are not injected. Every child records `skill_selection_reason`, including the short no-match reason when no skill applies.
+The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited, and explicit `skill_ids` can add exact top-level installed skill IDs, up to four total. The harness never infers skills from assignment prose, `SKILL.md`, referenced resources, or file/directory names. Every child records whether Jarvis selected skills or selected none.
 
 The main agent receives high-level subagent usage guidance through `PROGRAM.md` and detailed primitive docs from `src/jarvis/subagent/primitives.py`.
 
@@ -110,7 +110,7 @@ Returns:
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
 
-When the user explicitly requires delegation, task acceptance is coupled to an observed successful `subagent_invoke`; merely claiming delegation in `acceptance_record` is insufficient. Semantic edits to test artifacts additionally create a changed-test-review obligation that requires an independent subagent review and cited artifact evidence before completion.
+When the user explicitly requires delegation, task acceptance is coupled to an observed successful `subagent_invoke`; merely claiming delegation in `acceptance_record` is insufficient. Semantic edits to test artifacts create a changed-test-review obligation. A child reports its changed test paths upward and can finish its own bounded assignment after normal acceptance; the owning main task inherits the independent-review obligation and remains incomplete until a different, non-editing reviewer finishes and the artifact evidence is cited.
 
 ### `subagent_monitor`
 
@@ -142,7 +142,7 @@ It releases the codename, marks the catalog entry disposed, closes the child loo
 
 ### `orchestrator_wait`
 
-Parks only the main orchestrator when route-owned children or detached jobs are still active and there is no actionable main work. Jarvis supplies a preferred `wake_after_seconds`, a concise reason, and optional pending actor IDs. The runtime validates the actor set, clamps the liveness deadline, applies exponential backoff after unchanged reviews, and wakes immediately on terminal/attention events. Routine running/output-growth observations do not poll either model. This primitive is general across any pending actor mix; it is not special-cased to one child.
+Parks only the main orchestrator when route-owned children or detached jobs are still active and there is no actionable main work. Jarvis supplies a preferred `wake_after_seconds`, a concise reason, and optional pending actor IDs. A successful call persists its tool result and yields the current main turn without another provider request. The runtime atomically persists and consumes routine queued notices; material inspect/finalize notices return one typed review result instead of parking. The runtime validates the actor set, clamps the liveness deadline, applies exponential backoff after unchanged reviews, and wakes immediately on later material events. Routine running/output-growth observations do not poll either model. This primitive is general across any pending actor mix; it is not special-cased to one child.
 
 ## Lifecycle And Status
 
@@ -198,7 +198,7 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background, service, and acceptance-gate Bash without model-declared paths or lease generations.
 
-Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
+Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A silent-job attention notice first resumes the owning child and remains routine from Jarvis's perspective; the main agent is escalated only if that child subsequently cannot recover, pauses, fails, needs approval, or reports an unresolved blocker. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
 
 ## Storage
 

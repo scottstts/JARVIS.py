@@ -62,7 +62,8 @@ class SubagentCatalogEntry:
     shared_context: str | None = None
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
-    skill_selection_reason: str = "none:no_matching_installed_skill"
+    skill_selection_reason: str = "none:not_selected_by_main"
+    changed_test_artifact_paths: tuple[str, ...] = field(default_factory=tuple)
     deliverable: str | None = None
     current_subagent_session_id: str | None = None
     disposed_at: str | None = None
@@ -89,6 +90,7 @@ class SubagentCatalogEntry:
             "owned_paths": list(self.owned_paths),
             "skill_ids": list(self.skill_ids),
             "skill_selection_reason": self.skill_selection_reason,
+            "changed_test_artifact_paths": list(self.changed_test_artifact_paths),
             "deliverable": self.deliverable,
             "current_subagent_session_id": self.current_subagent_session_id,
             "disposed_at": self.disposed_at,
@@ -123,6 +125,9 @@ class SubagentCatalogEntry:
             }
             else None
         )
+        raw_changed_test_paths = payload.get("changed_test_artifact_paths", ())
+        if not isinstance(raw_changed_test_paths, (list, tuple)):
+            raw_changed_test_paths = ()
         return cls(
             subagent_id=str(payload.get("subagent_id", "")),
             codename=str(payload.get("codename", "")),
@@ -149,8 +154,13 @@ class SubagentCatalogEntry:
             skill_selection_reason=str(
                 payload.get(
                     "skill_selection_reason",
-                    "none:no_matching_installed_skill",
+                    "none:not_selected_by_main",
                 )
+            ),
+            changed_test_artifact_paths=tuple(
+                str(item)
+                for item in raw_changed_test_paths
+                if str(item).strip()
             ),
             deliverable=(
                 str(payload["deliverable"])
@@ -200,7 +210,8 @@ class SubagentSnapshot:
     shared_context: str | None = None
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
-    skill_selection_reason: str = "none:no_matching_installed_skill"
+    skill_selection_reason: str = "none:not_selected_by_main"
+    changed_test_artifact_paths: tuple[str, ...] = field(default_factory=tuple)
     deliverable: str | None = None
     current_subagent_session_id: str | None = None
     pause_reason: SubagentPauseReason | None = None

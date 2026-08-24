@@ -214,5 +214,7 @@
 - Bash admission is permit-by-default inside `tool_runtime`; only functional-malfunction commands, unmanaged detachment, broad recursive root deletion, and destructive repository erasure are restricted.
 - Unverified workspace mutation now auto-continues through acceptance instead of parking, while terminal blocks carry a structured `completion_block_reason`.
 - OpenRouter empty-response recovery is post-acceptance retry-safe only when no semantic delta escaped; a partial malformed tool delta must fail without replay to avoid duplicate side effects.
+- Child test mutations must transfer an independent-review obligation to the owning main task; children may never receive acceptance requirements that require unavailable subagent primitives.
+- `orchestrator_wait` is a persisted first-class turn yield, consumes routine/stale queued notices atomically, and returns material notices once for review without spending another provider call or liveness round.
+- Subagent skills are selected only by Jarvis through exact top-level skill IDs or same-turn inheritance; the harness never infers them from assignment text or skill resource paths.
 - The real-gateway headless runner is development-only under `tests/headless/`, uses the workspace Ox Alpha settings unchanged, and must recognize command-only `/new` completion before cleaning its unique test workspace.
-- Automatic subagent skill matching must overlap assignment text with skill ID/name identity; description-only overlap can inject huge unrelated prompts.

@@ -22,8 +22,9 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                 "Start a background subagent for bounded side work that can run independently "
                 "while you supervise. Supply a stable task label and only the context the child "
                 "needs: explicit user constraints, shared interfaces/environment, owned paths, "
-                "and selected skill ids. Skills opened by Jarvis in this turn are inherited "
-                "automatically; use skill_ids only to add relevant installed skills."
+                "and selected skill ids. Only Jarvis may select skills: name the exact top-level "
+                "installed skill id, never infer one from SKILL.md, references, or other paths. "
+                "Skills opened by Jarvis in this turn are inherited automatically."
             ),
             input_schema={
                 "type": "object",
@@ -66,8 +67,8 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                         "maxItems": 4,
                         "uniqueItems": True,
                         "description": (
-                            "Canonical installed skill ids Jarvis selected; their SKILL.md "
-                            "documents are embedded into the child bootstrap."
+                            "Exact top-level installed skill ids Jarvis selected; file or folder "
+                            "names inside a skill are not skill ids."
                         ),
                     },
                     "deliverable": {
@@ -146,7 +147,8 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
             description=(
                 "Park Jarvis while route-owned subagents or detached jobs continue and there is "
                 "no actionable main-agent work. Material actor events wake Jarvis immediately; "
-                "wake_after_seconds is only a bounded liveness review deadline."
+                "wake_after_seconds is only a bounded liveness review deadline. Call this only "
+                "after other actions, as the final control tool in the response."
             ),
             input_schema={
                 "type": "object",
@@ -178,7 +180,8 @@ def render_subagent_primitive_docs() -> str:
         "Use subagents only for bounded side work; Jarvis remains responsible for the final answer.",
         f"- `{definitions['subagent_invoke'].name}`: start bounded background side work. "
         "Give it a stable `task_label`, explicit constraints, shared interfaces, owned paths, "
-        "selected `skill_ids`, and a concrete deliverable. Continue independent main-task work "
+        "exact top-level `skill_ids` you selected, and a concrete deliverable. Never infer a "
+        "skill from a referenced skill file or directory. Continue independent main-task work "
         "after invoking; do not poll, and let orchestrator updates drive supervision.",
         f"- `{definitions['subagent_monitor'].name}`: inspect on demand. Omit `agent` to summarize all active "
         "subagents; use `detail=\"full\"` only when you need current internals.",

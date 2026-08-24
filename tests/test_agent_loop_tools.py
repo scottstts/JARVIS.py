@@ -276,6 +276,39 @@ class _FakeToolLLMService:
             )
 
 
+class _FakeYieldToolLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+        self.stream_calls = 0
+
+    @staticmethod
+    def _yield_response() -> LLMResponse:
+        return _build_response(
+            "",
+            tool_calls=[
+                ToolCall(
+                    call_id="wait_1",
+                    name="orchestrator_wait",
+                    arguments={"wake_after_seconds": 600, "reason": "Child is running."},
+                    raw_arguments="",
+                )
+            ],
+            finish_reason="tool_calls",
+        )
+
+    async def generate(self, _request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        if self.generate_calls > 1:
+            raise AssertionError("A yielded turn must not request a follow-up generation.")
+        return self._yield_response()
+
+    async def stream_generate(self, _request: LLMRequest):
+        self.stream_calls += 1
+        if self.stream_calls > 1:
+            raise AssertionError("A yielded turn must not request a follow-up stream.")
+        yield DoneEvent(response=self._yield_response())
+
+
 class _FakeToolFirstLLMService(_FakeToolLLMService):
     async def stream_generate(self, request: LLMRequest):
         self.stream_calls += 1
@@ -2630,6 +2663,78 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message_records[-3].content, "")
             self.assertEqual(message_records[-3].metadata["tool_calls"][0]["name"], "bash")
             self.assertIn("Bash execution result", message_records[-2].content)
+
+    async def test_handle_user_input_yielding_tool_ends_turn_without_followup_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _FakeYieldToolLLMService()
+
+            async def execute_wait(tool_call, _context):
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    ok=True,
+                    content="Orchestrator wait registered",
+                    metadata={"orchestrator_wait": True},
+                    turn_disposition="yield_turn",
+                )
+
+            loop = AgentLoop(
+                llm_service=llm_service,  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+                tool_executor=execute_wait,
+            )
+
+            result = await loop.handle_user_input("Wait for the child.")
+
+            self.assertEqual(result.response_text, "")
+            self.assertEqual(llm_service.generate_calls, 1)
+            session = storage.get_session(result.session_id)
+            self.assertIsNotNone(session)
+            if session is None:
+                self.fail("Expected active session metadata.")
+            self.assertIn("active_tool_task_id", session.backend_state)
+            wait_record = next(
+                record
+                for record in storage.load_records(result.session_id)
+                if record.role == "tool" and record.metadata.get("tool_name") == "orchestrator_wait"
+            )
+            self.assertEqual(wait_record.metadata["turn_disposition"], "yield_turn")
+
+    async def test_stream_turn_yielding_tool_ends_turn_without_followup_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            llm_service = _FakeYieldToolLLMService()
+
+            async def execute_wait(tool_call, _context):
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    ok=True,
+                    content="Orchestrator wait registered",
+                    metadata={"orchestrator_wait": True},
+                    turn_disposition="yield_turn",
+                )
+
+            loop = AgentLoop(
+                llm_service=llm_service,  # type: ignore[arg-type]
+                settings=settings,
+                tool_executor=execute_wait,
+            )
+
+            events = [
+                event
+                async for event in loop.stream_turn(user_text="Wait for the child.")
+            ]
+
+            self.assertEqual(llm_service.stream_calls, 1)
+            done = [event for event in events if isinstance(event, AgentTurnDoneEvent)]
+            self.assertEqual(len(done), 1)
+            self.assertEqual(done[0].response_text, "")
 
     async def test_handle_user_input_handles_bash_foreground_promotion(
         self,

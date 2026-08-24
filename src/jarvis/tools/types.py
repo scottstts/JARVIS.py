@@ -10,6 +10,7 @@ from jarvis.llm import ToolDefinition
 
 ToolExposure = Literal["basic", "discoverable"]
 AgentToolAccess = Literal["main", "subagent"]
+ToolTurnDisposition = Literal["continue", "yield_turn"]
 
 if TYPE_CHECKING:
     from jarvis.memory import MemoryService
@@ -42,6 +43,7 @@ class ToolExecutionResult:
     ok: bool
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    turn_disposition: ToolTurnDisposition = "continue"
 
 
 @dataclass(slots=True, frozen=True)

@@ -661,3 +661,342 @@ class TaskContractTests(unittest.TestCase):
             ),
         )
         self.assertFalse(tracker.unverified_workspace_mutation)
+
+    def test_subagent_test_changes_transfer_review_obligation_to_main_tracker(self) -> None:
+        child_tracker = ToolSafetyTracker(_actor_kind="subagent")
+        child_tracker.record(
+            _call("file_write", {"path": "tests/vehicle.test.ts"}, "child-write"),
+            ToolExecutionResult(
+                call_id="child-write",
+                name="file_write",
+                ok=True,
+                content="changed",
+                metadata={
+                    "changed": True,
+                    "path": "/workspace/tests/vehicle.test.ts",
+                },
+            ),
+        )
+
+        self.assertNotIn(
+            "system-test-change-review",
+            "\n".join(child_tracker.checkpoint_lines()),
+        )
+        self.assertTrue(child_tracker.unverified_workspace_mutation)
+
+        main_tracker = ToolSafetyTracker()
+        made_progress = main_tracker.record_runtime_progress(
+            content="Vehicle builder completed.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "builder-agent",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "changed_test_artifact_paths": [
+                    "tests/vehicle.test.ts",
+                    "src/physics/__tests__/physics.test.ts",
+                ],
+            },
+        )
+
+        checkpoint = "\n".join(main_tracker.checkpoint_lines())
+        self.assertTrue(made_progress)
+        self.assertTrue(main_tracker.unverified_workspace_mutation)
+        self.assertIn("system-test-change-review", checkpoint)
+        self.assertIn("tests/vehicle.test.ts", checkpoint)
+        self.assertIn("src/physics/__tests__/physics.test.ts", checkpoint)
+
+        main_tracker.record(
+            _call(
+                "subagent_invoke",
+                {
+                    "task_label": "Independent test review",
+                    "instructions": (
+                        "Review tests/vehicle.test.ts and "
+                        "src/physics/__tests__/physics.test.ts."
+                    ),
+                },
+                "review-invoke",
+            ),
+            ToolExecutionResult(
+                call_id="review-invoke",
+                name="subagent_invoke",
+                ok=True,
+                content="started",
+                metadata={"subagent_id": "review-agent"},
+            ),
+        )
+        main_tracker.record_runtime_progress(
+            content="Independent review completed.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "review-agent",
+                "subagent_status": "completed",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "latest_subagent_report_complete": True,
+                "changed_test_artifact_paths": [],
+            },
+        )
+        self.assertEqual(
+            main_tracker.to_state()["completed_test_review_subagent_ids"],
+            ["review-agent"],
+        )
+
+        editing_reviewer = ToolSafetyTracker()
+        editing_reviewer.record_runtime_progress(
+            content="Builder completed.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "builder-agent",
+                "subagent_status": "completed",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "latest_subagent_report_complete": True,
+                "changed_test_artifact_paths": ["tests/vehicle.test.ts"],
+            },
+        )
+        editing_reviewer.record(
+            _call(
+                "subagent_invoke",
+                {
+                    "task_label": "Independent test review",
+                    "instructions": "Review tests/vehicle.test.ts.",
+                },
+                "editing-review-invoke",
+            ),
+            ToolExecutionResult(
+                call_id="editing-review-invoke",
+                name="subagent_invoke",
+                ok=True,
+                content="started",
+                metadata={"subagent_id": "editing-review-agent"},
+            ),
+        )
+        editing_reviewer.record_runtime_progress(
+            content="Review completed after editing the target test.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "editing-review-agent",
+                "subagent_status": "completed",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "latest_subagent_report_complete": True,
+                "changed_test_artifact_paths": ["tests/vehicle.test.ts"],
+            },
+        )
+        self.assertEqual(
+            editing_reviewer.to_state()["completed_test_review_subagent_ids"],
+            [],
+        )
+
+        expanding_obligation = ToolSafetyTracker()
+        expanding_obligation.record_runtime_progress(
+            content="First builder completed.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "first-builder",
+                "subagent_status": "completed",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "latest_subagent_report_complete": True,
+                "changed_test_artifact_paths": ["tests/first.test.ts"],
+            },
+        )
+        expanding_obligation.record(
+            _call(
+                "subagent_invoke",
+                {
+                    "task_label": "Review first test",
+                    "instructions": "Review tests/first.test.ts.",
+                },
+                "first-review-invoke",
+            ),
+            ToolExecutionResult(
+                call_id="first-review-invoke",
+                name="subagent_invoke",
+                ok=True,
+                content="started",
+                metadata={"subagent_id": "first-reviewer"},
+            ),
+        )
+        expanding_obligation.record_runtime_progress(
+            content="First review completed.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "first-reviewer",
+                "subagent_status": "completed",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "latest_subagent_report_complete": True,
+                "changed_test_artifact_paths": [],
+            },
+        )
+        expanding_obligation.record_runtime_progress(
+            content="Second builder completed.",
+            metadata={
+                "subagent_progress_update": True,
+                "subagent_id": "second-builder",
+                "subagent_status": "completed",
+                "subagent_notice_kind": "subagent_completed",
+                "recommended_action": "finalize",
+                "latest_subagent_report_complete": True,
+                "changed_test_artifact_paths": ["tests/second.test.ts"],
+            },
+        )
+        expanded_state = expanding_obligation.to_state()
+        self.assertEqual(
+            expanded_state["completed_test_review_paths"],
+            ["tests/first.test.ts"],
+        )
+        self.assertIn(
+            "tests/second.test.ts",
+            expanded_state["contract_requirements"]["system-test-change-review"][
+                "criterion"
+            ],
+        )
+
+    def test_failed_wait_result_transfers_delegated_test_review_obligation(self) -> None:
+        tracker = ToolSafetyTracker()
+
+        tracker.record(
+            _call(
+                "orchestrator_wait",
+                {
+                    "wake_after_seconds": 60,
+                    "reason": "Waiting for productive child work.",
+                },
+                "wait-review",
+            ),
+            ToolExecutionResult(
+                call_id="wait-review",
+                name="orchestrator_wait",
+                ok=False,
+                content="A child completion requires review.",
+                metadata={
+                    "execution_failed": True,
+                    "error_code": "orchestrator_review_required",
+                    "changed_test_artifact_paths": ["tests/vehicle.test.ts"],
+                },
+            ),
+        )
+
+        state = tracker.to_state()
+        self.assertTrue(tracker.unverified_workspace_mutation)
+        self.assertIn(
+            "tests/vehicle.test.ts",
+            state["contract_requirements"]["system-test-change-review"][
+                "criterion"
+            ],
+        )
+
+    def test_aggregated_subagent_runtime_progress_preserves_test_review_evidence(
+        self,
+    ) -> None:
+        tracker = ToolSafetyTracker()
+
+        tracker.record_runtime_progress(
+            content="Aggregated builder update.",
+            metadata={
+                "subagent_progress_update": True,
+                "recommended_action": "finalize",
+                "changed_test_artifact_paths": ["tests/vehicle.test.ts"],
+                "subagents": [
+                    {
+                        "subagent_id": "builder-agent",
+                        "status": "completed",
+                        "report_complete": True,
+                        "changed_test_artifact_paths": [
+                            "tests/vehicle.test.ts"
+                        ],
+                    }
+                ],
+            },
+        )
+        tracker.record(
+            _call(
+                "subagent_invoke",
+                {
+                    "task_label": "Independent test review",
+                    "instructions": "Review tests/vehicle.test.ts.",
+                },
+                "review-invoke",
+            ),
+            ToolExecutionResult(
+                call_id="review-invoke",
+                name="subagent_invoke",
+                ok=True,
+                content="started",
+                metadata={"subagent_id": "review-agent"},
+            ),
+        )
+        tracker.record_runtime_progress(
+            content="Aggregated reviewer update.",
+            metadata={
+                "subagent_progress_update": True,
+                "recommended_action": "finalize",
+                "changed_test_artifact_paths": [],
+                "subagents": [
+                    {
+                        "subagent_id": "review-agent",
+                        "status": "completed",
+                        "report_complete": True,
+                        "changed_test_artifact_paths": [],
+                    }
+                ],
+            },
+        )
+
+        state = tracker.to_state()
+        self.assertEqual(
+            state["completed_test_review_subagent_ids"],
+            ["review-agent"],
+        )
+        self.assertEqual(
+            state["completed_test_review_paths"],
+            ["tests/vehicle.test.ts"],
+        )
+
+    def test_loading_subagent_tracker_drops_legacy_local_test_review_gate(self) -> None:
+        legacy = ToolSafetyTracker()
+        legacy.record(
+            _call("file_write", {"path": "tests/legacy.test.ts"}, "legacy-write"),
+            ToolExecutionResult(
+                call_id="legacy-write",
+                name="file_write",
+                ok=True,
+                content="changed",
+                metadata={"changed": True, "path": "tests/legacy.test.ts"},
+            ),
+        )
+
+        restored = ToolSafetyTracker.from_state(
+            legacy.to_state(),
+            actor_kind="subagent",
+        )
+
+        self.assertNotIn(
+            "system-test-change-review",
+            "\n".join(restored.checkpoint_lines()),
+        )
+
+    def test_turn_yield_results_never_enter_no_progress_suppression(self) -> None:
+        tracker = ToolSafetyTracker()
+        for index in range(5):
+            call = _call(
+                "orchestrator_wait",
+                {"wake_after_seconds": 600, "reason": "Children are running."},
+                f"wait-{index}",
+            )
+            observation = tracker.record(
+                call,
+                ToolExecutionResult(
+                    call_id=call.call_id,
+                    name=call.name,
+                    ok=True,
+                    content="registered",
+                    turn_disposition="yield_turn",
+                ),
+            )
+            self.assertFalse(observation.repeated_no_progress)
+            self.assertIsNone(tracker.blocked_call_reason(call))

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 from jarvis.codex_backend.types import CodexConnectionError
 from jarvis.core import (
     AgentAssistantMessageEvent,
+    AgentRuntimeMessage,
     AgentTextDeltaEvent,
     AgentTurnDoneEvent,
     AgentTurnResult,
@@ -436,6 +437,193 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_orchestrator_wait_tool_requests_real_turn_yield(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="running",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="turn",
+            )
+            with patch.object(
+                runtime._subagent_manager,
+                "active_snapshots",
+                return_value=(snapshot,),
+            ):
+                result = await runtime._execute_subagent_primitive(
+                    ToolCall(
+                        call_id="wait",
+                        name="orchestrator_wait",
+                        arguments={
+                            "wake_after_seconds": 600,
+                            "reason": "Ultron is still working.",
+                        },
+                        raw_arguments="",
+                    ),
+                    ToolExecutionContext(
+                        workspace_dir=runtime._core_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                    ),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.turn_disposition, "yield_turn")
+            self.assertIsNotNone(runtime._orchestrator_wait_task)
+            runtime._cancel_orchestrator_wait(reset_backoff=True)
+
+    async def test_wait_consumes_routine_notices_but_returns_material_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="running",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="turn",
+                changed_test_artifact_paths=("tests/vehicle.test.ts",),
+            )
+            routine_notice = RouteSystemNoticeEvent(
+                route_id="route_1",
+                agent_kind="subagent",
+                agent_name="Ultron",
+                subagent_id="sub_1",
+                notice_kind="subagent_waiting_background",
+                text="still waiting.",
+            )
+            runtime._pending_main_subagent_notices["sub_1"] = routine_notice
+            routine_message = AgentRuntimeMessage(
+                role="system",
+                content="Subagent update: still waiting.",
+                metadata={
+                    "subagent_progress_update": True,
+                    "subagent_id": "sub_1",
+                    "subagent_notice_kind": "subagent_waiting_background",
+                    "recommended_action": "wait",
+                    "pending_subagent_ids": ["sub_1"],
+                },
+            )
+            with (
+                patch.object(
+                    runtime._subagent_manager,
+                    "snapshot_for",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    runtime._subagent_manager,
+                    "build_main_progress_message",
+                    return_value=(session_id, routine_message),
+                ),
+            ):
+                self.assertEqual(
+                    runtime._consume_orchestrator_wait_notices(
+                        session_id=session_id
+                    ),
+                    ((), ()),
+                )
+
+            self.assertEqual(runtime._pending_main_subagent_notices, {})
+            self.assertTrue(
+                any(
+                    record.content == routine_message.content
+                    for record in runtime._main_loop._storage.load_records(session_id)
+                )
+            )
+
+            runtime._pending_main_subagent_notices["sub_1"] = replace(
+                routine_notice,
+                notice_kind="subagent_needs_attention",
+                text="blocked.",
+            )
+            review_message = AgentRuntimeMessage(
+                role="system",
+                content="Subagent update: inspect this blocker.",
+                metadata={
+                    "subagent_progress_update": True,
+                    "subagent_id": "sub_1",
+                    "subagent_notice_kind": "subagent_needs_attention",
+                    "recommended_action": "inspect",
+                    "pending_subagent_ids": ["sub_1"],
+                },
+            )
+            with (
+                patch.object(
+                    runtime._subagent_manager,
+                    "snapshot_for",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    runtime._subagent_manager,
+                    "build_main_progress_message",
+                    return_value=(session_id, review_message),
+                ),
+            ):
+                review = runtime._consume_orchestrator_wait_notices(
+                    session_id=session_id
+                )
+
+            self.assertEqual(
+                review,
+                ((review_message.content,), ("tests/vehicle.test.ts",)),
+            )
+            self.assertEqual(runtime._pending_main_subagent_notices, {})
+
+            runtime._pending_main_subagent_notices["sub_1"] = replace(
+                routine_notice,
+                notice_kind="subagent_needs_attention",
+                text="blocked again.",
+            )
+            with (
+                patch.object(
+                    runtime._subagent_manager,
+                    "snapshot_for",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    runtime._subagent_manager,
+                    "build_main_progress_message",
+                    return_value=(session_id, review_message),
+                ),
+            ):
+                result = await runtime._execute_subagent_primitive(
+                    ToolCall(
+                        call_id="wait-review",
+                        name="orchestrator_wait",
+                        arguments={
+                            "wake_after_seconds": 60,
+                            "reason": "Waiting for productive child work.",
+                        },
+                        raw_arguments="",
+                    ),
+                    ToolExecutionContext(
+                        workspace_dir=runtime._core_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                    ),
+                )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(
+                result.metadata["error_code"],
+                "orchestrator_review_required",
+            )
+            self.assertEqual(
+                result.metadata["changed_test_artifact_paths"],
+                ["tests/vehicle.test.ts"],
+            )
+
     async def test_orchestrator_wait_supports_general_pending_actor_sets_with_bounds(
         self,
     ) -> None:
@@ -1663,6 +1851,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 current_subagent_session_id="sub_session",
                 pending_background_job_count=1,
                 pending_background_job_ids=("deadbeefdeadbeefdeadbeefdeadbeef",),
+                changed_test_artifact_paths=("tests/vehicle.test.ts",),
             )
             notice = RouteSystemNoticeEvent(
                 route_id="route_1",
@@ -1708,6 +1897,23 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("recommendation=wait", system_notes[0].content)
             self.assertIn("not a new user message", system_notes[0].content)
             self.assertLess(len(system_notes[0].content), 600)
+            self.assertEqual(
+                system_notes[0].metadata["subagents"],
+                [
+                    {
+                        "subagent_id": "sub_1",
+                        "status": "waiting_background",
+                        "report_complete": False,
+                        "changed_test_artifact_paths": [
+                            "tests/vehicle.test.ts"
+                        ],
+                    }
+                ],
+            )
+            self.assertEqual(
+                system_notes[0].metadata["changed_test_artifact_paths"],
+                ["tests/vehicle.test.ts"],
+            )
             self.assertEqual(user_records, [])
             self.assertEqual(len(published_events), 1)
             self.assertEqual(published_events[0].notice_kind, "subagent_progress_update")

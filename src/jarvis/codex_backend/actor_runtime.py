@@ -1268,6 +1268,11 @@ class CodexActorRuntime:
                     **dict(result.metadata),
                     "tool_name": result.name,
                     "tool_call_id": result.call_id,
+                    **(
+                        {"turn_disposition": result.turn_disposition}
+                        if result.turn_disposition != "continue"
+                        else {}
+                    ),
                     _TURN_ID_METADATA_KEY: visible_turn_id,
                 },
             ),
@@ -2100,6 +2105,10 @@ def _collect_turn_activated_discoverable_tool_names(
 
 
 def _orchestrator_wait_reason(result: ToolExecutionResult) -> str | None:
+    if result.turn_disposition == "yield_turn":
+        return str(result.metadata.get("reason", "orchestrator_wait")).strip() or (
+            "orchestrator_wait"
+        )
     if result.name == "bash":
         status = str(result.metadata.get("status") or result.metadata.get("state") or "").strip()
         mode = str(result.metadata.get("mode", "")).strip()

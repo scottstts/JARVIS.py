@@ -34,7 +34,8 @@ class SubagentRuntime:
     shared_context: str | None = None
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
-    skill_selection_reason: str = "none:no_matching_installed_skill"
+    skill_selection_reason: str = "none:not_selected_by_main"
+    changed_test_artifact_paths: set[str] = field(default_factory=set)
     deliverable: str | None = None
     task: asyncio.Task[None] | None = None
     pause_reason: SubagentPauseReason | None = None
@@ -65,6 +66,7 @@ class SubagentRuntime:
             owned_paths=self.owned_paths,
             skill_ids=self.skill_ids,
             skill_selection_reason=self.skill_selection_reason,
+            changed_test_artifact_paths=tuple(sorted(self.changed_test_artifact_paths)),
             deliverable=self.deliverable,
             current_subagent_session_id=self.loop.active_session_id(),
             pause_reason=self.pause_reason,

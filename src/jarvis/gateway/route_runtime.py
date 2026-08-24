@@ -1464,6 +1464,31 @@ class RouteRuntime:
         try:
             payload: dict[str, Any]
             if tool_call.name == "orchestrator_wait":
+                (
+                    review_required,
+                    changed_test_artifact_paths,
+                ) = self._consume_orchestrator_wait_notices(
+                    session_id=context.session_id,
+                )
+                if review_required:
+                    return ToolExecutionResult(
+                        call_id=tool_call.call_id,
+                        name=tool_call.name,
+                        ok=False,
+                        content=(
+                            "Orchestrator wait requires review\n"
+                            + "\n\n".join(review_required)
+                        ),
+                        metadata={
+                            "execution_failed": True,
+                            "error_code": "orchestrator_review_required",
+                            "review_required": True,
+                            "review_items": list(review_required),
+                            "changed_test_artifact_paths": list(
+                                changed_test_artifact_paths
+                            ),
+                        },
+                    )
                 payload = self._register_orchestrator_wait(
                     wake_after_seconds=int(
                         tool_call.arguments.get("wake_after_seconds", 0)
@@ -1482,6 +1507,7 @@ class RouteRuntime:
                         "Orchestrator wait registered\n" + _format_payload_lines(payload)
                     ),
                     metadata={"orchestrator_wait": True, **payload},
+                    turn_disposition="yield_turn",
                 )
             if tool_call.name == "subagent_invoke":
                 task_label = str(tool_call.arguments.get("task_label", "")).strip()
@@ -1621,11 +1647,6 @@ class RouteRuntime:
         pending_jobs = self._bash_job_supervisor.pending_jobs(include_services=True)
         if not pending_subagents and not pending_jobs:
             raise ValueError("No route-owned work is pending; orchestrator_wait is not valid.")
-        if self._pending_main_subagent_notices or self._pending_main_bash_notices:
-            raise ValueError(
-                "Unprocessed orchestrator notices are actionable; handle them before waiting."
-            )
-
         known_actor_ids = {
             *(snapshot.subagent_id for snapshot in pending_subagents),
             *(record.job_id for record in pending_jobs),
@@ -1683,6 +1704,86 @@ class RouteRuntime:
             "pending_subagent_count": len(pending_subagents),
             "pending_job_count": len(pending_jobs),
         }
+
+    def _consume_orchestrator_wait_notices(
+        self,
+        *,
+        session_id: str | None,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Persist routine notices and return only material items needing model review."""
+
+        target_session_id = session_id or self._main_loop.active_session_id()
+        if target_session_id is None:
+            return (
+                ("No active main session is available for persisted notice handling.",),
+                (),
+            )
+
+        review_items: list[str] = []
+        changed_test_artifact_paths: set[str] = set()
+        bash_notices = tuple(self._pending_main_bash_notices.values())
+        if bash_notices:
+            bash_message = self._build_main_bash_job_followup_message(bash_notices)
+            recommendation = str(
+                bash_message.metadata.get("recommended_action", "inspect")
+            )
+            if recommendation == "wait":
+                if not self._main_loop.append_system_note(
+                    bash_message.content,
+                    session_id=target_session_id,
+                    metadata=bash_message.metadata,
+                ):
+                    return (("Routine detached-job notices could not be persisted.",), ())
+            else:
+                review_items.append(bash_message.content)
+            self._pending_main_bash_notices.clear()
+            self._record_bash_notice_delivery(bash_notices)
+
+        for subagent_id, notice in tuple(self._pending_main_subagent_notices.items()):
+            snapshot = self._subagent_manager.snapshot_for(subagent_id)
+            if snapshot is None or snapshot.status == "disposed":
+                self._pending_main_subagent_notices.pop(subagent_id, None)
+                continue
+            if (
+                notice.actor_run_generation is not None
+                and notice.actor_run_generation != snapshot.run_generation
+            ):
+                self._pending_main_subagent_notices.pop(subagent_id, None)
+                continue
+            progress = self._subagent_manager.build_main_progress_message(
+                agent=subagent_id,
+                notice_kind=notice.notice_kind,
+                notice_text=notice.text,
+            )
+            if progress is None:
+                self._pending_main_subagent_notices.pop(subagent_id, None)
+                continue
+            _owner_session_id, message = progress
+            recommendation = str(message.metadata.get("recommended_action", "inspect"))
+            if recommendation == "wait":
+                if not self._main_loop.append_system_note(
+                    message.content,
+                    session_id=target_session_id,
+                    metadata=message.metadata,
+                ):
+                    changed_test_artifact_paths.update(
+                        snapshot.changed_test_artifact_paths
+                    )
+                    return (
+                        (
+                            *review_items,
+                            f"Routine notice for subagent {subagent_id} could not be persisted.",
+                        ),
+                        tuple(sorted(changed_test_artifact_paths)),
+                    )
+            else:
+                review_items.append(message.content)
+                changed_test_artifact_paths.update(
+                    snapshot.changed_test_artifact_paths
+                )
+            self._pending_main_subagent_notices.pop(subagent_id, None)
+
+        return tuple(review_items), tuple(sorted(changed_test_artifact_paths))
 
     async def _orchestrator_wait_deadline(
         self,
@@ -2259,6 +2360,8 @@ class RouteRuntime:
         lines = ["Subagent update."]
         pending_subagent_ids: list[str] = []
         recommendations: list[str] = []
+        subagent_updates: list[dict[str, Any]] = []
+        changed_test_artifact_paths: set[str] = set()
         for notice in notices:
             if notice.subagent_id is None:
                 continue
@@ -2278,6 +2381,23 @@ class RouteRuntime:
             recommendation = str(message.metadata.get("recommended_action", "")).strip()
             if recommendation:
                 recommendations.append(recommendation)
+            update = {
+                "subagent_id": str(message.metadata.get("subagent_id", "")).strip(),
+                "status": str(message.metadata.get("subagent_status", "")).strip(),
+                "report_complete": bool(
+                    message.metadata.get("latest_subagent_report_complete", False)
+                ),
+                "changed_test_artifact_paths": list(
+                    message.metadata.get("changed_test_artifact_paths", [])
+                ),
+            }
+            if update["subagent_id"]:
+                subagent_updates.append(update)
+            changed_test_artifact_paths.update(
+                str(path).strip()
+                for path in update["changed_test_artifact_paths"]
+                if str(path).strip()
+            )
         if len(lines) == 1:
             return None
         aggregated_recommendation = self._aggregate_recommendations(recommendations)
@@ -2288,6 +2408,10 @@ class RouteRuntime:
                 "notice_kind": _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND,
                 "recommended_action": aggregated_recommendation,
                 "pending_subagent_ids": pending_subagent_ids,
+                "subagents": subagent_updates,
+                "changed_test_artifact_paths": sorted(
+                    changed_test_artifact_paths
+                ),
             },
             content="\n".join(lines),
         )

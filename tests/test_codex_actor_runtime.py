@@ -1101,6 +1101,84 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected an active session.")
             self.assertEqual(active.turn_states["turn_1"], "completed")
 
+    async def test_control_tool_yield_disposition_interrupts_codex_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator = _FakeCoordinator()
+
+            async def tool_executor(tool_call, context):
+                _ = context
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name="orchestrator_wait",
+                    ok=True,
+                    content="Orchestrator wait registered",
+                    metadata={"reason": "Child is still running."},
+                    turn_disposition="yield_turn",
+                )
+
+            runtime, storage, _storage_coordinator = _build_runtime(
+                root_dir=Path(tmp),
+                coordinator=coordinator,
+                tool_definitions_provider=lambda _activated: (
+                    ToolDefinition(
+                        name="orchestrator_wait",
+                        description="Park the orchestrator.",
+                        input_schema={"type": "object"},
+                    ),
+                ),
+                tool_executor=tool_executor,
+            )
+
+            events_task = asyncio.create_task(
+                _collect_events(runtime.stream_turn(user_text="wait for the child"))
+            )
+            await asyncio.sleep(0)
+            response = await runtime.handle_server_request(
+                "item/tool/call",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "callId": "call_1",
+                    "tool": "orchestrator_wait",
+                    "arguments": {"wake_after_seconds": 600},
+                },
+            )
+            await runtime.handle_notification(
+                "turn/completed",
+                {
+                    "threadId": "thread_1",
+                    "turn": {
+                        "id": "turn_1",
+                        "items": [],
+                        "status": "failed",
+                        "error": {"message": "Interrupted"},
+                    },
+                },
+            )
+            events = await events_task
+
+            self.assertEqual(response["success"], True)
+            self.assertEqual(
+                [event.type for event in events],
+                ["turn_started", "tool_call", "done"],
+            )
+            self.assertFalse(events[-1].interrupted)
+            self.assertEqual(events[-1].response_text, "")
+            self.assertEqual(
+                [method for method, _params in coordinator.requests].count("turn/interrupt"),
+                1,
+            )
+            active = storage.get_active_session()
+            self.assertIsNotNone(active)
+            if active is None:
+                self.fail("Expected an active Codex session.")
+            wait_record = next(
+                record
+                for record in storage.load_records(active.session_id)
+                if record.role == "tool"
+            )
+            self.assertEqual(wait_record.metadata["turn_disposition"], "yield_turn")
+
     async def test_aclose_unregisters_loaded_thread(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _storage, coordinator = _build_runtime(root_dir=Path(tmp))
