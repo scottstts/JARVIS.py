@@ -89,6 +89,20 @@ class RemoteToolRuntimeClient:
             payload["session_id"] = context.session_id
         if context.route_id is not None:
             payload["route_id"] = context.route_id
+        payload["agent_kind"] = context.agent_kind
+        payload["agent_name"] = context.agent_name
+        if context.subagent_id is not None:
+            payload["subagent_id"] = context.subagent_id
+        if context.workspace_write_allowed_paths:
+            payload["workspace_write_allowed_paths"] = [
+                str(path) for path in context.workspace_write_allowed_paths
+            ]
+        if context.workspace_write_denied_paths:
+            payload["workspace_write_denied_paths"] = [
+                str(path) for path in context.workspace_write_denied_paths
+            ]
+        if context.workspace_lease_generation is not None:
+            payload["workspace_lease_generation"] = context.workspace_lease_generation
 
         endpoint = f"/tools/{tool_name}/execute"
         request_timeout = _resolve_request_timeout_seconds(

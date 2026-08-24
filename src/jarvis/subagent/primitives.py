@@ -55,7 +55,10 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                         "items": {"type": "string", "minLength": 1},
                         "maxItems": 32,
                         "uniqueItems": True,
-                        "description": "Workspace paths the child owns or may edit.",
+                        "description": (
+                            "Existing workspace files or directories the child exclusively owns "
+                            "and may edit; create them before invoking the child."
+                        ),
                     },
                     "skill_ids": {
                         "type": "array",

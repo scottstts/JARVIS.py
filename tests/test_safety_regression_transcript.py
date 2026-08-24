@@ -202,7 +202,9 @@ class TranscriptScaleSafetyRegressionTests(unittest.IsolatedAsyncioTestCase):
                 any(record.metadata.get("tool_safety_stop") for record in records)
             )
 
-    async def test_repeated_failure_gets_one_replan_then_exact_reuse_parks_silently(self) -> None:
+    async def test_repeated_failure_suppresses_exact_reuse_then_reports_liveness_exhaustion(
+        self,
+    ) -> None:
         class RepeatingService:
             def __init__(self) -> None:
                 self.calls = 0
@@ -241,35 +243,41 @@ class TranscriptScaleSafetyRegressionTests(unittest.IsolatedAsyncioTestCase):
             settings = build_core_settings(root_dir=Path(tmp))
             storage = SessionStorage(settings.transcript_archive_dir)
             service = RepeatingService()
-            loop = AgentLoop(
-                llm_service=service,  # type: ignore[arg-type]
-                settings=settings,
-                storage=storage,
-                tool_executor=execute_repeated,
-            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "JARVIS_TOOL_MAX_ROUNDS_PER_TURN": "3",
+                    "JARVIS_TOOL_MAX_ROUNDS_PER_TASK": "3",
+                },
+            ):
+                loop = AgentLoop(
+                    llm_service=service,  # type: ignore[arg-type]
+                    settings=settings,
+                    storage=storage,
+                    tool_executor=execute_repeated,
+                )
 
             result = await loop.handle_user_input("Investigate this failure.")
 
             self.assertTrue(result.completion_blocked)
-            self.assertEqual(result.response_text, "")
+            self.assertEqual(result.completion_block_reason, "tool_liveness_exhausted")
+            self.assertIn("could not make stable tool progress", result.response_text)
             self.assertEqual(executions, 2)
-            self.assertEqual(service.calls, 3)
+            self.assertEqual(service.calls, 5)
             records = storage.load_records(result.session_id)
-            self.assertTrue(any(record.metadata.get("tool_safety_stop") for record in records))
-            self.assertFalse(
-                any(
-                    record.role == "assistant"
-                    and record.metadata.get("tool_safety_stop")
-                    for record in records
-                )
+            self.assertTrue(
+                any(record.metadata.get("tool_liveness_exhausted") for record in records)
             )
-            blocked_tool_records = [
+            suppressed_tool_records = [
                 record
                 for record in records
-                if record.role == "tool" and record.metadata.get("tool_safety_blocked")
+                if record.role == "tool"
+                and record.metadata.get("tool_liveness_suppressed")
             ]
-            self.assertEqual(len(blocked_tool_records), 1)
-            diagnostics = blocked_tool_records[0].metadata.get("tool_safety_diagnostics")
+            self.assertEqual(len(suppressed_tool_records), 1)
+            diagnostics = suppressed_tool_records[0].metadata.get(
+                "tool_liveness_diagnostics"
+            )
             self.assertIsInstance(diagnostics, dict)
             assert isinstance(diagnostics, dict)
             self.assertEqual(diagnostics.get("first_call_id"), "repeat-1")

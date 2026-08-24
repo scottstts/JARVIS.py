@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 
-TOOL_RUNTIME_PROTOCOL_VERSION = 1
+TOOL_RUNTIME_PROTOCOL_VERSION = 2
 TOOL_RUNTIME_CAPABILITIES: dict[str, dict[str, tuple[str, ...]]] = {
     "bash": {
         "modes": (
@@ -16,6 +16,7 @@ TOOL_RUNTIME_CAPABILITIES: dict[str, dict[str, tuple[str, ...]]] = {
             "tail",
             "cancel",
         ),
+        "workspace_enforcement": ("mount_namespace",),
     },
     "web_fetch": {},
 }

@@ -92,6 +92,7 @@ class GatewayTurnDoneEvent(GatewayRouteEventBase):
     interrupted: bool = False
     approval_rejected: bool = False
     completion_blocked: bool = False
+    completion_block_reason: str | None = None
     interruption_reason: str | None = None
     type: str = "turn_done"
 
@@ -570,6 +571,11 @@ def _parse_route_event(payload: dict[str, Any]) -> GatewayRouteEvent:
             interrupted=bool(payload.get("interrupted", False)),
             approval_rejected=bool(payload.get("approval_rejected", False)),
             completion_blocked=bool(payload.get("completion_blocked", False)),
+            completion_block_reason=(
+                str(payload["completion_block_reason"])
+                if payload.get("completion_block_reason") is not None
+                else None
+            ),
             interruption_reason=(
                 str(payload["interruption_reason"])
                 if payload.get("interruption_reason") is not None

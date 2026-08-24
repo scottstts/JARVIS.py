@@ -14,6 +14,7 @@ from .runtime import ToolRuntime
 from .workspace_access import (
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    with_workspace_capabilities,
     with_workspace_observation,
 )
 from .basic.send_file import SendFilePolicy
@@ -58,6 +59,7 @@ __all__ = [
     "ToolRuntime",
     "WorkspaceAccessCoordinator",
     "WorkspaceLeaseError",
+    "with_workspace_capabilities",
     "with_workspace_observation",
     "ToolSettings",
     "ToolSearchPolicy",

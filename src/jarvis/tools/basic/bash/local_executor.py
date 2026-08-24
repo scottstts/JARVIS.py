@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import os
 import signal
 import socket
 import time
+import sys
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -164,16 +167,18 @@ class DirectBashToolExecutor:
     ) -> ToolExecutionResult:
         started_at = perf_counter()
 
+        process_arguments, process_cwd = _capability_process_arguments(
+            executable=self._settings.bash_executable,
+            arguments=("--noprofile", "--norc", "-lc", f"set -e -o pipefail\n{command}"),
+            context=context,
+            execution_cwd=execution_cwd,
+        )
         process = await asyncio.create_subprocess_exec(
-            self._settings.bash_executable,
-            "--noprofile",
-            "--norc",
-            "-lc",
-            f"set -e -o pipefail\n{command}",
+            *process_arguments,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(execution_cwd),
-            env=_build_scrubbed_environment(self._settings),
+            cwd=str(process_cwd),
+            env=_build_scrubbed_environment(self._settings, context=context),
             start_new_session=True,
         )
 
@@ -241,7 +246,7 @@ class DirectBashToolExecutor:
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
-                "filesystem_scope": "container_direct",
+                "filesystem_scope": _filesystem_scope(context),
                 "container_mutation_boundary": self._container_mutation_boundary,
             },
         )
@@ -264,6 +269,7 @@ class DirectBashToolExecutor:
                 execution_cwd=execution_cwd,
                 display_cwd=display_cwd,
                 command=command,
+                context=context,
             )
         except (BashJobError, OSError) as exc:
             return ToolExecutionResult(
@@ -354,7 +360,7 @@ class DirectBashToolExecutor:
                     "runtime_location": self._runtime_location,
                     "runtime_transport": self._runtime_transport,
                     "target_runtime": self._target_runtime,
-                    "filesystem_scope": "container_direct",
+                    "filesystem_scope": _filesystem_scope(context),
                     "container_mutation_boundary": self._container_mutation_boundary,
                 },
             )
@@ -407,7 +413,7 @@ class DirectBashToolExecutor:
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
-                "filesystem_scope": "container_direct",
+                "filesystem_scope": _filesystem_scope(context),
                 "container_mutation_boundary": self._container_mutation_boundary,
             },
         )
@@ -437,6 +443,7 @@ class DirectBashToolExecutor:
                 execution_cwd=working_directory.resolved,
                 display_cwd=working_directory.display,
                 command=command,
+                context=context,
             )
         except (BashJobError, OSError) as exc:
             return ToolExecutionResult(
@@ -494,7 +501,7 @@ class DirectBashToolExecutor:
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
-                "filesystem_scope": "container_direct",
+                "filesystem_scope": _filesystem_scope(context),
                 "container_mutation_boundary": self._container_mutation_boundary,
             },
         )
@@ -548,6 +555,7 @@ class DirectBashToolExecutor:
                 execution_cwd=working_directory.resolved,
                 display_cwd=working_directory.display,
                 command=command,
+                context=context,
             )
         except (BashJobError, OSError) as exc:
             return _service_failure(call_id, str(exc))
@@ -645,7 +653,7 @@ class DirectBashToolExecutor:
                 "runtime_location": self._runtime_location,
                 "runtime_transport": self._runtime_transport,
                 "target_runtime": self._target_runtime,
-                "filesystem_scope": "container_direct",
+                "filesystem_scope": _filesystem_scope(context),
                 "container_mutation_boundary": self._container_mutation_boundary,
             },
         )
@@ -657,6 +665,7 @@ class DirectBashToolExecutor:
         execution_cwd: Path,
         display_cwd: str,
         command: str,
+        context: ToolExecutionContext,
     ) -> tuple[BashJobPaths, asyncio.subprocess.Process, int, int]:
         job = create_background_job(
             workspace_dir=workspace_dir,
@@ -668,16 +677,20 @@ class DirectBashToolExecutor:
             retention_seconds=self._settings.bash_job_retention_seconds,
         )
         try:
+            process_arguments, process_cwd = _capability_process_arguments(
+                executable=self._settings.bash_executable,
+                arguments=("--noprofile", "--norc", str(job.runner_path)),
+                context=context,
+                execution_cwd=execution_cwd,
+                runtime_allowed_paths=(job.job_dir,),
+            )
             with open(os.devnull, "wb") as devnull:
                 process = await asyncio.create_subprocess_exec(
-                    self._settings.bash_executable,
-                    "--noprofile",
-                    "--norc",
-                    str(job.runner_path),
+                    *process_arguments,
                     stdout=devnull,
                     stderr=devnull,
-                    cwd=str(execution_cwd),
-                    env=_build_scrubbed_environment(self._settings),
+                    cwd=str(process_cwd),
+                    env=_build_scrubbed_environment(self._settings, context=context),
                     start_new_session=True,
                 )
             runner_pgid = os.getpgid(process.pid)
@@ -1042,25 +1055,94 @@ def _service_failure(
     )
 
 
-def _build_scrubbed_environment(settings: ToolSettings) -> dict[str, str]:
+def _build_scrubbed_environment(
+    settings: ToolSettings,
+    *,
+    context: ToolExecutionContext | None = None,
+) -> dict[str, str]:
     venv_root = str(settings.central_python_venv)
     venv_bin = f"{venv_root}/bin"
     runtime_path = os.getenv("PATH") or _DEFAULT_RUNTIME_PATH
     path_entries = [entry for entry in runtime_path.split(":") if entry and entry != venv_bin]
     path_value = ":".join([venv_bin, *path_entries]) if path_entries else venv_bin
+    home = "/workspace"
+    temp = "/tmp"
+    if context is not None and context.workspace_lease_generation is not None:
+        identity = ":".join(
+            filter(
+                None,
+                (
+                    context.route_id,
+                    context.agent_kind,
+                    context.subagent_id,
+                    context.session_id,
+                ),
+            )
+        )
+        suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        actor_root = Path("/tmp") / "jarvis-actors" / suffix
+        actor_root.mkdir(parents=True, exist_ok=True)
+        home = str(actor_root / "home")
+        temp = str(actor_root / "tmp")
+        Path(home).mkdir(exist_ok=True)
+        Path(temp).mkdir(exist_ok=True)
     return {
         "PATH": path_value,
-        "HOME": "/workspace",
+        "HOME": home,
         "PWD": "/workspace",
-        "TMPDIR": "/tmp",
-        "TMP": "/tmp",
-        "TEMP": "/tmp",
+        "TMPDIR": temp,
+        "TMP": temp,
+        "TEMP": temp,
+        "XDG_CACHE_HOME": f"{home}/.cache",
         "LANG": "C",
         "LC_ALL": "C",
         "VIRTUAL_ENV": venv_root,
         "UV_PROJECT_ENVIRONMENT": venv_root,
         "PIP_REQUIRE_VIRTUALENV": "1",
     }
+
+
+def _capability_process_arguments(
+    *,
+    executable: str,
+    arguments: tuple[str, ...],
+    context: ToolExecutionContext,
+    execution_cwd: Path,
+    runtime_allowed_paths: tuple[Path, ...] = (),
+) -> tuple[tuple[str, ...], Path]:
+    if context.workspace_lease_generation is None:
+        return (executable, *arguments), execution_cwd
+    config = {
+        "workspace": str(context.workspace_dir),
+        "cwd": str(execution_cwd),
+        "agent_kind": context.agent_kind,
+        "allowed": [str(path) for path in context.workspace_write_allowed_paths],
+        "denied": [str(path) for path in context.workspace_write_denied_paths],
+        "runtime_allowed": [str(path) for path in runtime_allowed_paths],
+    }
+    return (
+        (
+            "/usr/bin/unshare",
+            "--mount",
+            "--",
+            sys.executable,
+            "-m",
+            "jarvis.tools.basic.bash.filesystem_view",
+            json.dumps(config, separators=(",", ":")),
+            "--",
+            executable,
+            *arguments,
+        ),
+        Path("/"),
+    )
+
+
+def _filesystem_scope(context: ToolExecutionContext) -> str:
+    return (
+        "actor_capability_view"
+        if context.workspace_lease_generation is not None
+        else "container_direct"
+    )
 
 
 def _resolve_timeout_seconds(arguments: dict[str, Any], settings: ToolSettings) -> float:
@@ -1095,10 +1177,10 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
         "terminal updates on its own. Use `mode='status'`, `mode='tail'`, or `mode='cancel'` only for explicit "
         "on-demand inspection or cancellation; do not rely on proactive polling or sleep loops to keep progress "
         "moving. "
-        "Approvals and installation: user approval is required for commands that install packages or "
-        "tools, perform system-level mutations outside `/workspace`, recursively delete or "
-        "restore workspace state, or publish Git changes. "
-        "When approval is likely needed, provide clear "
+        "Commands are permitted by default. Only unmanaged process detachment, container-control "
+        "operations, broad workspace deletion, and destructive repository-state erasure are "
+        "restricted. Project-local installs, builds, pipelines, redirects, and cleanup are allowed. "
+        "When an explicitly destructive operation is required, provide clear "
         "`approval_summary`, `approval_details`, and optional `inspection_url` context."
     )
 

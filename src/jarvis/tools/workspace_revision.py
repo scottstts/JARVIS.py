@@ -29,7 +29,26 @@ _IGNORED_REVISION_PARTS = frozenset(
 def workspace_revision(workspace_dir: Path) -> str:
     """Return Git identity plus a deterministic fingerprint of material file content."""
 
+    return workspace_revision_excluding(workspace_dir, ())
+
+
+def workspace_revision_excluding(
+    workspace_dir: Path,
+    excluded_paths: Iterable[Path],
+) -> str:
+    """Return a workspace revision while excluding concurrently owned path roots."""
+
     root = workspace_dir.resolve(strict=False)
+    excluded = tuple(
+        sorted(
+            {
+                path.resolve(strict=False)
+                for path in excluded_paths
+                if path.resolve(strict=False) == root
+                or path.resolve(strict=False).is_relative_to(root)
+            }
+        )
+    )
     revision = _git_revision(root)
     fingerprint = sha256()
     try:
@@ -41,6 +60,12 @@ def workspace_revision(workspace_dir: Path) -> str:
     for path in paths:
         relative = path.relative_to(root)
         if _revision_path_is_ignored(relative):
+            continue
+        resolved = path.resolve(strict=False)
+        if any(
+            resolved == excluded_path or resolved.is_relative_to(excluded_path)
+            for excluded_path in excluded
+        ):
             continue
         try:
             if path.is_symlink():

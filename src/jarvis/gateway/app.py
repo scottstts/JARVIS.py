@@ -455,6 +455,7 @@ async def _serve_legacy_router_connection(
                             "interrupted": turn_event.interrupted,
                             "approval_rejected": turn_event.approval_rejected,
                             "completion_blocked": turn_event.completion_blocked,
+                            "completion_block_reason": turn_event.completion_block_reason,
                             "interruption_reason": turn_event.interruption_reason,
                         },
                     ):

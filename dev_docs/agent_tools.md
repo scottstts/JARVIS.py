@@ -132,8 +132,10 @@ Policy routing lives in `src/jarvis/tools/policy.py`; per-tool policy lives besi
 Current policy highlights:
 
 - `bash` is checked in `jarvis_runtime` and executed in isolated `tool_runtime`
-- `bash` requires approval for install/build/system-mutation commands and high-confidence destructive repository/workspace commands unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
+- `bash` commands are admitted by default; unfamiliar commands, pipelines, redirects, installs, builds, cleanup, and container-local system writes do not need allowlist membership or approval
+- high-confidence destructive repository erasure and recursive deletion of `/`, `/workspace`, or the active working directory require exact-command approval unless `BASH_DANGEROUSLY_SKIP_PERMISSION=True`
 - `bash` hard-denies upgrade, service/init-control, mount/kernel-admin, and container-runtime-recursion commands
+- unmanaged shell detachment is denied because it breaks process ownership; use supervised background/service modes
 - `view_image`, `send_file`, generated image paths, transcribe inputs, and email attachments must stay inside `/workspace`
 - `.env` files and `.env` directories are denied for file-send and patch-like surfaces
 - `tool_register` always requires exact manifest approval
@@ -176,7 +178,7 @@ Important boundaries:
 - the environment is scrubbed
 - agent-facing Python resolves through `/opt/venv`
 
-Files written outside `/workspace` stay local to the long-lived `tool_runtime` container and are not durable Jarvis artifacts.
+Files written outside `/workspace` stay local to the long-lived `tool_runtime` container and are not durable Jarvis artifacts. Bash filesystem ownership is enforced in a per-execution mount namespace supplied by the route coordinator, independently of shell parsing: main actors see active child-owned paths read-only, and subagents see the workspace read-only except for their existing owned roots. Runtime-owned job directories are separately writable for supervised process bookkeeping.
 
 The app and isolated service share a versioned compatibility contract from `src/jarvis/tool_runtime_protocol.py`. `/health` declares the protocol version and supported tool capabilities; app startup fails with an actionable rebuild/restart error when the service is stale or missing a required mode. Remote status returned by `tool_runtime` is authoritative because app and tool containers do not share a PID namespace. Routine internal `httpx` request INFO records are context-locally suppressed, while warnings and failures remain logged.
 
@@ -209,9 +211,9 @@ Route-level `/stop` hard-preempts foreground tool awaits and then asks the route
 
 ### `bash`
 
-Runs shell commands in `tool_runtime` with `/workspace` as the durable boundary. Foreground and background calls may provide `cwd` as a relative path or `/workspace`-absolute path; it must resolve to an existing directory inside the workspace, applies only to that call, and defaults to `/workspace`. Job-control calls do not accept `cwd`. The tool also supports status, tail, cancellation, output truncation, log retention, approval-gated installs/builds/destructive commands, and route-level background supervision.
+Runs shell commands in `tool_runtime` with `/workspace` as the durable boundary. Foreground and background calls may provide `cwd` as a relative path or `/workspace`-absolute path; it must resolve to an existing directory inside the workspace, applies only to that call, and defaults to `/workspace`. Job-control calls do not accept `cwd`. The tool also supports status, tail, cancellation, output truncation, log retention, exact approval for the narrow destructive blacklist, and route-level background supervision.
 
-The command shell starts with `set -e -o pipefail`, so a failing verification command cannot be hidden by a later successful command in the same invocation. A shared non-executing shell lexer distinguishes asynchronous-list operators from descriptor/combined redirects such as `2>&1`, `<&3`, `&>`, and `>|`, and ignores quoted text, comments, arithmetic, and heredoc bodies. Shell-managed backgrounding (`&`, `nohup`, `disown`, `setsid`, nested shell/eval payloads, and equivalent detach wrappers) is rejected. Use `mode="background"` for supervised jobs or `mode="service"` for a long-lived process with allocated/preflighted loopback port, PID/PGID ownership, readiness URL, command/revision provenance, logs, status, and cancellation. When another actor has a workspace lease, every mutable bash call must provide non-empty `write_paths` plus the observed `expected_lease_generation`. Read-only shell commands take an exclusive workspace snapshot barrier because their accessed paths cannot be inferred safely.
+The command shell starts with `set -e -o pipefail`, so a failing verification command cannot be hidden by a later successful command in the same invocation. A shared non-executing shell lexer distinguishes asynchronous-list operators from descriptor/combined redirects such as `2>&1`, `<&3`, `&>`, and `>|`, and ignores quoted text, comments, arithmetic, and heredoc bodies. Shell-managed backgrounding (`&`, `nohup`, `disown`, `setsid`, nested shell/eval payloads, and equivalent detach wrappers) is rejected. Use `mode="background"` for supervised jobs or `mode="service"` for a long-lived process with allocated/preflighted loopback port, PID/PGID ownership, readiness URL, command/revision provenance, logs, status, and cancellation. Bash has no model-declared write scope or lease-generation arguments; the route runtime derives actor capabilities and the isolated executor applies them to foreground commands, promoted/background jobs, services, and Bash invoked inside acceptance gates.
 
 ### `file_patch`
 
@@ -227,7 +229,7 @@ Writes are atomic. Non-write operations require exact single matches.
 
 Every operation has the same required shape: `type`, `match`, and `replacement`. `write` uses an empty `match` and full-file `replacement`; `delete` uses an empty `replacement`; the other operations apply their documented literal semantics. This avoids provider-incompatible operation unions and reduces malformed model calls.
 
-Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application, or `expected_file_absent=true` when inspection established a new target. While any workspace lease is active, file writes require one of those content-state preconditions plus `expected_lease_generation`. Successful results return artifact provenance and the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
+Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application, or `expected_file_absent=true` when inspection established a new target. These content preconditions are optional compare-and-swap controls and are independent of actor ownership. Successful results return artifact provenance and the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
 
 The tool description includes a minimal valid replace payload because nested patch operations are a common model-shape failure; runtime schema errors use stable error codes, canonical examples, and a bounded retry budget without reflecting malformed raw payloads into the transcript.
 
@@ -243,11 +245,11 @@ Use `file_write(path, content)` for a whole-file create or rewrite, and `file_re
 
 ## Workspace Coordination
 
-Route actors share `/workspace`, but no longer share one global tool mutex. The route coordinator permits concurrent exact-path reads and disjoint declared writes, while persistent `owned_paths` assigned to a subagent remain write leases until the child is disposed. Direct file edits and file-consuming tools acquire the precise target path automatically; whole-workspace snapshots use an exclusive barrier. Directory/file overlap is recognized, unknown mutation tools use the global write barrier, and stale lease generations or content hashes are rejected rather than racing silently.
+Route actors share `/workspace`, but no longer share one global tool mutex. Persistent `owned_paths` assigned to a subagent remain write leases until the child is disposed. Owned roots must already exist, preventing a missing-path capability from widening to a writable parent. Direct path tools coordinate their targets automatically; subagents cannot write outside their owned roots, and main writes that overlap child ownership are rejected. Bash receives a runtime-derived filesystem view, while unknown unscoped writers use the global barrier and are unavailable to subagents.
 
-Lease denials return a structured `conflict_class`, semantic `conflict_key`, and remediation. Tool safety keys repeated failures by that semantic identity rather than tool name/arguments, so changing command syntax cannot loop around the same owner/path conflict; a genuinely different owned path remains a separate failure.
+Lease denials return a structured `conflict_class`, diagnostic `conflict_key`, and remediation. Tool liveness accounting never merges different commands or tools by a broad semantic class: only the exact normalized tool and arguments with the same stable result accumulate toward suppression.
 
-Every routed tool call also receives a content-derived before/after workspace observation covering its coordinated access scope. The observation is attached even when execution fails, so Bash and other tools cannot hide a real mutation merely by omitting `write_paths`, returning a failing exit status, or lacking tool-specific `changed` metadata. Declared-write metadata remains a fallback only when direct observation is unavailable.
+Every routed tool call also receives a content-derived before/after workspace observation covering its coordinated access scope. Main Bash observations exclude concurrently child-owned roots, while child Bash observations cover only that child’s owned roots, so another actor’s concurrent mutation is not misattributed. The observation is attached even when execution fails; tool-declared mutation metadata is only a fallback when direct observation is unavailable.
 
 ### `view_image`
 

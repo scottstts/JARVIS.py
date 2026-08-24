@@ -18,6 +18,9 @@ SubagentPauseReason = Literal[
     "main_stop",
     "new_session",
     "approval_rejected",
+    "tool_liveness_exhausted",
+    "provider_recovery_exhausted",
+    "external_blocked",
 ]
 
 

@@ -28,6 +28,9 @@ class ToolExecutionContext:
     subagent_id: str | None = None
     memory_service: "MemoryService | None" = None
     approved_action: dict[str, Any] | None = None
+    workspace_write_allowed_paths: tuple[Path, ...] = ()
+    workspace_write_denied_paths: tuple[Path, ...] = ()
+    workspace_lease_generation: int | None = None
 
 
 @dataclass(slots=True, frozen=True)

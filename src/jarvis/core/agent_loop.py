@@ -18,7 +18,6 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
-    Iterable,
     Literal,
     Mapping,
     Protocol,
@@ -93,9 +92,9 @@ from .task_contract import (
     user_message_is_side_query,
 )
 from .tool_safety import (
-    ToolSafetyObservation,
-    ToolSafetyTracker,
-    build_blocked_repetition_result,
+    ToolActivityObservation,
+    ToolActivityTracker,
+    build_suppressed_repetition_result,
 )
 
 _OVERFLOW_ERROR_HINTS = (
@@ -132,14 +131,21 @@ _ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _SKILLS_BOOTSTRAP_METADATA_KEY = "skills_bootstrap"
 _TASK_COMPLETION_DEFERRED_METADATA_KEY = "task_completion_deferred"
+_ACCEPTANCE_CONTINUATION_TEXT = (
+    "The task cannot finish yet because workspace mutations do not have current acceptance "
+    "evidence. Continue autonomously: run the required acceptance gates with explicit material "
+    "revision paths, record the resolved acceptance ledger, fix any failures, and only then "
+    "provide the final answer."
+)
 _TOOL_ROUND_CONTINUATION_EMPTY_TEXT = (
     "I could not produce a continuation after the tool execution slice boundary."
 )
-_TOOL_SAFETY_STOP_TEXT = (
-    "Tool execution stopped safely because repeated calls were no longer making progress. "
-    "Do not repeat the blocked action automatically; resume only after a materially new "
-    "user instruction or orchestrator update."
+_TOOL_LIVENESS_EXHAUSTED_TEXT = (
+    "I could not make stable tool progress after repeated automatic replanning. The exact "
+    "unchanged actions have been suppressed; a new instruction or materially changed runtime "
+    "state is needed before this task can continue."
 )
+_ACCEPTANCE_CONTINUATION_METADATA_KEY = "acceptance_continuation_required"
 _FOLLOWUP_COMPACTION_FAILED_TEXT = (
     "Follow-up request overflow occurred and compaction could not proceed."
 )
@@ -227,6 +233,7 @@ class AgentTurnResult:
     interrupted: bool = False
     approval_rejected: bool = False
     completion_blocked: bool = False
+    completion_block_reason: str | None = None
     interruption_reason: InterruptionReason | None = None
 
 
@@ -285,6 +292,7 @@ class AgentTurnDoneEvent:
     interrupted: bool = False
     approval_rejected: bool = False
     completion_blocked: bool = False
+    completion_block_reason: str | None = None
     interruption_reason: InterruptionReason | None = None
     type: Literal["done"] = "done"
 
@@ -298,6 +306,7 @@ class AgentTurnDoneEvent:
             interrupted=self.interrupted,
             approval_rejected=self.approval_rejected,
             completion_blocked=self.completion_blocked,
+            completion_block_reason=self.completion_block_reason,
             interruption_reason=self.interruption_reason,
         )
 
@@ -347,8 +356,6 @@ class _ToolExecutionOutcome:
     pending_subagent_ids: frozenset[str] = frozenset()
     deferred_tool_successes: tuple["_DeferredToolSuccess", ...] = ()
     unexecuted_tool_names: tuple[str, ...] = ()
-    safety_stop: bool = False
-    safety_stop_reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -938,6 +945,7 @@ class AgentLoop:
                 )
 
             completion_blocked = _response_completion_blocked(final_response)
+            completion_block_reason = _response_completion_block_reason(final_response)
             self._persist_successful_turn(
                 session_id=session.session_id,
                 turn_id=turn_id,
@@ -977,6 +985,7 @@ class AgentLoop:
                 compaction_performed=did_compaction,
                 approval_rejected=approval_rejected,
                 completion_blocked=completion_blocked,
+                completion_block_reason=completion_block_reason,
             )
         except _TurnStopRequested:
             return self._interrupt_turn(
@@ -1004,17 +1013,13 @@ class AgentLoop:
         turn_id: str,
         pending_detached_job_ids: frozenset[str] = frozenset(),
         pending_subagent_ids: frozenset[str] = frozenset(),
-        tool_safety: ToolSafetyTracker | None = None,
+        tool_safety: ToolActivityTracker | None = None,
     ) -> _ToolExecutionOutcome:
         ephemeral_image_records: list[ConversationRecord] = []
         deferred_tool_successes: list[_DeferredToolSuccess] = []
         current_pending_detached_job_ids = set(pending_detached_job_ids)
         current_pending_subagent_ids = set(pending_subagent_ids)
         tool_calls = tuple(current_response.tool_calls)
-        safety_stop = False
-        safety_stop_reason: str | None = None
-        safety_stop_unexecuted_tool_names: tuple[str, ...] = ()
-        safety_stop_unexecuted_tool_calls: tuple[ToolCall, ...] = ()
         for tool_index, tool_call in enumerate(tool_calls):
             tool_context = replace(
                 self._tool_context,
@@ -1027,8 +1032,9 @@ class AgentLoop:
                     if tool_safety is not None
                     else None
                 )
+                tool_call_suppressed = blocked_reason is not None
                 if blocked_reason is not None:
-                    tool_result = build_blocked_repetition_result(
+                    tool_result = build_suppressed_repetition_result(
                         tool_call=tool_call,
                         reason=blocked_reason,
                         diagnostics=(
@@ -1059,7 +1065,7 @@ class AgentLoop:
                 )
                 if pending_approval is None:
                     observation = None
-                    if tool_safety is not None:
+                    if tool_safety is not None and not tool_call_suppressed:
                         observation = tool_safety.record(tool_call, tool_result)
                         tool_result = _with_tool_safety_replan_notice(
                             tool_result,
@@ -1103,14 +1109,6 @@ class AgentLoop:
                         current_pending_subagent_ids,
                         tool_result,
                     )
-                    if tool_safety is not None:
-                        if bool(tool_result.metadata.get("tool_safety_blocked")):
-                            safety_stop = True
-                            safety_stop_reason = "blocked_tool_signature_reused"
-                            safety_stop_unexecuted_tool_names = tuple(
-                                call.name for call in tool_calls[tool_index + 1:]
-                            )
-                            safety_stop_unexecuted_tool_calls = tool_calls[tool_index + 1:]
                     break
 
                 self._append_turn_record(
@@ -1157,25 +1155,11 @@ class AgentLoop:
                     )
                 tool_context = replace(tool_context, approved_action=pending_approval)
 
-            if safety_stop:
-                break
-
         pending_records.extend(ephemeral_image_records)
-        if safety_stop_unexecuted_tool_calls:
-            self._append_tool_safety_skips(
-                session_id=session_id,
-                pending_records=pending_records,
-                tool_calls=safety_stop_unexecuted_tool_calls,
-                reason=safety_stop_reason or "repeated_tool_result",
-                turn_id=turn_id,
-            )
         return _ToolExecutionOutcome(
             pending_detached_job_ids=frozenset(current_pending_detached_job_ids),
             pending_subagent_ids=frozenset(current_pending_subagent_ids),
             deferred_tool_successes=tuple(deferred_tool_successes),
-            safety_stop=safety_stop,
-            safety_stop_reason=safety_stop_reason,
-            unexecuted_tool_names=safety_stop_unexecuted_tool_names,
         )
 
     def _build_followup_attempt_request(
@@ -1415,9 +1399,9 @@ class AgentLoop:
             content=(
                 f"Tool execution slice completed {max_rounds} rounds. Pending round "
                 f"{attempted_round} was not executed. "
-                "A continuation is allowed only after a prior round made observable progress. "
-                "Avoid repeating completed work and use tools only when they can produce new "
-                "evidence or change.\n"
+                "Continue autonomously from the checkpoint. Exact unchanged failures are "
+                "suppressed individually; choose actions that can produce new evidence or "
+                "change, and do not repeat completed work.\n"
                 + "\n".join(tool_safety.checkpoint_lines())
             ),
             metadata={
@@ -1428,102 +1412,6 @@ class AgentLoop:
             },
             turn_id=turn_id,
         )
-
-    def _build_tool_safety_stop_record(
-        self,
-        *,
-        session_id: str,
-        turn_id: str,
-        reason: str,
-        pending_detached_job_ids: Iterable[str] = (),
-        pending_subagent_ids: Iterable[str] = (),
-    ) -> ConversationRecord:
-        details = [
-            _TOOL_SAFETY_STOP_TEXT,
-            f"reason: {reason}",
-        ]
-        if pending_detached_job_ids:
-            details.append(
-                "pending_detached_bash_jobs: " + ", ".join(sorted(pending_detached_job_ids))
-            )
-        if pending_subagent_ids:
-            details.append(
-                "pending_subagents: " + ", ".join(sorted(pending_subagent_ids))
-            )
-        return self._build_message_record(
-            session_id=session_id,
-            role="system",
-            content="\n".join(details),
-            metadata={
-                "tool_safety_stop": True,
-                "reason": reason,
-                "pending_detached_job_ids": list(pending_detached_job_ids),
-                "pending_subagent_ids": list(pending_subagent_ids),
-            },
-            turn_id=turn_id,
-        )
-
-    def _append_tool_safety_skips(
-        self,
-        *,
-        session_id: str,
-        pending_records: list[ConversationRecord],
-        tool_calls: Sequence[ToolCall],
-        reason: str,
-        turn_id: str,
-    ) -> None:
-        for tool_call in tool_calls:
-            result = ToolExecutionResult(
-                call_id=tool_call.call_id,
-                name=tool_call.name,
-                ok=False,
-                content=(
-                    "Tool call skipped\n"
-                    f"tool: {tool_call.name}\n"
-                    "error_code: tool_safety_stop\n"
-                    f"reason: {reason}"
-                ),
-                metadata={
-                    "tool_safety_skipped": True,
-                    "error_code": "tool_safety_stop",
-                    "reason": reason,
-                    "arguments": dict(tool_call.arguments),
-                },
-            )
-            self._append_turn_record(
-                session_id=session_id,
-                pending_records=pending_records,
-                record=self._build_tool_record(session_id, result, turn_id=turn_id),
-            )
-
-    def _append_tool_safety_stop_response(
-        self,
-        *,
-        session_id: str,
-        pending_records: list[ConversationRecord],
-        turn_id: str,
-        reason: str,
-        response: LLMResponse,
-    ) -> LLMResponse:
-        LOGGER.warning(
-            "Tool safety parked task session_id=%s turn_id=%s reason=%s",
-            session_id,
-            turn_id,
-            reason,
-        )
-        stopped_response = replace(
-            response,
-            text="",
-            tool_calls=[],
-            finish_reason="stop",
-            provider_metadata={
-                **response.provider_metadata,
-                "completion_blocked": True,
-                "tool_safety_parked": True,
-                "tool_safety_stop_reason": reason,
-            },
-        )
-        return stopped_response
 
     def _build_request(
         self,
@@ -1891,6 +1779,169 @@ class AgentLoop:
             )
         return recovery_events, normalized, estimated_input_tokens
 
+    def _build_tool_liveness_exhausted_request(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        tool_names: Sequence[str],
+        turn_id: str,
+    ) -> tuple[LLMRequest, int]:
+        if tool_names:
+            self._append_turn_record(
+                session_id=session_id,
+                pending_records=pending_records,
+                record=self._build_unexecuted_tool_call_note_record(
+                    session_id=session_id,
+                    tool_names=tool_names,
+                    turn_id=turn_id,
+                    boundary="tool_slice",
+                ),
+            )
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=self._build_runtime_message_record(
+                session_id=session_id,
+                message=AgentRuntimeMessage(
+                    role="system",
+                    content=(
+                        "Functional liveness limit reached after repeated unchanged tool rounds. "
+                        "Do not call tools or claim completion. Give a concise checkpoint naming "
+                        "the unresolved obstacle and the materially new input or state needed."
+                    ),
+                    metadata={
+                        "tool_liveness_exhausted": True,
+                        "automatic_replanning_exhausted": True,
+                    },
+                ),
+                turn_id=turn_id,
+            ),
+        )
+        self._reset_stateful_provider_continuation_for_replay(session_id)
+        return self._build_followup_request(
+            session_id=session_id,
+            base_records=base_records,
+            pending_records=pending_records,
+            allow_tools=False,
+        )
+
+    @staticmethod
+    def _normalize_tool_liveness_exhausted_response(response: LLMResponse) -> LLMResponse:
+        return replace(
+            response,
+            text=response.text.strip() or _TOOL_LIVENESS_EXHAUSTED_TEXT,
+            tool_calls=[],
+            finish_reason="stop",
+            provider_metadata={
+                **response.provider_metadata,
+                "completion_blocked": True,
+                "completion_block_reason": "tool_liveness_exhausted",
+                "tool_liveness_exhausted": True,
+            },
+        )
+
+    async def _recover_from_tool_liveness_exhaustion(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        tool_names: Sequence[str],
+        turn_id: str,
+    ) -> tuple[LLMResponse, int]:
+        request, estimated_input_tokens = self._build_tool_liveness_exhausted_request(
+            session_id=session_id,
+            base_records=base_records,
+            pending_records=pending_records,
+            tool_names=tool_names,
+            turn_id=turn_id,
+        )
+        response = await self._await_with_stop(
+            self._llm_service.generate(request),
+            turn_id=turn_id,
+            operation="llm_generate",
+        )
+        normalized = self._normalize_tool_liveness_exhausted_response(response)
+        assistant_record = self._build_assistant_record(
+            session_id,
+            normalized,
+            turn_id=turn_id,
+        )
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=assistant_record,
+        )
+        self._persist_provider_session_state_from_response(
+            session_id=session_id,
+            response=normalized,
+            assistant_record=assistant_record,
+        )
+        return normalized, estimated_input_tokens
+
+    async def _stream_recover_from_tool_liveness_exhaustion(
+        self,
+        *,
+        session_id: str,
+        base_records: Sequence[ConversationRecord],
+        pending_records: list[ConversationRecord],
+        tool_names: Sequence[str],
+        turn_id: str,
+    ) -> tuple[list[AgentTurnStreamEvent], LLMResponse, int]:
+        request, estimated_input_tokens = self._build_tool_liveness_exhausted_request(
+            session_id=session_id,
+            base_records=base_records,
+            pending_records=pending_records,
+            tool_names=tool_names,
+            turn_id=turn_id,
+        )
+        streamed_response: LLMResponse | None = None
+        events: list[AgentTurnStreamEvent] = []
+        async for event in self._stream_generate_with_stop(request, turn_id=turn_id):
+            if event.type == "text_delta" and event.delta:
+                events.append(
+                    AgentTextDeltaEvent(
+                        session_id=session_id,
+                        delta=event.delta,
+                        turn_id=turn_id,
+                    )
+                )
+            elif event.type == "done":
+                streamed_response = event.response
+        if streamed_response is None:
+            raise RuntimeError(
+                "Streaming liveness recovery completed without a final done event."
+            )
+        normalized = self._normalize_tool_liveness_exhausted_response(
+            streamed_response
+        )
+        assistant_record = self._build_assistant_record(
+            session_id,
+            normalized,
+            turn_id=turn_id,
+        )
+        self._append_turn_record(
+            session_id=session_id,
+            pending_records=pending_records,
+            record=assistant_record,
+        )
+        self._persist_provider_session_state_from_response(
+            session_id=session_id,
+            response=normalized,
+            assistant_record=assistant_record,
+        )
+        if normalized.text and not streamed_response.text.strip():
+            events.append(
+                AgentAssistantMessageEvent(
+                    session_id=session_id,
+                    text=normalized.text,
+                    turn_id=turn_id,
+                )
+            )
+        return events, normalized, estimated_input_tokens
+
     async def _stream_message_turn(  # pyright: ignore[reportGeneralTypeIssues] - orchestration state machine
         self,
         user_text: str | None,
@@ -2173,7 +2224,9 @@ class AgentLoop:
             turn_approval_rejected = False
             pending_detached_job_ids = initial_pending_detached_job_ids
             pending_subagent_ids = initial_pending_subagent_ids
-            while current_response.tool_calls:
+            while current_response.tool_calls or _response_requires_acceptance_continuation(
+                current_response
+            ):
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
                         session_id=session.session_id,
@@ -2204,61 +2257,44 @@ class AgentLoop:
                         rounds=self._tool_settings.max_tool_rounds_per_task,
                         tracker=tool_safety,
                     )
-                    self._append_tool_safety_skips(
+                    (
+                        recovery_events,
+                        current_response,
+                        final_estimated_input_tokens,
+                    ) = await self._stream_recover_from_tool_liveness_exhaustion(
                         session_id=session.session_id,
+                        base_records=base_records,
                         pending_records=pending_records,
-                        tool_calls=current_response.tool_calls,
-                        reason="tool_progress_budget_exhausted",
+                        tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
                         turn_id=turn_id,
                     )
+                    for recovery_event in recovery_events:
+                        yield recovery_event
+                    interrupted_response_text = current_response.text
+                    interrupted_unexecuted_tool_names = ()
+                    break
+                if _response_requires_acceptance_continuation(current_response):
                     self._append_turn_record(
                         session_id=session.session_id,
                         pending_records=pending_records,
-                        record=self._build_tool_safety_stop_record(
+                        record=self._build_runtime_message_record(
                             session_id=session.session_id,
+                            message=AgentRuntimeMessage(
+                                role="system",
+                                content=_ACCEPTANCE_CONTINUATION_TEXT,
+                                metadata={
+                                    _ACCEPTANCE_CONTINUATION_METADATA_KEY: True,
+                                    "automatic_continuation": True,
+                                },
+                            ),
                             turn_id=turn_id,
-                            reason="tool_progress_budget_exhausted",
-                            pending_detached_job_ids=pending_detached_job_ids,
-                            pending_subagent_ids=pending_subagent_ids,
                         ),
                     )
-                    current_response = self._append_tool_safety_stop_response(
-                        session_id=session.session_id,
-                        pending_records=pending_records,
-                        turn_id=turn_id,
-                        reason="tool_progress_budget_exhausted",
-                        response=current_response,
-                    )
-                    break
                 round_progress_epoch = tool_safety.progress_epoch
                 if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
-                    if not tool_safety.consume_slice_progress():
-                        self._append_tool_safety_skips(
-                            session_id=session.session_id,
-                            pending_records=pending_records,
-                            tool_calls=current_response.tool_calls,
-                            reason="tool_slice_without_progress",
-                            turn_id=turn_id,
-                        )
-                        self._append_turn_record(
-                            session_id=session.session_id,
-                            pending_records=pending_records,
-                            record=self._build_tool_safety_stop_record(
-                                session_id=session.session_id,
-                                turn_id=turn_id,
-                                reason="tool_slice_without_progress",
-                                pending_detached_job_ids=pending_detached_job_ids,
-                                pending_subagent_ids=pending_subagent_ids,
-                            ),
-                        )
-                        current_response = self._append_tool_safety_stop_response(
-                            session_id=session.session_id,
-                            pending_records=pending_records,
-                            turn_id=turn_id,
-                            reason="tool_slice_without_progress",
-                            response=current_response,
-                        )
-                        break
+                    tool_safety.consume_slice_progress()
                     (
                         recovery_events,
                         final_response,
@@ -2290,9 +2326,6 @@ class AgentLoop:
                     ephemeral_image_records: list[ConversationRecord] = []
                     staged_image_tool_successes: list[_DeferredToolSuccess] = []
                     approval_rejected = False
-                    safety_stop = False
-                    safety_stop_reason: str | None = None
-                    safety_stop_unexecuted_tool_calls: tuple[ToolCall, ...] = ()
                     current_pending_detached_job_ids = set(pending_detached_job_ids)
                     current_pending_subagent_ids = set(pending_subagent_ids)
                     tool_calls = tuple(current_response.tool_calls)
@@ -2304,8 +2337,9 @@ class AgentLoop:
                         )
                         while True:
                             blocked_reason = tool_safety.blocked_call_reason(tool_call)
+                            tool_call_suppressed = blocked_reason is not None
                             if blocked_reason is not None:
-                                tool_result = build_blocked_repetition_result(
+                                tool_result = build_suppressed_repetition_result(
                                     tool_call=tool_call,
                                     reason=blocked_reason,
                                     diagnostics=tool_safety.blocked_call_details(tool_call),
@@ -2351,11 +2385,15 @@ class AgentLoop:
                                 tool_name=tool_call.name,
                             )
                             if pending_approval is None:
-                                observation = tool_safety.record(tool_call, tool_result)
-                                tool_result = _with_tool_safety_replan_notice(
-                                    tool_result,
-                                    observation=observation,
-                                )
+                                if not tool_call_suppressed:
+                                    observation = tool_safety.record(
+                                        tool_call,
+                                        tool_result,
+                                    )
+                                    tool_result = _with_tool_safety_replan_notice(
+                                        tool_result,
+                                        observation=observation,
+                                    )
                                 tool_record = self._build_tool_record(
                                     session.session_id,
                                     tool_result,
@@ -2394,12 +2432,6 @@ class AgentLoop:
                                     current_pending_subagent_ids,
                                     tool_result,
                                 )
-                                if bool(tool_result.metadata.get("tool_safety_blocked")):
-                                    safety_stop = True
-                                    safety_stop_reason = "blocked_tool_signature_reused"
-                                    safety_stop_unexecuted_tool_calls = tool_calls[
-                                        tool_index + 1:
-                                    ]
                                 break
 
                             self._append_turn_record(
@@ -2489,8 +2521,6 @@ class AgentLoop:
 
                         if approval_rejected:
                             break
-                        if safety_stop:
-                            break
 
                     pending_records.extend(ephemeral_image_records)
                     deferred_tool_successes = tuple(staged_image_tool_successes)
@@ -2510,39 +2540,6 @@ class AgentLoop:
                                 pending_records=pending_records,
                                 deferred_tool_successes=deferred_tool_successes,
                             )
-                        break
-                    if safety_stop:
-                        if deferred_tool_successes:
-                            self._commit_deferred_tool_successes(
-                                session_id=session.session_id,
-                                pending_records=pending_records,
-                                deferred_tool_successes=deferred_tool_successes,
-                            )
-                        self._append_tool_safety_skips(
-                            session_id=session.session_id,
-                            pending_records=pending_records,
-                            tool_calls=safety_stop_unexecuted_tool_calls,
-                            reason=safety_stop_reason or "repeated_tool_result",
-                            turn_id=turn_id,
-                        )
-                        self._append_turn_record(
-                            session_id=session.session_id,
-                            pending_records=pending_records,
-                            record=self._build_tool_safety_stop_record(
-                                session_id=session.session_id,
-                                turn_id=turn_id,
-                                reason=safety_stop_reason or "repeated_tool_result",
-                                pending_detached_job_ids=pending_detached_job_ids,
-                                pending_subagent_ids=pending_subagent_ids,
-                            ),
-                        )
-                        current_response = self._append_tool_safety_stop_response(
-                            session_id=session.session_id,
-                            pending_records=pending_records,
-                            turn_id=turn_id,
-                            reason=safety_stop_reason or "repeated_tool_result",
-                            response=current_response,
-                        )
                         break
                     if self._stop_requested(turn_id):
                         if deferred_tool_successes:
@@ -2960,6 +2957,7 @@ class AgentLoop:
                 final_response = _mark_task_completion_deferred(final_response)
 
             completion_blocked = _response_completion_blocked(final_response)
+            completion_block_reason = _response_completion_block_reason(final_response)
             self._persist_successful_turn(
                 session_id=session.session_id,
                 turn_id=turn_id,
@@ -2991,6 +2989,7 @@ class AgentLoop:
                 compaction_performed=did_compaction,
                 approval_rejected=turn_approval_rejected,
                 completion_blocked=completion_blocked,
+                completion_block_reason=completion_block_reason,
             )
         except _TurnStopRequested:
             if interrupted_stream_fragment_text:
@@ -3323,7 +3322,7 @@ class AgentLoop:
                 active_contract,
                 user_text=user_text,
             )
-            tracker = ToolSafetyTracker.from_state(active_state.get("tracker"))
+            tracker = ToolActivityTracker.from_state(active_state.get("tracker"))
             tracker.seed_contract_requirements(contract.requirements)
             self._storage.write_tool_task_state(
                 contract.task_id,
@@ -3356,7 +3355,7 @@ class AgentLoop:
             origin_turn_id=proposed_task_id,
             user_text=user_text,
         )
-        tracker = ToolSafetyTracker()
+        tracker = ToolActivityTracker()
         tracker.seed_contract_requirements(contract.requirements)
         self._storage.write_tool_task_state(
             contract.task_id,
@@ -3381,18 +3380,18 @@ class AgentLoop:
             self._storage.update_session(session_id, backend_state=backend_state)
         return contract
 
-    def _load_tool_task_state(self, session_id: str) -> tuple[int, ToolSafetyTracker]:
+    def _load_tool_task_state(self, session_id: str) -> tuple[int, ToolActivityTracker]:
         session = self._storage.get_session(session_id)
         if session is None:
-            return 0, ToolSafetyTracker()
+            return 0, ToolActivityTracker()
         task_id = str(session.backend_state.get("active_tool_task_id", "")).strip()
         raw = self._storage.load_tool_task_state(task_id) if task_id else None
         if not isinstance(raw, dict):
             # Read the old inline shape during rolling upgrades, but never persist it again.
             raw = session.backend_state.get("tool_task_state")
         if not isinstance(raw, dict):
-            return 0, ToolSafetyTracker()
-        tracker = ToolSafetyTracker.from_state(raw.get("tracker"))
+            return 0, ToolActivityTracker()
+        tracker = ToolActivityTracker.from_state(raw.get("tracker"))
         schema_version = _safe_non_negative_int(raw.get("schema_version"))
         persisted_epoch = _safe_non_negative_int(raw.get("round_progress_epoch"))
         if schema_version < 2 or persisted_epoch != tracker.progress_epoch:
@@ -3409,7 +3408,7 @@ class AgentLoop:
         session_id: str,
         *,
         rounds: int,
-        tracker: ToolSafetyTracker,
+        tracker: ToolActivityTracker,
     ) -> None:
         session = self._storage.get_session(session_id)
         if session is None:
@@ -3681,7 +3680,9 @@ class AgentLoop:
         current_session = session
         current_base_records = list(base_records)
 
-        while current_response.tool_calls:
+        while current_response.tool_calls or _response_requires_acceptance_continuation(
+            current_response
+        ):
             if self._stop_requested(turn_id):
                 return (
                     current_session,
@@ -3700,61 +3701,50 @@ class AgentLoop:
                     rounds=self._tool_settings.max_tool_rounds_per_task,
                     tracker=tool_safety,
                 )
-                self._append_tool_safety_skips(
-                    session_id=current_session.session_id,
-                    pending_records=pending_records,
-                    tool_calls=current_response.tool_calls,
-                    reason="tool_progress_budget_exhausted",
-                    turn_id=turn_id,
-                )
+                try:
+                    (
+                        current_response,
+                        current_estimated_input_tokens,
+                    ) = await self._recover_from_tool_liveness_exhaustion(
+                        session_id=current_session.session_id,
+                        base_records=current_base_records,
+                        pending_records=pending_records,
+                        tool_names=tuple(
+                            call.name for call in current_response.tool_calls
+                        ),
+                        turn_id=turn_id,
+                    )
+                except _TurnStopRequested:
+                    return (
+                        current_session,
+                        current_response,
+                        current_estimated_input_tokens,
+                        did_compaction,
+                        True,
+                        approval_rejected,
+                        (),
+                    )
+                break
+            if _response_requires_acceptance_continuation(current_response):
                 self._append_turn_record(
                     session_id=current_session.session_id,
                     pending_records=pending_records,
-                    record=self._build_tool_safety_stop_record(
+                    record=self._build_runtime_message_record(
                         session_id=current_session.session_id,
+                        message=AgentRuntimeMessage(
+                            role="system",
+                            content=_ACCEPTANCE_CONTINUATION_TEXT,
+                            metadata={
+                                _ACCEPTANCE_CONTINUATION_METADATA_KEY: True,
+                                "automatic_continuation": True,
+                            },
+                        ),
                         turn_id=turn_id,
-                        reason="tool_progress_budget_exhausted",
-                        pending_detached_job_ids=pending_detached_job_ids,
-                        pending_subagent_ids=pending_subagent_ids,
                     ),
                 )
-                current_response = self._append_tool_safety_stop_response(
-                    session_id=current_session.session_id,
-                    pending_records=pending_records,
-                    turn_id=turn_id,
-                    reason="tool_progress_budget_exhausted",
-                    response=current_response,
-                )
-                break
             round_progress_epoch = tool_safety.progress_epoch
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
-                if not tool_safety.consume_slice_progress():
-                    self._append_tool_safety_skips(
-                        session_id=current_session.session_id,
-                        pending_records=pending_records,
-                        tool_calls=current_response.tool_calls,
-                        reason="tool_slice_without_progress",
-                        turn_id=turn_id,
-                    )
-                    self._append_turn_record(
-                        session_id=current_session.session_id,
-                        pending_records=pending_records,
-                        record=self._build_tool_safety_stop_record(
-                            session_id=current_session.session_id,
-                            turn_id=turn_id,
-                            reason="tool_slice_without_progress",
-                            pending_detached_job_ids=pending_detached_job_ids,
-                            pending_subagent_ids=pending_subagent_ids,
-                        ),
-                    )
-                    current_response = self._append_tool_safety_stop_response(
-                        session_id=current_session.session_id,
-                        pending_records=pending_records,
-                        turn_id=turn_id,
-                        reason="tool_slice_without_progress",
-                        response=current_response,
-                    )
-                    break
+                tool_safety.consume_slice_progress()
                 try:
                     (
                         current_response,
@@ -3845,38 +3835,6 @@ class AgentLoop:
                             metadata={"approval_rejected": True},
                             turn_id=turn_id,
                         ),
-                    )
-                    break
-                if tool_execution_outcome.safety_stop:
-                    if deferred_tool_successes:
-                        self._commit_deferred_tool_successes(
-                            session_id=current_session.session_id,
-                            pending_records=pending_records,
-                            deferred_tool_successes=deferred_tool_successes,
-                        )
-                    self._append_turn_record(
-                        session_id=current_session.session_id,
-                        pending_records=pending_records,
-                        record=self._build_tool_safety_stop_record(
-                            session_id=current_session.session_id,
-                            turn_id=turn_id,
-                            reason=(
-                                tool_execution_outcome.safety_stop_reason
-                                or "repeated_tool_result"
-                            ),
-                            pending_detached_job_ids=pending_detached_job_ids,
-                            pending_subagent_ids=pending_subagent_ids,
-                        ),
-                    )
-                    current_response = self._append_tool_safety_stop_response(
-                        session_id=current_session.session_id,
-                        pending_records=pending_records,
-                        turn_id=turn_id,
-                        reason=(
-                            tool_execution_outcome.safety_stop_reason
-                            or "repeated_tool_result"
-                        ),
-                        response=current_response,
                     )
                     break
                 if self._stop_requested(turn_id):
@@ -6459,24 +6417,36 @@ def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
 def _enforce_acceptance_handoff(
     response: LLMResponse,
     *,
-    tool_safety: ToolSafetyTracker,
+    tool_safety: ToolActivityTracker,
 ) -> LLMResponse:
     if not tool_safety.unverified_workspace_mutation:
         return response
     return replace(
         response,
-        text="",
-        finish_reason="stop",
         provider_metadata={
             **response.provider_metadata,
             "acceptance_required": True,
-            "completion_blocked": True,
+            _ACCEPTANCE_CONTINUATION_METADATA_KEY: True,
         },
     )
 
 
 def _response_completion_blocked(response: LLMResponse) -> bool:
     return bool(response.provider_metadata.get("completion_blocked", False))
+
+
+def _response_completion_block_reason(response: LLMResponse) -> str | None:
+    if not _response_completion_blocked(response):
+        return None
+    value = response.provider_metadata.get("completion_block_reason")
+    normalized = str(value).strip() if value is not None else ""
+    return normalized or "external_blocked"
+
+
+def _response_requires_acceptance_continuation(response: LLMResponse) -> bool:
+    return bool(
+        response.provider_metadata.get(_ACCEPTANCE_CONTINUATION_METADATA_KEY, False)
+    )
 
 
 def _mark_task_completion_deferred(response: LLMResponse) -> LLMResponse:
@@ -6498,43 +6468,31 @@ def _response_task_completion_deferred(response: LLMResponse) -> bool:
 def _with_tool_safety_replan_notice(
     result: ToolExecutionResult,
     *,
-    observation: ToolSafetyObservation,
+    observation: ToolActivityObservation,
 ) -> ToolExecutionResult:
     if not (
         observation.repeated_invalid_call or observation.repeated_no_progress
-    ) or bool(result.metadata.get("tool_safety_blocked")):
+    ) or bool(result.metadata.get("tool_liveness_suppressed")):
         return result
     metadata = dict(result.metadata)
     metadata.update(
         {
-            "tool_safety_replan_required": True,
-            "tool_safety_signature_id": observation.signature_id,
-            "tool_safety_occurrence_count": observation.occurrence_count,
-            "tool_safety_progress_epoch": observation.progress_epoch,
-            "tool_safety_first_call_id": observation.first_call_id,
+            "tool_liveness_replan_required": True,
+            "tool_liveness_signature_id": observation.signature_id,
+            "tool_liveness_occurrence_count": observation.occurrence_count,
+            "tool_liveness_progress_epoch": observation.progress_epoch,
+            "tool_liveness_first_call_id": observation.first_call_id,
         }
     )
-    workspace_lease_blocked = (
-        observation.blocked_invalid_signature
-        and result.metadata.get("error_code") == "workspace_lease_conflict"
-    )
-    if workspace_lease_blocked:
-        metadata["tool_safety_blocked"] = True
-        metadata["tool_safety_block_reason"] = "repeated_workspace_lease_conflict"
     remediation = str(result.metadata.get("remediation", "")).strip()
     return replace(
         result,
         content=(
             result.content.rstrip()
-            + "\n\nTool safety checkpoint\n"
-            + (
-                "The same underlying workspace lease conflict occurred twice in the current "
-                "unchanged workspace epoch. This turn is now parked. "
-                if workspace_lease_blocked
-                else "This exact action is now blocked in the current unchanged workspace epoch. "
-            )
+            + "\n\nTool liveness checkpoint\n"
+            + "This exact action has reached its unchanged-state retry limit. "
             + (remediation + " " if remediation else "")
-            + "Do not vary the command merely to retry the same underlying failure."
+            + "Continue with a materially different action or gather new evidence."
         ),
         metadata=metadata,
     )

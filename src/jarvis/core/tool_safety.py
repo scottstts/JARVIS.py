@@ -1,4 +1,4 @@
-"""Turn-scoped safety accounting for repeated or non-progressing tool activity."""
+"""Task-scoped liveness and acceptance accounting for tool activity."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ _FILE_EDIT_TOOL_NAMES = frozenset({"file_patch", "file_write", "file_replace"})
 
 
 @dataclass(slots=True, frozen=True)
-class ToolSafetyObservation:
-    """Safety result for one completed tool call."""
+class ToolActivityObservation:
+    """Liveness result for one completed tool call."""
 
     repeated_invalid_call: bool = False
     blocked_invalid_signature: bool = False
@@ -34,8 +34,8 @@ class ToolSafetyObservation:
 
 
 @dataclass(slots=True)
-class ToolSafetyTracker:
-    """Detect repeated invalid calls and identical no-progress tool activity."""
+class ToolActivityTracker:
+    """Track exact repeated calls, material progress, and acceptance evidence."""
 
     _invalid_counts: dict[str, int] = field(default_factory=dict)
     _no_progress_counts: dict[str, int] = field(default_factory=dict)
@@ -80,7 +80,7 @@ class ToolSafetyTracker:
     def blocked_call_details(self, tool_call: ToolCall) -> dict[str, Any]:
         return dict(self._blocked_call_details.get(_tool_call_signature(tool_call), {}))
 
-    def record(self, tool_call: ToolCall, result: ToolExecutionResult) -> ToolSafetyObservation:
+    def record(self, tool_call: ToolCall, result: ToolExecutionResult) -> ToolActivityObservation:
         workspace_mutated = _result_mutated_workspace(tool_call, result)
         if workspace_mutated:
             self._advance_progress_epoch(invalidate_acceptance=True)
@@ -111,7 +111,7 @@ class ToolSafetyTracker:
                     "occurrence_count": count,
                     "progress_epoch": self._progress_epoch,
                 }
-            return ToolSafetyObservation(
+            return ToolActivityObservation(
                 repeated_invalid_call=count >= 2,
                 blocked_invalid_signature=blocked,
                 signature_id=invalid_signature,
@@ -189,7 +189,7 @@ class ToolSafetyTracker:
                     "occurrence_count": count,
                     "progress_epoch": self._progress_epoch,
                 }
-            return ToolSafetyObservation(
+            return ToolActivityObservation(
                 repeated_no_progress=repeated,
                 made_progress=first_seen,
                 signature_id=activity_signature,
@@ -200,7 +200,7 @@ class ToolSafetyTracker:
 
         self._seen_activity_signatures.add(activity_signature)
         self._progress_since_slice = True
-        return ToolSafetyObservation(
+        return ToolActivityObservation(
             made_progress=True,
             progress_epoch=self._progress_epoch,
         )
@@ -381,8 +381,8 @@ class ToolSafetyTracker:
         }
 
     @classmethod
-    def from_state(cls, value: object) -> "ToolSafetyTracker":
-        """Restore validated state; malformed persisted data safely starts empty."""
+    def from_state(cls, value: object) -> "ToolActivityTracker":
+        """Restore validated state; malformed persisted data starts empty."""
 
         if not isinstance(value, dict):
             return cls()
@@ -446,32 +446,33 @@ class ToolSafetyTracker:
         )
 
 
-def build_blocked_repetition_result(
+def build_suppressed_repetition_result(
     *,
     tool_call: ToolCall,
     reason: str,
     diagnostics: dict[str, Any] | None = None,
 ) -> ToolExecutionResult:
-    """Return deterministic feedback without executing an already-blocked action."""
+    """Return deterministic feedback without re-executing an exact repeated action."""
 
     return ToolExecutionResult(
         call_id=tool_call.call_id,
         name=tool_call.name,
         ok=False,
         content=(
-            "Tool call blocked\n"
+            "Exact tool call suppressed\n"
             f"tool: {tool_call.name}\n"
-            "error_code: blocked_repeated_tool_call\n"
+            "error_code: suppressed_repeated_tool_call\n"
             f"reason: {reason}. This exact action already crossed its unchanged-state retry "
-            "limit. Replan with different arguments or gather material new evidence before "
-            "trying it again."
+            "limit. Continue the task by choosing a materially different action or gathering "
+            "new evidence."
         ),
         metadata={
-            "tool_safety_blocked": True,
-            "error_code": "blocked_repeated_tool_call",
+            "tool_liveness_suppressed": True,
+            "tool_liveness_replan_required": True,
+            "error_code": "suppressed_repeated_tool_call",
             "reason": reason,
-            "blocked_call_signature": _tool_call_signature(tool_call),
-            "tool_safety_diagnostics": dict(diagnostics or {}),
+            "suppressed_call_signature": _tool_call_signature(tool_call),
+            "tool_liveness_diagnostics": dict(diagnostics or {}),
             "arguments": dict(tool_call.arguments),
         },
     )
@@ -489,17 +490,6 @@ def _invalid_signature(tool_call: ToolCall, result: ToolExecutionResult) -> str 
         or tool_call.provider_metadata.get(TOOL_CALL_VALIDATION_ERROR_METADATA_KEY)
     ):
         return None
-    if metadata.get("error_code") == "workspace_lease_conflict":
-        return _digest(
-            {
-                "error_code": "workspace_lease_conflict",
-                "conflict_key": str(
-                    metadata.get("conflict_key")
-                    or metadata.get("conflict_class")
-                    or "workspace_access_conflict"
-                ),
-            }
-        )
     reason = str(metadata.get("reason") or metadata.get("error") or "").strip()
     return _digest(
         {
@@ -618,13 +608,18 @@ def _result_mutated_workspace(tool_call: ToolCall, result: ToolExecutionResult) 
         return bool(result.metadata.get("workspace_changed"))
     if tool_call.name in _FILE_EDIT_TOOL_NAMES:
         return bool(result.metadata.get("changed"))
-    if tool_call.name == "bash":
-        return bool(result.ok and tool_call.arguments.get("write_paths"))
     if tool_call.name == "acceptance_run":
         return bool(result.ok and result.metadata.get("changed"))
     if tool_call.name in {"generate_edit_image", "memory_write", "tool_register"}:
         return result.ok
     return False
+
+
+# Compatibility aliases for persisted-state consumers and external imports. New runtime code
+# uses the functional names above; removing the aliases would needlessly invalidate extensions.
+ToolSafetyObservation = ToolActivityObservation
+ToolSafetyTracker = ToolActivityTracker
+build_blocked_repetition_result = build_suppressed_repetition_result
 
 
 def _result_is_material_progress(result: ToolExecutionResult) -> bool:

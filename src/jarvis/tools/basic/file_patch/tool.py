@@ -130,7 +130,6 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                         ),
                     },
                     "expected_file_absent": _expected_file_absent_schema(),
-                    "expected_lease_generation": _expected_lease_generation_schema(),
                     "operations": {
                         "type": "array",
                         "minItems": 1,
@@ -206,7 +205,6 @@ def build_file_write_tool(settings: ToolSettings) -> RegisteredTool:
                     },
                     "expected_sha256": _expected_sha256_schema(),
                     "expected_file_absent": _expected_file_absent_schema(),
-                    "expected_lease_generation": _expected_lease_generation_schema(),
                 },
                 "required": ["path", "content"],
                 "additionalProperties": False,
@@ -244,7 +242,6 @@ def build_file_replace_tool(settings: ToolSettings) -> RegisteredTool:
                     },
                     "expected_sha256": _expected_sha256_schema(),
                     "expected_file_absent": _expected_file_absent_schema(),
-                    "expected_lease_generation": _expected_lease_generation_schema(),
                 },
                 "required": ["path", "match", "replacement"],
                 "additionalProperties": False,
@@ -270,17 +267,6 @@ def _expected_sha256_schema() -> dict[str, object]:
         "maxLength": 64,
         "pattern": "^[0-9a-fA-F]{64}$",
         "description": "Optional SHA-256 observed before this edit.",
-    }
-
-
-def _expected_lease_generation_schema() -> dict[str, object]:
-    return {
-        "type": "integer",
-        "minimum": 0,
-        "description": (
-            "Optional workspace lease generation observed during inspection. The write fails "
-            "if path ownership changed before execution."
-        ),
     }
 
 

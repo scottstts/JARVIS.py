@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -12,72 +13,11 @@ from ...config import ToolSettings
 from ...types import ToolExecutionContext, ToolPolicyDecision
 from .shell_syntax import background_operator, masked_shell_syntax
 
-_INSTALL_KEYWORDS = (
-    "apt install",
-    "apt-get install",
-    "apt-get update",
-    "pip install",
-    "pip3 install",
-    "uv tool install",
-    "uv pip install",
-    "npm install -g",
-    "npm uninstall -g",
-    "pnpm add -g",
-    "yarn global add",
-    "cargo install",
-    "go install",
-    "brew install",
-    "brew tap",
-    "gem install",
-    "pipx install",
-    "poetry add",
-)
 _MODE_VALUES = {"foreground", "background", "service", "status", "tail", "cancel"}
 _COMMAND_PREFIX = r"(?:^|[;&|()]\s*|\n\s*)"
 _OPTIONAL_SUDO = r"(?:sudo\s+)?"
 _OPTIONAL_ENV_WRAPPER = r"(?:env\s+)?"
 _OPTIONAL_ENV_ASSIGNMENTS = r"(?:[a-z_][a-z0-9_]*=[^\s;&|()]+\s+)*"
-_PYTHON_COMMAND_PATTERN = re.compile(
-    _COMMAND_PREFIX
-    + _OPTIONAL_SUDO
-    + _OPTIONAL_ENV_WRAPPER
-    + _OPTIONAL_ENV_ASSIGNMENTS
-    + r"(?P<command>(?:\./|\.\./|/)?(?:[\w.-]+/)*python(?:\d+(?:\.\d+)*)?)\b"
-)
-_PYTHON_ENV_OVERRIDE_PATTERN = re.compile(
-    _COMMAND_PREFIX
-    + _OPTIONAL_SUDO
-    + _OPTIONAL_ENV_WRAPPER
-    + r"(?:path|virtual_env)\s*=[^\n;&|()]*\bpython(?:\d+(?:\.\d+)*)?\b"
-)
-_PYTHON_ACTIVATE_PATTERN = re.compile(
-    _COMMAND_PREFIX
-    + _OPTIONAL_SUDO
-    + r"(?:source|\.)\s+(?P<activate>[^\n;&|()]*?/bin/activate)\b"
-)
-_UV_RUN_PYTHON_PATTERN = re.compile(
-    _COMMAND_PREFIX
-    + _OPTIONAL_SUDO
-    + _OPTIONAL_ENV_WRAPPER
-    + _OPTIONAL_ENV_ASSIGNMENTS
-    + r"uv\s+run(?:\s+[^\n;&|()]+)*\s+python(?:\d+(?:\.\d+)*)?\b"
-)
-_UV_PIP_INSTALL_TARGET_PATTERN = re.compile(
-    _COMMAND_PREFIX
-    + _OPTIONAL_SUDO
-    + _OPTIONAL_ENV_WRAPPER
-    + _OPTIONAL_ENV_ASSIGNMENTS
-    + r"uv\s+pip\s+install\b(?P<flags>[^\n;&|()]*)"
-)
-_UV_PYTHON_FLAG_PATTERN = re.compile(
-    r"(?:^|\s)--python(?:=|\s+)(?P<python>[^\s;&|()]+)"
-)
-_PYTHON_ENV_CREATION_PATTERN = re.compile(
-    _COMMAND_PREFIX
-    + _OPTIONAL_SUDO
-    + r"(?:python(?:\d+(?:\.\d+)*)?\s+-m\s+venv|uv\s+venv|virtualenv|conda\s+create)\b"
-)
-_PYTHON_COMMAND_NAME_PATTERN = re.compile(r"python(?:\d+(?:\.\d+)*)?$")
 _UNMANAGED_PROCESS_COMMAND_PATTERN = re.compile(
     r"(?:^|[;&|()\n]\s*)(?:sudo\s+)?(?:env\s+)?"
     r"(?:[a-z_][a-z0-9_]*=[^\s;&|()]+\s+)*(?:nohup|disown|setsid)\b",
@@ -127,14 +67,6 @@ _HARD_DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "tool_runtime container-runtime recursion is denied.",
     ),
 )
-_SYSTEM_DESTINATION_PATTERN = re.compile(
-    r"\b(?:install|cp|mv|ln|chmod|chown)\b[^\n]*\s"
-    r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*|/var/\S*|/root/\S*)\s*$"
-)
-_SYSTEM_REDIRECT_PATTERN = re.compile(
-    r"(?:^|[;&|])[^#\n]*(?:>|>>)\s*"
-    r"(/usr/local/bin\S*|/usr/bin\S*|/bin/\S*|/sbin/\S*|/etc/\S*|/opt/\S*|/var/\S*|/root/\S*)"
-)
 _MUTATING_COMMAND_PREFIX = (
     _COMMAND_PREFIX
     + _OPTIONAL_SUDO
@@ -161,26 +93,11 @@ _DESTRUCTIVE_WORKSPACE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "matched destructive git working-tree restore",
     ),
     (
-        re.compile(_MUTATING_COMMAND_PREFIX + r"git\s+push\b"),
-        "matched external git push",
-    ),
-    (
         re.compile(
             _MUTATING_COMMAND_PREFIX
             + r"git\s+(?:branch|tag)\s+(?:-[a-z]*d[a-z]*|--delete)(?:\s|$)"
         ),
         "matched destructive git ref deletion",
-    ),
-    (
-        re.compile(
-            _MUTATING_COMMAND_PREFIX
-            + r"rm\b[^\n;&|]*\s(?:-[a-z]*r[a-z]*|--recursive)(?:\s|$)"
-        ),
-        "matched recursive deletion",
-    ),
-    (
-        re.compile(_MUTATING_COMMAND_PREFIX + r"find\b[^\n;&|]*\s-delete\b"),
-        "matched recursive find deletion",
     ),
 )
 
@@ -291,16 +208,17 @@ class BashCommandPolicy:
                 ),
             )
 
-        hard_deny_reason = _python_environment_violation_reason(command, self._settings)
-        if hard_deny_reason is None:
-            hard_deny_reason = _hard_deny_reason(command)
+        hard_deny_reason = _hard_deny_reason(command)
         if hard_deny_reason is not None:
             return ToolPolicyDecision(allowed=False, reason=hard_deny_reason)
 
         if self._settings.bash_dangerously_skip_permission:
             return ToolPolicyDecision(allowed=True)
 
-        detector_reason = _approval_detector_reason(command)
+        detector_reason = _approval_detector_reason(
+            command,
+            working_directory=working_directory.display,
+        )
         if detector_reason is None:
             return ToolPolicyDecision(allowed=True)
 
@@ -319,8 +237,7 @@ class BashCommandPolicy:
             summary = "Run a bash command that requires explicit review."
         if not details:
             details = (
-                "This command appears to install software, mutate system tooling, overwrite "
-                "or delete workspace state, or publish repository changes. Review the exact "
+                "This command would discard broad workspace or repository state. Review the exact "
                 f"command and working directory ({working_directory.display}) before approving."
             )
 
@@ -404,104 +321,11 @@ def _hard_deny_reason(command: str) -> str | None:
     return None
 
 
-def _python_environment_violation_reason(
+def _approval_detector_reason(
     command: str,
-    settings: ToolSettings,
+    *,
+    working_directory: str = "/workspace",
 ) -> str | None:
-    lowered = command.lower()
-    if _PYTHON_ENV_OVERRIDE_PATTERN.search(lowered):
-        return (
-            "bash Python commands must not override PATH or VIRTUAL_ENV away from the "
-            f"central {_central_venv_path(settings)} environment. "
-            f"{_central_python_guidance(settings)}"
-        )
-
-    central_activate_path = f"{_central_venv_path(settings)}/bin/activate"
-    for match in _PYTHON_ACTIVATE_PATTERN.finditer(lowered):
-        if match.group("activate") != central_activate_path:
-            return (
-                "bash must not activate a second Python environment for agent work. "
-                f"{_central_python_guidance(settings)}"
-            )
-
-    if _UV_RUN_PYTHON_PATTERN.search(lowered):
-        return (
-            "bash Python commands must not route through `uv run python`, because that can "
-            f"select a different interpreter. {_central_python_guidance(settings)}"
-        )
-
-    for match in _UV_PIP_INSTALL_TARGET_PATTERN.finditer(lowered):
-        python_flag = _UV_PYTHON_FLAG_PATTERN.search(match.group("flags"))
-        if python_flag is None:
-            continue
-        attempted = python_flag.group("python")
-        if attempted == _central_interpreter_path(settings):
-            continue
-        return (
-            "bash denied this package install because `uv pip install --python` targets a "
-            f"non-central interpreter path '{attempted}'. {_central_python_guidance(settings)}"
-        )
-
-    if _PYTHON_ENV_CREATION_PATTERN.search(lowered):
-        return (
-            "bash must not create a second Python environment for agent work. "
-            f"{_central_python_guidance(settings)}"
-        )
-
-    allowed_commands = _allowed_central_python_commands(settings)
-    central_bin_prefix = f"{_central_venv_path(settings)}/bin/"
-    for match in _PYTHON_COMMAND_PATTERN.finditer(lowered):
-        attempted = match.group("command")
-        if "/" in attempted:
-            if attempted.startswith(central_bin_prefix):
-                basename = attempted.rsplit("/", 1)[-1]
-                if basename in allowed_commands:
-                    continue
-            return (
-                f"bash denied Python command '{attempted}' because it targets a non-central "
-                f"interpreter path. {_central_python_guidance(settings)}"
-            )
-
-        if attempted not in allowed_commands:
-            return (
-                f"bash denied Python command '{attempted}' because it does not resolve to the "
-                f"central interpreter set. {_central_python_guidance(settings)}"
-            )
-
-    return None
-
-
-def _allowed_central_python_commands(settings: ToolSettings) -> set[str]:
-    venv_bin = settings.central_python_venv / "bin"
-    allowed: set[str] = {"python", "python3"}
-    try:
-        for entry in venv_bin.iterdir():
-            if _PYTHON_COMMAND_NAME_PATTERN.fullmatch(entry.name.lower()):
-                allowed.add(entry.name.lower())
-    except OSError:
-        pass
-    return allowed
-
-
-def _central_venv_path(settings: ToolSettings) -> str:
-    return str(settings.central_python_venv)
-
-
-def _central_interpreter_path(settings: ToolSettings) -> str:
-    return f"{_central_venv_path(settings)}/bin/python"
-
-
-def _central_python_guidance(settings: ToolSettings) -> str:
-    venv_path = _central_venv_path(settings)
-    interpreter_path = _central_interpreter_path(settings)
-    return (
-        f"The only agent Python environment is {venv_path}. "
-        f"Use {interpreter_path} explicitly, or use bare `python`/`python3` only when they "
-        f"resolve there. Install packages with `uv pip install --python {interpreter_path} ...`."
-    )
-
-
-def _approval_detector_reason(command: str) -> str | None:
     lowered = command.strip().lower()
     if not lowered:
         return None
@@ -509,25 +333,120 @@ def _approval_detector_reason(command: str) -> str | None:
     for pattern, reason in _DESTRUCTIVE_WORKSPACE_PATTERNS:
         if pattern.search(lowered):
             return reason
+    return _broad_recursive_delete_reason(
+        command,
+        working_directory=working_directory,
+    )
 
-    compact = " ".join(lowered.split())
 
-    if any(keyword in compact for keyword in _INSTALL_KEYWORDS):
-        return "matched install or package-manager mutation pattern for tool_runtime"
+def _broad_recursive_delete_reason(
+    command: str,
+    *,
+    working_directory: str,
+) -> str | None:
+    """Recognize only high-confidence deletion of a broad functional root."""
 
-    if ("curl " in compact or "wget " in compact) and (
-        "| sh" in compact
-        or "| bash" in compact
-        or "| zsh" in compact
-        or "| python" in compact
-        or "| python3" in compact
-    ):
-        return "matched remote installer pipeline pattern for tool_runtime"
-
-    if _SYSTEM_DESTINATION_PATTERN.search(lowered):
-        return "matched non-workspace system-path mutation pattern in tool_runtime"
-
-    if _SYSTEM_REDIRECT_PATTERN.search(lowered):
-        return "matched non-workspace system-path mutation pattern in tool_runtime"
-
+    for segment in re.split(r"(?:&&|\|\||[;|\n])", command):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        rm_tokens = _recursive_delete_arguments(tokens)
+        if rm_tokens is None:
+            continue
+        recursive = any(
+            token == "--recursive"
+            or (token.startswith("-") and "r" in token[1:].lower())
+            for token in rm_tokens
+        )
+        if not recursive:
+            continue
+        targets = [token for token in rm_tokens if not token.startswith("-")]
+        for target in targets:
+            if target in {"$PWD", "${PWD}", "$PWD/*", "${PWD}/*"}:
+                return "matched recursive deletion of the current working directory"
+            resolved = (
+                posixpath.normpath(target)
+                if target.startswith("/")
+                else posixpath.normpath(posixpath.join(working_directory, target))
+            )
+            if resolved in {"/", "/workspace", posixpath.normpath(working_directory)}:
+                return f"matched recursive deletion of functional root {resolved}"
+            if resolved in {
+                "/*",
+                "/workspace/*",
+                posixpath.join(posixpath.normpath(working_directory), "*"),
+            }:
+                return f"matched recursive deletion of functional root contents {resolved}"
     return None
+
+
+def _recursive_delete_arguments(tokens: list[str]) -> list[str] | None:
+    """Return arguments only when the segment unambiguously invokes ``rm``."""
+
+    index = 0
+    while index < len(tokens) and _looks_like_environment_assignment(tokens[index]):
+        index += 1
+    while index < len(tokens):
+        executable = Path(tokens[index]).name
+        if executable == "sudo":
+            index = _skip_sudo_prefix(tokens, index + 1)
+            if index < 0:
+                return None
+            continue
+        if executable == "env":
+            index += 1
+            while index < len(tokens) and (
+                tokens[index] in {"-i", "--ignore-environment"}
+                or _looks_like_environment_assignment(tokens[index])
+            ):
+                index += 1
+            continue
+        if executable in {"command", "exec"}:
+            index += 1
+            while index < len(tokens) and tokens[index] in {"--", "-p"}:
+                index += 1
+            continue
+        break
+    if index >= len(tokens) or Path(tokens[index]).name != "rm":
+        return None
+    return tokens[index + 1 :]
+
+
+def _skip_sudo_prefix(tokens: list[str], index: int) -> int:
+    options_with_values = {
+        "-C",
+        "-D",
+        "-g",
+        "-h",
+        "-p",
+        "-R",
+        "-T",
+        "-u",
+        "--chdir",
+        "--close-from",
+        "--group",
+        "--host",
+        "--prompt",
+        "--role",
+        "--type",
+        "--user",
+    }
+    while index < len(tokens) and tokens[index].startswith("-"):
+        option = tokens[index]
+        if option == "--":
+            return index + 1
+        option_name = option.split("=", 1)[0]
+        index += 1
+        if option_name in options_with_values and "=" not in option:
+            if index >= len(tokens):
+                return -1
+            index += 1
+    return index
+
+
+def _looks_like_environment_assignment(token: str) -> bool:
+    name, separator, _value = token.partition("=")
+    return bool(separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))

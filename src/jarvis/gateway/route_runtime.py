@@ -63,6 +63,7 @@ from jarvis.tools import (
     ToolSettings,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    with_workspace_capabilities,
     with_workspace_observation,
 )
 from jarvis.tools.basic.bash.jobs import (
@@ -460,6 +461,7 @@ class RouteRuntime:
                     response_text="",
                     interrupted=True,
                     completion_blocked=True,
+                    completion_block_reason="user_stop",
                     interruption_reason="user_stop",
                 )
             )
@@ -1173,6 +1175,7 @@ class RouteRuntime:
                     origin_session_id=session_id,
                     response_text=pause_text,
                     completion_blocked=True,
+                    completion_block_reason="provider_recovery_exhausted",
                     interruption_reason="provider_recovery_exhausted",
                 )
             )
@@ -1322,6 +1325,7 @@ class RouteRuntime:
                     interrupted=event.interrupted,
                     approval_rejected=event.approval_rejected,
                     completion_blocked=event.completion_blocked,
+                    completion_block_reason=event.completion_block_reason,
                     interruption_reason=event.interruption_reason,
                 )
             )
@@ -1410,7 +1414,10 @@ class RouteRuntime:
             ) as workspace_observation:
                 result = await self._main_tool_runtime.execute(
                     tool_call=tool_call,
-                    context=context,
+                    context=with_workspace_capabilities(
+                        context,
+                        workspace_observation,
+                    ),
                 )
             result = with_workspace_observation(result, workspace_observation)
             result = _with_workspace_lease_generation(
@@ -2614,6 +2621,7 @@ def _map_route_event_to_agent_event(event: RouteEvent) -> AgentTurnStreamEvent |
             interrupted=event.interrupted,
             approval_rejected=event.approval_rejected,
             completion_blocked=event.completion_blocked,
+            completion_block_reason=event.completion_block_reason,
             interruption_reason=event.interruption_reason,
         )
     return None

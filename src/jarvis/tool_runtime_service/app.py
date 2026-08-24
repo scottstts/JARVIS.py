@@ -97,11 +97,26 @@ async def _execute_request(
     except ToolRuntimeRequestError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    context = ToolExecutionContext(
-        workspace_dir=resolved_workspace_dir,
-        route_id=tool_request.route_id,
-        session_id=tool_request.session_id,
-    )
+    try:
+        context = ToolExecutionContext(
+            workspace_dir=resolved_workspace_dir,
+            route_id=tool_request.route_id,
+            session_id=tool_request.session_id,
+            agent_kind=tool_request.agent_kind,
+            agent_name=tool_request.agent_name,
+            subagent_id=tool_request.subagent_id,
+            workspace_write_allowed_paths=tuple(
+                _resolve_capability_path(path, workspace_dir=resolved_workspace_dir)
+                for path in tool_request.workspace_write_allowed_paths
+            ),
+            workspace_write_denied_paths=tuple(
+                _resolve_capability_path(path, workspace_dir=resolved_workspace_dir)
+                for path in tool_request.workspace_write_denied_paths
+            ),
+            workspace_lease_generation=tool_request.workspace_lease_generation,
+        )
+    except ToolRuntimeRequestError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     result = await executor(
         call_id=tool_request.call_id,
         arguments=tool_request.arguments,
@@ -128,4 +143,14 @@ def _resolve_workspace_dir(
         raise ToolRuntimeRequestError("workspace_dir does not exist inside tool_runtime.")
     if not candidate.is_dir():
         raise ToolRuntimeRequestError("workspace_dir must point to a directory.")
+    return candidate
+
+
+def _resolve_capability_path(raw_path: str, *, workspace_dir: Path) -> Path:
+    candidate = Path(raw_path).resolve(strict=False)
+    root = workspace_dir.resolve(strict=False)
+    if candidate != root and not candidate.is_relative_to(root):
+        raise ToolRuntimeRequestError(
+            "workspace capability paths must stay inside the requested workspace."
+        )
     return candidate

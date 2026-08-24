@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -21,6 +22,7 @@ from jarvis.tools import (
     WorkspaceLeaseError,
 )
 from jarvis.tools.basic.bash.local_executor import DirectBashToolExecutor
+from jarvis.tools.basic.bash.tool import BashToolExecutor
 from jarvis.tools.basic.acceptance_run.tool import (
     AcceptanceRunToolExecutor,
     _source_line_count_gate,
@@ -39,6 +41,103 @@ def _tool_call(name: str, arguments: dict[str, object], *, call_id: str = "call_
 
 
 class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(
+        os.getenv("JARVIS_TOOL_RUNTIME_BASE_URL"),
+        "requires the isolated tool runtime",
+    )
+    async def test_isolated_bash_enforces_subagent_write_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="jarvis-test-", dir="/workspace") as tmp:
+            workspace_dir = Path(tmp)
+            owned_dir = workspace_dir / "owned"
+            denied_dir = workspace_dir / "denied"
+            owned_dir.mkdir()
+            denied_dir.mkdir()
+            executor = BashToolExecutor(
+                ToolSettings.from_workspace_dir(workspace_dir)
+            )
+            context = ToolExecutionContext(
+                workspace_dir=workspace_dir,
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="child",
+                workspace_write_allowed_paths=(owned_dir,),
+                workspace_write_denied_paths=(denied_dir,),
+                workspace_lease_generation=1,
+            )
+
+            allowed = await executor(
+                call_id="allowed",
+                arguments={"command": "printf allowed > owned/result.txt"},
+                context=context,
+            )
+            denied = await executor(
+                call_id="denied",
+                arguments={"command": "printf denied > denied/result.txt"},
+                context=context,
+            )
+            unowned = await executor(
+                call_id="unowned",
+                arguments={"command": "printf unowned > outside.txt"},
+                context=context,
+            )
+
+            self.assertTrue(allowed.ok, allowed.content)
+            self.assertFalse(denied.ok)
+            self.assertFalse(unowned.ok)
+            self.assertEqual((owned_dir / "result.txt").read_text(), "allowed")
+            self.assertFalse((denied_dir / "result.txt").exists())
+            self.assertFalse((workspace_dir / "outside.txt").exists())
+
+            background = await executor(
+                call_id="background",
+                arguments={
+                    "mode": "background",
+                    "command": "printf background > owned/background.txt",
+                },
+                context=context,
+            )
+            self.assertTrue(background.ok, background.content)
+            job_id = str(background.metadata.get("job_id", ""))
+            self.assertTrue(job_id)
+            terminal: ToolExecutionResult | None = None
+            for attempt in range(100):
+                status = await executor(
+                    call_id=f"status-{attempt}",
+                    arguments={"mode": "status", "job_id": job_id},
+                    context=context,
+                )
+                if status.metadata.get("status") != "running":
+                    terminal = status
+                    break
+                await asyncio.sleep(0.02)
+            self.assertIsNotNone(terminal)
+            assert terminal is not None
+            self.assertEqual(terminal.metadata.get("exit_code"), 0)
+            self.assertEqual(
+                (owned_dir / "background.txt").read_text(),
+                "background",
+            )
+
+            main_context = ToolExecutionContext(
+                workspace_dir=workspace_dir,
+                workspace_write_denied_paths=(owned_dir,),
+                workspace_lease_generation=2,
+            )
+            main_allowed = await executor(
+                call_id="main-allowed",
+                arguments={"command": "printf main > main.txt"},
+                context=main_context,
+            )
+            main_denied = await executor(
+                call_id="main-denied",
+                arguments={"command": "printf main > owned/main.txt"},
+                context=main_context,
+            )
+            self.assertTrue(main_allowed.ok, main_allowed.content)
+            self.assertFalse(main_denied.ok)
+            self.assertEqual((workspace_dir / "main.txt").read_text(), "main")
+            self.assertFalse((owned_dir / "main.txt").exists())
+
     async def test_flat_file_edits_and_acceptance_ledger_are_durable_tool_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -123,11 +222,12 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             artifact.write_text("result\n")
             self.assertNotEqual(workspace_revision(workspace_dir), initial)
 
-    async def test_workspace_leases_block_conflicting_edits_and_unscoped_bash_writes(self) -> None:
+    async def test_workspace_leases_enforce_actor_filesystem_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
             coordinator = WorkspaceAccessCoordinator(workspace_dir=workspace_dir)
+            (workspace_dir / "owned.py").write_text("original")
             await coordinator.claim_paths(owner="subagent:child_1", paths=("owned.py",))
             main_context = ToolExecutionContext(workspace_dir=workspace_dir)
             child_context = ToolExecutionContext(
@@ -143,25 +243,32 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     pass
 
-            with self.assertRaises(WorkspaceLeaseError):
-                async with coordinator.execute(
-                    tool_call=_tool_call("bash", {"command": "printf x > other.py"}),
-                    context=main_context,
-                ):
-                    pass
+            async with coordinator.execute(
+                tool_call=_tool_call("bash", {"command": "printf x > other.py"}),
+                context=main_context,
+            ) as main_observation:
+                self.assertIn(
+                    workspace_dir / "owned.py",
+                    main_observation.write_denied_paths,
+                )
 
             async with coordinator.execute(
-                tool_call=_tool_call(
-                    "bash",
-                    {
-                        "command": "printf x > owned.py",
-                        "write_paths": ["owned.py"],
-                        "expected_lease_generation": await coordinator.lease_generation(),
-                    },
-                ),
+                tool_call=_tool_call("bash", {"command": "printf x > owned.py"}),
                 context=child_context,
-            ):
-                pass
+            ) as child_observation:
+                self.assertEqual(
+                    child_observation.write_allowed_paths,
+                    (workspace_dir / "owned.py",),
+                )
+            with self.assertRaises(WorkspaceLeaseError):
+                async with coordinator.execute(
+                    tool_call=_tool_call(
+                        "file_write",
+                        {"path": "outside.py", "content": "x"},
+                    ),
+                    context=child_context,
+                ):
+                    pass
 
     async def test_overlapping_directory_and_file_writes_are_serialized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,8 +283,8 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             async def first_write() -> None:
                 async with coordinator.execute(
                     tool_call=_tool_call(
-                        "bash",
-                        {"command": "touch src/a.py", "write_paths": ["src"]},
+                        "file_write",
+                        {"path": "src", "content": "directory scope"},
                     ),
                     context=context,
                 ):
@@ -265,26 +372,26 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("inside", view_result.content)
             self.assertIn("inside", send_result.content)
 
-    async def test_stale_workspace_lease_generation_is_rejected(self) -> None:
+    async def test_model_supplied_lease_generation_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
             coordinator = WorkspaceAccessCoordinator(workspace_dir=workspace_dir)
             observed = await coordinator.lease_generation()
+            (workspace_dir / "other.py").write_text("other")
             await coordinator.claim_paths(owner="subagent:child", paths=("other.py",))
-            with self.assertRaises(WorkspaceLeaseError):
-                async with coordinator.execute(
-                    tool_call=_tool_call(
-                        "file_write",
-                        {
-                            "path": "mine.py",
-                            "content": "x",
-                            "expected_lease_generation": observed,
-                        },
-                    ),
-                    context=ToolExecutionContext(workspace_dir=workspace_dir),
-                ):
-                    pass
+            async with coordinator.execute(
+                tool_call=_tool_call(
+                    "file_write",
+                    {
+                        "path": "mine.py",
+                        "content": "x",
+                        "expected_lease_generation": observed,
+                    },
+                ),
+                context=ToolExecutionContext(workspace_dir=workspace_dir),
+            ):
+                pass
 
     async def test_workspace_access_observes_undeclared_bash_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,7 +406,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             ) as observation:
                 (workspace_dir / "generated.txt").write_text("created before failure")
 
-            self.assertEqual(observation.mode, "global_write")
+            self.assertEqual(observation.mode, "actor_workspace")
             self.assertTrue(observation.changed)
             self.assertNotEqual(
                 observation.revision_before,
@@ -406,7 +513,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             tracker.blocked_call_reason(_tool_call("bash", {"command": "false --different"}))
         )
 
-    async def test_tool_safety_normalizes_varied_workspace_lease_conflicts(self) -> None:
+    async def test_tool_liveness_does_not_merge_varied_workspace_conflicts(self) -> None:
         tracker = ToolSafetyTracker()
         first_call = _tool_call("bash", {"command": "write a.py"}, call_id="lease_1")
         second_call = _tool_call(
@@ -433,8 +540,10 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         second = tracker.record(second_call, conflict("lease_2", "file_write"))
 
         self.assertFalse(first.repeated_invalid_call)
-        self.assertTrue(second.repeated_invalid_call)
-        self.assertTrue(second.blocked_invalid_signature)
+        self.assertFalse(second.repeated_invalid_call)
+        repeated_first = tracker.record(first_call, conflict("lease_1", "bash"))
+        self.assertTrue(repeated_first.repeated_invalid_call)
+        self.assertTrue(repeated_first.blocked_invalid_signature)
 
         distinct_target = ToolExecutionResult(
             call_id="lease_3",

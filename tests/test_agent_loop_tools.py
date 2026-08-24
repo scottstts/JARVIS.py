@@ -19,7 +19,6 @@ from jarvis.core import (
     AgentAssistantMessageEvent,
     AgentLoop,
     AgentRuntimeMessage,
-    AgentTextDeltaEvent,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
     ContextBudgetError,
@@ -97,6 +96,18 @@ def _build_response(
         usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
         response_id="resp_fake",
     )
+
+
+def _tool_result_field(request: LLMRequest, *, field: str) -> str:
+    for message in reversed(request.messages):
+        for part in message.parts:
+            if not isinstance(part, ToolResultPart):
+                continue
+            prefix = field + ":"
+            for line in part.content.splitlines():
+                if line.startswith(prefix):
+                    return line.removeprefix(prefix).strip()
+    raise AssertionError(f"Expected tool result field {field!r}.")
 
 
 def _is_compaction_request(request: LLMRequest) -> bool:
@@ -1044,6 +1055,68 @@ class _FakeFilePatchLLMService:
                 finish_reason="tool_calls",
             )
 
+        if self.generate_calls == 3:
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="acceptance_run_file_patch",
+                        name="acceptance_run",
+                        arguments={
+                            "scope": "Verify created file",
+                            "revision_paths": ["notes/todo.txt"],
+                            "gates": [
+                                {
+                                    "gate_id": "file_exists",
+                                    "command": "test -f notes/todo.txt",
+                                }
+                            ],
+                        },
+                        raw_arguments="{}",
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if self.generate_calls == 4:
+            revision = _tool_result_field(
+                request,
+                field="workspace_revision_after",
+            )
+            return _build_response(
+                "",
+                tool_calls=[
+                    ToolCall(
+                        call_id="acceptance_record_file_patch",
+                        name="acceptance_record",
+                        arguments={
+                            "scope": "Verify created file",
+                            "workspace_revision": revision,
+                            "revision_paths": ["notes/todo.txt"],
+                            "checks": [
+                                {
+                                    "item_id": "created-file",
+                                    "criterion": "The requested file exists.",
+                                    "required": True,
+                                    "outcome": "passed",
+                                    "evidence_kind": "test_result",
+                                    "evidence": "test -f passed",
+                                    "source_tool_call_ids": [
+                                        "acceptance_run_file_patch"
+                                    ],
+                                    "artifact_paths": ["notes/todo.txt"],
+                                }
+                            ],
+                        },
+                        raw_arguments="{}",
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        if self.generate_calls == 5:
+            return _build_response("Patched and verified file.")
+
         assistant_message = request.messages[-2]
         tool_message = request.messages[-1]
         if assistant_message.role != "assistant":
@@ -1359,6 +1432,84 @@ class _FakeToolRegisterApprovalLLMService:
             )
             return
 
+        if self.stream_calls == 3:
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="acceptance_run_tool_register",
+                            name="acceptance_run",
+                            arguments={
+                                "scope": "Verify runtime tool registration",
+                                "revision_paths": [
+                                    "runtime_tools/google_workspace_cli.json"
+                                ],
+                                "gates": [
+                                    {
+                                        "gate_id": "manifest_exists",
+                                        "command": (
+                                            "test -f runtime_tools/"
+                                            "google_workspace_cli.json"
+                                        ),
+                                    }
+                                ],
+                            },
+                            raw_arguments="{}",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        if self.stream_calls == 4:
+            revision = _tool_result_field(
+                request,
+                field="workspace_revision_after",
+            )
+            yield DoneEvent(
+                response=_build_response(
+                    "",
+                    tool_calls=[
+                        ToolCall(
+                            call_id="acceptance_record_tool_register",
+                            name="acceptance_record",
+                            arguments={
+                                "scope": "Verify runtime tool registration",
+                                "workspace_revision": revision,
+                                "revision_paths": [
+                                    "runtime_tools/google_workspace_cli.json"
+                                ],
+                                "checks": [
+                                    {
+                                        "item_id": "runtime-tool-registered",
+                                        "criterion": "The runtime manifest exists.",
+                                        "required": True,
+                                        "outcome": "passed",
+                                        "evidence_kind": "test_result",
+                                        "evidence": "test -f passed",
+                                        "source_tool_call_ids": [
+                                            "acceptance_run_tool_register"
+                                        ],
+                                        "artifact_paths": [
+                                            "runtime_tools/google_workspace_cli.json"
+                                        ],
+                                    }
+                                ],
+                            },
+                            raw_arguments="{}",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            )
+            return
+
+        if self.stream_calls == 5:
+            yield DoneEvent(response=_build_response("Registered and verified runtime tool."))
+            return
+
         if names != _EXPECTED_BASIC_TOOL_NAMES:
             raise AssertionError(
                 f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
@@ -1399,7 +1550,7 @@ class _FakeToolRoundLimitLLMService:
                 for part in system_message.parts
                 if isinstance(part, TextPart)
             )
-            if "continuation is allowed only" not in system_text:
+            if "Continue autonomously from the checkpoint" not in system_text:
                 raise AssertionError("Expected automatic continuation guidance.")
             return _build_response(
                 "",
@@ -2400,7 +2551,10 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(boundary_records), 1)
             self.assertTrue(boundary_records[0].metadata["automatic_continuation"])
-            self.assertIn("continuation is allowed only", boundary_records[0].content)
+            self.assertIn(
+                "Continue autonomously from the checkpoint",
+                boundary_records[0].content,
+            )
             self.assertEqual(
                 (settings.workspace_dir / "continuation.txt").read_text(),
                 "continued",
@@ -3948,12 +4102,12 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             result = await loop.handle_user_input("Create notes/todo.txt with hello.")
 
-            self.assertEqual(result.response_text, "")
-            self.assertTrue(result.completion_blocked)
+            self.assertEqual(result.response_text, "Patched and verified file.")
+            self.assertFalse(result.completion_blocked)
             session = storage.get_session(result.session_id)
             self.assertIsNotNone(session)
             assert session is not None
-            self.assertEqual(session.turn_states[result.turn_id], "blocked")
+            self.assertEqual(session.turn_states[result.turn_id], "completed")
             self.assertEqual(
                 (notes_dir / "todo.txt").read_text(encoding="utf-8"),
                 "hello\n",
@@ -3961,18 +4115,27 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             records = storage.load_records(result.session_id)
             message_records = [record for record in records if record.kind == "message"]
-            semantic_turn_records = [
-                record for record in message_records if record.role != "system"
-            ][-4:]
-            self.assertEqual(
-                [record.role for record in semantic_turn_records],
-                ["user", "assistant", "tool", "assistant"],
+            self.assertTrue(
+                any(
+                    record.metadata.get("acceptance_continuation_required")
+                    for record in message_records
+                )
             )
-            self.assertEqual(
-                semantic_turn_records[1].metadata["tool_calls"][0]["name"],
-                "file_patch",
+            self.assertEqual(message_records[-1].content, "Patched and verified file.")
+            file_patch_call = next(
+                record
+                for record in message_records
+                if record.role == "assistant"
+                and record.metadata.get("tool_calls")
+                and record.metadata["tool_calls"][0]["name"] == "file_patch"
             )
-            self.assertIn("File patch applied", semantic_turn_records[2].content)
+            self.assertEqual(file_patch_call.metadata["tool_calls"][0]["name"], "file_patch")
+            self.assertTrue(
+                any(
+                    record.role == "tool" and "File patch applied" in record.content
+                    for record in message_records
+                )
+            )
 
     async def test_handle_user_input_executes_bash_python_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4259,11 +4422,15 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             final_event = events[-1]
             if not isinstance(final_event, AgentTurnDoneEvent):
                 self.fail("Expected streamed turn to finish with AgentTurnDoneEvent.")
-            self.assertEqual(final_event.response_text, "")
-            self.assertTrue(final_event.completion_blocked)
-            self.assertFalse(
+            self.assertEqual(
+                final_event.response_text,
+                "Registered and verified runtime tool.",
+            )
+            self.assertFalse(final_event.completion_blocked)
+            self.assertTrue(
                 any(
-                    isinstance(event, (AgentTextDeltaEvent, AgentAssistantMessageEvent))
+                    isinstance(event, AgentAssistantMessageEvent)
+                    and event.text == "Registered and verified runtime tool."
                     for event in events
                 )
             )

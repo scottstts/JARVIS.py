@@ -174,6 +174,8 @@ Important metadata:
 - `run_generation`
 - `pending_background_job_ids`
 
+Pause reasons distinguish user/orchestrator control (`main_stop`, `new_session`, `approval_rejected`) from typed runtime dispositions (`tool_liveness_exhausted`, `provider_recovery_exhausted`, `external_blocked`). Acceptance evidence does not pause a child; it triggers an automatic continuation inside that child loop.
+
 ## Tool Access
 
 Subagents receive a filtered registry view.
@@ -194,7 +196,7 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 ## Tool Execution Coordination
 
-Route-level tool execution uses a workspace coordinator rather than one global tool mutex. Exact-path reads and disjoint declared writes can run concurrently, while broad snapshot reads take an exclusive barrier. A child’s `owned_paths` are exclusive persistent write leases until disposal; direct file producers/consumers acquire exact paths automatically, while mutable `bash` must declare all `write_paths` whenever another actor holds a lease. Overlapping access is serialized or rejected with ownership guidance instead of racing shared state.
+Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background, service, and acceptance-gate Bash without model-declared paths or lease generations.
 
 Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
 

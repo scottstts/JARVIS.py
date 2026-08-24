@@ -56,6 +56,7 @@ from jarvis.tools import (
     ToolRuntime,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    with_workspace_capabilities,
     with_workspace_observation,
 )
 from jarvis.tools.basic.bash.jobs import (
@@ -225,30 +226,39 @@ class SubagentManager:
         # consumers never observe an invocation from generation 0 followed by work
         # from generation 1, and the child cannot race ahead of its invocation notice.
         runtime.run_generation = 1
-        session_id = await runtime.loop.prepare_session(start_reason="subagent_initial")
         lease_claimed = False
         lease_generation: int | None = None
-        if self._workspace_access is not None:
-            await self._workspace_access.claim_paths(
-                owner=f"subagent:{subagent_id}",
-                paths=normalized_owned_paths,
+        try:
+            session_id = await runtime.loop.prepare_session(
+                start_reason="subagent_initial"
             )
-            lease_claimed = True
-            lease_generation = await self._workspace_access.lease_generation()
-            runtime.loop.append_system_note(
-                (
-                    "Workspace lease established. Before every declared write, inspect the "
-                    "target and provide expected_lease_generation="
-                    f"{lease_generation} plus expected_sha256 for an existing file or "
-                    "expected_file_absent=true for a new file."
-                ),
-                session_id=session_id,
-                metadata={
-                    "workspace_lease": True,
-                    "workspace_lease_generation": lease_generation,
-                    "owned_paths": list(normalized_owned_paths),
-                },
-            )
+            if self._workspace_access is not None:
+                await self._workspace_access.claim_paths(
+                    owner=f"subagent:{subagent_id}",
+                    paths=normalized_owned_paths,
+                )
+                lease_claimed = True
+                lease_generation = await self._workspace_access.lease_generation()
+                runtime.loop.append_system_note(
+                    (
+                        "Workspace ownership established. You may read the shared workspace and "
+                        "write your owned paths. Writes to another actor's paths are blocked by "
+                        "the runtime."
+                    ),
+                    session_id=session_id,
+                    metadata={
+                        "workspace_lease": True,
+                        "workspace_lease_generation": lease_generation,
+                        "owned_paths": list(normalized_owned_paths),
+                    },
+                )
+        except BaseException:
+            if lease_claimed and self._workspace_access is not None:
+                await self._workspace_access.release_owner(
+                    owner=f"subagent:{subagent_id}"
+                )
+            await runtime.loop.aclose()
+            raise
         self._subagents[subagent_id] = runtime
         try:
             self._catalog.create_entry(
@@ -943,18 +953,26 @@ class SubagentManager:
                             session_id=event.session_id,
                         )
                     elif event.completion_blocked:
+                        block_reason = (
+                            event.completion_block_reason or "external_blocked"
+                        )
                         runtime.status = "paused"
-                        runtime.pause_reason = None
+                        runtime.pause_reason = _completion_block_pause_reason(
+                            block_reason
+                        )
                         runtime.report_complete = False
                         self._append_notable_event(
                             runtime,
-                            kind="acceptance_blocked",
-                            summary="Completion blocked by unresolved acceptance evidence.",
+                            kind="completion_blocked",
+                            summary=(
+                                "Completion blocked by runtime condition: "
+                                f"{block_reason}."
+                            ),
                         )
                         await self._publish_lifecycle_notice(
                             runtime,
                             notice_kind="subagent_needs_attention",
-                            text="needs acceptance verification before completion.",
+                            text=f"paused ({block_reason}).",
                             session_id=event.session_id,
                         )
                     elif event.approval_rejected:
@@ -1122,7 +1140,10 @@ class SubagentManager:
                     ) as workspace_observation:
                         result = await tool_runtime.execute(
                             tool_call=tool_call,
-                            context=context,
+                            context=with_workspace_capabilities(
+                                context,
+                                workspace_observation,
+                            ),
                         )
                     result = with_workspace_observation(result, workspace_observation)
                     result = _with_workspace_lease_generation(
@@ -2058,6 +2079,14 @@ def _bounded_terminal_tail(value: str, *, limit: int = 2_000) -> str:
     head = limit // 2
     tail = limit - head
     return "  " + value[:head] + "\n  ...[terminal tail truncated]...\n  " + value[-tail:]
+
+
+def _completion_block_pause_reason(reason: str) -> SubagentPauseReason:
+    if reason == "tool_liveness_exhausted":
+        return "tool_liveness_exhausted"
+    if reason == "provider_recovery_exhausted":
+        return "provider_recovery_exhausted"
+    return "external_blocked"
 
 
 def _workspace_lease_error_result(

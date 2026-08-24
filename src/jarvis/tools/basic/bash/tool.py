@@ -89,23 +89,6 @@ def build_bash_tool(settings: ToolSettings) -> RegisteredTool:
                             "from /workspace. Defaults to /workspace."
                         ),
                     },
-                    "write_paths": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {"type": "string", "minLength": 1},
-                        "description": (
-                            "Every workspace path this command will modify. Required for "
-                            "mutable bash work while another actor owns workspace paths."
-                        ),
-                    },
-                    "expected_lease_generation": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": (
-                            "Optional lease generation observed before a declared workspace "
-                            "write. The command is rejected if ownership changed."
-                        ),
-                    },
                     "job_id": {
                         "type": "string",
                         "description": "Background job id for 'status', 'tail', or 'cancel'.",

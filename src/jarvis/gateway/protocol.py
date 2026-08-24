@@ -191,6 +191,7 @@ def build_turn_done_event(
     compaction_performed: bool,
     interrupted: bool,
     completion_blocked: bool = False,
+    completion_block_reason: str | None = None,
     interruption_reason: str | None = None,
 ) -> dict[str, Any]:
     return {
@@ -204,6 +205,7 @@ def build_turn_done_event(
         "compaction_performed": compaction_performed,
         "interrupted": interrupted,
         "completion_blocked": completion_blocked,
+        "completion_block_reason": completion_block_reason,
         "interruption_reason": interruption_reason,
     }
 
@@ -294,6 +296,7 @@ def build_route_event_payload(event: RouteEvent) -> dict[str, Any]:
                 "interrupted": event.interrupted,
                 "approval_rejected": event.approval_rejected,
                 "completion_blocked": event.completion_blocked,
+                "completion_block_reason": event.completion_block_reason,
                 "interruption_reason": event.interruption_reason,
             }
         )

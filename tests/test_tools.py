@@ -622,7 +622,7 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("built-ins:", description)
         self.assertIn("python:", description)
         self.assertIn("long-running jobs:", description)
-        self.assertIn("approvals and installation:", description)
+        self.assertIn("commands are permitted by default", description)
         self.assertIn("central `/opt/venv` environment", description)
         self.assertIn("mode='background'", description)
         self.assertIn("mode='status'", description)
@@ -633,10 +633,9 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("uv pip install --python /opt/venv/bin/python", description)
         self.assertIn("`rg`, `jq`, `yq`", description)
         self.assertIn("`node`, `npm`, `npx`, and `corepack`", description)
-        self.assertIn("user approval is required", description)
-        self.assertIn("install packages or tools", description)
-        self.assertIn("system-level mutations outside `/workspace`", description)
-        self.assertIn("publish git changes", description)
+        self.assertIn("project-local installs", description)
+        self.assertIn("broad workspace deletion", description)
+        self.assertIn("destructive repository-state erasure", description)
         self.assertIn("approval_summary", description)
         self.assertIn("use bare `python`/`python3`", description)
         self.assertIn("optional `cwd`", description)
@@ -1193,6 +1192,12 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
                     workspace_dir=Path("/workspace"),
                     route_id="tg_123",
                     session_id="session_9",
+                    agent_kind="subagent",
+                    agent_name="Friday",
+                    subagent_id="child_1",
+                    workspace_write_allowed_paths=(Path("/workspace/project"),),
+                    workspace_write_denied_paths=(Path("/workspace/other"),),
+                    workspace_lease_generation=3,
                 ),
             )
 
@@ -1210,6 +1215,12 @@ class RemoteToolRuntimeClientTests(unittest.IsolatedAsyncioTestCase):
                         "workspace_dir": "/workspace",
                         "session_id": "session_9",
                         "route_id": "tg_123",
+                        "agent_kind": "subagent",
+                        "agent_name": "Friday",
+                        "subagent_id": "child_1",
+                        "workspace_write_allowed_paths": ["/workspace/project"],
+                        "workspace_write_denied_paths": ["/workspace/other"],
+                        "workspace_lease_generation": 3,
                     },
                 )
             ],
@@ -1814,10 +1825,7 @@ class ToolPolicyTests(unittest.TestCase):
             "git clean -fd",
             "git restore src/app.py",
             "git checkout -- src/app.py",
-            "git push origin main",
             "git branch -D obsolete",
-            "rm -rf build",
-            "find . -delete",
         )
         for command in commands:
             with self.subTest(command=command):
@@ -1835,12 +1843,12 @@ class ToolPolicyTests(unittest.TestCase):
     def test_bash_destructive_detector_uses_shell_command_boundaries(self) -> None:
         quoted_example = self.policy.authorize(
             tool_name="bash",
-            arguments={"command": "printf 'git push origin main'"},
+            arguments={"command": "printf 'git reset --hard HEAD'"},
             context=self.context,
         )
         multiline_command = self.policy.authorize(
             tool_name="bash",
-            arguments={"command": "printf 'ready\\n'\ngit push origin main"},
+            arguments={"command": "printf 'ready\\n'\ngit reset --hard HEAD"},
             context=self.context,
         )
 
@@ -1849,7 +1857,7 @@ class ToolPolicyTests(unittest.TestCase):
 
     def test_bash_destructive_approval_is_bound_to_requested_cwd(self) -> None:
         (self.workspace_dir / "project").mkdir()
-        command = "rm -rf build"
+        command = "rm -rf ."
         arguments = {"command": command, "cwd": "project"}
         initial = self.policy.authorize(
             tool_name="bash",
@@ -1889,6 +1897,38 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(wrong_cwd.allowed)
         self.assertTrue(exact_cwd.allowed)
 
+    def test_bash_policy_requires_approval_for_broad_recursive_deletion(self) -> None:
+        for command in (
+            "rm -rf /",
+            "rm -rf /workspace",
+            "rm -rf /workspace/*",
+            'rm -rf "$PWD"/*',
+            "sudo -n rm -rf /workspace",
+            "env CLEANUP=1 command rm -rf /workspace",
+        ):
+            with self.subTest(command=command):
+                decision = self.policy.authorize(
+                    tool_name="bash",
+                    arguments={"command": command},
+                    context=self.context,
+                )
+                self.assertFalse(decision.allowed)
+                self.assertIsNotNone(decision.approval_request)
+
+    def test_bash_recursive_delete_detector_ignores_non_command_tokens(self) -> None:
+        for command in (
+            "printf '%s' rm -rf /workspace",
+            "echo rm -rf /workspace",
+            "python -c 'print(\"rm -rf /workspace\")'",
+        ):
+            with self.subTest(command=command):
+                decision = self.policy.authorize(
+                    tool_name="bash",
+                    arguments={"command": command},
+                    context=self.context,
+                )
+                self.assertTrue(decision.allowed)
+
     def test_bash_policy_allows_workspace_write_commands(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
@@ -1914,7 +1954,7 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("null bytes", decision.reason or "")
 
-    def test_bash_policy_requires_approval_for_system_write_command(self) -> None:
+    def test_bash_policy_allows_isolated_container_system_write_command(self) -> None:
         command = "printf 'jarvis' > /etc/jarvis-bash-test"
         decision = self.policy.authorize(
             tool_name="bash",
@@ -1922,14 +1962,17 @@ class ToolPolicyTests(unittest.TestCase):
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "bash command requires explicit approval.")
-        self.assertIsNotNone(decision.approval_request)
-        if decision.approval_request is None:
-            self.fail("Expected approval request metadata.")
-        self.assertEqual(decision.approval_request["kind"], "bash_command")
-        self.assertEqual(decision.approval_request["command"], command)
-        self.assertEqual(decision.approval_request["target_runtime"], "tool_runtime")
+        self.assertTrue(decision.allowed)
+
+    def test_bash_policy_allows_cleanup_and_publish_commands(self) -> None:
+        for command in ("git push origin main", "rm -rf build", "find . -delete"):
+            with self.subTest(command=command):
+                decision = self.policy.authorize(
+                    tool_name="bash",
+                    arguments={"command": command},
+                    context=self.context,
+                )
+                self.assertTrue(decision.allowed)
 
     def test_bash_policy_hard_denies_os_upgrade_commands(self) -> None:
         decision = self.policy.authorize(
@@ -1973,39 +2016,32 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("job_id", decision.reason or "")
 
-    def test_bash_policy_hard_denies_noncentral_python_path(self) -> None:
+    def test_bash_policy_allows_noncentral_python_path(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "/usr/bin/python -c 'print(1)'"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertIn("non-central interpreter path", decision.reason or "")
-        self.assertIn("/opt/venv", decision.reason or "")
-        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
-    def test_bash_policy_hard_denies_uv_run_python_execution(self) -> None:
+    def test_bash_policy_allows_uv_run_python_execution(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "uv run python script.py"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertIn("must not route through `uv run python`", decision.reason or "")
-        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
-    def test_bash_policy_hard_denies_unknown_python_command_name(self) -> None:
+    def test_bash_policy_allows_unknown_python_command_name(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "python9.9 -c 'print(1)'"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertIn("does not resolve to the central interpreter set", decision.reason or "")
-        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
     def test_bash_policy_allows_explicit_central_python_path(self) -> None:
         decision = self.policy.authorize(
@@ -2016,29 +2052,25 @@ class ToolPolicyTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed)
 
-    def test_bash_policy_hard_denies_workspace_venv_python_path(self) -> None:
+    def test_bash_policy_allows_workspace_venv_python_path(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "./.venv/bin/python -c 'print(1)'"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertIn("non-central interpreter path", decision.reason or "")
-        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
-    def test_bash_policy_hard_denies_second_venv_creation(self) -> None:
+    def test_bash_policy_allows_second_venv_creation(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "python -m venv .venv"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertIn("must not create a second Python environment", decision.reason or "")
-        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
-    def test_bash_policy_hard_denies_uv_pip_install_targeting_noncentral_python(self) -> None:
+    def test_bash_policy_allows_uv_pip_install_targeting_noncentral_python(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={
@@ -2047,9 +2079,7 @@ class ToolPolicyTests(unittest.TestCase):
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertIn("targets a non-central interpreter path", decision.reason or "")
-        self.assertIn("/opt/venv/bin/python", decision.reason or "")
+        self.assertTrue(decision.allowed)
 
     def test_bash_policy_allows_background_mode_command_validation(self) -> None:
         decision = self.policy.authorize(
@@ -2060,24 +2090,16 @@ class ToolPolicyTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed)
 
-    def test_bash_policy_requires_approval_for_uv_pip_install(self) -> None:
+    def test_bash_policy_allows_uv_pip_install(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={"command": "uv pip install requests"},
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "bash command requires explicit approval.")
-        self.assertIsNotNone(decision.approval_request)
-        if decision.approval_request is None:
-            self.fail("Expected approval request metadata.")
-        self.assertEqual(
-            decision.approval_request["detector_reason"],
-            "matched install or package-manager mutation pattern for tool_runtime",
-        )
+        self.assertTrue(decision.allowed)
 
-    def test_bash_policy_requires_approval_for_background_system_write(self) -> None:
+    def test_bash_policy_allows_background_system_write(self) -> None:
         decision = self.policy.authorize(
             tool_name="bash",
             arguments={
@@ -2087,9 +2109,7 @@ class ToolPolicyTests(unittest.TestCase):
             context=self.context,
         )
 
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "bash command requires explicit approval.")
-        self.assertIsNotNone(decision.approval_request)
+        self.assertTrue(decision.allowed)
 
     def test_bash_policy_allows_exactly_approved_system_write_command(self) -> None:
         command = "printf 'jarvis' > /etc/jarvis-bash-test"
@@ -2974,28 +2994,23 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         _BASH_RUNTIME_AVAILABLE,
         _BASH_RUNTIME_SKIP_REASON,
     )
-    async def test_bash_requires_approval_for_system_write_command(self) -> None:
+    async def test_bash_allows_isolated_system_write_command(self) -> None:
         result = await self.runtime.execute(
             tool_call=ToolCall(
                 call_id="call_etc_read_only",
                 name="bash",
-                arguments={"command": "printf 'jarvis' > /etc/jarvis-bash-test"},
-                raw_arguments='{"command":"printf \\"jarvis\\" > /etc/jarvis-bash-test"}',
+                arguments={
+                    "command": (
+                        "printf 'jarvis' > /etc/jarvis-bash-test; "
+                        "test -s /etc/jarvis-bash-test; rm /etc/jarvis-bash-test"
+                    )
+                },
+                raw_arguments="{}",
             ),
             context=self.context,
         )
 
-        self.assertFalse(result.ok)
-        self.assertIn("Approval required", result.content)
-        self.assertTrue(result.metadata["approval_required"])
-        self.assertEqual(
-            result.metadata["approval_request"]["kind"],
-            "bash_command",
-        )
-        self.assertEqual(
-            result.metadata["approval_request"]["command"],
-            "printf 'jarvis' > /etc/jarvis-bash-test",
-        )
+        self.assertTrue(result.ok, result.content)
 
     async def test_file_patch_creates_new_file_with_write_operation(self) -> None:
         scripts_dir = self.workspace_dir / "scripts"

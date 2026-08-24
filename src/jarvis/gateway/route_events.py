@@ -99,6 +99,7 @@ class RouteTurnDoneEvent(RouteEventBase):
     interrupted: bool = False
     approval_rejected: bool = False
     completion_blocked: bool = False
+    completion_block_reason: str | None = None
     interruption_reason: str | None = None
     type: Literal["turn_done"] = "turn_done"
 
