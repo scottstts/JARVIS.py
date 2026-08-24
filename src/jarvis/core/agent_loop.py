@@ -52,6 +52,7 @@ from jarvis.llm import (
     strategy_for_provider,
 )
 from jarvis.memory import MemoryService, MemorySettings
+from jarvis.runtime_errors import record_runtime_error
 from jarvis.skills import (
     SkillsSettings,
     import_staged_skills,
@@ -112,6 +113,7 @@ _IMAGE_ATTACHMENT_ERROR_HINTS = (
     "vision",
     "multimodal",
 )
+_COMPACTION_FAILURE_LATCH_KEY = "compaction_failure_latch"
 _TRANSCRIPT_ONLY_RECORD_METADATA_KEY = "transcript_only"
 _IMAGE_INPUT_METADATA_KEY = "image_input"
 _EPHEMERAL_IMAGE_INPUT_METADATA_KEY = "ephemeral_image_input"
@@ -3086,18 +3088,28 @@ class AgentLoop:
             user_text=user_text,
         )
         if task_contract is not None:
-            turn_runtime_messages = (
-                *turn_runtime_messages,
-                AgentRuntimeMessage(
-                    role="system",
-                    content=task_contract.render(),
-                    metadata={
-                        "task_contract": True,
-                        "task_id": task_contract.task_id,
-                        "user_message_sha256": task_contract.user_message_sha256,
-                    },
-                ),
+            rendered_contract = task_contract.render()
+            contract_prompt_hash = hashlib.sha256(
+                rendered_contract.encode("utf-8")
+            ).hexdigest()
+            contract_already_persisted = any(
+                record.metadata.get("task_contract_revision") == contract_prompt_hash
+                for record in records
             )
+            if not contract_already_persisted:
+                turn_runtime_messages = (
+                    *turn_runtime_messages,
+                    AgentRuntimeMessage(
+                        role="system",
+                        content=rendered_contract,
+                        metadata={
+                            "task_contract": True,
+                            "task_id": task_contract.task_id,
+                            "task_contract_revision": contract_prompt_hash,
+                            "user_message_sha256": task_contract.user_message_sha256,
+                        },
+                    ),
+                )
         self._record_tool_task_runtime_progress(
             session_id=session.session_id,
             runtime_messages=turn_runtime_messages,
@@ -4246,8 +4258,14 @@ class AgentLoop:
                     core_memory_bootstrap,
                     ongoing_memory_bootstrap,
                 ) = await self._memory_service.render_bootstrap_messages()
-            except Exception:
+            except Exception as exc:
                 LOGGER.exception("Memory bootstrap rendering failed.")
+                self._record_runtime_error(
+                    exc,
+                    event="memory_bootstrap_failed",
+                    error_code="memory_bootstrap_failed",
+                    session_id=session.session_id,
+                )
                 core_memory_bootstrap, ongoing_memory_bootstrap = "", ""
             if core_memory_bootstrap.strip():
                 self._append_message(
@@ -4295,6 +4313,7 @@ class AgentLoop:
         excluded_turn_ids: tuple[str, ...] = (),
         turn_id: str | None = None,
     ) -> SessionMetadata | None:
+        session = self._storage.get_session(session.session_id) or session
         excluded_turn_id_set = {turn_id.strip() for turn_id in excluded_turn_ids if turn_id.strip()}
         records = self._storage.load_records(
             session.session_id,
@@ -4309,6 +4328,35 @@ class AgentLoop:
         ]
         previous_bundle = load_compaction_bundle(records)
         source_records = prune_compaction_source_records(compactable_records)
+        source_revision = _compaction_source_revision(
+            source_records=source_records,
+            previous_bundle=previous_bundle,
+        )
+        failure_latch = session.backend_state.get(_COMPACTION_FAILURE_LATCH_KEY)
+        if (
+            reason != "manual"
+            and isinstance(failure_latch, Mapping)
+            and failure_latch.get("source_revision") == source_revision
+        ):
+            self._storage.update_session(
+                session.session_id,
+                pending_reactive_compaction=False,
+            )
+            error = ContextBudgetError(
+                "Automatic compaction is latched after the same source evidence already failed. "
+                "Use /compact for an explicit retry after correcting the underlying cause, or "
+                "/new to start a fresh session."
+            )
+            setattr(error, "metadata", {
+                "operation": "compaction",
+                "compaction_retry_suppressed": True,
+                "compaction_source_revision": source_revision,
+                "compaction_failure_latch": dict(failure_latch),
+                "compaction_reason": reason,
+                "compaction_session_id": session.session_id,
+                "compaction_turn_id": turn_id,
+            })
+            raise error
         if not source_records and previous_bundle is None:
             if excluded_turn_id_set:
                 next_compaction_count = session.compaction_count + 1
@@ -4367,8 +4415,15 @@ class AgentLoop:
                     )
                 except (_TurnStopRequested, _CompactionStopRequested):
                     raise
-                except Exception:
+                except Exception as exc:
                     LOGGER.exception("Memory pre-compaction flush failed.")
+                    self._record_runtime_error(
+                        exc,
+                        event="memory_pre_compaction_flush_failed",
+                        error_code="memory_pre_compaction_flush_failed",
+                        session_id=session.session_id,
+                        context={"compaction_reason": reason, "turn_id": turn_id},
+                    )
 
             outcome = await self._await_compaction_operation(
                 self._compactor.compact(
@@ -4400,6 +4455,35 @@ class AgentLoop:
                 metadata.setdefault("compaction_session_id", session.session_id)
                 metadata.setdefault("compaction_reason", reason)
                 metadata.setdefault("compaction_turn_id", turn_id)
+            self._record_runtime_error(
+                exc,
+                event="compaction_failed",
+                error_code=(
+                    "context_budget_exceeded"
+                    if isinstance(exc, ContextBudgetError)
+                    else "compaction_failed"
+                ),
+                session_id=session.session_id,
+                context={"compaction_reason": reason, "turn_id": turn_id},
+            )
+            refreshed = self._storage.get_session(session.session_id) or session
+            backend_state = deepcopy(refreshed.backend_state)
+            backend_state[_COMPACTION_FAILURE_LATCH_KEY] = {
+                "source_revision": source_revision,
+                "exception_type": type(exc).__name__,
+                "error_code": (
+                    "context_budget_exceeded"
+                    if isinstance(exc, ContextBudgetError)
+                    else "compaction_failed"
+                ),
+                "reason": reason,
+                "failed_at": _utc_now_iso(),
+            }
+            self._storage.update_session(
+                session.session_id,
+                pending_reactive_compaction=False,
+                backend_state=backend_state,
+            )
             LOGGER.exception(
                 "Compaction failed for session %s (reason=%s, turn_id=%s).",
                 session.session_id,
@@ -4488,8 +4572,14 @@ class AgentLoop:
         try:
             await self._memory_service.ensure_index_synced()
             await self._memory_service.run_due_maintenance()
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("Memory runtime maintenance failed.")
+            self._record_runtime_error(
+                exc,
+                event="memory_runtime_maintenance_failed",
+                error_code="memory_runtime_maintenance_failed",
+                session_id=self.active_session_id(),
+            )
 
     async def _reflect_completed_turn(
         self,
@@ -4512,8 +4602,38 @@ class AgentLoop:
                 session_id=session_id,
                 records=turn_records,
             )
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("Memory post-turn reflection failed.")
+            self._record_runtime_error(
+                exc,
+                event="memory_post_turn_reflection_failed",
+                error_code="memory_post_turn_reflection_failed",
+                session_id=session_id,
+                context={"turn_id": turn_id},
+            )
+
+    def _record_runtime_error(
+        self,
+        exc: Exception,
+        *,
+        event: str,
+        error_code: str,
+        session_id: str | None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Path:
+        route_id = self._tool_context.route_id or "local"
+        return record_runtime_error(
+            transcript_archive_dir=self._settings.transcript_archive_dir,
+            route_id=route_id,
+            session_id=session_id,
+            component="core.agent_loop",
+            event=event,
+            agent_kind=self._identity.kind,
+            exc=exc,
+            error_code=error_code,
+            message=f"{self._identity.name} runtime operation {event} failed.",
+            context=context,
+        )
 
     def _append_compaction_record(
         self,
@@ -5890,6 +6010,35 @@ def _carry_compaction_backend_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compaction_source_revision(
+    *,
+    source_records: Sequence[ConversationRecord],
+    previous_bundle: CompactionBundle | None,
+) -> str:
+    payload = {
+        "previous_bundle_id": previous_bundle.bundle_id if previous_bundle is not None else None,
+        "records": [
+            {
+                "record_id": record.record_id,
+                "role": record.role,
+                "content_sha256": hashlib.sha256(record.content.encode("utf-8")).hexdigest(),
+                "metadata_sha256": hashlib.sha256(
+                    json.dumps(
+                        record.metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+            for record in source_records
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _assert_compaction_effective(
     *,
     source_records: Sequence[ConversationRecord],
@@ -6365,13 +6514,27 @@ def _with_tool_safety_replan_notice(
             "tool_safety_first_call_id": observation.first_call_id,
         }
     )
+    workspace_lease_blocked = (
+        observation.blocked_invalid_signature
+        and result.metadata.get("error_code") == "workspace_lease_conflict"
+    )
+    if workspace_lease_blocked:
+        metadata["tool_safety_blocked"] = True
+        metadata["tool_safety_block_reason"] = "repeated_workspace_lease_conflict"
+    remediation = str(result.metadata.get("remediation", "")).strip()
     return replace(
         result,
         content=(
             result.content.rstrip()
             + "\n\nTool safety checkpoint\n"
-            + "This exact action is now blocked in the current unchanged workspace epoch. "
-            + "Do not repeat it; replan with different arguments or make material progress."
+            + (
+                "The same underlying workspace lease conflict occurred twice in the current "
+                "unchanged workspace epoch. This turn is now parked. "
+                if workspace_lease_blocked
+                else "This exact action is now blocked in the current unchanged workspace epoch. "
+            )
+            + (remediation + " " if remediation else "")
+            + "Do not vary the command merely to retry the same underlying failure."
         ),
         metadata=metadata,
     )

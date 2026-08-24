@@ -21,7 +21,7 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 - Subagents do not have access to memory tools.
 - Runtime tool manifests under `/workspace/runtime_tools/` remain visible to subagents.
 - The user does not directly converse with subagents.
-- `/stop` cooperatively stops the main agent and active subagents.
+- `/stop` hard-quiesces the route: main/child turns are preempted, waiting children pause, and detached jobs/services are terminated.
 - `/new` hard-stops and disposes route subagents.
 - Ordinary user messages supersede only the active main turn; they never redirect, pause, or stop a child.
 - Jarvis decides whether to continue independent main-task work, inspect a child, step in, stop it, or wait.
@@ -140,6 +140,10 @@ Permanently closes and removes a non-running subagent from the active set.
 
 It releases the codename, marks the catalog entry disposed, closes the child loop resources, and emits a public route notice.
 
+### `orchestrator_wait`
+
+Parks only the main orchestrator when route-owned children or detached jobs are still active and there is no actionable main work. Jarvis supplies a preferred `wake_after_seconds`, a concise reason, and optional pending actor IDs. The runtime validates the actor set, clamps the liveness deadline, applies exponential backoff after unchanged reviews, and wakes immediately on terminal/attention events. Routine running/output-growth observations do not poll either model. This primitive is general across any pending actor mix; it is not special-cased to one child.
+
 ## Lifecycle And Status
 
 Any non-disposed subagent counts toward the active limit, including completed and failed subagents. Explicit disposal is required to free a slot.
@@ -192,7 +196,7 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 Route-level tool execution uses a workspace coordinator rather than one global tool mutex. Exact-path reads and disjoint declared writes can run concurrently, while broad snapshot reads take an exclusive barrier. A child’s `owned_paths` are exclusive persistent write leases until disposal; direct file producers/consumers acquire exact paths automatically, while mutable `bash` must declare all `write_paths` whenever another actor holds a lease. Overlapping access is serialized or rejected with ownership guidance instead of racing shared state.
 
-Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and later revive the owning child loop through persisted child-system notes and runtime turns. Unchanged jobs do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. Explicitly stopped children remain paused while terminal bookkeeping still clears their pending job IDs.
+Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
 
 ## Storage
 
@@ -243,7 +247,7 @@ Approval requests include the acting agent name. Rejected subagent approvals pau
 
 ## User Stop And Supersede
 
-`/stop` asks the main loop and active subagents to stop through the same route stop path. Active provider/tool awaits are preempted and foreground bash gets best-effort cancellation; already-detached bash jobs are not cancelled by plain `/stop`.
+`/stop` uses the same hard-preemption mechanism as the destructive part of `/new`, but preserves the current session and child objects for a later explicit resume. Active provider/tool awaits are cancelled, `waiting_background` children become `paused(main_stop)`, pending child notices are cleared, and the route supervisor terminates/finalizes detached jobs and services before the stop acknowledgement. Only children actually affected by the stop are reported in the persisted stop note.
 
 When a newer ordinary user message arrives, it supersedes only the active main turn. Existing children continue their original Jarvis assignments unchanged. The user message cannot become child context or an implicit child stop/redirect. Jarvis can later inspect, stop, or step into a child explicitly.
 

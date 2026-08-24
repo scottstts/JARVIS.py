@@ -1069,7 +1069,7 @@ class BashJobMetadataTests(unittest.TestCase):
                 command="true",
                 cwd=str(workspace_dir),
                 log_max_bytes=1_024,
-                total_storage_budget_bytes=100_000,
+                total_storage_budget_bytes=1_000_000,
                 retention_seconds=60.0,
             )
 

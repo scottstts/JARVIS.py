@@ -48,7 +48,7 @@ class MemoryReflectionPlanner:
             "Artifacts",
             "Candidate Promotions",
         ]
-        prompt = (
+        system_prompt = (
             "You are Jarvis memory reflection. Produce compact JSON only.\n"
             "Decide whether the completed turn implies memory actions.\n"
             "Allowed actions: append_daily, create_ongoing, update_ongoing, close_ongoing, "
@@ -65,7 +65,9 @@ class MemoryReflectionPlanner:
             "For close_ongoing, payload should include document_id or title and close_reason.\n"
             "Good fact example: {\"text\": \"The user prefers direct code review findings first.\", \"status\": \"current\", \"confidence\": \"high\"}\n"
             "Good relation example: {\"subject\": \"The user\", \"predicate\": \"is working on\", \"object\": \"the memory system\", \"status\": \"current\", \"confidence\": \"high\", \"cardinality\": \"single\"}\n"
-            "Respond as: {\"actions\": [{\"action\": ..., \"confidence\": ..., \"payload\": {...}, \"rationale\": ...}]}\n\n"
+            "Respond as: {\"actions\": [{\"action\": ..., \"confidence\": ..., \"payload\": {...}, \"rationale\": ...}]}"
+        )
+        reflection_input = (
             f"route_id: {route_id}\n"
             f"session_id: {session_id}\n"
             f"active_memories: {json.dumps(list(active_memories), ensure_ascii=True)}\n\n"
@@ -78,7 +80,8 @@ class MemoryReflectionPlanner:
                 model=self._settings.maintenance_model,
                 max_output_tokens=self._settings.maintenance_max_output_tokens,
                 messages=(
-                    LLMMessage.text("system", prompt),
+                    LLMMessage.text("system", system_prompt),
+                    LLMMessage.text("user", reflection_input),
                 ),
             )
         )

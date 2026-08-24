@@ -39,8 +39,9 @@ class RouteRuntimeLike(Protocol):
     def active_session_id(self) -> str | None:
         """Return active main session id for this route."""
 
-    def request_stop(self) -> bool:
+    async def request_stop(self) -> bool:
         """Request stop for active route work, if any."""
+        ...
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         """Resolve one pending approval request for the active route."""
@@ -94,8 +95,8 @@ class SessionRouter:
     def active_session_id(self, route_id: str) -> str | None:
         return self.get_or_create(route_id).runtime.active_session_id()
 
-    def request_stop(self, route_id: str) -> bool:
-        return self.get_or_create(route_id).runtime.request_stop()
+    async def request_stop(self, route_id: str) -> bool:
+        return await self.get_or_create(route_id).runtime.request_stop()
 
     def resolve_approval(self, route_id: str, approval_id: str, approved: bool) -> bool:
         return self.get_or_create(route_id).runtime.resolve_approval(approval_id, approved)

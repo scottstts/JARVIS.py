@@ -381,6 +381,8 @@ That means:
 
 Codex is not used for those maintenance/reflection model calls.
 
+The reflection caller still uses the shared stable-system plus dynamic-user request shape. Swallowed memory bootstrap/maintenance/pre-compaction failures and Codex compaction failures are persisted through the same route/session JSONL error recorder as the normal agent loop; propagation does not create a duplicate entry for the same exception object.
+
 Subagents keep memory disabled exactly like the non-Codex subagent path.
 
 ## Operational Notes

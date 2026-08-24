@@ -191,7 +191,7 @@ def create_app(
                     if not await _send_json_if_open(
                         websocket,
                         build_stop_ack_event(
-                            stop_requested=resolved_router.request_stop(route_id),
+                            stop_requested=await resolved_router.request_stop(route_id),
                         ),
                     ):
                         return
@@ -343,7 +343,7 @@ async def _serve_legacy_router_connection(
             if not await _send_json_if_open(
                 websocket,
                 build_stop_ack_event(
-                    stop_requested=router.request_stop(route_id),
+                    stop_requested=await router.request_stop(route_id),
                 ),
             ):
                 return

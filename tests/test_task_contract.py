@@ -246,6 +246,9 @@ class TaskContractTests(unittest.TestCase):
                 content="passed",
                 metadata={
                     "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["."],
+                        "workspace_revision_after": "revision-1",
                         "gates": [
                             {"gate_id": "tests", "command": "npm test", "passed": True},
                             {"gate_id": "lint", "command": "npm run lint", "passed": True},
@@ -300,6 +303,8 @@ class TaskContractTests(unittest.TestCase):
                 metadata={
                     "acceptance_ledger": {
                         "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["."],
                         "complete": True,
                         "checks": checks,
                     }
@@ -330,6 +335,9 @@ class TaskContractTests(unittest.TestCase):
                 content="passed",
                 metadata={
                     "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["."],
+                        "workspace_revision_after": "revision-1",
                         "gates": [
                             {"gate_id": "tests", "command": "pytest", "passed": True}
                         ]
@@ -348,6 +356,8 @@ class TaskContractTests(unittest.TestCase):
                 metadata={
                     "acceptance_ledger": {
                         "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["."],
                         "complete": True,
                         "checks": [checks[0]],
                     }
@@ -612,6 +622,9 @@ class TaskContractTests(unittest.TestCase):
                 content="passed",
                 metadata={
                     "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["."],
+                        "workspace_revision_after": "revision-1",
                         "gates": [
                             {"gate_id": "tests", "command": "pytest", "passed": True}
                         ]
@@ -630,6 +643,8 @@ class TaskContractTests(unittest.TestCase):
                 metadata={
                     "acceptance_ledger": {
                         "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["."],
                         "complete": True,
                         "checks": [
                             {

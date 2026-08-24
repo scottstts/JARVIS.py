@@ -149,6 +149,9 @@ src/jarvis/
   - resolves the effective startup provider/model targets shared by terminal and UI status rendering
 - `logging_setup.py`
   - application logging configuration
+- `runtime_errors.py`
+  - central durable JSONL exception recorder with propagated-exception de-duplication
+  - writes route/session-aware records under `archive/error_logs/`
 - `workspace_paths.py`
   - shared workspace path helpers
 
@@ -171,7 +174,8 @@ Key responsibilities:
 - session routing
 - route event publication
 - detached bash-job observation
-- separate cooperative `/stop` and destructive `/new` lifecycle paths; `/new` hard-resets route work, archives the old session trace, and leaves the replacement session idle
+- route-wide hard-quiesce for `/stop` (preserve session) and destructive `/new` (replace session); both terminate owned jobs/services, while `/new` also disposes children and archives the old lineage
+- bounded adaptive `orchestrator_wait` timers and route-wide `task_status` snapshots for UI liveness
 - route-scoped runtime error capture, with full tracebacks persisted as JSONL entries under `/workspace/archive/error_logs/<session_id>.jsonl` and only a short Rich terminal reminder emitted inline
 
 ### `src/jarvis/identities/`

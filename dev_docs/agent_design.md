@@ -117,9 +117,9 @@ Tool execution is bounded at two levels: `JARVIS_TOOL_MAX_ROUNDS_PER_TURN` defau
 
 Tool safety is task-scoped rather than session-scoped. Each user task has a compact schema-v2 sidecar under the transcript archive's `tool_tasks/` directory containing its task contract, stalled-round count, progress epoch, bounded runtime-progress signatures, and safety tracker. The stalled count resets on material tool or distinct orchestrator progress; persisted bash/subagent system notes record that progress at delivery time, and stable job/status/byte fingerprints distinguish real output growth without treating changing wall-clock text as progress. Legacy schema-v1 cumulative `rounds` values migrate to zero so old long sessions cannot permanently poison a task. The session index stores only `active_tool_task_id`; unchanged sidecars and unchanged session metadata are not rewritten. Explicit resumes and superseding clarifications merge new requirements into the active contract, explicit task or requirement replacement creates a fresh contract, and short status/time side queries use a temporary child contract before restoring the active task. Compaction carries the active task pointer without copying the sidecar into every session record.
 
-Repeated-result limits are evaluated inside progress epochs. A real workspace mutation or other material orchestration progress starts a new epoch and clears stale call/result signatures. The second identical invalid result or third identical no-progress result blocks only that exact tool-and-arguments signature. The threshold result remains visible with deterministic call/result signatures, call IDs, count, and epoch; only a later attempt to reuse the blocked signature parks the task. Alternative actions remain available.
+Repeated-result limits are evaluated inside progress epochs. A real workspace mutation or other material orchestration progress starts a new epoch and clears stale call/result signatures. The second identical invalid result or third identical no-progress result blocks only that exact tool-and-arguments signature. Workspace-lease failures additionally use a structured semantic conflict key, so superficial command/tool variations cannot evade the second-failure park while conflicts on different owned paths remain distinct. Threshold evidence stays visible with deterministic signatures, call IDs, count, epoch, and remediation. Alternative actions remain available unless the same underlying lease blocker has parked the turn.
 
-At task creation Jarvis deterministically extracts explicit user requirements into a prompt-visible, persisted contract with stable item IDs. The contract is re-injected on continuations and cannot be silently reduced by the model's acceptance ledger. Delegation, verification-gate, authored-source-line, visual-inspection, and changed-test-review requirements need matching runtime-observed evidence before a mutation can be marked accepted. Slice rollover notices include the current progress epoch and outstanding contract items.
+At task creation Jarvis deterministically extracts explicit user requirements into a prompt-visible, persisted contract with stable item IDs. A content-addressed contract revision is injected once per session, re-injected after compaction creates a new session, and injected again only when merged requirements materially change it; ordinary continuations reuse the persisted record instead of duplicating prompt bytes. The contract cannot be silently reduced by the model's acceptance ledger. Delegation, verification-gate, authored-source-line, visual-inspection, and changed-test-review requirements need matching runtime-observed evidence before a mutation can be marked accepted. Slice rollover notices include the current progress epoch and outstanding contract items.
 
 Slice rollover follows the same unresolved-call normalization rule:
 
@@ -163,7 +163,7 @@ When a new user message arrives while a main turn is active:
 
 Multiple mid-turn user messages remain distinct turns and run FIFO.
 
-Explicit `/stop` is separate. `/stop` cooperatively stops active main and subagent work, suppresses automatic follow-ups, and pauses until the next user message. Already-detached bash jobs keep running. A newer ordinary user message supersedes only the active main task and continues automatically into the newer request.
+Explicit `/stop` is separate from ordinary supersession but now uses route-wide hard quiescence. It hard-preempts the active main turn and active child turns, converts waiting children to a paused `main_stop` state, terminates and finalizes route-owned detached jobs and services, drains queued user/runtime continuations with terminal interruption events, clears retained notices/timers, and leaves the existing session available only for an explicit later user resume. Concurrent stop requests serialize through one route lock.
 
 `/new` is a control-only hard session boundary and does not reuse `/stop` semantics. As soon as the command is accepted, `RouteRuntime` closes the internal-follow-up gate, hard-preempts active main and subagent turns with reason `new_session`, and invalidates queued runtime continuations. Before the replacement session is created, the runtime terminates and finalizes all route-owned detached bash jobs, disposes every old subagent, clears retained bash/subagent notices, and persists a hard-reset trace in the old main transcript. The old main session is archived, provider/thread continuity is severed, and the fresh session remains idle. Only a later ordinary user message can start its agent loop.
 
@@ -171,7 +171,9 @@ Queued user turns outrank internal runtime follow-ups. Runtime follow-ups from s
 
 Chronology stays truthful. Tool results completed by the superseded turn remain in the older turn. Priority is expressed through persisted interruption and priority notes, not by rewriting history.
 
-Detached bash jobs are intentionally distinct from in-turn awaits. `/stop` suppresses their automatic follow-ups but does not cancel already-detached jobs; foreground bash execution is best-effort cancelled when the active tool await is preempted. `/new` terminates and finalizes detached jobs because none of their work may cross the hard session boundary.
+Detached bash jobs are intentionally distinct from in-turn awaits, but both `/stop` and `/new` terminate and finalize route-owned detached jobs and services. Foreground bash execution is best-effort cancelled when its active tool await is preempted. `/new` additionally disposes children and replaces the session; `/stop` preserves paused child/session state for an explicit resume.
+
+When route-owned children or detached jobs remain active but the main agent has no actionable work, Jarvis can call `orchestrator_wait` with a preferred liveness deadline and optional actor IDs. The runtime clamps the deadline to 30 seconds–30 minutes and applies an exponential 60-second adaptive floor after unchanged reviews. Material terminal/attention events cancel the timer and wake Jarvis immediately; routine running/output-growth observations are recorded by the supervisor without spending a main or child model turn. A deadline wake performs one runtime review, after which Jarvis must act or register another bounded wait. Narrow wait-only detached `sleep` polling commands are rejected.
 
 ## Turn Identity And Gateway Events
 
@@ -199,6 +201,8 @@ Turn-scoped events include:
 
 Interrupted `turn_done` events include `interruption_reason`.
 
+`task_status` is the route-wide activity latch, not a mirror of one main turn. It stays active while a main request, queued work, a pending detached job, or a running/waiting/approval-blocked child exists, even if the main agent itself is paused for user input. Every new subscriber receives an immediate authoritative snapshot before incremental events. Lifecycle transitions log route/task counts so a dropped UI indicator can be correlated with the server state.
+
 ## Telegram Submission Model
 
 Telegram inbound handling submits user messages immediately over the persistent route session. It does not wait for the current turn to finish before forwarding the next user message.
@@ -213,6 +217,8 @@ For each chat, the bridge maintains:
 - active display state keyed by `turn_id`
 
 `turn_started` binds streamed output to the correct submitted Telegram message. No special Telegram “interrupting current task” acknowledgement is sent.
+
+Telegram treats `task_status` as the master typing indicator. Approval/auth prompts, visible progress updates, provider failures, and chat-output pause do not clear it; only an inactive route status does. If the heartbeat task exits unexpectedly while the route remains active, the bridge persists the exception and restarts the task. Gateway/runtime errors never become Telegram fallback text. `/stop` temporarily mutes stale in-flight output, waits for the hard-quiesce acknowledgement, and then sends the single functional confirmation `Session stopped.`
 
 ## Approvals
 
@@ -252,7 +258,7 @@ Provider-specific metadata and raw provider argument encodings, bootstrap materi
 
 The provider does not receive this verbose internal representation. Jarvis renders a compact causal transcript with short local references (`E1`, `E2`, ...), short tool-call/result links, event type, role, time, and semantic content. Internal record, session, turn, and call IDs are not exposed. When an exact long tool argument already appears in its paired result, the renderer substitutes a reference instead of sending the bytes twice.
 
-Every compaction request is estimated before dispatch. Its safety ceiling is 70% of the normal preflight input limit to absorb provider-tokenizer variance. If necessary, Jarvis bounds only large tool evidence with a head/tail excerpt, omitted-character count, and hash; user and assistant messages are never shortened. If the request still cannot fit, compaction fails before contacting the provider and logs the estimate, ceiling, source count, selected bound, and truncation count.
+Every compaction request is estimated before dispatch with the intentionally lightweight four-characters-per-token heuristic. Its safety ceiling is 70% of the operator-selected normal preflight input limit. Jarvis first reserves the fixed instructions/prior-bundle cost, then applies one global source-character budget across all tool/system evidence; tool arguments receive both nested-string and whole-payload bounds. User messages and plain assistant messages are never shortened. Repeated task-contract records, routine bash lifecycle updates, identical system evidence, and selected repeated failure records are deterministically coalesced to their latest causal event before dispatch. If the exact messages plus minimum causal evidence cannot fit, compaction fails before contacting the provider and records detailed budget diagnostics rather than silently dropping exact content.
 
 ### Canonical bundle
 
@@ -280,6 +286,8 @@ The provider is forced through the shared `submit_compaction` tool schema and in
 No second model verifier resends the source. The earlier verifier duplicated cost and latency while asking another model response to police bookkeeping that Jarvis should own. If a provider nevertheless returns malformed output or an invalid local reference, Jarvis may make at most two targeted full-record repairs. Those retries are fault containment, not a normal stage. Rejection issues and call traces are logged immediately.
 
 The workflow shares one total deadline across all exceptional attempts. Compaction provider and memory awaits participate in route interruption. Mid-turn compaction races against the active turn stop signal. Reactive, preflight, and manual compaction register their own active operation before a normal turn exists, so `/stop`, a superseding user message, and `/new` can cancel them as well. A validated result is checked for interruption before the old session is archived; bundle activation then runs as a consistency-sensitive commit. Phase, attempt, call trace, validation issue, budget, deadline, session, reason, and turn metadata are attached to runtime failures.
+
+Failed compaction records a durable JSONL error and stores a latch keyed by the exact source revision in session backend state. Automatic reactive/preflight attempts for the unchanged source are suppressed after the first failure and clear the reactive flag, preventing an error loop; `/compact` deliberately bypasses the latch for a user-authorized retry. New source evidence changes the revision and permits a new automatic attempt.
 
 ## Compaction Pruning
 

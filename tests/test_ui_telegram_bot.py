@@ -1340,6 +1340,68 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.08)
         self.assertEqual(len(telegram.sent_chat_actions), actions_after_task_done)
 
+    async def test_master_typing_survives_provider_error_and_output_pause(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_typing_indicator_interval_seconds=0.05),
+            telegram_client=telegram,
+            gateway_client=_PersistentFakeGatewayClient(session),
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTaskStatusEvent(
+                route_id="tg_777",
+                active=True,
+                reason="user_message_queued",
+            )
+        )
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+            )
+        )
+        await asyncio.sleep(0.08)
+
+        await session.emit(
+            GatewayErrorEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                code="provider_temporary_error",
+                message="internal provider failure",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+        bridge._pause_chat_output(777)
+        actions_after_error = len(telegram.sent_chat_actions)
+        await asyncio.sleep(0.08)
+
+        self.assertGreater(len(telegram.sent_chat_actions), actions_after_error)
+        self.assertEqual(telegram.sent_messages, [])
+
+        await session.emit(
+            GatewayTaskStatusEvent(
+                route_id="tg_777",
+                active=False,
+                reason="route_idle",
+            )
+        )
+        await asyncio.sleep(0.02)
+        actions_after_inactive = len(telegram.sent_chat_actions)
+        await asyncio.sleep(0.08)
+        self.assertEqual(len(telegram.sent_chat_actions), actions_after_inactive)
+
     async def test_dispatch_message_repeats_tool_notice_when_same_tool_is_used_in_next_turn(
         self,
     ) -> None:
@@ -1680,7 +1742,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(telegram.sent_messages[0].text), 4096)
         self.assertEqual(len(telegram.sent_messages[1].text), 904)
 
-    async def test_gateway_error_sends_runtime_error_message_for_active_turn(self) -> None:
+    async def test_gateway_error_suppresses_runtime_error_message_for_active_turn(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             error=GatewayBridgeError(code="internal_error", message="gateway failed"),
@@ -1695,10 +1757,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
         )
 
-        self.assertEqual(
-            [message.text for message in telegram.sent_messages],
-            ["❌ Error occurred. Try again."],
-        )
+        self.assertEqual(telegram.sent_messages, [])
 
     async def test_handle_message_does_not_send_placeholder_for_interrupted_turn(self) -> None:
         telegram = _FakeTelegramClient()
@@ -1747,14 +1806,11 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.stop_calls, ["tg_777"])
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            [
-                "⚙️ <b>System:</b> Prepare to stop the session.",
-                "⚙️ <b>System:</b> Session stopped.",
-            ],
+            ["⚙️ <b>System:</b> Session stopped."],
         )
         self.assertEqual(
             [message.parse_mode for message in telegram.sent_messages],
-            ["HTML", "HTML"],
+            ["HTML"],
         )
 
     async def test_dispatch_message_submits_second_message_immediately_while_first_turn_is_active(
@@ -1947,10 +2003,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.stop_requested)
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            [
-                "⚙️ <b>System:</b> Prepare to stop the session.",
-                "⚙️ <b>System:</b> Session stopped.",
-            ],
+            ["⚙️ <b>System:</b> Session stopped."],
         )
 
     async def test_stop_command_reports_completion_when_active_turn_ends_with_error(self) -> None:
@@ -1999,10 +2052,72 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            [
-                "⚙️ <b>System:</b> Prepare to stop the session.",
-                "⚙️ <b>System:</b> Session stopped.",
-            ],
+            ["⚙️ <b>System:</b> Session stopped."],
+        )
+
+    async def test_stop_confirmation_does_not_depend_on_late_turn_done_event(self) -> None:
+        class _TerminalBeforeStopAckSession(_PersistentFakeRouteSession):
+            async def request_stop(self) -> bool:
+                self.stop_requested = True
+                client_message_id = self.sent_messages[0][1]
+                await self.emit(
+                    GatewayTurnDoneEvent(
+                        route_id="tg_777",
+                        session_id="session_1",
+                        turn_id="turn_1",
+                        turn_kind="user",
+                        client_message_id=client_message_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        response_text="",
+                        interrupted=True,
+                        interruption_reason="user_stop",
+                    )
+                )
+                await asyncio.sleep(0.01)
+                return True
+
+        telegram = _FakeTelegramClient()
+        session = _TerminalBeforeStopAckSession()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_PersistentFakeGatewayClient(session),
+        )
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=1,
+                chat_id=777,
+                chat_type="private",
+                text="first",
+            )
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session_1",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+            )
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(
+                update_id=2,
+                chat_id=777,
+                chat_type="private",
+                text="/stop",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["⚙️ <b>System:</b> Session stopped."],
         )
 
     async def test_stop_command_resumes_output_only_after_next_user_turn_event(self) -> None:
@@ -2106,7 +2221,6 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "⚙️ <b>System:</b> Prepare to stop the session.",
                 "⚙️ <b>System:</b> Session stopped.",
                 "handled second",
             ],
@@ -2189,9 +2303,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "⚙️ <b>System:</b> Prepare to stop the session.",
-                "⚙️ <b>System:</b> Prepare to start a new session.",
                 "⚙️ <b>System:</b> Session stopped.",
+                "⚙️ <b>System:</b> Prepare to start a new session.",
                 "⚙️ <b>System:</b> Started a new session.",
             ],
         )

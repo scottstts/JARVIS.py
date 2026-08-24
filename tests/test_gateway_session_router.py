@@ -18,7 +18,14 @@ from jarvis.core import (
     AgentTurnDoneEvent,
     AgentTurnResult,
 )
-from jarvis.llm import DoneEvent, LLMResponse, LLMUsage, ProviderTimeoutError, TextPart
+from jarvis.llm import (
+    DoneEvent,
+    LLMResponse,
+    LLMUsage,
+    ProviderTimeoutError,
+    TextPart,
+    ToolCall,
+)
 from jarvis.gateway.bash_job_supervisor import (
     BashJobNotice,
     BashJobResetResult,
@@ -32,12 +39,14 @@ from jarvis.gateway.route_events import (
     RouteSystemNoticeEvent,
     RouteTaskStatusEvent,
     RouteTurnDoneEvent,
+    RouteTurnStartedEvent,
 )
 from jarvis.gateway.route_runtime import (
     CompositeMainBootstrapLoader,
     RouteEventBus,
     RouteRuntime,
     _RouteTurnRequest,
+    _is_wait_only_bash_call,
     _tool_result_for_payload,
 )
 from tests.helpers import build_compaction_test_outcome
@@ -96,7 +105,7 @@ class _TrackingLoop:
     def active_session_id(self) -> str | None:
         return self._session_id
 
-    def request_stop(self) -> bool:
+    async def request_stop(self) -> bool:
         self.stop_requests += 1
         return True
 
@@ -143,6 +152,8 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             snapshot = SubagentSnapshot(
                 subagent_id="subagent_1",
                 codename="Atlas",
@@ -218,6 +229,8 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued.provider_recovery_task_id, "task_1")
 
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             runtime._provider_recovery_turn_ids["task_1"] = "retry_turn_3"
             try:
                 exhausted = await runtime._enqueue_main_provider_recovery(
@@ -310,7 +323,7 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
         loop = _TrackingLoop(session_id="alpha-session")
         router = SessionRouter(lambda _route_id: loop)
 
-        stop_requested = router.request_stop("alpha")
+        stop_requested = await router.request_stop("alpha")
 
         self.assertTrue(stop_requested)
         self.assertEqual(loop.stop_requests, 1)
@@ -423,6 +436,130 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_orchestrator_wait_supports_general_pending_actor_sets_with_bounds(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            snapshots = (
+                SubagentSnapshot(
+                    subagent_id="sub_1",
+                    codename="Ultron",
+                    status="running",
+                    owner_main_session_id="main",
+                    owner_main_turn_id="turn",
+                ),
+                SubagentSnapshot(
+                    subagent_id="sub_2",
+                    codename="Friday",
+                    status="waiting_background",
+                    owner_main_session_id="main",
+                    owner_main_turn_id="turn",
+                ),
+            )
+            with patch.object(
+                runtime._subagent_manager,
+                "active_snapshots",
+                return_value=snapshots,
+            ):
+                first = runtime._register_orchestrator_wait(
+                    wake_after_seconds=1,
+                    reason="Both children are still working.",
+                    watch_actor_ids=(),
+                    session_id="main",
+                )
+                self.assertEqual(first["effective_wait_seconds"], 60)
+                first_task = runtime._orchestrator_wait_task
+                assert first_task is not None
+
+                runtime._orchestrator_unchanged_waits = 3
+                second = runtime._register_orchestrator_wait(
+                    wake_after_seconds=99_999,
+                    reason="No actor event changed.",
+                    watch_actor_ids=("sub_1", "sub_2"),
+                    session_id="main",
+                )
+                self.assertTrue(first_task.cancelled() or first_task.cancelling())
+                self.assertEqual(second["adaptive_floor_seconds"], 480)
+                self.assertEqual(second["effective_wait_seconds"], 1_800)
+                self.assertEqual(second["pending_subagent_count"], 2)
+            runtime._cancel_orchestrator_wait(reset_backoff=True)
+
+    async def test_orchestrator_wait_deadline_queues_one_liveness_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="running",
+                owner_main_session_id="main",
+                owner_main_turn_id="turn",
+            )
+            runtime._orchestrator_wait_generation = 7
+            with (
+                patch.object(
+                    runtime._subagent_manager,
+                    "active_snapshots",
+                    return_value=(snapshot,),
+                ),
+                patch.object(runtime, "_ensure_message_worker"),
+            ):
+                await runtime._orchestrator_wait_deadline(
+                    generation=7,
+                    delay_seconds=0,
+                    session_id="main",
+                    reason="Await child progress.",
+                )
+
+            request = runtime._message_queue.get_nowait()
+            runtime._message_queue.task_done()
+            self.assertEqual(request.runtime_turn_kind, "main_orchestrator_review")
+            self.assertEqual(request.orchestrator_wait_generation, 7)
+            self.assertTrue(
+                request.pre_turn_messages[0].metadata["orchestrator_liveness_review"]
+            )
+            self.assertEqual(runtime._orchestrator_unchanged_waits, 1)
+            self.assertTrue(runtime._message_queue.empty())
+
+            runtime._orchestrator_wait_generation = 8
+            self.assertTrue(runtime._internal_request_is_blocked(request))
+
+    async def test_wait_only_bash_timer_is_narrowly_rejected(self) -> None:
+        self.assertTrue(
+            _is_wait_only_bash_call(
+                ToolCall(
+                    call_id="wait",
+                    name="bash",
+                    arguments={
+                        "mode": "background",
+                        "command": "sleep 30 && echo poll tick",
+                    },
+                    raw_arguments="",
+                )
+            )
+        )
+        self.assertFalse(
+            _is_wait_only_bash_call(
+                ToolCall(
+                    call_id="real",
+                    name="bash",
+                    arguments={
+                        "mode": "background",
+                        "command": "python build_assets.py",
+                    },
+                    raw_arguments="",
+                )
+            )
+        )
+
     async def test_subagent_awaiting_approval_keeps_route_task_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
@@ -448,6 +585,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
 
             async def _stream_user_input(_user_text: str):
                 yield AgentTurnDoneEvent(
@@ -486,6 +625,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             running_snapshot = SubagentSnapshot(
                 subagent_id="sub_1",
                 codename="Ultron",
@@ -540,6 +681,41 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 worker.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await worker
+
+    async def test_task_status_remains_active_for_running_child_while_main_is_paused(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            runtime._main_resume_requires_user_message = True
+            running_snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Ultron",
+                status="running",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="turn_1",
+                current_subagent_session_id="sub_session",
+            )
+
+            with patch.object(
+                runtime._subagent_manager,
+                "active_snapshots",
+                return_value=(running_snapshot,),
+            ):
+                self.assertTrue(runtime._route_task_active())
+                subscriber_id, queue = runtime.subscribe()
+
+            try:
+                snapshot = queue.get_nowait()
+                self.assertIsInstance(snapshot, RouteTaskStatusEvent)
+                assert isinstance(snapshot, RouteTaskStatusEvent)
+                self.assertTrue(snapshot.active)
+            finally:
+                runtime.unsubscribe(subscriber_id)
 
     async def test_enqueue_user_message_supersedes_active_main_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -820,6 +996,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             worker: asyncio.Task[None] | None = None
             try:
                 await runtime.enqueue_user_message("hello", client_message_id="msg_1")
@@ -859,6 +1037,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             stream_called = False
 
             async def _stream_user_input(_user_text: str):
@@ -922,6 +1102,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             session_id_holder: dict[str, str] = {}
 
             async def _stream_user_input(_user_text: str):
@@ -1000,6 +1182,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
             session_id_holder: dict[str, str] = {}
             provider_metadata = {
                 "generation_id": "gen_header_123",
@@ -1074,6 +1258,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
             subscriber_id, queue = runtime.subscribe()
+            subscriber_snapshot = queue.get_nowait()
+            self.assertIsInstance(subscriber_snapshot, RouteTaskStatusEvent)
 
             async def _stream_user_input(_user_text: str):
                 raise CodexConnectionError("Codex app-server unavailable")
@@ -1126,13 +1312,23 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 current_subagent_session_id="sub_session",
             )
 
-            with patch.object(runtime._main_loop, "request_stop", return_value=False):
+            with patch.object(runtime._main_loop, "request_hard_stop", return_value=False):
                 with patch.object(
                     runtime._subagent_manager,
-                    "request_stop_all_for_user_stop",
+                    "request_hard_stop_all_for_user_stop",
                     return_value=(snapshot,),
                 ):
-                    self.assertTrue(runtime.request_stop())
+                    settle_stop = AsyncMock(return_value=(snapshot,))
+                    with patch.object(
+                        runtime._subagent_manager,
+                        "settle_hard_user_stop",
+                        new=settle_stop,
+                    ):
+                        self.assertTrue(await runtime.request_stop())
+
+            settle_stop.assert_awaited_once_with(
+                subagent_ids=frozenset({"sub_1"})
+            )
 
             self.assertTrue(runtime._main_resume_requires_user_message)
             records = runtime._main_loop._storage.load_records(session_id)
@@ -1154,8 +1350,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
 
-            with patch.object(runtime._main_loop, "request_stop", return_value=True):
-                self.assertTrue(runtime.request_stop())
+            with patch.object(runtime._main_loop, "request_hard_stop", return_value=True):
+                self.assertTrue(await runtime.request_stop())
 
             await runtime.publish_event(
                 RouteSystemNoticeEvent(
@@ -1171,6 +1367,93 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(runtime._message_queue.empty())
 
+    async def test_stop_drains_queued_user_request_with_complete_terminal_event_pair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            subscriber_id, queue = runtime.subscribe()
+            self.assertIsInstance(queue.get_nowait(), RouteTaskStatusEvent)
+            await runtime._user_message_queue.put(
+                _RouteTurnRequest(
+                    user_text="queued work",
+                    parse_commands=True,
+                    user_initiated=True,
+                    client_message_id="queued_message",
+                )
+            )
+
+            try:
+                with patch.object(runtime._main_loop, "request_hard_stop", return_value=False):
+                    self.assertTrue(await runtime.request_stop())
+
+                started = queue.get_nowait()
+                done = queue.get_nowait()
+                self.assertIsInstance(started, RouteTurnStartedEvent)
+                self.assertIsInstance(done, RouteTurnDoneEvent)
+                assert isinstance(started, RouteTurnStartedEvent)
+                assert isinstance(done, RouteTurnDoneEvent)
+                self.assertEqual(started.client_message_id, "queued_message")
+                self.assertEqual(done.client_message_id, "queued_message")
+                self.assertEqual(done.turn_id, started.turn_id)
+                self.assertTrue(done.interrupted)
+                self.assertTrue(done.completion_blocked)
+                self.assertEqual(done.interruption_reason, "user_stop")
+                self.assertTrue(runtime._user_message_queue.empty())
+            finally:
+                runtime.unsubscribe(subscriber_id)
+
+    async def test_user_message_waits_for_hard_stop_to_quiesce_before_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            stop_started = asyncio.Event()
+            release_stop = asyncio.Event()
+
+            async def terminate_route_jobs(*, reason: str) -> BashJobResetResult:
+                self.assertEqual(reason, "user_stop")
+                stop_started.set()
+                await release_stop.wait()
+                return BashJobResetResult((), ())
+
+            with (
+                patch.object(runtime._main_loop, "request_hard_stop", return_value=True),
+                patch.object(
+                    runtime._bash_job_supervisor,
+                    "terminate_route_jobs",
+                    side_effect=terminate_route_jobs,
+                ),
+                patch.object(runtime, "_ensure_message_worker"),
+            ):
+                stop_task = asyncio.create_task(runtime.request_stop())
+                await stop_started.wait()
+                enqueue_task = asyncio.create_task(
+                    runtime.enqueue_user_message(
+                        "resume after stop",
+                        client_message_id="resume_message",
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(enqueue_task.done())
+                self.assertTrue(runtime._user_message_queue.empty())
+
+                release_stop.set()
+                self.assertTrue(await stop_task)
+                await enqueue_task
+
+            queued = runtime._user_message_queue.get_nowait()
+            runtime._user_message_queue.task_done()
+            self.assertEqual(queued.user_text, "resume after stop")
+            self.assertEqual(queued.client_message_id, "resume_message")
+            self.assertTrue(runtime._main_resume_requires_user_message)
+
     async def test_stop_suppresses_paused_subagent_followup_until_user_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
@@ -1179,8 +1462,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 core_settings=build_core_settings(root_dir=Path(tmp)),
             )
 
-            with patch.object(runtime._main_loop, "request_stop", return_value=True):
-                self.assertTrue(runtime.request_stop())
+            with patch.object(runtime._main_loop, "request_hard_stop", return_value=True):
+                self.assertTrue(await runtime.request_stop())
 
             await runtime.publish_event(
                 RouteSystemNoticeEvent(
@@ -1235,11 +1518,12 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            with patch.object(runtime._main_loop, "request_stop", return_value=True):
-                self.assertTrue(runtime.request_stop())
+            with patch.object(runtime._main_loop, "request_hard_stop", return_value=True):
+                self.assertTrue(await runtime.request_stop())
 
             await runtime.enqueue_user_message("continue")
             runtime._ensure_message_worker()
+            await asyncio.wait_for(runtime._user_message_queue.join(), timeout=1)
             await asyncio.wait_for(runtime._message_queue.join(), timeout=1)
 
             self.assertEqual(observed_calls, [("user", "continue")])
@@ -1590,8 +1874,8 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 agent_name="Jarvis",
             )
 
-            with patch.object(runtime._main_loop, "request_stop", return_value=False):
-                self.assertTrue(runtime.request_stop())
+            with patch.object(runtime._main_loop, "request_hard_stop", return_value=False):
+                self.assertTrue(await runtime.request_stop())
 
             self.assertTrue(runtime._main_resume_requires_user_message)
             records = runtime._main_loop._storage.load_records(session_id)
@@ -1867,7 +2151,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(accepted)
             self.assertTrue(runtime._message_queue.empty())
 
-    async def test_main_bash_runtime_turn_persists_concise_agent_only_system_notice_and_uses_runtime_turn(
+    async def test_main_running_bash_output_does_not_poll_the_llm(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1902,12 +2186,15 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 progress_hint="done",
             )
             published_events: list[RouteSystemNoticeEvent] = []
+            runtime_turn_called = False
 
             async def _publish_event(event):
                 if isinstance(event, RouteSystemNoticeEvent):
                     published_events.append(event)
 
             async def _stream_runtime_turn(*, force_session_id=None, command_override=None, pre_turn_messages=()):
+                nonlocal runtime_turn_called
+                runtime_turn_called = True
                 _ = command_override, pre_turn_messages
                 yield AgentTurnDoneEvent(
                     session_id=force_session_id or session_id,
@@ -1929,17 +2216,10 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                 and record.metadata.get("bash_job_progress_update") is True
             ]
             user_records = [record for record in records if record.role == "user"]
-            self.assertEqual(len(system_notes), 1)
-            self.assertIn(notice.job_id, system_notes[0].content)
-            self.assertNotIn("command:", system_notes[0].content)
-            self.assertNotIn("stdout tail:", system_notes[0].content)
-            self.assertIn("not a new user message", system_notes[0].content)
-            self.assertLess(len(system_notes[0].content), 500)
+            self.assertEqual(system_notes, [])
             self.assertEqual(user_records, [])
-            self.assertEqual(len(published_events), 1)
-            self.assertEqual(published_events[0].notice_kind, "bash_job_progress_update")
-            self.assertIn(notice.job_id, published_events[0].text)
-            self.assertFalse(published_events[0].public)
+            self.assertEqual(published_events, [])
+            self.assertFalse(runtime_turn_called)
 
             worker = runtime._message_worker
             if worker is not None:

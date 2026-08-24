@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from jarvis.logging_setup import get_application_logger
+from jarvis.runtime_errors import record_runtime_error
 from jarvis.runtime_provider_configuration import (
     RuntimeProviderConfiguration,
     load_runtime_provider_configuration,
@@ -58,7 +59,6 @@ _SENTENCE_BREAK_PATTERN = re.compile(r'[.!?](?:["\')\]]+)?(?:\s+|$)')
 _WHITESPACE_BREAK_PATTERN = re.compile(r"\s+")
 _TYPING_ACTION = "typing"
 _TYPING_INITIAL_DELAY_SECONDS = 0.5
-_ACTIVE_TURN_RUNTIME_ERROR_TEXT = "❌ Error occurred. Try again."
 
 
 class GatewayClientLike(Protocol):
@@ -377,7 +377,6 @@ class TelegramGatewayBridge:
         self._output_pause_state_by_chat: dict[int, _ChatOutputPauseState] = {}
         self._typing_indicator_by_chat: dict[int, _ChatTypingIndicatorState] = {}
         self._task_status_active_by_chat: dict[int, bool] = {}
-        self._pending_stop_completion_by_chat: set[int] = set()
 
     async def run_forever(self) -> None:
         bot_profile = await self._telegram.get_me()
@@ -733,14 +732,6 @@ class TelegramGatewayBridge:
     ) -> None:
         output_paused = self._chat_output_paused(chat_id)
         if isinstance(event, GatewayErrorEvent):
-            await self._send_stop_completion_if_pending(chat_id)
-            if not output_paused:
-                self._task_status_active_by_chat.pop(chat_id, None)
-                self._stop_typing_indicator(chat_id)
-                await self._send_final_text(
-                    chat_id=chat_id,
-                    text=_ACTIVE_TURN_RUNTIME_ERROR_TEXT,
-                )
             self._finish_submitted_turn(
                 chat_id=chat_id,
                 client_message_id=active_turn.client_message_id,
@@ -824,13 +815,11 @@ class TelegramGatewayBridge:
                 )
                 active_turn.pending_finalized_text_for_dedup = flushed_text
             if not output_paused:
-                self._stop_typing_indicator(chat_id)
                 await self._send_approval_request_message(chat_id=chat_id, approval=event)
             self._reset_stream_segment(chat_id=chat_id, active_turn=active_turn)
             return
         if isinstance(event, GatewayAuthRequiredEvent):
             if not output_paused:
-                self._stop_typing_indicator(chat_id)
                 await self._send_html_message(
                     chat_id=chat_id,
                     html_text=_format_auth_required_message(event),
@@ -838,7 +827,6 @@ class TelegramGatewayBridge:
                 active_turn.delivered_any_segment = True
             return
         if isinstance(event, GatewayTurnDoneEvent):
-            await self._send_stop_completion_if_pending(chat_id)
             if (
                 not output_paused
                 and not event.interrupted
@@ -867,15 +855,6 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 client_message_id=active_turn.client_message_id,
             )
-
-    async def _send_stop_completion_if_pending(self, chat_id: int) -> None:
-        if chat_id not in self._pending_stop_completion_by_chat:
-            return
-        self._pending_stop_completion_by_chat.discard(chat_id)
-        await self._send_html_message(
-            chat_id=chat_id,
-            html_text=_format_local_system_notice("Session stopped."),
-        )
 
     async def _activate_submitted_turn(
         self,
@@ -918,7 +897,7 @@ class TelegramGatewayBridge:
         )
         next_delay = initial_delay
         try:
-            while not self._chat_output_paused(chat_id):
+            while True:
                 reset_event = state.reset_event
                 if reset_event is None:
                     return
@@ -929,8 +908,6 @@ class TelegramGatewayBridge:
                 else:
                     reset_event.clear()
                     next_delay = initial_delay
-                    continue
-                if self._chat_output_paused(chat_id):
                     continue
                 try:
                     await self._telegram.send_chat_action(
@@ -949,7 +926,7 @@ class TelegramGatewayBridge:
         chat_id: int,
         event: GatewayTaskStatusEvent,
     ) -> None:
-        if event.active and not self._chat_output_paused(chat_id):
+        if event.active:
             self._task_status_active_by_chat[chat_id] = True
             self._ensure_typing_indicator(chat_id)
             return
@@ -957,8 +934,6 @@ class TelegramGatewayBridge:
         self._stop_typing_indicator(chat_id)
 
     def _ensure_typing_indicator(self, chat_id: int) -> None:
-        if self._chat_output_paused(chat_id):
-            return
         state = self._typing_indicator_by_chat.get(chat_id)
         if state is not None and state.task is not None and not state.task.done():
             return
@@ -967,7 +942,58 @@ class TelegramGatewayBridge:
             self._typing_indicator_loop(chat_id=chat_id, state=state),
             name=f"jarvis-telegram-typing-{chat_id}",
         )
+        state.task.add_done_callback(
+            lambda task: self._typing_indicator_task_done(
+                chat_id=chat_id,
+                state=state,
+                task=task,
+            )
+        )
         self._typing_indicator_by_chat[chat_id] = state
+        LOGGER.info("Telegram master typing indicator started (chat_id=%s).", chat_id)
+
+    def _typing_indicator_task_done(
+        self,
+        *,
+        chat_id: int,
+        state: _ChatTypingIndicatorState,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._typing_indicator_by_chat.get(chat_id) is not state:
+            return
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            LOGGER.error(
+                "Telegram typing indicator task failed unexpectedly.",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            if isinstance(error, Exception):
+                route_id = route_id_for_chat(chat_id)
+                workspace_dir = self._settings.telegram_temp_dir.parent
+                record_runtime_error(
+                    transcript_archive_dir=workspace_dir / "archive" / "transcripts",
+                    route_id=route_id,
+                    session_id=None,
+                    component="ui.telegram.bot",
+                    event="typing_indicator_task_failed",
+                    agent_kind="main",
+                    exc=error,
+                    error_code="typing_indicator_task_failed",
+                    message=(
+                        f"Telegram typing indicator task failed for route {route_id}."
+                    ),
+                    context={"chat_id": chat_id},
+                )
+        self._typing_indicator_by_chat.pop(chat_id, None)
+        if self._task_status_active_by_chat.get(chat_id):
+            LOGGER.info(
+                "Telegram master typing indicator restarting while route remains active "
+                "(chat_id=%s).",
+                chat_id,
+            )
+            asyncio.get_running_loop().call_soon(self._ensure_typing_indicator, chat_id)
 
     def _refresh_typing_indicator(self, chat_id: int) -> None:
         if self._task_status_active_by_chat.get(chat_id):
@@ -990,6 +1016,7 @@ class TelegramGatewayBridge:
         typing_task.cancel()
         state.task = None
         state.reset_event = None
+        LOGGER.info("Telegram master typing indicator stopped (chat_id=%s).", chat_id)
 
     async def _maybe_publish_stream_chunks(
         self,
@@ -1192,14 +1219,12 @@ class TelegramGatewayBridge:
                 self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayApprovalRequestEvent):
-            self._stop_typing_indicator(chat_id)
             await self._send_approval_request_message(
                 chat_id=chat_id,
                 approval=event,
             )
             return
         if isinstance(event, GatewayAuthRequiredEvent):
-            self._stop_typing_indicator(chat_id)
             await self._send_html_message(
                 chat_id=chat_id,
                 html_text=_format_auth_required_message(event),
@@ -1452,26 +1477,32 @@ class TelegramGatewayBridge:
         return None
 
     async def _handle_stop_command(self, message: IncomingTelegramMessage) -> None:
+        output_was_paused = self._chat_output_paused(message.chat_id)
+        self._pause_chat_output(message.chat_id)
         try:
             route_session = await self._ensure_route_session(message.chat_id)
             stop_requested = await route_session.request_stop()
         except GatewayBridgeError as exc:
+            if not output_was_paused:
+                self._output_pause_state_by_chat.pop(message.chat_id, None)
             LOGGER.exception(
                 "Gateway stop request failed; suppressing Telegram error text (code=%s, message=%s).",
                 exc.code,
                 exc.message,
             )
             return
+        except Exception:
+            if not output_was_paused:
+                self._output_pause_state_by_chat.pop(message.chat_id, None)
+            raise
 
         if stop_requested:
-            self._pending_stop_completion_by_chat.add(message.chat_id)
             await self._send_html_message(
                 chat_id=message.chat_id,
-                html_text=_format_local_system_notice(
-                    "Prepare to stop the session."
-                ),
+                html_text=_format_local_system_notice("Session stopped."),
             )
-            self._pause_chat_output(message.chat_id)
+        elif not output_was_paused:
+            self._output_pause_state_by_chat.pop(message.chat_id, None)
         return
 
     async def _handle_ui_command(self, message: IncomingTelegramMessage) -> bool:
@@ -1498,8 +1529,6 @@ class TelegramGatewayBridge:
             self._output_pause_state_by_chat[chat_id] = state
         state.paused = True
         state.resume_client_message_id = None
-        self._task_status_active_by_chat.pop(chat_id, None)
-        self._stop_typing_indicator(chat_id)
 
     def _chat_output_paused(self, chat_id: int) -> bool:
         state = self._output_pause_state_by_chat.get(chat_id)

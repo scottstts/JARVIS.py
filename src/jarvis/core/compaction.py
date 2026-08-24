@@ -50,6 +50,8 @@ _COMPACTION_SOURCE_EVENT_LIMITS: tuple[int | None, ...] = (
     4_000,
     2_000,
 )
+_COMPACTION_RENDER_TOKEN_MARGIN = 512
+_COMPACTION_MIN_EVENT_BODY_CHARS = 256
 _COMPACTION_TOOL_NAME = "submit_compaction"
 _COMPACTION_TOOL = ToolDefinition(
     name=_COMPACTION_TOOL_NAME,
@@ -189,6 +191,17 @@ _SOURCE_METADATA_KEYS = {
     "carry_forward_compacted",
     "carry_forward_compaction_strength",
     "image_input",
+    "task_contract",
+    "task_contract_revision",
+    "task_id",
+    "user_message_sha256",
+    "bash_job_progress_update",
+    "bash_job_notice_kinds",
+    "bash_job_running_ids",
+    "bash_job_terminal_ids",
+    "error_code",
+    "conflict_class",
+    "conflict_key",
 }
 LOGGER = get_application_logger(__name__)
 
@@ -431,17 +444,71 @@ class ContextCompactor:
             )
             // 100,
         )
+        base_text, _ = _render_compaction_input(
+            source_events=(),
+            previous_bundle=previous_bundle,
+            user_instruction=user_instruction,
+            repair_issues=repair_issues,
+            rejected_payload=rejected_payload,
+            rejected_raw_text=rejected_raw_text,
+            event_content_limit=0,
+            source_char_budget=0,
+        )
+        base_estimate = estimate_request_input_tokens(
+            self._build_request(user_text=base_text)
+        )
+        diagnostics.update(
+            {
+                "compaction_safe_input_limit_tokens": safe_input_limit,
+                "compaction_preflight_limit_tokens": (
+                    self._context_policy.preflight_limit_tokens
+                ),
+                "compaction_source_event_count": len(source_events),
+            }
+        )
+        if base_estimate + _COMPACTION_RENDER_TOKEN_MARGIN >= safe_input_limit:
+            diagnostics["compaction_estimated_input_tokens"] = base_estimate
+            error = ContextBudgetError(
+                "Compaction instructions and prior canonical context exceed the safe input budget."
+            )
+            _attach_compaction_error_metadata(error, diagnostics)
+            raise error
+        source_char_budget = max(
+            1,
+            (
+                safe_input_limit
+                - base_estimate
+                - _COMPACTION_RENDER_TOKEN_MARGIN
+            )
+            * 4,
+        )
         last_estimate = 0
         for event_content_limit in _COMPACTION_SOURCE_EVENT_LIMITS:
-            user_text, truncated_event_count = _render_compaction_input(
-                source_events=source_events,
-                previous_bundle=previous_bundle,
-                user_instruction=user_instruction,
-                repair_issues=repair_issues,
-                rejected_payload=rejected_payload,
-                rejected_raw_text=rejected_raw_text,
-                event_content_limit=event_content_limit,
-            )
+            try:
+                user_text, truncated_event_count = _render_compaction_input(
+                    source_events=source_events,
+                    previous_bundle=previous_bundle,
+                    user_instruction=user_instruction,
+                    repair_issues=repair_issues,
+                    rejected_payload=rejected_payload,
+                    rejected_raw_text=rejected_raw_text,
+                    event_content_limit=event_content_limit,
+                    source_char_budget=source_char_budget,
+                )
+            except ContextBudgetError as exc:
+                metadata = getattr(exc, "metadata", {})
+                minimum_chars = int(metadata.get("compaction_minimum_render_chars", 0))
+                diagnostics.update(
+                    {
+                        "compaction_estimated_input_tokens": (
+                            base_estimate + max(0, minimum_chars + 3) // 4
+                        ),
+                        "compaction_source_global_char_budget": source_char_budget,
+                        "compaction_source_event_char_limit": event_content_limit,
+                    }
+                )
+                _attach_compaction_error_metadata(exc, diagnostics)
+                raise
             request = self._build_request(user_text=user_text)
             last_estimate = estimate_request_input_tokens(request)
             diagnostics.update(
@@ -454,6 +521,7 @@ class ContextCompactor:
                     "compaction_source_event_count": len(source_events),
                     "compaction_source_input_chars": len(user_text),
                     "compaction_source_event_char_limit": event_content_limit,
+                    "compaction_source_global_char_budget": source_char_budget,
                     "compaction_source_truncated_event_count": truncated_event_count,
                 }
             )
@@ -469,6 +537,8 @@ class ContextCompactor:
                     event_content_limit,
                 )
                 return request
+            excess_chars = max(4, (last_estimate - safe_input_limit + 1) * 4)
+            source_char_budget = max(1, source_char_budget - excess_chars)
         error = ContextBudgetError(
             "Compaction source remains over its safe input budget after bounded rendering."
         )
@@ -662,6 +732,7 @@ def _render_compaction_input(
     rejected_payload: Mapping[str, Any] | None,
     rejected_raw_text: str | None,
     event_content_limit: int | None,
+    source_char_budget: int | None = None,
 ) -> tuple[str, int]:
     previous_context = (
         _canonical_json(_previous_bundle_semantics(previous_bundle))
@@ -671,6 +742,7 @@ def _render_compaction_input(
     transcript, truncated_event_count = _render_source_transcript(
         source_events,
         event_content_limit=event_content_limit,
+        total_char_budget=source_char_budget,
     )
     sections = [
         "Create the complete current continuation record and call submit_compaction once.",
@@ -762,6 +834,7 @@ def _render_source_transcript(
     source_events: Sequence[CompactionSourceEvent],
     *,
     event_content_limit: int | None,
+    total_char_budget: int | None = None,
 ) -> tuple[str, int]:
     event_ref_by_call_id: dict[str, str] = {}
     result_by_call_id: dict[str, tuple[str, str]] = {}
@@ -774,74 +847,219 @@ def _render_source_transcript(
             for call_id in event.causal_ids:
                 result_by_call_id[call_id] = (source_ref, event.content)
 
-    blocks: list[str] = []
-    truncated_event_count = 0
-    for index, event in enumerate(source_events, start=1):
-        source_ref = f"E{index}"
-        header_parts = [
-            source_ref,
-            f"role={event.role}",
-            f"type={event.event_type}",
-            f"at={event.created_at}",
-        ]
-        tool_name = _optional_string((event.metadata or {}).get("tool_name"))
-        if tool_name is not None:
-            header_parts.append(f"tool={tool_name}")
-        ok = (event.metadata or {}).get("ok")
-        if isinstance(ok, bool):
-            header_parts.append(f"ok={str(ok).lower()}")
-        if event.event_type == "tool_result" and event.causal_ids:
-            call_ref = event_ref_by_call_id.get(event.causal_ids[0])
-            if call_ref is not None:
-                header_parts.append(f"responds_to={call_ref}")
+    duplicate_refs = _duplicate_system_event_refs(source_events)
+    exact_indices = {
+        index
+        for index, event in enumerate(source_events, start=1)
+        if _source_event_requires_exact_render(event) and index not in duplicate_refs
+    }
 
-        body_parts: list[str] = []
-        if event.content:
-            content_limit = event_content_limit if event.role == "tool" else None
-            rendered_content, truncated = _bounded_source_text(
-                event.content,
-                max_chars=content_limit,
+    def render_with_limit(content_limit: int | None) -> tuple[str, int]:
+        blocks: list[str] = []
+        truncated_event_count = 0
+        for index, event in enumerate(source_events, start=1):
+            block, event_truncated_count = _render_source_event_block(
+                event=event,
+                index=index,
+                event_ref_by_call_id=event_ref_by_call_id,
+                result_by_call_id=result_by_call_id,
+                content_limit=None if index in exact_indices else content_limit,
+                duplicate_ref=duplicate_refs.get(index),
             )
-            body_parts.append(rendered_content)
-            truncated_event_count += int(truncated)
+            blocks.append(block)
+            truncated_event_count += event_truncated_count
+        return "\n\n".join(blocks), truncated_event_count
 
-        raw_calls = (event.metadata or {}).get("tool_calls")
-        if isinstance(raw_calls, list):
-            rendered_calls: list[str] = []
-            for raw_call in raw_calls:
-                if not isinstance(raw_call, Mapping):
-                    continue
-                call_id = _optional_string(raw_call.get("call_id"))
-                name = _optional_string(raw_call.get("name")) or "unknown"
-                paired_result = result_by_call_id.get(call_id or "")
-                call_header = f"tool call: {name}"
-                if paired_result is not None:
-                    call_header += f" -> result {paired_result[0]}"
-                arguments, arguments_truncated = _render_tool_arguments(
-                    raw_call.get("arguments", {}),
-                    paired_result_content=(
-                        paired_result[1] if paired_result is not None else None
-                    ),
-                    max_string_chars=event_content_limit,
-                )
-                if arguments:
-                    call_header += "\narguments: " + arguments
-                rendered_calls.append(call_header)
-                truncated_event_count += int(arguments_truncated)
-            if rendered_calls:
-                body_parts.append("\n".join(rendered_calls))
+    if total_char_budget is None:
+        return render_with_limit(event_content_limit)
 
-        metadata_notes = _render_event_metadata_notes(event.metadata)
-        if metadata_notes:
-            body_parts.append(metadata_notes)
-        blocks.append(
-            "[EVENT "
-            + " | ".join(header_parts)
-            + "]\n"
-            + ("\n".join(body_parts) or "(no visible content)")
-            + f"\n[/EVENT {source_ref}]"
+    minimum_text, minimum_truncated_count = render_with_limit(
+        _COMPACTION_MIN_EVENT_BODY_CHARS
+    )
+    minimum_chars = len(minimum_text)
+    if minimum_chars > total_char_budget:
+        error = ContextBudgetError(
+            "Compaction exact messages and minimum causal evidence exceed the safe input budget."
         )
-    return "\n\n".join(blocks), truncated_event_count
+        _attach_compaction_error_metadata(
+            error,
+            {
+                "compaction_minimum_render_chars": minimum_chars,
+                "compaction_source_global_char_budget": total_char_budget,
+                "compaction_exact_event_count": len(exact_indices),
+            },
+        )
+        raise error
+
+    upper_limit = max(
+        _COMPACTION_MIN_EVENT_BODY_CHARS,
+        event_content_limit if event_content_limit is not None else total_char_budget,
+    )
+    upper_text, upper_truncated_count = render_with_limit(upper_limit)
+    if len(upper_text) <= total_char_budget:
+        return upper_text, upper_truncated_count
+
+    best_text = minimum_text
+    best_truncated_count = minimum_truncated_count
+    lower = _COMPACTION_MIN_EVENT_BODY_CHARS + 1
+    upper = upper_limit - 1
+    while lower <= upper:
+        midpoint = (lower + upper) // 2
+        candidate_text, candidate_truncated_count = render_with_limit(midpoint)
+        if len(candidate_text) <= total_char_budget:
+            best_text = candidate_text
+            best_truncated_count = candidate_truncated_count
+            lower = midpoint + 1
+        else:
+            upper = midpoint - 1
+    return best_text, best_truncated_count
+
+
+def _render_source_event_block(
+    *,
+    event: CompactionSourceEvent,
+    index: int,
+    event_ref_by_call_id: Mapping[str, str],
+    result_by_call_id: Mapping[str, tuple[str, str]],
+    content_limit: int | None,
+    duplicate_ref: tuple[str, int] | None,
+) -> tuple[str, int]:
+    source_ref = f"E{index}"
+    header_parts = [
+        source_ref,
+        f"role={event.role}",
+        f"type={event.event_type}",
+        f"at={event.created_at}",
+    ]
+    tool_name = _optional_string((event.metadata or {}).get("tool_name"))
+    if tool_name is not None:
+        header_parts.append(f"tool={tool_name}")
+    ok = (event.metadata or {}).get("ok")
+    if isinstance(ok, bool):
+        header_parts.append(f"ok={str(ok).lower()}")
+    if event.event_type == "tool_result" and event.causal_ids:
+        call_ref = event_ref_by_call_id.get(event.causal_ids[0])
+        if call_ref is not None:
+            header_parts.append(f"responds_to={call_ref}")
+
+    body_parts: list[str] = []
+    truncated_event_count = 0
+    if duplicate_ref is not None:
+        canonical_ref, occurrence_count = duplicate_ref
+        body_parts.append(
+            "Earlier coalesced lifecycle or repeated evidence; "
+            f"see latest event {canonical_ref} ({occurrence_count} related occurrences)."
+        )
+        truncated_event_count += 1
+    elif event.content:
+        rendered_content, truncated = _bounded_source_text(
+            event.content,
+            max_chars=content_limit,
+        )
+        body_parts.append(rendered_content)
+        truncated_event_count += int(truncated)
+
+    raw_calls = (event.metadata or {}).get("tool_calls")
+    if isinstance(raw_calls, list):
+        rendered_calls: list[str] = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, Mapping):
+                continue
+            call_id = _optional_string(raw_call.get("call_id"))
+            name = _optional_string(raw_call.get("name")) or "unknown"
+            paired_result = result_by_call_id.get(call_id or "")
+            call_header = f"tool call: {name}"
+            if paired_result is not None:
+                call_header += f" -> result {paired_result[0]}"
+            arguments, arguments_truncated = _render_tool_arguments(
+                raw_call.get("arguments", {}),
+                paired_result_content=(
+                    paired_result[1] if paired_result is not None else None
+                ),
+                max_string_chars=content_limit,
+            )
+            if arguments:
+                call_header += "\narguments: " + arguments
+            rendered_calls.append(call_header)
+            truncated_event_count += int(arguments_truncated)
+        if rendered_calls:
+            body_parts.append("\n".join(rendered_calls))
+
+    metadata_notes = _render_event_metadata_notes(event.metadata)
+    if metadata_notes:
+        body_parts.append(metadata_notes)
+    block = (
+        "[EVENT "
+        + " | ".join(header_parts)
+        + "]\n"
+        + ("\n".join(body_parts) or "(no visible content)")
+        + f"\n[/EVENT {source_ref}]"
+    )
+    return block, truncated_event_count
+
+
+def _source_event_requires_exact_render(event: CompactionSourceEvent) -> bool:
+    if event.role == "user":
+        return True
+    return event.role == "assistant" and event.event_type == "assistant_message"
+
+
+def _duplicate_system_event_refs(
+    source_events: Sequence[CompactionSourceEvent],
+) -> dict[int, tuple[str, int]]:
+    occurrences: dict[tuple[str, str], list[int]] = {}
+    for index, event in enumerate(source_events, start=1):
+        metadata = event.metadata or {}
+        key: tuple[str, str] | None = None
+        if event.role == "system" and event.content.strip():
+            if bool(metadata.get("task_contract")):
+                revision = _optional_string(metadata.get("task_contract_revision"))
+                key = (
+                    "task_contract",
+                    revision or _sha256_text(event.content),
+                )
+            elif event.event_type == "system_event":
+                key = ("system_event", _sha256_text(event.content))
+        if bool(metadata.get("bash_job_progress_update")):
+            job_id_set: set[str] = set()
+            for field in ("bash_job_running_ids", "bash_job_terminal_ids"):
+                raw_job_ids = metadata.get(field)
+                if not isinstance(raw_job_ids, list):
+                    continue
+                job_id_set.update(
+                    str(item).strip() for item in raw_job_ids if str(item).strip()
+                )
+            job_ids = tuple(sorted(job_id_set))
+            if job_ids:
+                key = ("bash_lifecycle", _canonical_json(job_ids))
+        error_code = _optional_string(metadata.get("error_code"))
+        if error_code in {
+            "workspace_lease_conflict",
+            "blocked_repeated_tool_call",
+            "orchestrator_wait_required",
+        }:
+            key = (
+                "repeated_failure",
+                error_code
+                + ":"
+                + (
+                    _optional_string(metadata.get("conflict_key"))
+                    or _optional_string(metadata.get("conflict_class"))
+                    or "default"
+                ),
+            )
+        if key is None:
+            continue
+        occurrences.setdefault(key, []).append(index)
+
+    duplicate_refs: dict[int, tuple[str, int]] = {}
+    for indices in occurrences.values():
+        if len(indices) < 2:
+            continue
+        canonical_index = indices[-1]
+        for index in indices[:-1]:
+            duplicate_refs[index] = (f"E{canonical_index}", len(indices))
+    return duplicate_refs
 
 
 def _render_tool_arguments(
@@ -876,7 +1094,12 @@ def _render_tool_arguments(
     normalized = compact(value)
     if normalized in ({}, [], None, ""):
         return "", truncated
-    return _canonical_json(normalized), truncated
+    rendered = _canonical_json(normalized)
+    rendered, whole_truncated = _bounded_source_text(
+        rendered,
+        max_chars=max_string_chars,
+    )
+    return rendered, truncated or whole_truncated
 
 
 def _render_event_metadata_notes(metadata: Mapping[str, Any] | None) -> str:

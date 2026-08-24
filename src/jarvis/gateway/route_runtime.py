@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
 from pathlib import Path
-import traceback
 from typing import Any
 from uuid import uuid4
 
@@ -47,8 +46,8 @@ from jarvis.llm import (
     ToolDefinition,
 )
 from jarvis.logging_setup import get_application_logger
+from jarvis.runtime_errors import record_runtime_error
 from jarvis.storage import SessionStorage
-from jarvis.storage.layout import transcript_archive_root_from_runtime_path
 from jarvis.subagent import (
     SUBAGENT_PRIMITIVE_NAMES,
     SubagentManager,
@@ -100,15 +99,22 @@ _SUBAGENT_MAIN_PROGRESS_NOTICE_KINDS = frozenset(
     }
 )
 _SUBAGENT_USER_STOP_NOTE_HEADER = (
-    "The user issued /stop. Any active background subagents were also asked to stop "
-    "cooperatively."
+    "The user issued /stop. Route-owned subagents were hard-paused."
 )
 _MAIN_BASH_PROGRESS_RUNTIME_KIND = "main_bash_progress"
 _MAIN_BASH_PROGRESS_NOTICE_KIND = "bash_job_progress_update"
 _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND = "main_subagent_progress"
 _MAIN_SUBAGENT_PROGRESS_NOTICE_KIND = "subagent_progress_update"
 _MAIN_PROVIDER_RECOVERY_RUNTIME_KIND = "main_provider_recovery"
+_MAIN_ORCHESTRATOR_REVIEW_RUNTIME_KIND = "main_orchestrator_review"
 _MAX_MAIN_PROVIDER_RECOVERY_ATTEMPTS = 3
+_ORCHESTRATOR_WAIT_MIN_SECONDS = 30
+_ORCHESTRATOR_WAIT_MAX_SECONDS = 30 * 60
+_ORCHESTRATOR_WAIT_BACKOFF_BASE_SECONDS = 60
+_WAIT_ONLY_BASH_PATTERN = re.compile(
+    r"^\s*sleep\s+\d+(?:\.\d+)?\s*(?:&&|;)\s*(?:echo|printf)\b[^\n]*(?:tick|wait|poll)",
+    re.IGNORECASE,
+)
 LOGGER = get_application_logger(__name__)
 
 
@@ -124,6 +130,7 @@ class _RouteTurnRequest:
     runtime_turn_kind: str | None = None
     provider_recovery_attempt: int = 0
     provider_recovery_task_id: str | None = None
+    orchestrator_wait_generation: int | None = None
 
 
 class RouteEventBus:
@@ -223,6 +230,10 @@ class RouteRuntime:
         self._main_subagent_runtime_turn_queued = False
         self._subagent_reset_in_progress = False
         self._published_task_active = False
+        self._orchestrator_wait_task: asyncio.Task[None] | None = None
+        self._orchestrator_wait_generation = 0
+        self._orchestrator_unchanged_waits = 0
+        self._hard_stop_lock = asyncio.Lock()
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
         self._codex_settings = CodexBackendSettings.from_env()
@@ -301,20 +312,6 @@ class RouteRuntime:
     def active_session_id(self) -> str | None:
         return self._main_loop.active_session_id()
 
-    def _runtime_error_log_dir(self) -> Path:
-        transcript_root = transcript_archive_root_from_runtime_path(
-            transcript_archive_dir=self._core_settings.transcript_archive_dir,
-            route_id=self._route_id,
-        )
-        return transcript_root.parent / "error_logs"
-
-    def _runtime_error_log_path(self, *, session_id: str | None) -> Path:
-        stem = (session_id or f"route_{self._route_id}_unbound").strip()
-        if not stem:
-            stem = f"route_{self._route_id}_unbound"
-        sanitized = stem.replace("/", "_")
-        return self._runtime_error_log_dir() / f"{sanitized}.jsonl"
-
     def _write_runtime_error_log(
         self,
         *,
@@ -327,44 +324,32 @@ class RouteRuntime:
         exc: Exception,
         error_code: str = "internal_error",
     ) -> Path:
-        error_log_path = self._runtime_error_log_path(session_id=session_id)
-        error_log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        entry = {
-            "schema": "jarvis.runtime_error.v1",
-            "logged_at": timestamp,
-            "component": "gateway.route_runtime",
-            "event": "main_turn_runtime_error",
-            "level": "ERROR",
-            "route_id": self._route_id,
-            "agent_kind": "main",
-            "message": (
+        return record_runtime_error(
+            transcript_archive_dir=self._core_settings.transcript_archive_dir,
+            route_id=self._route_id,
+            session_id=session_id,
+            component="gateway.route_runtime",
+            event="main_turn_runtime_error",
+            agent_kind="main",
+            exc=exc,
+            error_code=error_code,
+            message=(
                 f"Route {self._route_id} main turn failed while processing "
                 f"client_message_id={request.client_message_id}."
             ),
-            "error_code": error_code,
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "request_turn_kind": "user" if request.user_initiated else "runtime",
-            "published_turn_kind": published_turn_kind,
-            "client_message_id": request.client_message_id,
-            "published_client_message_id": published_client_message_id,
-            "user_initiated": request.user_initiated,
-            "parse_commands": request.parse_commands,
-            "parsed_command_kind": parsed_command_kind,
-            "runtime_turn_kind": request.runtime_turn_kind,
-            "force_session_id": request.force_session_id,
-            "exception_type": type(exc).__name__,
-            "exception_module": type(exc).__module__,
-            "exception_message": str(exc),
-            "exception_metadata": _exception_metadata(exc),
-            "traceback": traceback_text,
-        }
-        with error_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False))
-            handle.write("\n")
-        return error_log_path
+            context={
+                "turn_id": turn_id,
+                "request_turn_kind": "user" if request.user_initiated else "runtime",
+                "published_turn_kind": published_turn_kind,
+                "client_message_id": request.client_message_id,
+                "published_client_message_id": published_client_message_id,
+                "user_initiated": request.user_initiated,
+                "parse_commands": request.parse_commands,
+                "parsed_command_kind": parsed_command_kind,
+                "runtime_turn_kind": request.runtime_turn_kind,
+                "force_session_id": request.force_session_id,
+            },
+        )
 
     def _print_runtime_error_notice(self, *, error_log_path: Path) -> None:
         from rich.console import Console
@@ -374,17 +359,118 @@ class RouteRuntime:
         text.append(str(error_log_path), style="bold cyan")
         Console(stderr=True).print(text, highlight=False)
 
-    def request_stop(self) -> bool:
-        stop_requested, affected_subagents, pending_bash_jobs = self._request_route_stop()
-        if stop_requested and not self._main_resume_requires_user_message:
-            self._main_resume_requires_user_message = True
-            self._invalidate_stale_internal_followups()
-            self._published_task_active = False
-        if affected_subagents:
-            self._append_user_stop_subagent_note(affected_subagents)
+    async def request_stop(self) -> bool:
+        """Hard-quiesce all work owned by this route without replacing the session."""
+        async with self._hard_stop_lock:
+            return await self._request_stop_locked()
+
+    async def _request_stop_locked(self) -> bool:
+        LOGGER.info("Route hard stop requested (route=%s).", self._route_id)
+        self._cancel_orchestrator_wait(reset_backoff=True)
+        pending_bash_jobs = tuple(
+            self._bash_job_supervisor.pending_jobs(include_services=True)
+        )
+        affected_subagents = self._subagent_manager.request_hard_stop_all_for_user_stop()
+        main_stop_requested = self._main_loop.request_hard_stop(reason="user_stop")
+        stop_requested = (
+            main_stop_requested
+            or bool(affected_subagents)
+            or bool(pending_bash_jobs)
+            or self._active_turn_request is not None
+            or not self._user_message_queue.empty()
+            or not self._message_queue.empty()
+        )
+        if not stop_requested:
+            LOGGER.info("Route hard stop was already quiescent (route=%s).", self._route_id)
+            return False
+
+        self._main_resume_requires_user_message = True
+        self._invalidate_stale_internal_followups()
+        self._clear_pending_main_bash_notices()
+        self._clear_pending_main_subagent_notices()
+        cancelled_user_requests = self._drain_user_request_queue()
+        self._drain_internal_request_queue()
+
+        try:
+            bash_reset = await self._bash_job_supervisor.terminate_route_jobs(
+                reason="user_stop"
+            )
+            settled_subagents = await self._subagent_manager.settle_hard_user_stop(
+                subagent_ids=frozenset(
+                    snapshot.subagent_id for snapshot in affected_subagents
+                )
+            )
+            await self._wait_for_main_hard_stop_settle()
+        except Exception as exc:
+            error_log_path = record_runtime_error(
+                transcript_archive_dir=self._core_settings.transcript_archive_dir,
+                route_id=self._route_id,
+                session_id=self._main_loop.active_session_id(),
+                component="gateway.route_runtime",
+                event="route_hard_stop_failed",
+                agent_kind="main",
+                exc=exc,
+                error_code="route_hard_stop_failed",
+                message=f"Route {self._route_id} failed to hard-quiesce after /stop.",
+                context={
+                    "pending_bash_job_ids": [item.job_id for item in pending_bash_jobs],
+                    "affected_subagent_ids": [
+                        item.subagent_id for item in affected_subagents
+                    ],
+                },
+            )
+            self._print_runtime_error_notice(error_log_path=error_log_path)
+            await self._publish_task_status_if_changed(reason="user_stop_failed")
+            raise
+
+        if settled_subagents or affected_subagents:
+            self._append_user_stop_subagent_note(
+                settled_subagents or affected_subagents
+            )
         if pending_bash_jobs:
             self._append_user_stop_bash_job_note(pending_bash_jobs)
-        return stop_requested
+        self._append_user_stop_hard_quiesce_note(
+            bash_reset=bash_reset,
+            affected_subagents=settled_subagents or affected_subagents,
+        )
+        for cancelled_request in cancelled_user_requests:
+            cancelled_turn_id = (
+                cancelled_request.client_message_id or f"stopped_{uuid4().hex}"
+            )
+            await self.publish_event(
+                RouteTurnStartedEvent(
+                    route_id=self._route_id,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    session_id=self._main_loop.active_session_id(),
+                    turn_id=cancelled_turn_id,
+                    turn_kind="user",
+                    client_message_id=cancelled_request.client_message_id,
+                )
+            )
+            await self.publish_event(
+                RouteTurnDoneEvent(
+                    route_id=self._route_id,
+                    agent_kind="main",
+                    agent_name="Jarvis",
+                    session_id=self._main_loop.active_session_id(),
+                    turn_id=cancelled_turn_id,
+                    turn_kind="user",
+                    client_message_id=cancelled_request.client_message_id,
+                    response_text="",
+                    interrupted=True,
+                    completion_blocked=True,
+                    interruption_reason="user_stop",
+                )
+            )
+        await self._publish_task_status_if_changed(reason="user_stop_quiesced")
+        LOGGER.info(
+            "Route hard stop completed (route=%s, subagents=%d, jobs=%d).",
+            self._route_id,
+            len(settled_subagents or affected_subagents),
+            len(pending_bash_jobs),
+        )
+        return True
 
     def _request_user_message_supersede(self) -> None:
         self._main_loop.request_stop(
@@ -393,25 +479,44 @@ class RouteRuntime:
         self._invalidate_stale_internal_followups()
 
     def _request_new_session_hard_reset(self) -> None:
+        self._cancel_orchestrator_wait(reset_backoff=True)
         self._new_session_boundary_pending = True
         self._main_loop.request_hard_stop(reason="new_session")
         self._subagent_manager.request_hard_stop_all_for_new_session()
         self._invalidate_stale_internal_followups()
 
-    def _request_route_stop(
-        self,
-    ) -> tuple[bool, tuple[SubagentSnapshot, ...], tuple[object, ...]]:
-        main_stop_requested = self._main_loop.request_stop(reason="user_stop")
+    def _drain_internal_request_queue(self) -> None:
+        while True:
+            try:
+                self._message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._message_queue.task_done()
+        self._main_bash_runtime_turn_queued = False
+        self._main_subagent_runtime_turn_queued = False
 
-        affected_subagents = self._subagent_manager.request_stop_all_for_user_stop()
+    def _drain_user_request_queue(self) -> tuple[_RouteTurnRequest, ...]:
+        requests: list[_RouteTurnRequest] = []
+        while True:
+            try:
+                request = self._user_message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                requests.append(request)
+                self._user_message_queue.task_done()
+        return tuple(requests)
 
-        pending_bash_jobs = self._bash_job_supervisor.pending_jobs()
-        self._invalidate_stale_internal_followups()
-        return (
-            main_stop_requested or bool(affected_subagents) or bool(pending_bash_jobs),
-            affected_subagents,
-            tuple(pending_bash_jobs),
-        )
+    async def _wait_for_main_hard_stop_settle(self) -> None:
+        async def wait_until_idle() -> None:
+            while self._active_turn_request is not None or self._main_loop.has_active_turn():
+                await asyncio.sleep(0.01)
+
+        try:
+            await asyncio.wait_for(wait_until_idle(), timeout=30.0)
+        except TimeoutError as exc:
+            raise RuntimeError("Main route work did not settle after hard stop.") from exc
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         return self._approval_registry.resolve(approval_id, approved)
@@ -422,6 +527,19 @@ class RouteRuntime:
         *,
         client_message_id: str | None = None,
     ) -> None:
+        async with self._hard_stop_lock:
+            await self._enqueue_user_message_locked(
+                user_text,
+                client_message_id=client_message_id,
+            )
+
+    async def _enqueue_user_message_locked(
+        self,
+        user_text: str,
+        *,
+        client_message_id: str | None,
+    ) -> None:
+        self._cancel_orchestrator_wait(reset_backoff=True)
         self._bash_job_supervisor.ensure_running()
         command = parse_user_command(user_text)
         if command.kind == "new":
@@ -442,7 +560,31 @@ class RouteRuntime:
         self._ensure_message_worker()
 
     def subscribe(self) -> tuple[str, asyncio.Queue[RouteEvent]]:
-        return self._event_bus.subscribe()
+        subscriber_id, queue = self._event_bus.subscribe()
+        active_session_id = self._main_loop.active_session_id()
+        active_turn_id = self._main_loop.active_turn_id()
+        queue.put_nowait(
+            RouteTaskStatusEvent(
+                route_id=self._route_id,
+                agent_kind="main",
+                agent_name="Jarvis",
+                session_id=active_session_id,
+                turn_id=active_turn_id,
+                origin_session_id=active_session_id,
+                origin_turn_id=active_turn_id,
+                active=self._route_task_active(),
+                reason="subscriber_snapshot",
+                actor_id="main",
+                actor_sequence=self._actor_event_sequences.get("main", 0),
+                sequence=self._event_sequence,
+            )
+        )
+        LOGGER.info(
+            "Route subscriber received task-status snapshot (route=%s, active=%s).",
+            self._route_id,
+            self._route_task_active(),
+        )
+        return subscriber_id, queue
 
     def unsubscribe(self, subscriber_id: str) -> None:
         self._event_bus.unsubscribe(subscriber_id)
@@ -491,6 +633,20 @@ class RouteRuntime:
         if active == self._published_task_active:
             return
         self._published_task_active = active
+        LOGGER.info(
+            "Route task status changed (route=%s, active=%s, reason=%s, "
+            "user_queue=%d, runtime_queue=%d, pending_jobs=%d, pending_subagents=%d).",
+            self._route_id,
+            active,
+            reason,
+            self._user_message_queue.qsize(),
+            self._message_queue.qsize(),
+            len(self._bash_job_supervisor.pending_jobs()),
+            sum(
+                snapshot.status in {"running", "waiting_background", "awaiting_approval"}
+                for snapshot in self._subagent_manager.active_snapshots()
+            ),
+        )
         actor_id = "main"
         actor_sequence = self._actor_event_sequences.get(actor_id, 0) + 1
         self._actor_event_sequences[actor_id] = actor_sequence
@@ -515,6 +671,13 @@ class RouteRuntime:
         )
 
     def _route_task_active(self) -> bool:
+        if self._bash_job_supervisor.has_pending_jobs():
+            return True
+        if any(
+            snapshot.status in {"running", "waiting_background", "awaiting_approval"}
+            for snapshot in self._subagent_manager.active_snapshots()
+        ):
+            return True
         if self._main_resume_requires_user_message:
             return False
         if self._active_turn_request is not None:
@@ -527,12 +690,7 @@ class RouteRuntime:
             return True
         if self._pending_main_bash_notices or self._pending_main_subagent_notices:
             return True
-        if self._bash_job_supervisor.has_pending_jobs():
-            return True
-        return any(
-            snapshot.status in {"running", "waiting_background", "awaiting_approval"}
-            for snapshot in self._subagent_manager.active_snapshots()
-        )
+        return False
 
     async def _publish_main_local_notice(self, notice_kind: str, text: str) -> None:
         request = self._active_turn_request
@@ -726,7 +884,7 @@ class RouteRuntime:
                         continue
                     event_stream = self._main_loop.stream_runtime_turn(
                         force_session_id=force_session_id,
-                        pre_turn_messages=self._build_wait_only_runtime_messages(system_message),
+                        pre_turn_messages=(),
                     )
                 elif request.runtime_turn_kind == _MAIN_SUBAGENT_PROGRESS_RUNTIME_KIND:
                     self._main_subagent_runtime_turn_queued = False
@@ -737,6 +895,13 @@ class RouteRuntime:
                         continue
                     force_session_id, system_message, notices = runtime_message
                     if self._internal_request_is_blocked(request):
+                        continue
+                    if str(system_message.metadata.get("recommended_action", "")) == "wait":
+                        await self._publish_main_subagent_system_message(
+                            session_id=force_session_id,
+                            message=system_message,
+                            notices=notices,
+                        )
                         continue
                     published = await self._publish_main_subagent_system_message(
                         session_id=force_session_id,
@@ -773,6 +938,19 @@ class RouteRuntime:
                     emitted_main_turn_event = True
                     await self._publish_main_loop_event(event, request=request)
             except ContextBudgetError as exc:
+                error_log_path = self._write_runtime_error_log(
+                    request=request,
+                    session_id=self._main_loop.active_session_id() or request.force_session_id,
+                    turn_id=self._main_loop.active_turn_id(),
+                    published_turn_kind="user" if request.user_initiated else "runtime",
+                    published_client_message_id=request.client_message_id,
+                    parsed_command_kind=(
+                        parsed_command.kind if parsed_command is not None else None
+                    ),
+                    exc=exc,
+                    error_code="context_budget_exceeded",
+                )
+                self._print_runtime_error_notice(error_log_path=error_log_path)
                 await self.publish_event(
                     RouteErrorEvent(
                         route_id=self._route_id,
@@ -824,13 +1002,19 @@ class RouteRuntime:
                     )
                 )
             except CodexBackendError as exc:
-                LOGGER.warning(
-                    "Route %s main turn hit a Codex backend error while processing "
-                    "client_message_id=%s: %s",
-                    self._route_id,
-                    request.client_message_id,
-                    exc,
+                error_log_path = self._write_runtime_error_log(
+                    request=request,
+                    session_id=self._main_loop.active_session_id() or request.force_session_id,
+                    turn_id=self._main_loop.active_turn_id(),
+                    published_turn_kind="user" if request.user_initiated else "runtime",
+                    published_client_message_id=request.client_message_id,
+                    parsed_command_kind=(
+                        parsed_command.kind if parsed_command is not None else None
+                    ),
+                    exc=exc,
+                    error_code="codex_backend_error",
                 )
+                self._print_runtime_error_notice(error_log_path=error_log_path)
                 await self.publish_event(
                     RouteErrorEvent(
                         route_id=self._route_id,
@@ -908,6 +1092,10 @@ class RouteRuntime:
             return
         if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return
+        if event.notice_kind != "subagent_waiting_background":
+            self._cancel_orchestrator_wait(reset_backoff=True)
+        else:
+            self._orchestrator_unchanged_waits = 0
         await self._enqueue_main_subagent_followup(event)
 
     async def _enqueue_main_provider_recovery(
@@ -1201,6 +1389,20 @@ class RouteRuntime:
     ) -> ToolExecutionResult:
         if tool_call.name in SUBAGENT_PRIMITIVE_NAMES:
             return await self._execute_subagent_primitive(tool_call, context)
+        if tool_call.name == "bash" and _is_wait_only_bash_call(tool_call):
+            return ToolExecutionResult(
+                call_id=tool_call.call_id,
+                name=tool_call.name,
+                ok=False,
+                content=(
+                    "Wait-only detached timers are not allowed. Use orchestrator_wait when "
+                    "route-owned work is still running and Jarvis has nothing actionable to do."
+                ),
+                metadata={
+                    "execution_failed": True,
+                    "error_code": "orchestrator_wait_required",
+                },
+            )
         try:
             async with self._workspace_access.execute(
                 tool_call=tool_call,
@@ -1254,6 +1456,26 @@ class RouteRuntime:
     ) -> ToolExecutionResult:
         try:
             payload: dict[str, Any]
+            if tool_call.name == "orchestrator_wait":
+                payload = self._register_orchestrator_wait(
+                    wake_after_seconds=int(
+                        tool_call.arguments.get("wake_after_seconds", 0)
+                    ),
+                    reason=str(tool_call.arguments.get("reason", "")),
+                    watch_actor_ids=_optional_string_tuple(
+                        tool_call.arguments.get("watch_actor_ids")
+                    ),
+                    session_id=context.session_id,
+                )
+                return ToolExecutionResult(
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    ok=True,
+                    content=(
+                        "Orchestrator wait registered\n" + _format_payload_lines(payload)
+                    ),
+                    metadata={"orchestrator_wait": True, **payload},
+                )
             if tool_call.name == "subagent_invoke":
                 task_label = str(tool_call.arguments.get("task_label", "")).strip()
                 instructions = str(tool_call.arguments.get("instructions", "")).strip()
@@ -1350,12 +1572,17 @@ class RouteRuntime:
                 )
             raise ValueError(f"Unknown subagent primitive: {tool_call.name}")
         except Exception as exc:
+            failure_title = (
+                "Orchestrator wait failed"
+                if tool_call.name == "orchestrator_wait"
+                else "Subagent control failed"
+            )
             return ToolExecutionResult(
                 call_id=tool_call.call_id,
                 name=tool_call.name,
                 ok=False,
                 content=(
-                    "Subagent control failed\n"
+                    f"{failure_title}\n"
                     f"tool: {tool_call.name}\n"
                     f"error_type: {type(exc).__name__}\n"
                     f"error: {exc}"
@@ -1367,6 +1594,179 @@ class RouteRuntime:
                     "arguments": dict(tool_call.arguments),
                 },
             )
+
+    def _register_orchestrator_wait(
+        self,
+        *,
+        wake_after_seconds: int,
+        reason: str,
+        watch_actor_ids: tuple[str, ...],
+        session_id: str | None,
+    ) -> dict[str, Any]:
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("orchestrator_wait reason must be non-empty.")
+        pending_subagents = tuple(
+            snapshot
+            for snapshot in self._subagent_manager.active_snapshots()
+            if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
+        )
+        pending_jobs = self._bash_job_supervisor.pending_jobs(include_services=True)
+        if not pending_subagents and not pending_jobs:
+            raise ValueError("No route-owned work is pending; orchestrator_wait is not valid.")
+        if self._pending_main_subagent_notices or self._pending_main_bash_notices:
+            raise ValueError(
+                "Unprocessed orchestrator notices are actionable; handle them before waiting."
+            )
+
+        known_actor_ids = {
+            *(snapshot.subagent_id for snapshot in pending_subagents),
+            *(record.job_id for record in pending_jobs),
+        }
+        unknown_actor_ids = tuple(
+            actor_id for actor_id in watch_actor_ids if actor_id not in known_actor_ids
+        )
+        if unknown_actor_ids:
+            raise ValueError(
+                "Unknown or non-pending watch_actor_ids: " + ", ".join(unknown_actor_ids)
+            )
+
+        adaptive_floor = min(
+            _ORCHESTRATOR_WAIT_MAX_SECONDS,
+            _ORCHESTRATOR_WAIT_BACKOFF_BASE_SECONDS
+            * (2 ** min(self._orchestrator_unchanged_waits, 8)),
+        )
+        effective_seconds = min(
+            _ORCHESTRATOR_WAIT_MAX_SECONDS,
+            max(
+                _ORCHESTRATOR_WAIT_MIN_SECONDS,
+                adaptive_floor,
+                wake_after_seconds,
+            ),
+        )
+        self._cancel_orchestrator_wait(reset_backoff=False)
+        generation = self._orchestrator_wait_generation
+        target_session_id = session_id or self._main_loop.active_session_id()
+        self._orchestrator_wait_task = asyncio.create_task(
+            self._orchestrator_wait_deadline(
+                generation=generation,
+                delay_seconds=effective_seconds,
+                session_id=target_session_id,
+                reason=normalized_reason,
+            ),
+            name=f"jarvis-orchestrator-wait-{self._route_id}-{generation}",
+        )
+        LOGGER.info(
+            "Orchestrator wait registered (route=%s, generation=%d, requested=%d, "
+            "effective=%d, unchanged_waits=%d, actors=%s).",
+            self._route_id,
+            generation,
+            wake_after_seconds,
+            effective_seconds,
+            self._orchestrator_unchanged_waits,
+            ",".join(watch_actor_ids or tuple(sorted(known_actor_ids))),
+        )
+        return {
+            "requested_wait_seconds": wake_after_seconds,
+            "effective_wait_seconds": effective_seconds,
+            "adaptive_floor_seconds": adaptive_floor,
+            "hard_ceiling_seconds": _ORCHESTRATOR_WAIT_MAX_SECONDS,
+            "reason": normalized_reason,
+            "watch_actor_ids": list(watch_actor_ids or tuple(sorted(known_actor_ids))),
+            "pending_subagent_count": len(pending_subagents),
+            "pending_job_count": len(pending_jobs),
+        }
+
+    async def _orchestrator_wait_deadline(
+        self,
+        *,
+        generation: int,
+        delay_seconds: int,
+        session_id: str | None,
+        reason: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+            if generation != self._orchestrator_wait_generation:
+                return
+            if not self._internal_followups_allowed():
+                return
+            if not self._route_has_pending_background_work():
+                return
+            self._orchestrator_unchanged_waits += 1
+            LOGGER.info(
+                "Orchestrator wait liveness deadline elapsed "
+                "(route=%s, generation=%d, unchanged_waits=%d).",
+                self._route_id,
+                generation,
+                self._orchestrator_unchanged_waits,
+            )
+            await self._message_queue.put(
+                _RouteTurnRequest(
+                    user_text=None,
+                    force_session_id=session_id,
+                    pre_turn_messages=(
+                        AgentRuntimeMessage(
+                            role="system",
+                            metadata={
+                                "orchestrator_liveness_review": True,
+                                "orchestrator_wait_reason": reason,
+                            },
+                            content=(
+                                "The orchestrator liveness deadline elapsed while route-owned "
+                                "work remains pending. Review the current actor snapshot, act only "
+                                "if something is actionable, or call orchestrator_wait again."
+                            ),
+                        ),
+                    ),
+                    parse_commands=False,
+                    user_initiated=False,
+                    internal_generation=self._internal_followup_generation,
+                    runtime_turn_kind=_MAIN_ORCHESTRATOR_REVIEW_RUNTIME_KIND,
+                    orchestrator_wait_generation=generation,
+                )
+            )
+            self._queue_wakeup.set()
+            self._ensure_message_worker()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_log_path = record_runtime_error(
+                transcript_archive_dir=self._core_settings.transcript_archive_dir,
+                route_id=self._route_id,
+                session_id=session_id,
+                component="gateway.route_runtime",
+                event="orchestrator_wait_deadline_failed",
+                agent_kind="main",
+                exc=exc,
+                error_code="orchestrator_wait_deadline_failed",
+                message=(
+                    f"Route {self._route_id} orchestrator liveness deadline failed."
+                ),
+                context={"wait_generation": generation, "wait_reason": reason},
+            )
+            self._print_runtime_error_notice(error_log_path=error_log_path)
+        finally:
+            current = asyncio.current_task()
+            if self._orchestrator_wait_task is current:
+                self._orchestrator_wait_task = None
+
+    def _cancel_orchestrator_wait(self, *, reset_backoff: bool) -> None:
+        task = self._orchestrator_wait_task
+        self._orchestrator_wait_task = None
+        self._orchestrator_wait_generation += 1
+        if task is not None and not task.done():
+            task.cancel()
+        if reset_backoff:
+            self._orchestrator_unchanged_waits = 0
+
+    def _route_has_pending_background_work(self) -> bool:
+        if self._bash_job_supervisor.has_pending_jobs(include_services=True):
+            return True
+        return any(
+            snapshot.status in {"running", "waiting_background", "awaiting_approval"}
+            for snapshot in self._subagent_manager.active_snapshots()
+        )
 
 
     def _append_user_stop_subagent_note(
@@ -1394,7 +1794,6 @@ class RouteRuntime:
         lines.extend(
             [
                 "",
-                "Any tool execution already started by one of these subagents was allowed to finish and log its result in the child transcript before the child settles.",
                 "When you resume, inspect current subagent status, then decide whether to resume it, step in, dispose it, or otherwise handle it so no paused child is left orphaned.",
             ]
         )
@@ -1437,7 +1836,7 @@ class RouteRuntime:
         lines.extend(
             [
                 "",
-                "The bash jobs continue running, but automatic runtime follow-ups are suppressed until the next user message.",
+                "All listed jobs were cancelled and finalized before /stop completed.",
             ]
         )
         self._main_loop.append_system_note(
@@ -1449,6 +1848,31 @@ class RouteRuntime:
             },
         )
 
+    def _append_user_stop_hard_quiesce_note(
+        self,
+        *,
+        bash_reset: BashJobResetResult,
+        affected_subagents: Sequence[SubagentSnapshot],
+    ) -> None:
+        session_id = self._main_loop.active_session_id()
+        if session_id is None:
+            return
+        self._main_loop.append_system_note(
+            "The user issued /stop. Jarvis hard-stopped the active main turn, "
+            "hard-paused route-owned subagents, terminated detached jobs and services, "
+            "and invalidated queued automatic follow-ups. The current session remains "
+            "available for an explicit user resume.",
+            session_id=session_id,
+            metadata={
+                "user_stop_hard_quiesce": True,
+                "subagent_ids": [item.subagent_id for item in affected_subagents],
+                "finalized_bash_job_ids": list(bash_reset.finalized_job_ids),
+                "cancelled_bash_job_ids": list(
+                    bash_reset.cancellation_requested_job_ids
+                ),
+            },
+        )
+
     def _internal_followups_allowed(self) -> bool:
         return not (
             self._main_resume_requires_user_message
@@ -1457,11 +1881,19 @@ class RouteRuntime:
         )
 
     def _internal_request_is_blocked(self, request: _RouteTurnRequest) -> bool:
-        return (
+        generally_blocked = (
             request.user_initiated
             or self._main_resume_requires_user_message
             or self._new_session_boundary_pending
             or request.internal_generation != self._internal_followup_generation
+        )
+        if generally_blocked:
+            return True
+        if request.runtime_turn_kind != _MAIN_ORCHESTRATOR_REVIEW_RUNTIME_KIND:
+            return False
+        return (
+            request.orchestrator_wait_generation != self._orchestrator_wait_generation
+            or not self._route_has_pending_background_work()
         )
 
     def _main_loop_has_active_turn(self) -> bool:
@@ -1478,6 +1910,10 @@ class RouteRuntime:
             return False
         if self._main_resume_requires_user_message or self._new_session_boundary_pending:
             return False
+        if self._recommend_main_bash_action(notices) != "wait":
+            self._cancel_orchestrator_wait(reset_backoff=True)
+        elif notices:
+            self._orchestrator_unchanged_waits = 0
         self._merge_main_bash_notices(notices)
         if self._main_bash_runtime_turn_queued:
             return True
@@ -1849,38 +2285,12 @@ class RouteRuntime:
             content="\n".join(lines),
         )
 
-    def _build_wait_only_runtime_messages(
-        self,
-        message: AgentRuntimeMessage,
-    ) -> tuple[AgentRuntimeMessage, ...]:
-        if str(message.metadata.get("recommended_action", "")).strip() != "wait":
-            return ()
-        return (
-            AgentRuntimeMessage(
-                role="system",
-                metadata={
-                    "force_no_tools_this_turn": True,
-                    "orchestrator_wait_only_update": True,
-                },
-                content=(
-                    "This orchestrator progress update is wait-only. Do not call tools in this "
-                    "response. Send a brief progress update and wait for the next orchestrator "
-                    "system message unless the user explicitly asks for immediate inspection."
-                ),
-            ),
-        )
-
     def _recommend_main_bash_action(self, notices: Sequence[BashJobNotice]) -> str:
         if any(
             notice.notice_kind in {"bash_job_failed", "bash_job_cancelled", "bash_job_needs_attention"}
             for notice in notices
         ):
             return "inspect"
-        if any(
-            notice.notice_kind in {"bash_job_output_started", "bash_job_output_grew"}
-            for notice in notices
-        ):
-            return "continue"
         if any(notice.status == "running" for notice in notices):
             return "wait"
         return "finalize"
@@ -2074,12 +2484,18 @@ def _workspace_lease_error_result(
             "Tool execution denied\n"
             f"tool: {tool_call.name}\n"
             "error_code: workspace_lease_conflict\n"
-            f"reason: {error}"
+            f"conflict_class: {error.conflict_class}\n"
+            f"conflict_key: {error.conflict_key}\n"
+            f"reason: {error}\n"
+            f"remediation: {error.remediation}"
         ),
         metadata={
             "execution_failed": True,
             "error_code": "workspace_lease_conflict",
+            "conflict_class": error.conflict_class,
+            "conflict_key": error.conflict_key,
             "reason": str(error),
+            "remediation": error.remediation,
             "arguments": dict(tool_call.arguments),
         },
     )
@@ -2092,6 +2508,14 @@ def _with_workspace_lease_generation(
     metadata = dict(result.metadata)
     metadata["workspace_lease_generation"] = generation
     return replace(result, metadata=metadata)
+
+
+def _is_wait_only_bash_call(tool_call: ToolCall) -> bool:
+    mode = str(tool_call.arguments.get("mode", "foreground")).strip().lower()
+    if mode not in {"background", "service"}:
+        return False
+    command = str(tool_call.arguments.get("command", ""))
+    return bool(_WAIT_ONLY_BASH_PATTERN.match(command))
 
 
 def _optional_string_tuple(value: Any) -> tuple[str, ...]:

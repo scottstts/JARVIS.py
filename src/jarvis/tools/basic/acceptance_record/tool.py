@@ -9,7 +9,7 @@ from typing import Any
 from jarvis.llm import ToolDefinition
 
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
-from ...workspace_revision import workspace_revision
+from ...workspace_revision import normalize_revision_paths, scoped_workspace_revision
 
 _MAX_CHECKS = 24
 _MAX_CHECK_TEXT_CHARS = 4_000
@@ -46,10 +46,21 @@ class AcceptanceRecordToolExecutor:
     ) -> ToolExecutionResult:
         scope = str(arguments.get("scope", "")).strip()
         observed_revision = str(arguments.get("workspace_revision", "")).strip()
+        revision_paths, revision_error = normalize_revision_paths(
+            arguments.get("revision_paths")
+        )
         checks = arguments.get("checks")
         if not scope or len(scope) > _MAX_SCOPE_CHARS:
             return _failure(call_id, "scope must be a non-empty concise string.")
-        current_revision = workspace_revision(context.workspace_dir)
+        if revision_error is not None:
+            return _failure(call_id, revision_error)
+        try:
+            current_revision = scoped_workspace_revision(
+                context.workspace_dir,
+                revision_paths,
+            )
+        except ValueError as exc:
+            return _failure(call_id, str(exc))
         if not observed_revision:
             return _failure(
                 call_id,
@@ -116,6 +127,7 @@ class AcceptanceRecordToolExecutor:
             metadata={
                 "acceptance_ledger": {
                     "scope": scope,
+                    "revision_paths": list(revision_paths),
                     "checks": normalized_checks,
                     "summary": counts,
                     "unresolved_required_count": unresolved_required,
@@ -138,13 +150,21 @@ def build_acceptance_record_tool() -> RegisteredTool:
             description=(
                 "Record explicit acceptance evidence before claiming implementation work is "
                 "complete. Each check must state its actual outcome and evidence; an exit code "
-                "alone does not prove semantic success."
+                "alone does not prove semantic success. Copy both workspace_revision and the "
+                "exact revision_paths from the matching acceptance_run."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "scope": {"type": "string", "minLength": 1, "maxLength": _MAX_SCOPE_CHARS},
                     "workspace_revision": {"type": "string", "minLength": 1},
+                    "revision_paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
                     "checks": {
                         "type": "array",
                         "minItems": 1,
@@ -197,7 +217,12 @@ def build_acceptance_record_tool() -> RegisteredTool:
                         },
                     },
                 },
-                "required": ["scope", "workspace_revision", "checks"],
+                "required": [
+                    "scope",
+                    "workspace_revision",
+                    "revision_paths",
+                    "checks",
+                ],
                 "additionalProperties": False,
             },
         ),

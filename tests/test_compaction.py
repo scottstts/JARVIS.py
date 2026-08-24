@@ -420,6 +420,105 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
             policy.preflight_limit_tokens * 70 // 100,
         )
 
+    async def test_long_session_shape_is_globally_bounded_and_semantically_coalesced(
+        self,
+    ) -> None:
+        contract = "Task contract\ntask_id: long-task\nRequired acceptance items:\n- run tests"
+        records: list[ConversationRecord] = [
+            _record(record_id="user_1", role="user", content="Implement the full repair."),
+            _record(
+                record_id="assistant_1",
+                role="assistant",
+                content="I am coordinating the workstreams.",
+            ),
+        ]
+        records.extend(
+            _record(
+                record_id=f"contract_{index}",
+                role="system",
+                content=contract,
+                metadata={
+                    "task_contract": True,
+                    "task_id": "long-task",
+                    "task_contract_revision": "revision-1",
+                },
+            )
+            for index in range(131)
+        )
+        for index in range(40):
+            records.append(
+                _record(
+                    record_id=f"bash_progress_{index}",
+                    role="system",
+                    content=(f"Job job_1 progress update {index}\n" + "log line\n" * 2_000),
+                    metadata={
+                        "bash_job_progress_update": True,
+                        "bash_job_running_ids": ["job_1"],
+                        "bash_job_terminal_ids": [],
+                    },
+                )
+            )
+        service = _QueuedCompactionLLMService([_response(_draft())])
+        policy = ContextPolicySettings(context_window_tokens=100_000)
+        compactor = ContextCompactor(
+            llm_service=service,  # type: ignore[arg-type]
+            context_policy=policy,
+        )
+
+        await compactor.compact(tuple(records))
+
+        request = service.requests[0]
+        request_text = _request_user_text(request)
+        self.assertEqual(request_text.count(contract), 1)
+        self.assertIn("Earlier coalesced lifecycle or repeated evidence", request_text)
+        self.assertLess(
+            estimate_request_input_tokens(request),
+            policy.preflight_limit_tokens * 70 // 100,
+        )
+
+    async def test_global_budget_accounts_for_multiple_tool_arguments_per_event(
+        self,
+    ) -> None:
+        records: list[ConversationRecord] = [
+            _record(record_id="user_1", role="user", content="Continue the repair.")
+        ]
+        for event_index in range(20):
+            records.append(
+                _record(
+                    record_id=f"assistant_tools_{event_index}",
+                    role="assistant",
+                    content="",
+                    metadata={
+                        "tool_calls": [
+                            {
+                                "call_id": f"call_{event_index}_{call_index}",
+                                "name": "bash",
+                                "arguments": {
+                                    "command": "x" * 20_000,
+                                    "write_paths": [f"src/{call_index}.py"],
+                                },
+                            }
+                            for call_index in range(5)
+                        ]
+                    },
+                )
+            )
+        service = _QueuedCompactionLLMService([_response(_draft())])
+        policy = ContextPolicySettings(context_window_tokens=30_000)
+        compactor = ContextCompactor(
+            llm_service=service,  # type: ignore[arg-type]
+            context_policy=policy,
+        )
+
+        await compactor.compact(tuple(records))
+
+        request = service.requests[0]
+        self.assertLess(
+            estimate_request_input_tokens(request),
+            policy.preflight_limit_tokens * 70 // 100,
+        )
+        self.assertIn("source characters omitted", _request_user_text(request))
+
     async def test_oversized_non_tool_evidence_fails_before_calling_provider(self) -> None:
         service = _QueuedCompactionLLMService([])
         compactor = ContextCompactor(

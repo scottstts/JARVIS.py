@@ -12,7 +12,7 @@ from jarvis.llm import ToolDefinition
 
 from ...config import ToolSettings
 from ...types import RegisteredTool, ToolExecutionContext, ToolExecutionResult
-from ...workspace_revision import workspace_revision
+from ...workspace_revision import normalize_revision_paths, scoped_workspace_revision
 from ..bash import BashCommandPolicy
 from ..bash.shell_syntax import shell_control_operators
 from ..bash.tool import BashToolExecutor
@@ -83,13 +83,23 @@ class AcceptanceRunToolExecutor:
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
         scope = str(arguments.get("scope", "")).strip()
+        raw_revision_paths = arguments.get("revision_paths")
         raw_gates = arguments.get("gates")
         if not scope:
             return _failure(call_id, "scope must be non-empty.")
         if not isinstance(raw_gates, list) or not raw_gates or len(raw_gates) > _MAX_GATES:
             return _failure(call_id, f"gates must contain between 1 and {_MAX_GATES} entries.")
+        revision_paths, revision_error = normalize_revision_paths(raw_revision_paths)
+        if revision_error is not None:
+            return _failure(call_id, revision_error)
+        try:
+            initial_revision = scoped_workspace_revision(
+                context.workspace_dir,
+                revision_paths,
+            )
+        except ValueError as exc:
+            return _failure(call_id, str(exc))
 
-        initial_revision = workspace_revision(context.workspace_dir)
         gate_results: list[dict[str, object]] = []
         for index, raw_gate in enumerate(raw_gates, start=1):
             if not isinstance(raw_gate, dict):
@@ -116,7 +126,10 @@ class AcceptanceRunToolExecutor:
                 )
                 if reason is not None:
                     return _failure(call_id, f"gates[{index}]: {reason}")
-                metric_revision = workspace_revision(context.workspace_dir)
+                metric_revision = scoped_workspace_revision(
+                    context.workspace_dir,
+                    revision_paths,
+                )
                 gate_results.append(
                     {
                         "gate_id": gate_id,
@@ -168,7 +181,10 @@ class AcceptanceRunToolExecutor:
                     reason += " Run and approve that setup action separately before verification."
                 return _failure(call_id, f"gates[{index}]: {reason}")
 
-            revision_before = workspace_revision(context.workspace_dir)
+            revision_before = scoped_workspace_revision(
+                context.workspace_dir,
+                revision_paths,
+            )
             started = perf_counter()
             result = await self._bash(
                 call_id=f"{call_id}:gate:{index}",
@@ -176,7 +192,10 @@ class AcceptanceRunToolExecutor:
                 context=context,
             )
             duration = round(perf_counter() - started, 3)
-            revision_after = workspace_revision(context.workspace_dir)
+            revision_after = scoped_workspace_revision(
+                context.workspace_dir,
+                revision_paths,
+            )
             gate_results.append(
                 {
                     "gate_id": gate_id,
@@ -195,7 +214,10 @@ class AcceptanceRunToolExecutor:
             )
 
         passed = all(bool(gate["passed"]) for gate in gate_results)
-        final_revision = workspace_revision(context.workspace_dir)
+        final_revision = scoped_workspace_revision(
+            context.workspace_dir,
+            revision_paths,
+        )
         lines = [
             "Acceptance gates completed",
             f"scope: {scope}",
@@ -217,6 +239,7 @@ class AcceptanceRunToolExecutor:
             metadata={
                 "acceptance_run": {
                     "scope": scope,
+                    "revision_paths": list(revision_paths),
                     "workspace_revision_before": initial_revision,
                     "workspace_revision_after": final_revision,
                     "passed": passed,
@@ -236,12 +259,21 @@ def build_acceptance_run_tool(settings: ToolSettings) -> RegisteredTool:
             description=(
                 "Run required verification gates independently and return one structured ledger. "
                 "Each gate must be one command without top-level pipes or command chaining, so a "
-                "later success cannot hide an earlier failure."
+                "later success cannot hide an earlier failure. revision_paths must name only the "
+                "project or artifacts whose material content the gates verify; exclude caches, "
+                "logs, dependency trees, and runtime state."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "scope": {"type": "string", "minLength": 1, "maxLength": 800},
+                    "revision_paths": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
                     "gates": {
                         "type": "array",
                         "minItems": 1,
@@ -282,7 +314,7 @@ def build_acceptance_run_tool(settings: ToolSettings) -> RegisteredTool:
                         },
                     },
                 },
-                "required": ["scope", "gates"],
+                "required": ["scope", "revision_paths", "gates"],
                 "additionalProperties": False,
             },
         ),

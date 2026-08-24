@@ -25,8 +25,8 @@ from jarvis.tools.basic.acceptance_run.tool import (
     AcceptanceRunToolExecutor,
     _source_line_count_gate,
     _top_level_compound_operator,
-    workspace_revision,
 )
+from jarvis.tools.workspace_revision import scoped_workspace_revision, workspace_revision
 
 
 def _tool_call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -> ToolCall:
@@ -69,7 +69,11 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                     "acceptance_record",
                     {
                         "scope": "report rewrite",
-                        "workspace_revision": workspace_revision(workspace_dir),
+                        "workspace_revision": scoped_workspace_revision(
+                            workspace_dir,
+                            ("report.txt",),
+                        ),
+                        "revision_paths": ["report.txt"],
                         "checks": [
                             {
                                 "criterion": "report contains the requested replacement",
@@ -333,6 +337,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 call_id="acceptance",
                 arguments={
                     "scope": "verification",
+                    "revision_paths": ["."],
                     "gates": [
                         {
                             "gate_id": "masked",
@@ -401,6 +406,94 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             tracker.blocked_call_reason(_tool_call("bash", {"command": "false --different"}))
         )
 
+    async def test_tool_safety_normalizes_varied_workspace_lease_conflicts(self) -> None:
+        tracker = ToolSafetyTracker()
+        first_call = _tool_call("bash", {"command": "write a.py"}, call_id="lease_1")
+        second_call = _tool_call(
+            "file_write",
+            {"path": "a.py", "content": "x"},
+            call_id="lease_2",
+        )
+
+        def conflict(call_id: str, name: str) -> ToolExecutionResult:
+            return ToolExecutionResult(
+                call_id=call_id,
+                name=name,
+                ok=False,
+                content="workspace lease conflict",
+                metadata={
+                    "execution_failed": True,
+                    "error_code": "workspace_lease_conflict",
+                    "conflict_class": "path_owned_by_other_actor",
+                    "remediation": "Wait for or dispose the owner.",
+                },
+            )
+
+        first = tracker.record(first_call, conflict("lease_1", "bash"))
+        second = tracker.record(second_call, conflict("lease_2", "file_write"))
+
+        self.assertFalse(first.repeated_invalid_call)
+        self.assertTrue(second.repeated_invalid_call)
+        self.assertTrue(second.blocked_invalid_signature)
+
+        distinct_target = ToolExecutionResult(
+            call_id="lease_3",
+            name="file_write",
+            ok=False,
+            content="different workspace lease conflict",
+            metadata={
+                "execution_failed": True,
+                "error_code": "workspace_lease_conflict",
+                "conflict_class": "path_owned_by_other_actor",
+                "conflict_key": "path_owned_by_other_actor:b.py:subagent_2",
+            },
+        )
+        distinct = tracker.record(
+            _tool_call(
+                "file_write",
+                {"path": "b.py", "content": "y"},
+                call_id="lease_3",
+            ),
+            distinct_target,
+        )
+        self.assertFalse(distinct.repeated_invalid_call)
+
+    async def test_scoped_revision_ignores_runtime_files_outside_material_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            source_dir = workspace_dir / "project" / "src"
+            runtime_dir = workspace_dir / "runtime-logs"
+            source_dir.mkdir(parents=True)
+            runtime_dir.mkdir(parents=True)
+            source_file = source_dir / "main.ts"
+            source_file.write_text("export const value = 1;\n")
+            runtime_log = runtime_dir / "npm-debug.log"
+            runtime_log.write_text("first\n")
+
+            before = scoped_workspace_revision(workspace_dir, ("project",))
+            runtime_log.write_text("second\n")
+            after_runtime_change = scoped_workspace_revision(workspace_dir, ("project",))
+            source_file.write_text("export const value = 2;\n")
+            after_source_change = scoped_workspace_revision(workspace_dir, ("project",))
+
+            self.assertEqual(after_runtime_change, before)
+            self.assertNotEqual(after_source_change, before)
+
+    async def test_workspace_root_revision_ignores_archive_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            source_file = workspace_dir / "main.py"
+            source_file.write_text("value = 1\n")
+            before = scoped_workspace_revision(workspace_dir, (".",))
+
+            error_dir = workspace_dir / "archive" / "error_logs"
+            error_dir.mkdir(parents=True)
+            (error_dir / "session.jsonl").write_text("runtime error\n")
+            after_archive_change = scoped_workspace_revision(workspace_dir, (".",))
+
+            self.assertEqual(after_archive_change, before)
+
     async def test_tool_safety_forgets_stale_failure_after_workspace_mutation(self) -> None:
         tracker = ToolSafetyTracker()
         failed_call = _tool_call("bash", {"command": "npx vitest run 2>&1"})
@@ -454,6 +547,8 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             metadata={
                 "acceptance_ledger": {
                     "workspace_revision_verified": True,
+                    "workspace_revision": "revision-1",
+                    "revision_paths": ["src"],
                     "complete": True,
                     "checks": [
                         {
@@ -474,7 +569,15 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 name="acceptance_run",
                 ok=True,
                 content="passed",
-                metadata={"changed": False},
+                metadata={
+                    "changed": False,
+                    "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["src"],
+                        "workspace_revision_after": "revision-1",
+                        "gates": [],
+                    },
+                },
             ),
         )
         tracker.record(_tool_call("acceptance_record", {}), acceptance)
@@ -512,7 +615,15 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 name="acceptance_run",
                 ok=True,
                 content="passed",
-                metadata={"changed": False},
+                metadata={
+                    "changed": False,
+                    "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["src"],
+                        "workspace_revision_after": "revision-1",
+                        "gates": [],
+                    },
+                },
             ),
         )
 
@@ -525,6 +636,8 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                 metadata={
                     "acceptance_ledger": {
                         "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["src"],
                         "complete": outcome != "open",
                         "checks": [
                             {
@@ -552,6 +665,65 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             ledger("fixed_ledger", "issue-1", "fixed"),
         )
         self.assertFalse(tracker.unverified_workspace_mutation)
+
+    async def test_acceptance_ledger_rejects_cited_gate_from_different_revision_scope(
+        self,
+    ) -> None:
+        tracker = ToolSafetyTracker()
+        tracker.record(
+            _tool_call("file_write", {"path": "src/a.py", "content": "x"}),
+            ToolExecutionResult(
+                call_id="write_1",
+                name="file_write",
+                ok=True,
+                content="changed",
+                metadata={"changed": True},
+            ),
+        )
+        tracker.record(
+            _tool_call("acceptance_run", {}),
+            ToolExecutionResult(
+                call_id="gate_1",
+                name="acceptance_run",
+                ok=True,
+                content="passed",
+                metadata={
+                    "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["src"],
+                        "workspace_revision_after": "revision-1",
+                        "gates": [],
+                    }
+                },
+            ),
+        )
+        tracker.record(
+            _tool_call("acceptance_record", {}),
+            ToolExecutionResult(
+                call_id="accept_1",
+                name="acceptance_record",
+                ok=True,
+                content="recorded",
+                metadata={
+                    "acceptance_ledger": {
+                        "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["tests"],
+                        "complete": True,
+                        "checks": [
+                            {
+                                "item_id": "implementation",
+                                "required": True,
+                                "outcome": "fixed",
+                                "source_tool_call_ids": ["gate_1"],
+                            }
+                        ],
+                    }
+                },
+            ),
+        )
+
+        self.assertTrue(tracker.unverified_workspace_mutation)
 
     async def test_managed_service_allocates_owned_port_and_can_be_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

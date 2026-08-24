@@ -18,6 +18,15 @@ from .workspace_revision import workspace_paths_revision, workspace_revision
 class WorkspaceLeaseError(RuntimeError):
     """Raised when an actor attempts to write a path leased by another actor."""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.conflict_class = _workspace_lease_conflict_class(message)
+        self.conflict_key = _workspace_lease_conflict_key(
+            conflict_class=self.conflict_class,
+            message=message,
+        )
+        self.remediation = _workspace_lease_remediation(self.conflict_class)
+
 
 @dataclass(slots=True)
 class WorkspaceAccessObservation:
@@ -430,6 +439,55 @@ def _access_request(
     # Runtime-manifest and future tools are mutation-unknown. Keep them behind the
     # global write barrier until they declare a narrower access contract.
     return _AccessRequest(mode="global_write")
+
+
+def _workspace_lease_conflict_class(message: str) -> str:
+    normalized = message.lower()
+    if "expected_lease_generation" in normalized:
+        return "missing_lease_generation"
+    if "lease generation changed" in normalized:
+        return "stale_lease_generation"
+    if "observed file precondition" in normalized:
+        return "missing_file_precondition"
+    if "leased by" in normalized or "already leased" in normalized:
+        return "path_owned_by_other_actor"
+    if "declare write_paths" in normalized or "write_paths" in normalized:
+        return "missing_or_invalid_write_scope"
+    if "stay inside the workspace" in normalized:
+        return "invalid_workspace_path"
+    if "lease owner" in normalized:
+        return "invalid_lease_owner"
+    return "workspace_access_conflict"
+
+
+def _workspace_lease_remediation(conflict_class: str) -> str:
+    if conflict_class == "missing_lease_generation":
+        return "Inspect current actor ownership, then retry with expected_lease_generation."
+    if conflict_class == "stale_lease_generation":
+        return "Reread actor ownership and the target, then retry with the current generation."
+    if conflict_class == "missing_file_precondition":
+        return (
+            "Reread the target and supply expected_sha256, or expected_file_absent=true for "
+            "a new file."
+        )
+    if conflict_class == "path_owned_by_other_actor":
+        return (
+            "Wait for the owning actor, or explicitly stop and dispose it before editing its "
+            "leased path."
+        )
+    if conflict_class == "missing_or_invalid_write_scope":
+        return "Declare every mutated workspace path in write_paths, then retry."
+    if conflict_class == "invalid_workspace_path":
+        return "Use only normalized paths inside the shared workspace."
+    if conflict_class == "invalid_lease_owner":
+        return "Provide a non-empty stable actor owner id."
+    return "Inspect current workspace ownership and replan before retrying."
+
+
+def _workspace_lease_conflict_key(*, conflict_class: str, message: str) -> str:
+    if conflict_class == "path_owned_by_other_actor":
+        return f"{conflict_class}:{' '.join(message.lower().split())}"
+    return conflict_class
 
 
 _READ_ONLY_SHELL_PATTERN = re.compile(

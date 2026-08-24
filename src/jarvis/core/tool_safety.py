@@ -49,6 +49,9 @@ class ToolSafetyTracker:
     _workspace_mutated: bool = False
     _acceptance_recorded: bool = False
     _passed_acceptance_run_call_ids: set[str] = field(default_factory=set)
+    _passed_acceptance_run_scopes: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     _acceptance_items: dict[str, dict[str, Any]] = field(default_factory=dict)
     _contract_requirements: dict[str, dict[str, str]] = field(default_factory=dict)
     _subagent_invocation_count: int = 0
@@ -119,6 +122,9 @@ class ToolSafetyTracker:
 
         if result.name == "acceptance_run" and result.ok:
             self._passed_acceptance_run_call_ids.add(result.call_id)
+            run_scope = _acceptance_run_scope(result)
+            if run_scope is not None:
+                self._passed_acceptance_run_scopes[result.call_id] = run_scope
             self._passed_acceptance_gates.update(_passed_acceptance_gates(result))
         if result.name == "subagent_invoke" and result.ok:
             self._subagent_invocation_count += 1
@@ -145,6 +151,7 @@ class ToolSafetyTracker:
             self._acceptance_recorded = _acceptance_ledger_resolved(
                 result,
                 valid_gate_call_ids=self._passed_acceptance_run_call_ids,
+                valid_gate_scopes=self._passed_acceptance_run_scopes,
                 durable_items=self._acceptance_items,
                 contract_requirements=self._contract_requirements,
                 subagent_invocation_count=self._subagent_invocation_count,
@@ -211,6 +218,7 @@ class ToolSafetyTracker:
         if invalidate_acceptance:
             self._acceptance_recorded = False
             self._passed_acceptance_run_call_ids.clear()
+            self._passed_acceptance_run_scopes.clear()
             self._passed_acceptance_gates.clear()
 
     @property
@@ -357,6 +365,9 @@ class ToolSafetyTracker:
             "passed_acceptance_run_call_ids": sorted(
                 self._passed_acceptance_run_call_ids
             ),
+            "passed_acceptance_run_scopes": dict(
+                self._passed_acceptance_run_scopes
+            ),
             "acceptance_items": dict(self._acceptance_items),
             "contract_requirements": dict(self._contract_requirements),
             "subagent_invocation_count": self._subagent_invocation_count,
@@ -399,6 +410,9 @@ class ToolSafetyTracker:
             _acceptance_recorded=bool(value.get("acceptance_recorded", False)),
             _passed_acceptance_run_call_ids=_bounded_string_set(
                 value.get("passed_acceptance_run_call_ids")
+            ),
+            _passed_acceptance_run_scopes=_bounded_acceptance_run_scopes(
+                value.get("passed_acceptance_run_scopes")
             ),
             _acceptance_items=_bounded_acceptance_items(
                 value.get("acceptance_items")
@@ -475,6 +489,17 @@ def _invalid_signature(tool_call: ToolCall, result: ToolExecutionResult) -> str 
         or tool_call.provider_metadata.get(TOOL_CALL_VALIDATION_ERROR_METADATA_KEY)
     ):
         return None
+    if metadata.get("error_code") == "workspace_lease_conflict":
+        return _digest(
+            {
+                "error_code": "workspace_lease_conflict",
+                "conflict_key": str(
+                    metadata.get("conflict_key")
+                    or metadata.get("conflict_class")
+                    or "workspace_access_conflict"
+                ),
+            }
+        )
     reason = str(metadata.get("reason") or metadata.get("error") or "").strip()
     return _digest(
         {
@@ -621,6 +646,7 @@ def _acceptance_ledger_resolved(
     result: ToolExecutionResult,
     *,
     valid_gate_call_ids: set[str],
+    valid_gate_scopes: dict[str, dict[str, Any]],
     durable_items: dict[str, dict[str, Any]],
     contract_requirements: dict[str, dict[str, str]],
     subagent_invocation_count: int,
@@ -668,7 +694,19 @@ def _acceptance_ledger_resolved(
         if isinstance(check, dict)
         for call_id in check.get("source_tool_call_ids", [])
     }
-    return bool(supplied_source_ids & valid_gate_call_ids)
+    cited_valid_ids = supplied_source_ids & valid_gate_call_ids
+    if not cited_valid_ids:
+        return False
+    ledger_paths = _string_list(ledger.get("revision_paths"))
+    ledger_revision = str(ledger.get("workspace_revision", "")).strip()
+    if not ledger_paths or not ledger_revision:
+        return False
+    return any(
+        scope.get("revision_paths") == ledger_paths
+        and scope.get("workspace_revision") == ledger_revision
+        for call_id in cited_valid_ids
+        if (scope := valid_gate_scopes.get(call_id)) is not None
+    )
 
 
 def _acceptance_ledger_items(result: ToolExecutionResult) -> dict[str, dict[str, Any]]:
@@ -750,6 +788,28 @@ def _bounded_acceptance_items(
     return output
 
 
+def _bounded_acceptance_run_scopes(
+    value: object,
+    *,
+    limit: int = 64,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, dict[str, Any]] = {}
+    for raw_call_id, raw_scope in list(value.items())[-limit:]:
+        call_id = str(raw_call_id).strip()
+        if not call_id or not isinstance(raw_scope, dict):
+            continue
+        revision_paths = _bounded_string_list(raw_scope.get("revision_paths"))
+        workspace_revision = str(raw_scope.get("workspace_revision", "")).strip()
+        if revision_paths and workspace_revision:
+            output[call_id] = {
+                "revision_paths": revision_paths,
+                "workspace_revision": workspace_revision,
+            }
+    return output
+
+
 def _bounded_string_map(value: object, *, limit: int = 64) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -810,6 +870,20 @@ def _passed_acceptance_gates(result: ToolExecutionResult) -> dict[str, str]:
         if command:
             output[gate_id] = command
     return output
+
+
+def _acceptance_run_scope(result: ToolExecutionResult) -> dict[str, Any] | None:
+    run = result.metadata.get("acceptance_run")
+    if not isinstance(run, dict) or not bool(run.get("passed", False)):
+        return None
+    revision_paths = _string_list(run.get("revision_paths"))
+    workspace_revision = str(run.get("workspace_revision_after", "")).strip()
+    if not revision_paths or not workspace_revision:
+        return None
+    return {
+        "revision_paths": revision_paths,
+        "workspace_revision": workspace_revision,
+    }
 
 
 def _contract_machine_evidence_resolved(

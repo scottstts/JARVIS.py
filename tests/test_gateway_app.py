@@ -34,7 +34,7 @@ class _FakeRouter:
     def active_session_id(self, route_id: str) -> str | None:
         return self.active_sessions.get(route_id)
 
-    def request_stop(self, route_id: str) -> bool:
+    async def request_stop(self, route_id: str) -> bool:
         self.stop_requests.append(route_id)
         return route_id == "dm_stop"
 
@@ -94,7 +94,7 @@ class _FailingRouteInitRouter:
     def active_session_id(self, route_id: str) -> str | None:
         raise RuntimeError(f"route init failed for {route_id}")
 
-    def request_stop(self, route_id: str) -> bool:
+    async def request_stop(self, route_id: str) -> bool:
         _ = route_id
         return False
 

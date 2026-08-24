@@ -153,7 +153,11 @@ class BashJobSupervisor:
         return tuple(records)
 
     async def terminate_route_jobs_for_new_session(self) -> BashJobResetResult:
+        return await self.terminate_route_jobs(reason="new_session")
+
+    async def terminate_route_jobs(self, *, reason: str) -> BashJobResetResult:
         """Terminate and finalize every detached job still owned by this route."""
+        normalized_reason = reason.strip() or "route_stop"
         finalized_job_ids: list[str] = []
         cancellation_requested_job_ids: list[str] = []
         async with self._job_operation_lock:
@@ -173,7 +177,7 @@ class BashJobSupervisor:
                 )
                 if not status_result.ok:
                     raise RuntimeError(
-                        "Failed to inspect detached bash job during /new hard reset: "
+                        f"Failed to inspect detached bash job during {normalized_reason}: "
                         f"{record.job_id}: {status_result.content}"
                     )
                 status = str(status_result.metadata.get("status", "")).strip()
@@ -186,14 +190,14 @@ class BashJobSupervisor:
                     )
                     if not cancel_result.ok:
                         raise RuntimeError(
-                            "Failed to cancel detached bash job during /new hard reset: "
+                            f"Failed to cancel detached bash job during {normalized_reason}: "
                             f"{record.job_id}: {cancel_result.content}"
                         )
                     status = str(cancel_result.metadata.get("status", "")).strip()
                     exit_code = _optional_int(cancel_result.metadata.get("exit_code"))
                 if status == "running" or not status:
                     raise RuntimeError(
-                        f"Detached bash job {record.job_id} survived /new hard reset."
+                        f"Detached bash job {record.job_id} survived {normalized_reason}."
                     )
                 try:
                     mark_job_terminal_notice_dispatched(
@@ -206,7 +210,7 @@ class BashJobSupervisor:
                     )
                 except BashJobError as exc:
                     raise RuntimeError(
-                        "Failed to finalize detached bash job archive state during /new: "
+                        f"Failed to finalize detached bash job archive state during {normalized_reason}: "
                         f"{record.job_id}: {exc}"
                     ) from exc
                 self._tracked_job_ids.discard(record.job_id)

@@ -31,7 +31,7 @@ class RemoteToolRuntimeClient:
         return self._base_url is not None
 
     async def healthcheck(self) -> dict[str, Any]:
-        if not self.enabled:
+        if self._base_url is None:
             return {"configured": False}
 
         try:

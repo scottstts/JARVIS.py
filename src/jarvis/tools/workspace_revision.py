@@ -9,12 +9,18 @@ from typing import Any, Iterable
 _IGNORED_REVISION_PARTS = frozenset(
     {
         ".git",
+        ".cache",
+        ".coverage",
         ".jarvis_internal",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
         ".venv",
+        ".npm",
+        ".tox",
         "__pycache__",
+        "coverage",
+        "htmlcov",
         "node_modules",
     }
 )
@@ -91,6 +97,43 @@ def workspace_paths_revision(workspace_dir: Path, paths: Iterable[Path]) -> str:
     return fingerprint.hexdigest()
 
 
+def scoped_workspace_revision(
+    workspace_dir: Path,
+    paths: Iterable[str | Path],
+) -> str:
+    """Return one Git/content revision for an explicit material workspace scope."""
+
+    root = workspace_dir.resolve(strict=False)
+    resolved: set[Path] = set()
+    for raw_path in paths:
+        candidate = Path(str(raw_path).strip())
+        if not str(candidate):
+            raise ValueError("workspace revision paths must be non-empty.")
+        if candidate.is_absolute():
+            if candidate == Path("/workspace") or candidate.is_relative_to(Path("/workspace")):
+                candidate = root / candidate.relative_to("/workspace")
+        else:
+            candidate = root / candidate
+        candidate = candidate.resolve(strict=False)
+        if candidate != root and not candidate.is_relative_to(root):
+            raise ValueError("workspace revision paths must stay inside the workspace.")
+        resolved.add(candidate)
+    if not resolved:
+        raise ValueError("workspace revision paths must contain at least one material path.")
+    return f"{_git_revision(root)}:{workspace_paths_revision(root, resolved)}"
+
+
+def normalize_revision_paths(value: object) -> tuple[tuple[str, ...], str | None]:
+    """Validate the shared acceptance-run/record material-scope contract."""
+
+    if not isinstance(value, list) or not value or len(value) > 64:
+        return (), "revision_paths must contain between 1 and 64 material workspace paths."
+    paths = tuple(str(item).strip() for item in value)
+    if any(not path for path in paths) or len(set(paths)) != len(paths):
+        return (), "revision_paths must contain unique non-empty workspace path strings."
+    return paths, None
+
+
 def _update_path_fingerprint(fingerprint: Any, *, path: Path, relative: Path) -> None:
     try:
         if path.is_symlink():
@@ -117,7 +160,7 @@ def _update_path_fingerprint(fingerprint: Any, *, path: Path, relative: Path) ->
 def _revision_path_is_ignored(relative: Path) -> bool:
     if any(part in _IGNORED_REVISION_PARTS for part in relative.parts):
         return True
-    return relative.parts[:2] == ("archive", "transcripts")
+    return relative.parts[:1] == ("archive",)
 
 
 def _git_revision(workspace_dir: Path) -> str:

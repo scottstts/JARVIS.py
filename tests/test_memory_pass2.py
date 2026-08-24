@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from jarvis.llm import EmbeddingRequest, EmbeddingResponse, LLMResponse, LLMUsage
+from jarvis.llm import EmbeddingRequest, EmbeddingResponse, LLMResponse, LLMUsage, TextPart
 from jarvis.memory import MemoryService, MemorySettings, SearchCandidate
 from jarvis.memory.bootstrap import render_core_bootstrap, render_ongoing_bootstrap
 from jarvis.memory.retrieval import _fuse_candidates
@@ -525,6 +525,17 @@ class MemoryPass2Tests(unittest.IsolatedAsyncioTestCase):
                 if document.kind == "ongoing" and document.status == "active" and not document.archived
             ]
             self.assertEqual(len(applied), 1)
+            self.assertEqual(
+                [message.role for message in fake_llm.requests[0].messages],
+                ["system", "user"],
+            )
+            reflection_user_part = fake_llm.requests[0].messages[1].parts[0]
+            self.assertIsInstance(reflection_user_part, TextPart)
+            assert isinstance(reflection_user_part, TextPart)
+            self.assertIn(
+                "Continue the Jarvis memory system work.",
+                reflection_user_part.text,
+            )
             self.assertEqual(applied[0].document_id, created.document_id)
             self.assertEqual(len(documents), 1)
             self.assertEqual(documents[0].summary, "Pass 2 is underway.")

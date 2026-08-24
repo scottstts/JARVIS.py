@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from datetime import datetime, timezone
 import json
+import re
 import traceback
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -377,6 +378,42 @@ class SubagentManager:
             if self._request_runtime_stop(runtime, pause_reason="new_session"):
                 affected.append(runtime.snapshot())
         return tuple(affected)
+
+    def request_hard_stop_all_for_user_stop(self) -> tuple[SubagentSnapshot, ...]:
+        affected: list[SubagentSnapshot] = []
+        for runtime in self._non_disposed_runtimes():
+            if runtime.status == "waiting_background":
+                runtime.pending_pause_reason = "main_stop"
+                affected.append(runtime.snapshot())
+                continue
+            if self._request_runtime_stop(
+                runtime,
+                pause_reason="main_stop",
+                hard=True,
+            ):
+                affected.append(runtime.snapshot())
+        return tuple(affected)
+
+    async def settle_hard_user_stop(
+        self,
+        *,
+        subagent_ids: frozenset[str],
+    ) -> tuple[SubagentSnapshot, ...]:
+        settled: list[SubagentSnapshot] = []
+        for runtime in tuple(self._non_disposed_runtimes()):
+            if runtime.subagent_id not in subagent_ids:
+                continue
+            await self._wait_for_turn_settle(runtime)
+            if runtime.status in {"running", "waiting_background", "awaiting_approval"}:
+                runtime.status = "paused"
+            if runtime.pending_pause_reason == "main_stop":
+                runtime.pause_reason = "main_stop"
+                runtime.pending_pause_reason = None
+            runtime.pending_background_job_ids.clear()
+            self._pending_bash_job_notices.pop(runtime.subagent_id, None)
+            self._sync_catalog(runtime)
+            settled.append(runtime.snapshot())
+        return tuple(settled)
 
     async def stop(self, *, agent: str, reason: str | None = None) -> dict[str, Any]:
         runtime = self._require_runtime(agent)
@@ -1436,11 +1473,6 @@ class SubagentManager:
             for notice in notices
         ):
             return "inspect"
-        if any(
-            notice.notice_kind in {"bash_job_output_started", "bash_job_output_grew"}
-            for notice in notices
-        ):
-            return "continue"
         if any(notice.status == "running" for notice in notices):
             return "wait"
         return "finalize"
@@ -1860,6 +1892,7 @@ class SubagentManager:
         runtime: SubagentRuntime,
         *,
         pause_reason: SubagentPauseReason,
+        hard: bool = False,
     ) -> bool:
         if runtime.status in {"paused", "completed", "waiting_background", "failed", "disposed"}:
             return False
@@ -1870,7 +1903,7 @@ class SubagentManager:
             interruption_reason = "new_session"
         else:
             interruption_reason = "user_stop"
-        if pause_reason == "new_session":
+        if pause_reason == "new_session" or hard:
             stop_requested = runtime.loop.request_hard_stop(reason=interruption_reason)
         else:
             stop_requested = runtime.loop.request_stop(reason=interruption_reason)
@@ -2042,12 +2075,18 @@ def _workspace_lease_error_result(
             "Tool execution denied\n"
             f"tool: {name}\n"
             "error_code: workspace_lease_conflict\n"
-            f"reason: {error}"
+            f"conflict_class: {error.conflict_class}\n"
+            f"conflict_key: {error.conflict_key}\n"
+            f"reason: {error}\n"
+            f"remediation: {error.remediation}"
         ),
         metadata={
             "execution_failed": True,
             "error_code": "workspace_lease_conflict",
+            "conflict_class": error.conflict_class,
+            "conflict_key": error.conflict_key,
             "reason": str(error),
+            "remediation": error.remediation,
             "arguments": dict(arguments) if isinstance(arguments, dict) else {},
         },
     )

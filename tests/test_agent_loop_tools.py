@@ -22,6 +22,7 @@ from jarvis.core import (
     AgentTextDeltaEvent,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
+    ContextBudgetError,
 )
 from jarvis.core.agent_loop import _collect_pending_detached_job_ids
 from jarvis.llm import (
@@ -420,6 +421,9 @@ class _FakeBackgroundMutationLLMService:
                             "mode": "background",
                             "command": "run verification",
                         },
+                        raw_arguments=(
+                            '{"mode":"background","command":"run verification"}'
+                        ),
                     )
                 ],
                 finish_reason="tool_calls",
@@ -1891,6 +1895,18 @@ class _FakeCompactionProviderSplitLLMService:
         raise AssertionError("Streaming is not expected in this test.")
 
 
+class _FailingCompactionLLMService:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.generate_calls += 1
+        raise RuntimeError("deterministic compaction failure")
+
+    async def stream_generate(self, request: LLMRequest):
+        raise AssertionError("Streaming is not expected in this test.")
+
+
 class _PreemptedBeforeToolProposalContinuationLLMService:
     def __init__(self) -> None:
         self.stream_started = asyncio.Event()
@@ -2204,6 +2220,125 @@ class _FakeInvalidToolCallLLMService:
 
 
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_task_contract_is_injected_once_per_session_and_after_compaction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _FakeCompactionProviderSplitLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+            )
+
+            (
+                session,
+                _records,
+                turn_context,
+                interruption_notice,
+                first_runtime_messages,
+                _request,
+                _estimate,
+                _compacted,
+            ) = await loop._prepare_turn(
+                user_text="Implement this fully and run all tests.",
+                task_id="turn_1",
+            )
+            first_contract = next(
+                message
+                for message in first_runtime_messages
+                if message.metadata.get("task_contract")
+            )
+            loop._persist_records(
+                session_id=session.session_id,
+                records=loop._build_pending_turn_records(
+                    session_id=session.session_id,
+                    turn_context_text=turn_context,
+                    interruption_notice_text=interruption_notice,
+                    runtime_messages=first_runtime_messages,
+                    turn_id="turn_1",
+                ),
+            )
+            storage.append_record(
+                session.session_id,
+                loop._build_message_record(
+                    session_id=session.session_id,
+                    role="user",
+                    content="Implement this fully and run all tests.",
+                    turn_id="turn_1",
+                ),
+            )
+            storage.set_turn_status(
+                session.session_id,
+                turn_id="turn_1",
+                status="completed",
+            )
+
+            *_, second_runtime_messages, _request, _estimate, _compacted = (
+                await loop._prepare_turn(user_text=None, task_id="turn_2")
+            )
+            self.assertFalse(
+                any(message.metadata.get("task_contract") for message in second_runtime_messages)
+            )
+
+            compacted_session = await loop._compact_session(session, reason="manual")
+            assert compacted_session is not None
+            *_, post_compaction_runtime_messages, _request, _estimate, _compacted = (
+                await loop._prepare_turn(
+                    user_text=None,
+                    task_id="turn_3",
+                    force_session_id=compacted_session.session_id,
+                )
+            )
+            post_compaction_contract = next(
+                message
+                for message in post_compaction_runtime_messages
+                if message.metadata.get("task_contract")
+            )
+            self.assertEqual(
+                post_compaction_contract.metadata["task_contract_revision"],
+                first_contract.metadata["task_contract_revision"],
+            )
+
+    async def test_automatic_compaction_failure_is_latched_for_unchanged_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            storage = SessionStorage(settings.transcript_archive_dir)
+            llm_service = _FailingCompactionLLMService()
+            loop = AgentLoop(
+                llm_service=llm_service,  # type: ignore[arg-type]
+                settings=settings,
+                storage=storage,
+                route_id="route_latch",
+            )
+            session_id = await loop.prepare_session()
+            storage.append_record(
+                session_id,
+                loop._build_message_record(
+                    session_id=session_id,
+                    role="user",
+                    content="Evidence that needs compaction.",
+                ),
+            )
+            session = storage.get_session(session_id)
+            assert session is not None
+
+            with self.assertRaisesRegex(RuntimeError, "deterministic compaction failure"):
+                await loop._compact_session(session, reason="reactive")
+            with self.assertRaises(ContextBudgetError) as raised:
+                await loop._compact_session(session, reason="reactive")
+
+            self.assertEqual(llm_service.generate_calls, 1)
+            self.assertTrue(raised.exception.metadata["compaction_retry_suppressed"])
+            refreshed = storage.get_session(session_id)
+            assert refreshed is not None
+            self.assertFalse(refreshed.pending_reactive_compaction)
+            self.assertIn("compaction_failure_latch", refreshed.backend_state)
+
     def test_terminal_bash_progress_metadata_is_not_treated_as_pending_work(self) -> None:
         terminal_update = AgentRuntimeMessage(
             role="system",

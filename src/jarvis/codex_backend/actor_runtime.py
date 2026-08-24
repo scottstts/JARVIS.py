@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
@@ -37,6 +37,7 @@ from jarvis.core.commands import ParsedCommand, parse_user_command
 from jarvis.llm import LLMUsage, LLMMessage, LLMService
 from jarvis.logging_setup import get_application_logger
 from jarvis.memory import MemoryService, MemorySettings
+from jarvis.runtime_errors import record_runtime_error
 from jarvis.skills import (
     SkillsSettings,
     import_staged_skills,
@@ -898,8 +899,14 @@ class CodexActorRuntime:
             return
         try:
             await self._memory_service.run_due_maintenance()
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("Codex actor memory maintenance failed.")
+            self._record_runtime_error(
+                exc,
+                event="memory_runtime_maintenance_failed",
+                error_code="memory_runtime_maintenance_failed",
+                session_id=self.active_session_id(),
+            )
 
     async def _ensure_thread_loaded(self, session: SessionMetadata) -> str:
         backend_state = dict(session.backend_state)
@@ -1009,8 +1016,14 @@ class CodexActorRuntime:
         if self._memory_mode.bootstrap:
             try:
                 core_text, ongoing_text = await self._memory_service.render_bootstrap_messages()
-            except Exception:
+            except Exception as exc:
                 LOGGER.exception("Codex actor memory bootstrap rendering failed.")
+                self._record_runtime_error(
+                    exc,
+                    event="memory_bootstrap_failed",
+                    error_code="memory_bootstrap_failed",
+                    session_id=self.active_session_id(),
+                )
                 core_text = ""
                 ongoing_text = ""
             if core_text:
@@ -1396,8 +1409,15 @@ class CodexActorRuntime:
                 )
             except _CodexCompactionStopRequested:
                 raise
-            except Exception:
+            except Exception as exc:
                 LOGGER.exception("Codex memory pre-compaction flush failed.")
+                self._record_runtime_error(
+                    exc,
+                    event="memory_pre_compaction_flush_failed",
+                    error_code="memory_pre_compaction_flush_failed",
+                    session_id=session.session_id,
+                    context={"compaction_reason": reason},
+                )
 
         try:
             outcome = await self._await_manual_compaction_operation(
@@ -1416,6 +1436,13 @@ class CodexActorRuntime:
                 metadata.setdefault("compaction_session_id", session.session_id)
                 metadata.setdefault("compaction_reason", reason)
                 metadata.setdefault("compaction_turn_id", None)
+            self._record_runtime_error(
+                exc,
+                event="compaction_failed",
+                error_code="compaction_failed",
+                session_id=session.session_id,
+                context={"compaction_reason": reason},
+            )
             LOGGER.exception(
                 "Codex compaction failed for session %s (reason=%s).",
                 session.session_id,
@@ -1437,6 +1464,28 @@ class CodexActorRuntime:
             compaction_count=session.compaction_count + 1,
         )
         return self._storage.get_session(next_session.session_id) or next_session
+
+    def _record_runtime_error(
+        self,
+        exc: Exception,
+        *,
+        event: str,
+        error_code: str,
+        session_id: str | None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        record_runtime_error(
+            transcript_archive_dir=self._core_settings.transcript_archive_dir,
+            route_id=self._tool_context.route_id or "local",
+            session_id=session_id,
+            component="codex_backend.actor_runtime",
+            event=event,
+            agent_kind=self._identity.kind,
+            exc=exc,
+            error_code=error_code,
+            message=f"{self._identity.name} Codex runtime operation {event} failed.",
+            context=context,
+        )
 
     async def _await_manual_compaction_operation(
         self,

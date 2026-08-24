@@ -333,9 +333,11 @@ Memory maintenance has three lanes:
 
 Immediate sync runs after memory writes, admin reindex actions, and dirty-file detection. It validates Markdown, updates SQLite, refreshes chunks, facts, relations, and embeddings. It does not call a generation model.
 
-Post-turn reflection runs after completed user turns. It uses the maintenance model, not the main chat model, to decide whether to apply memory actions. Routine turns can be ignored. The planner receives compact active-memory context and prefers updating existing documents over creating duplicates.
+Post-turn reflection runs after completed user turns. It uses the maintenance model, not the main chat model, to decide whether to apply memory actions. Routine turns can be ignored. The reflection caller sends one stable instruction-only `system` message and one dynamic `user` message containing route/session context, active memories, and the completed transcript. This keeps Gemini and other normal generation adapters on their ordinary chat/generate-content path; it does not change provider request routing or embedding calls. The planner prefers updating existing documents over creating duplicates.
 
 Pre-compaction flush runs a final reflection pass over the soon-to-be-archived session before compaction.
+
+Bootstrap, post-turn reflection, due maintenance, and pre-compaction flush failures are non-fatal to the main turn but are never server-log-only: the owning agent runtime persists one de-duplicated JSONL error entry with route/session/turn context and traceback before continuing.
 
 Due-time maintenance runs opportunistically at startup, before new user turns when due, and through `memory_admin`.
 

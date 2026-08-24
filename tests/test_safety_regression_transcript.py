@@ -34,12 +34,14 @@ def _response(*, tool_name: str | None = None, call_id: str = "", text: str = ""
         elif tool_name == "acceptance_run":
             arguments = {
                 "scope": "project",
+                "revision_paths": ["project"],
                 "gates": [{"gate_id": "tests", "command": "npm test"}],
             }
         else:
             arguments = {
                 "scope": "project",
                 "workspace_revision": "revision",
+                "revision_paths": ["project"],
                 "checks": [
                     {
                         "item_id": _CONTRACT_ITEM_ID,
@@ -128,6 +130,9 @@ async def _execute(
             metadata={
                 "changed": False,
                 "acceptance_run": {
+                    "passed": True,
+                    "revision_paths": ["project"],
+                    "workspace_revision_after": "revision",
                     "gates": [
                         {"gate_id": "tests", "command": "npm test", "passed": True}
                     ]
@@ -142,6 +147,8 @@ async def _execute(
         metadata={
             "acceptance_ledger": {
                 "workspace_revision_verified": True,
+                "workspace_revision": "revision",
+                "revision_paths": ["project"],
                 "complete": True,
                 "checks": [
                     {

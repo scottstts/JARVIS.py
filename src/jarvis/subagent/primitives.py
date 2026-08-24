@@ -10,6 +10,7 @@ SUBAGENT_PRIMITIVE_NAMES = (
     "subagent_stop",
     "subagent_step_in",
     "subagent_dispose",
+    "orchestrator_wait",
 )
 
 
@@ -137,6 +138,33 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                 "additionalProperties": False,
             },
         ),
+        ToolDefinition(
+            name="orchestrator_wait",
+            description=(
+                "Park Jarvis while route-owned subagents or detached jobs continue and there is "
+                "no actionable main-agent work. Material actor events wake Jarvis immediately; "
+                "wake_after_seconds is only a bounded liveness review deadline."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "wake_after_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Preferred maximum seconds before a liveness review.",
+                    },
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "watch_actor_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 32,
+                        "uniqueItems": True,
+                    },
+                },
+                "required": ["wake_after_seconds", "reason"],
+                "additionalProperties": False,
+            },
+        ),
     )
 
 
@@ -156,6 +184,9 @@ def render_subagent_primitive_docs() -> str:
         "instructions; it is not live prompt injection.",
         f"- `{definitions['subagent_dispose'].name}`: dispose completed, failed, or no-longer-needed children "
         "to free their slots.",
+        f"- `{definitions['orchestrator_wait'].name}`: when route-owned work is still running but "
+        "you have no actionable work, choose a liveness deadline and park. Material events wake "
+        "you immediately; never create sleep jobs to poll.",
         "Subagents cannot spawn subagents.",
         "A paused, rejected, or failed child requires inspection and a Jarvis decision; only a "
         "completed child with a complete report is ready to finalize.",
