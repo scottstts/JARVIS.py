@@ -392,14 +392,6 @@
             {
                 "code": "reportReturnType",
                 "range": {
-                    "startColumn": 30,
-                    "endColumn": 34,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportReturnType",
-                "range": {
                     "startColumn": 68,
                     "endColumn": 72,
                     "lineCount": 1
@@ -632,22 +624,6 @@
                     "endColumn": 62,
                     "lineCount": 1
                 }
-            },
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 43,
-                    "endColumn": 57,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 43,
-                    "endColumn": 57,
-                    "lineCount": 1
-                }
             }
         ],
         "./src/jarvis/tools/basic/bash/jobs.py": [
@@ -813,14 +789,6 @@
             }
         ],
         "./src/jarvis/tools/remote_runtime_client.py": [
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 25,
-                    "endColumn": 39,
-                    "lineCount": 1
-                }
-            },
             {
                 "code": "reportArgumentType",
                 "range": {

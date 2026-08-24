@@ -863,7 +863,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["Working on it.", "🔧 <b>Jarvis</b> used <b>bash</b> tool.", "Done."],
+            ["Working on it.", "🔧 <b>Jarvis</b>:\n• used <b>bash</b>", "Done."],
         )
 
     async def test_handle_message_preserves_underscores_in_tool_notice(self) -> None:
@@ -891,7 +891,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "🔧 <b>Jarvis</b> used <b>generate_edit_image</b> tool.",
+                "🔧 <b>Jarvis</b>:\n• used <b>generate_edit_image</b>",
                 "Done.",
             ],
         )
@@ -900,20 +900,15 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["HTML", "HTML"],
         )
 
-    async def test_handle_message_collapses_only_consecutive_duplicate_tool_notices(self) -> None:
+    async def test_handle_message_stacks_tool_usage_and_moves_latest_tool_to_bottom(
+        self,
+    ) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(
             events=[
-                GatewayToolCallEvent(
-                    session_id="session",
-                    tool_names=(
-                        "bash",
-                        "bash",
-                        "web_fetch",
-                        "web_fetch",
-                        "bash",
-                    ),
-                ),
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayToolCallEvent(session_id="session", tool_names=("file_patch",)),
+                GatewayToolCallEvent(session_id="session", tool_names=("bash", "bash")),
                 GatewayMessageEvent(session_id="session", text="Done."),
                 GatewayTurnDoneEvent(session_id="session", response_text="Done."),
             ],
@@ -931,12 +926,63 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
-                "🔧 <b>Jarvis</b> used <b>web_fetch</b> tool.",
-                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b>",
                 "Done.",
             ],
         )
+        self.assertEqual(
+            [message.text for message in telegram.edited_messages],
+            [
+                "🔧 <b>Jarvis</b>:\n"
+                "• used <b>bash</b>\n"
+                "• used <b>file_patch</b>",
+                "🔧 <b>Jarvis</b>:\n"
+                "• used <b>file_patch</b>\n"
+                "• used <b>bash</b> ×3",
+            ],
+        )
+        self.assertEqual(
+            [message.message_id for message in telegram.edited_messages],
+            [1, 1],
+        )
+        self.assertEqual(
+            [message.parse_mode for message in telegram.edited_messages],
+            ["HTML", "HTML"],
+        )
+
+    async def test_handle_message_user_facing_text_partitions_main_tool_stack(
+        self,
+    ) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayMessageEvent(session_id="session", text="Checkpoint."),
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_chunk_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b>",
+                "Checkpoint.",
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b>",
+                "Done.",
+            ],
+        )
+        self.assertEqual(telegram.edited_messages, [])
 
     async def test_handle_message_flushes_pending_stream_text_before_tool_notice(self) -> None:
         telegram = _FakeTelegramClient()
@@ -961,7 +1007,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["Working on it.", "🔧 <b>Jarvis</b> used <b>bash</b> tool.", "Done."],
+            ["Working on it.", "🔧 <b>Jarvis</b>:\n• used <b>bash</b>", "Done."],
         )
 
     async def test_handle_message_sends_approval_request_with_inline_keyboard(self) -> None:
@@ -1107,7 +1153,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["🔧 <b>Jarvis</b> used <b>bash</b> tool.", "Working on it."],
+            ["🔧 <b>Jarvis</b>:\n• used <b>bash</b>", "Working on it."],
         )
 
     async def test_handle_message_skips_whitespace_only_draft_payloads(self) -> None:
@@ -1239,7 +1285,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["🔧 <b>Jarvis</b> used <b>bash</b> tool."],
+            ["🔧 <b>Jarvis</b>:\n• used <b>bash</b>"],
         )
 
         await asyncio.sleep(0.6)
@@ -1272,7 +1318,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
-            ["🔧 <b>Jarvis</b> used <b>bash</b> tool.", "done"],
+            ["🔧 <b>Jarvis</b>:\n• used <b>bash</b>", "done"],
         )
 
     async def test_task_status_keeps_typing_after_user_turn_done(self) -> None:
@@ -1507,14 +1553,14 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b> ×2",
                 "Done 1.",
-                "🔧 <b>Jarvis</b> used <b>bash</b> tool.",
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b>",
                 "Done 2.",
             ],
         )
 
-    async def test_background_subagent_tool_notices_collapse_only_consecutive_duplicates(
+    async def test_background_subagent_tool_stack_partitions_on_main_message(
         self,
     ) -> None:
         telegram = _FakeTelegramClient()
@@ -1547,7 +1593,143 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 agent_kind="subagent",
                 agent_name="Friday",
                 subagent_id="sub_1",
-                tool_names=("bash", "bash", "web_fetch", "bash"),
+                tool_names=("bash",),
+            )
+        )
+        await session.emit(
+            GatewaySystemNoticeEvent(
+                route_id="tg_777",
+                session_id="sub_session",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_1",
+                notice_kind="subagent_completed",
+                text="completed.",
+            )
+        )
+        await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                text="Main update.",
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="sub_session",
+                turn_id="sub_turn_2",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_1",
+                tool_names=("file_patch",),
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                session_id="sub_session",
+                turn_id="sub_turn_3",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_1",
+                tool_names=("bash", "bash"),
+            )
+        )
+        await session.emit(
+            GatewayTurnDoneEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                response_text="Main update.",
+            )
+        )
+        await bridge.wait_for_chat_idle(777)
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 <b>Friday</b>:\n• used <b>bash</b>",
+                "⚙️ <b>System:</b> <b>Friday</b> completed.",
+                "Main update.",
+                "🔧 <b>Friday</b>:\n• used <b>file_patch</b>",
+            ],
+        )
+        self.assertEqual(
+            [message.text for message in telegram.edited_messages],
+            [
+                "🔧 <b>Friday</b>:\n"
+                "• used <b>file_patch</b>\n"
+                "• used <b>bash</b> ×2",
+            ],
+        )
+        self.assertEqual(
+            [message.message_id for message in telegram.edited_messages],
+            [4],
+        )
+
+    async def test_background_tool_stacks_are_independent_per_agent(self) -> None:
+        telegram = _FakeTelegramClient()
+        session = _PersistentFakeRouteSession()
+        gateway = _PersistentFakeGatewayClient(session)
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.dispatch_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+        client_message_id = session.sent_messages[0][1]
+        await session.emit(
+            GatewayTurnStartedEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_friday",
+                tool_names=("bash",),
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                agent_kind="subagent",
+                agent_name="Edith",
+                subagent_id="sub_edith",
+                tool_names=("acceptance_run",),
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                agent_kind="subagent",
+                agent_name="Friday",
+                subagent_id="sub_friday",
+                tool_names=("file_patch",),
+            )
+        )
+        await session.emit(
+            GatewayToolCallEvent(
+                route_id="tg_777",
+                agent_kind="subagent",
+                agent_name="Edith",
+                subagent_id="sub_edith",
+                tool_names=("acceptance_run",),
             )
         )
         await session.emit(
@@ -1566,9 +1748,21 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
             [
-                "🔧 <b>Friday</b> used <b>bash</b> tool.",
-                "🔧 <b>Friday</b> used <b>web_fetch</b> tool.",
-                "🔧 <b>Friday</b> used <b>bash</b> tool.",
+                "🔧 <b>Friday</b>:\n• used <b>bash</b>",
+                "🔧 <b>Edith</b>:\n• used <b>acceptance_run</b>",
+            ],
+        )
+        self.assertEqual(
+            [message.message_id for message in telegram.edited_messages],
+            [1, 2],
+        )
+        self.assertEqual(
+            [message.text for message in telegram.edited_messages],
+            [
+                "🔧 <b>Friday</b>:\n"
+                "• used <b>bash</b>\n"
+                "• used <b>file_patch</b>",
+                "🔧 <b>Edith</b>:\n• used <b>acceptance_run</b> ×2",
             ],
         )
 

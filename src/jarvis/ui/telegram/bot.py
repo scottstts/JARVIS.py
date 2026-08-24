@@ -11,7 +11,7 @@ import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -247,8 +247,8 @@ class _ChatTypingIndicatorState:
 
 @dataclass(slots=True)
 class _ToolNoticeState:
-    turn_id: str | None = None
-    last_tool_name: str | None = None
+    message_id: int | None = None
+    tool_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -798,7 +798,6 @@ class TelegramGatewayBridge:
                 notices_sent = await self._send_tool_usage_notices(
                     chat_id=chat_id,
                     event=event,
-                    fallback_turn_id=active_turn.turn_id,
                 )
             if notices_sent:
                 active_turn.delivered_any_segment = True
@@ -878,6 +877,7 @@ class TelegramGatewayBridge:
         )
         self._active_turn_by_chat[chat_id] = active_turn
         if submitted_turn.show_new_session_notice:
+            self._tool_notice_state_by_chat.pop(chat_id, None)
             await self._send_html_message(
                 chat_id=chat_id,
                 html_text=_format_local_system_notice("Started a new session."),
@@ -1086,11 +1086,13 @@ class TelegramGatewayBridge:
             active_turn.published_text = normalized_text
             active_turn.last_publish_at = time.monotonic()
             active_turn.delivered_any_segment = True
+            self._partition_tool_notice_stacks(chat_id)
             return
         if not normalized_text.startswith(active_turn.published_text):
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
             self._refresh_typing_indicator(chat_id)
             active_turn.delivered_any_segment = True
+            self._partition_tool_notice_stacks(chat_id)
             return
         try:
             await self._publish_stream_text(
@@ -1105,12 +1107,14 @@ class TelegramGatewayBridge:
             await self._send_final_text(chat_id=chat_id, text=normalized_text)
             self._refresh_typing_indicator(chat_id)
             active_turn.delivered_any_segment = True
+            self._partition_tool_notice_stacks(chat_id)
             return
         active_turn.published_text = normalized_text
         active_turn.last_publish_at = time.monotonic()
         active_turn.delivered_any_segment = True
         if active_turn.stream_transport == "draft":
             self._record_draft_success(chat_id=chat_id)
+        self._partition_tool_notice_stacks(chat_id)
 
     async def _publish_stream_text(
         self,
@@ -1242,6 +1246,11 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 html_text=_format_system_notice(event),
             )
+            if event.notice_kind == "subagent_disposed":
+                self._discard_subagent_tool_notice_stack(
+                    chat_id=chat_id,
+                    subagent_id=event.subagent_id,
+                )
             self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayTurnDoneEvent):
@@ -1256,6 +1265,7 @@ class TelegramGatewayBridge:
                 chat_id=chat_id,
                 text=final_text,
             )
+            self._partition_tool_notice_stacks(chat_id)
             self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayErrorEvent):
@@ -1404,28 +1414,7 @@ class TelegramGatewayBridge:
         *,
         chat_id: int,
         event: GatewayToolCallEvent,
-        fallback_turn_id: str | None = None,
     ) -> bool:
-        delivered_notice = False
-        for tool_name in self._tool_notice_names_for_event(
-            chat_id=chat_id,
-            event=event,
-            fallback_turn_id=fallback_turn_id,
-        ):
-            await self._send_html_message(
-                chat_id=chat_id,
-                html_text=_format_tool_usage_notice(event.agent_name, tool_name),
-            )
-            delivered_notice = True
-        return delivered_notice
-
-    def _tool_notice_names_for_event(
-        self,
-        *,
-        chat_id: int,
-        event: GatewayToolCallEvent,
-        fallback_turn_id: str | None = None,
-    ) -> tuple[str, ...]:
         state_by_agent = self._tool_notice_state_by_chat.setdefault(chat_id, {})
         agent_key = self._tool_notice_agent_key(event)
         state = state_by_agent.get(agent_key)
@@ -1433,24 +1422,40 @@ class TelegramGatewayBridge:
             state = _ToolNoticeState()
             state_by_agent[agent_key] = state
 
-        current_turn_id = self._tool_notice_turn_id(
-            event=event,
-            fallback_turn_id=fallback_turn_id,
-        )
-        if state.turn_id != current_turn_id:
-            state.turn_id = current_turn_id
-            state.last_tool_name = None
-
-        tool_names: list[str] = []
+        updated = False
         for raw_tool_name in event.tool_names:
             tool_name = raw_tool_name.strip()
             if not tool_name:
                 continue
-            if state.last_tool_name == tool_name:
-                continue
-            tool_names.append(tool_name)
-            state.last_tool_name = tool_name
-        return tuple(tool_names)
+            count = state.tool_counts.pop(tool_name, 0) + 1
+            state.tool_counts[tool_name] = count
+            updated = True
+        if not updated:
+            return False
+
+        notice_html = _format_tool_usage_notice(event.agent_name, state.tool_counts)
+        if state.message_id is None:
+            response = await self._send_html_message(
+                chat_id=chat_id,
+                html_text=notice_html,
+            )
+            if response is None:
+                return False
+            message_id = response.get("message_id")
+            if not isinstance(message_id, int):
+                raise TelegramAPIError(
+                    code="invalid_telegram_response",
+                    message="Telegram sendMessage did not include a message_id.",
+                )
+            state.message_id = message_id
+            return True
+
+        await self._edit_html_message(
+            chat_id=chat_id,
+            message_id=state.message_id,
+            html_text=notice_html,
+        )
+        return True
 
     def _tool_notice_agent_key(self, event: GatewayToolCallEvent) -> tuple[str, str]:
         agent_kind = event.agent_kind.strip() or "main"
@@ -1459,22 +1464,24 @@ class TelegramGatewayBridge:
             agent_id = event.agent_name.strip() or "Jarvis"
         return (agent_kind, agent_id)
 
-    def _tool_notice_turn_id(
+    def _partition_tool_notice_stacks(self, chat_id: int) -> None:
+        self._tool_notice_state_by_chat.pop(chat_id, None)
+
+    def _discard_subagent_tool_notice_stack(
         self,
         *,
-        event: GatewayToolCallEvent,
-        fallback_turn_id: str | None,
-    ) -> str | None:
-        candidates = (
-            (event.turn_id or "").strip(),
-            (fallback_turn_id or "").strip(),
-            (event.client_message_id or "").strip(),
-            event.event_id.strip(),
-        )
-        for candidate in candidates:
-            if candidate:
-                return candidate
-        return None
+        chat_id: int,
+        subagent_id: str | None,
+    ) -> None:
+        normalized_subagent_id = (subagent_id or "").strip()
+        if not normalized_subagent_id:
+            return
+        state_by_agent = self._tool_notice_state_by_chat.get(chat_id)
+        if state_by_agent is None:
+            return
+        state_by_agent.pop(("subagent", normalized_subagent_id), None)
+        if not state_by_agent:
+            self._tool_notice_state_by_chat.pop(chat_id, None)
 
     async def _handle_stop_command(self, message: IncomingTelegramMessage) -> None:
         output_was_paused = self._chat_output_paused(message.chat_id)
@@ -1757,14 +1764,48 @@ class TelegramGatewayBridge:
             text=plain_text,
         )
 
-    async def _send_html_message(self, *, chat_id: int, html_text: str) -> None:
+    async def _send_html_message(
+        self,
+        *,
+        chat_id: int,
+        html_text: str,
+    ) -> dict[str, Any] | None:
+        normalized_html = html_text.strip()
+        if not normalized_html:
+            return None
+
+        try:
+            return await self._telegram.send_message(
+                chat_id=chat_id,
+                text=normalized_html,
+                parse_mode="HTML",
+            )
+        except TelegramAPIError as exc:
+            if not _is_formatting_error(exc):
+                raise
+
+        plain_text = _coalesce_visible_text(
+            html.unescape(_HTML_TAG_PATTERN.sub("", normalized_html))
+        )
+        if plain_text is None:
+            return None
+        return await self._telegram.send_message(chat_id=chat_id, text=plain_text)
+
+    async def _edit_html_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        html_text: str,
+    ) -> None:
         normalized_html = html_text.strip()
         if not normalized_html:
             return
 
         try:
-            await self._telegram.send_message(
+            await self._telegram.edit_message_text(
                 chat_id=chat_id,
+                message_id=message_id,
                 text=normalized_html,
                 parse_mode="HTML",
             )
@@ -1778,7 +1819,11 @@ class TelegramGatewayBridge:
         )
         if plain_text is None:
             return
-        await self._telegram.send_message(chat_id=chat_id, text=plain_text)
+        await self._telegram.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=plain_text,
+        )
 
     async def _send_approval_request_message(
         self,
@@ -2468,10 +2513,17 @@ def _has_visible_telegram_text(text: str) -> bool:
     return _has_effective_text(_HTML_TAG_PATTERN.sub("", text))
 
 
-def _format_tool_usage_notice(agent_name: str, tool_name: str) -> str:
+def _format_tool_usage_notice(
+    agent_name: str,
+    tool_counts: dict[str, int],
+) -> str:
     normalized_agent = html.escape(agent_name.strip() or "Jarvis")
-    normalized_name = html.escape(tool_name.strip() or "unknown")
-    return f"🔧 <b>{normalized_agent}</b> used <b>{normalized_name}</b> tool."
+    lines = [f"🔧 <b>{normalized_agent}</b>:"]
+    for tool_name, count in tool_counts.items():
+        normalized_name = html.escape(tool_name)
+        count_suffix = f" ×{count}" if count > 1 else ""
+        lines.append(f"• used <b>{normalized_name}</b>{count_suffix}")
+    return "\n".join(lines)
 
 
 def _format_provider_configuration(

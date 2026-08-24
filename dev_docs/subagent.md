@@ -240,8 +240,10 @@ Public Telegram notices are intentionally minimal:
 
 - subagent invoked
 - subagent disposed
-- agent-attributed tool use
+- per-agent tool activity stacks using raw tool names
 - agent-attributed approval prompts
+
+Tool activity is rendered as one editable Telegram message per agent. Tool names are bold, repeated uses increment a count, and the most recently used tool is moved to the bottom of that agent's list. Every user-facing Jarvis message partitions all current tool-activity stacks, so the next main-agent or subagent tool use starts a fresh notice below that message. System notices remain separate and do not partition tool activity.
 
 General progress stays internal unless the main agent reports it in its own turn.
 
