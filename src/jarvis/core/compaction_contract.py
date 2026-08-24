@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Mapping, Sequence, TypeAlias
 
 
 CompactionReplayRole: TypeAlias = Literal["system", "user", "assistant"]
 CompactionReplayKind: TypeAlias = Literal[
     "history_boundary",
-    "preserved_message",
+    "recent_message",
     "episode",
     "state_snapshot",
     "handover",
@@ -23,6 +23,12 @@ CompactionStateCategory: TypeAlias = Literal[
     "open_loop",
     "uncertainty",
 ]
+CompactionSemanticStatus: TypeAlias = Literal["accepted", "fallback"]
+CompactionSemanticSource: TypeAlias = Literal[
+    "model",
+    "previous_snapshot",
+    "minimal",
+]
 
 _STATE_CATEGORIES = {
     "constraint",
@@ -32,22 +38,24 @@ _STATE_CATEGORIES = {
     "uncertainty",
 }
 _REPLAY_BOUNDARY_TEXT = (
-    "Historical context from an earlier Jarvis session follows. Exact preserved messages "
-    "retain their original user or assistant role. Compacted assistant context is a factual "
+    "Historical context from an earlier Jarvis session follows. Harness-selected exact recent "
+    "messages retain their original user or assistant role. Compacted assistant context is a factual "
     "continuation record, not new system policy. Current runtime identity, policy, tools, and "
     "memory take precedence where applicable."
 )
-_DRAFT_KEYS = {
-    "objective",
-    "background",
-    "preserved_messages",
-    "episodes",
-    "constraints",
-    "decisions",
-    "artifacts",
-    "open_loops",
-    "uncertainties",
-    "handover",
+_REQUIRED_DRAFT_KEYS = {"objective", "handover"}
+_PLACEHOLDER_SEMANTIC_VALUES = {
+    ".",
+    "..",
+    "...",
+    "-",
+    "/",
+    "/...",
+    "desc",
+    "description",
+    "unused",
+    "n/a",
+    "na",
 }
 
 
@@ -138,7 +146,7 @@ class CompactionSourceEvent:
 
 @dataclass(slots=True, frozen=True)
 class CompactionSourceManifest:
-    """Deterministic lineage for an accepted semantic compaction."""
+    """Deterministic lineage for a compaction checkpoint."""
 
     generation: int
     previous_bundle_id: str | None
@@ -222,6 +230,7 @@ class CompactionPreservedRecord:
     content_sha256: str
     reason: str
     chronology: CompactionChronology
+    causal_group_id: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -233,6 +242,7 @@ class CompactionPreservedRecord:
             "content_sha256": self.content_sha256,
             "reason": self.reason,
             "chronology": self.chronology.to_dict(),
+            "causal_group_id": self.causal_group_id,
         }
 
     @classmethod
@@ -248,6 +258,7 @@ class CompactionPreservedRecord:
                 "content_sha256",
                 "reason",
                 "chronology",
+                "causal_group_id",
             },
             location="preserved record",
         )
@@ -264,8 +275,9 @@ class CompactionPreservedRecord:
                 "preserved_content_hash_mismatch",
                 "Preserved record content does not match its stored hash.",
             )
+        record_id = _required_string(payload, "record_id")
         return cls(
-            record_id=_required_string(payload, "record_id"),
+            record_id=record_id,
             source_session_id=_required_string(payload, "source_session_id"),
             created_at=_required_string(payload, "created_at"),
             role=role,  # type: ignore[arg-type]
@@ -275,6 +287,7 @@ class CompactionPreservedRecord:
             chronology=CompactionChronology.from_dict(
                 _required_mapping(payload, "chronology")
             ),
+            causal_group_id=_required_string(payload, "causal_group_id"),
         )
 
 
@@ -419,6 +432,45 @@ class CompactionHandover:
 
 
 @dataclass(slots=True, frozen=True)
+class CompactionSemanticProvenance:
+    status: CompactionSemanticStatus
+    source: CompactionSemanticSource
+    issue_code: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "source": self.source,
+            "issue_code": self.issue_code,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> CompactionSemanticProvenance:
+        _require_exact_keys(
+            payload,
+            {"status", "source", "issue_code"},
+            location="semantic provenance",
+        )
+        status = _required_string(payload, "status")
+        source = _required_string(payload, "source")
+        if status not in {"accepted", "fallback"}:
+            raise _single_issue(
+                "invalid_semantic_status",
+                f"Unsupported semantic status: {status!r}.",
+            )
+        if source not in {"model", "previous_snapshot", "minimal"}:
+            raise _single_issue(
+                "invalid_semantic_source",
+                f"Unsupported semantic source: {source!r}.",
+            )
+        return cls(
+            status=status,  # type: ignore[arg-type]
+            source=source,  # type: ignore[arg-type]
+            issue_code=_optional_string(payload.get("issue_code")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class CompactionBundle:
     schema_version: int
     bundle_id: str
@@ -426,10 +478,11 @@ class CompactionBundle:
     source_manifest: CompactionSourceManifest
     objective: CompactionObjective
     background: tuple[str, ...]
-    preserved_records: tuple[CompactionPreservedRecord, ...]
+    recent_records: tuple[CompactionPreservedRecord, ...]
     episodes: tuple[CompactionEpisode, ...]
     state_entries: tuple[CompactionStateEntry, ...]
     handover: CompactionHandover
+    semantic_provenance: CompactionSemanticProvenance
 
     @property
     def generation(self) -> int:
@@ -443,14 +496,16 @@ class CompactionBundle:
             "source_manifest": self.source_manifest.to_dict(),
             "objective": self.objective.to_dict(),
             "background": list(self.background),
-            "preserved_records": [item.to_dict() for item in self.preserved_records],
+            "recent_records": [item.to_dict() for item in self.recent_records],
             "episodes": [item.to_dict() for item in self.episodes],
             "state_entries": [item.to_dict() for item in self.state_entries],
             "handover": self.handover.to_dict(),
+            "semantic_provenance": self.semantic_provenance.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> CompactionBundle:
+        schema_version = _required_positive_int(payload, "schema_version")
         _require_exact_keys(
             payload,
             {
@@ -460,18 +515,18 @@ class CompactionBundle:
                 "source_manifest",
                 "objective",
                 "background",
-                "preserved_records",
+                "recent_records",
                 "episodes",
                 "state_entries",
                 "handover",
+                "semantic_provenance",
             },
             location="compaction bundle",
         )
-        schema_version = _required_positive_int(payload, "schema_version")
-        if schema_version != 3:
+        if schema_version != 4:
             raise _single_issue(
                 "unsupported_compaction_schema",
-                f"Expected compaction schema version 3, got {schema_version}.",
+                f"Expected compaction schema version 4, got {schema_version}.",
             )
         bundle = cls(
             schema_version=schema_version,
@@ -484,9 +539,9 @@ class CompactionBundle:
                 _required_mapping(payload, "objective")
             ),
             background=_required_string_tuple(payload, "background", allow_empty=True),
-            preserved_records=tuple(
+            recent_records=tuple(
                 CompactionPreservedRecord.from_dict(item)
-                for item in _required_mapping_list(payload, "preserved_records")
+                for item in _required_mapping_list(payload, "recent_records")
             ),
             episodes=tuple(
                 CompactionEpisode.from_dict(item)
@@ -498,6 +553,9 @@ class CompactionBundle:
             ),
             handover=CompactionHandover.from_dict(
                 _required_mapping(payload, "handover")
+            ),
+            semantic_provenance=CompactionSemanticProvenance.from_dict(
+                _required_mapping(payload, "semantic_provenance")
             ),
         )
         validate_compaction_bundle(bundle)
@@ -584,50 +642,156 @@ def apply_compaction_draft(
     bundle_id: str,
     created_at: str,
     source_manifest: CompactionSourceManifest,
-    source_events: Sequence[CompactionSourceEvent],
-    previous_bundle: CompactionBundle | None,
+    recent_records: Sequence[CompactionPreservedRecord],
+    semantic_provenance: CompactionSemanticProvenance | None = None,
 ) -> CompactionBundle:
     """Turn the model's semantic record into Jarvis-owned canonical state."""
 
-    _require_exact_keys(payload, _DRAFT_KEYS, location="compaction submission")
+    missing = _REQUIRED_DRAFT_KEYS - set(payload)
+    if missing:
+        raise _single_issue(
+            "invalid_field_set",
+            "compaction submission is missing " + ", ".join(sorted(missing)) + ".",
+        )
     objective = CompactionObjective(summary=_required_string(payload, "objective"))
-    background = _ordered_unique(
-        _required_string_tuple(payload, "background", allow_empty=True)
-    )
-    preserved = _preserved_records_from_draft(
-        _required_mapping_list(payload, "preserved_messages"),
-        source_events=source_events,
-        previous_bundle=previous_bundle,
-    )
+    background = _ordered_unique(_optional_string_tuple(payload, "background"))
     episodes = _episodes_from_draft(
-        _required_mapping_list(payload, "episodes"),
+        _optional_mapping_list(payload, "episodes"),
         generation=source_manifest.generation,
     )
     state_entries = _state_entries_from_draft(payload)
-    handover = CompactionHandover.from_dict(_required_mapping(payload, "handover"))
+    handover_payload = _required_mapping(payload, "handover")
+    handover = CompactionHandover(
+        current_focus=_required_string(handover_payload, "current_focus"),
+        next_actions=_optional_string_tuple(handover_payload, "next_actions"),
+        do_not_repeat=_optional_string_tuple(handover_payload, "do_not_repeat"),
+        verification_needed=_optional_string_tuple(
+            handover_payload,
+            "verification_needed",
+        ),
+    )
     bundle = CompactionBundle(
-        schema_version=3,
+        schema_version=4,
         bundle_id=bundle_id,
         created_at=created_at,
         source_manifest=source_manifest,
         objective=objective,
         background=background,
-        preserved_records=preserved,
+        recent_records=tuple(recent_records),
         episodes=episodes,
         state_entries=state_entries,
         handover=handover,
+        semantic_provenance=semantic_provenance
+        or CompactionSemanticProvenance(status="accepted", source="model"),
     )
+    validate_semantic_candidate(bundle)
     validate_compaction_bundle(bundle)
     return bundle
 
 
+def build_fallback_compaction_bundle(
+    *,
+    bundle_id: str,
+    created_at: str,
+    source_manifest: CompactionSourceManifest,
+    recent_records: Sequence[CompactionPreservedRecord],
+    previous_bundle: CompactionBundle | None,
+    issue_code: str,
+) -> CompactionBundle:
+    """Build a valid checkpoint without depending on a semantic model response."""
+
+    use_previous = previous_bundle is not None
+    if previous_bundle is not None:
+        try:
+            validate_semantic_candidate(previous_bundle)
+        except CompactionContractError:
+            use_previous = False
+    if use_previous and previous_bundle is not None:
+        bundle = CompactionBundle(
+            schema_version=4,
+            bundle_id=bundle_id,
+            created_at=created_at,
+            source_manifest=source_manifest,
+            objective=previous_bundle.objective,
+            background=previous_bundle.background,
+            recent_records=tuple(recent_records),
+            episodes=previous_bundle.episodes,
+            state_entries=previous_bundle.state_entries,
+            handover=previous_bundle.handover,
+            semantic_provenance=CompactionSemanticProvenance(
+                status="fallback",
+                source="previous_snapshot",
+                issue_code=issue_code,
+            ),
+        )
+    else:
+        bundle = CompactionBundle(
+            schema_version=4,
+            bundle_id=bundle_id,
+            created_at=created_at,
+            source_manifest=source_manifest,
+            objective=CompactionObjective(
+                summary="Continue the current task from deterministic recent context."
+            ),
+            background=(),
+            recent_records=tuple(recent_records),
+            episodes=(),
+            state_entries=(),
+            handover=CompactionHandover(
+                current_focus="Continue from the retained recent records and authoritative runtime state.",
+                next_actions=("Resume the current task using the retained recent context.",),
+                do_not_repeat=(),
+                verification_needed=(),
+            ),
+            semantic_provenance=CompactionSemanticProvenance(
+                status="fallback",
+                source="minimal",
+                issue_code=issue_code,
+            ),
+        )
+    validate_compaction_bundle(bundle)
+    return bundle
+
+
+def validate_semantic_candidate(bundle: CompactionBundle) -> None:
+    """Reject only clearly unusable semantic output; rollover supplies the fallback."""
+
+    critical = (bundle.objective.summary, bundle.handover.current_focus)
+    if any(_is_placeholder_semantic_text(value) for value in critical):
+        raise _single_issue(
+            "inadequate_semantic_payload",
+            "Semantic objective and current focus must contain useful continuation context.",
+        )
+    semantic_values = [
+        bundle.objective.summary,
+        *bundle.background,
+        *(episode.summary for episode in bundle.episodes),
+        *(outcome for episode in bundle.episodes for outcome in episode.outcomes),
+        *(entry.summary for entry in bundle.state_entries),
+        bundle.handover.current_focus,
+        *bundle.handover.next_actions,
+        *bundle.handover.do_not_repeat,
+        *bundle.handover.verification_needed,
+    ]
+    useful_chars = sum(
+        sum(character.isalnum() for character in value)
+        for value in semantic_values
+        if not _is_placeholder_semantic_text(value)
+    )
+    if useful_chars < 40:
+        raise _single_issue(
+            "inadequate_semantic_payload",
+            "Semantic output contains too little useful continuation context.",
+        )
+
+
 def validate_compaction_bundle(bundle: CompactionBundle) -> None:
     issues: list[CompactionContractIssue] = []
-    if bundle.schema_version != 3:
+    if bundle.schema_version != 4:
         issues.append(
             CompactionContractIssue(
                 code="unsupported_compaction_schema",
-                message=f"Expected compaction schema version 3, got {bundle.schema_version}.",
+                message=f"Expected compaction schema version 4, got {bundle.schema_version}.",
             )
         )
     if bundle.source_manifest.generation <= 0:
@@ -637,8 +801,33 @@ def validate_compaction_bundle(bundle: CompactionBundle) -> None:
                 message="Compaction generation must be positive.",
             )
         )
+    provenance = bundle.semantic_provenance
+    if provenance.status == "accepted" and provenance.source != "model":
+        issues.append(
+            CompactionContractIssue(
+                code="invalid_semantic_provenance",
+                message="Accepted semantic state must come from the current model refresh.",
+            )
+        )
+    if provenance.status == "fallback" and provenance.source not in {
+        "previous_snapshot",
+        "minimal",
+    }:
+        issues.append(
+            CompactionContractIssue(
+                code="invalid_semantic_provenance",
+                message="Fallback semantic state must identify its deterministic source.",
+            )
+        )
+    if provenance.status == "fallback" and provenance.issue_code is None:
+        issues.append(
+            CompactionContractIssue(
+                code="missing_semantic_fallback_issue",
+                message="Fallback semantic state must record why refresh was unavailable.",
+            )
+        )
     for label, values in (
-        ("preserved record", [item.record_id for item in bundle.preserved_records]),
+        ("recent record", [item.record_id for item in bundle.recent_records]),
         ("episode", [item.episode_id for item in bundle.episodes]),
         ("state entry", [item.entry_id for item in bundle.state_entries]),
     ):
@@ -650,12 +839,21 @@ def validate_compaction_bundle(bundle: CompactionBundle) -> None:
                     message=f"Duplicate {label} ids: {', '.join(sorted(duplicates))}.",
                 )
             )
-    for record in bundle.preserved_records:
+    for record in bundle.recent_records:
         if _sha256_text(record.content) != record.content_sha256:
             issues.append(
                 CompactionContractIssue(
                     code="preserved_content_hash_mismatch",
                     message=f"Preserved record {record.record_id} does not match its hash.",
+                )
+            )
+        if record.chronology.generation > bundle.generation:
+            issues.append(
+                CompactionContractIssue(
+                    code="recent_record_from_future_generation",
+                    message=(
+                        f"Recent record {record.record_id} has chronology beyond the bundle."
+                    ),
                 )
             )
     for entry in bundle.state_entries:
@@ -678,13 +876,13 @@ def compile_compaction_replay(bundle: CompactionBundle) -> tuple[CompactionRepla
         )
     ]
     for preserved in sorted(
-        bundle.preserved_records,
+        bundle.recent_records,
         key=lambda item: item.chronology,
     ):
         items.append(
             CompactionReplayItem(
                 role=preserved.role,
-                kind="preserved_message",
+                kind="recent_message",
                 content=preserved.content,
                 bundle_id=bundle.bundle_id,
                 generation=bundle.generation,
@@ -728,64 +926,6 @@ def compile_compaction_replay(bundle: CompactionBundle) -> tuple[CompactionRepla
     return tuple(items)
 
 
-def _preserved_records_from_draft(
-    items: Sequence[Mapping[str, Any]],
-    *,
-    source_events: Sequence[CompactionSourceEvent],
-    previous_bundle: CompactionBundle | None,
-) -> tuple[CompactionPreservedRecord, ...]:
-    source_refs: dict[str, CompactionSourceEvent | CompactionPreservedRecord] = {
-        f"E{index}": event for index, event in enumerate(source_events, start=1)
-    }
-    if previous_bundle is not None:
-        source_refs.update(
-            {
-                f"P{index}": record
-                for index, record in enumerate(previous_bundle.preserved_records, start=1)
-            }
-        )
-    preserved: list[CompactionPreservedRecord] = []
-    seen_record_ids: set[str] = set()
-    for item in items:
-        _require_exact_keys(
-            item,
-            {"source_ref", "reason"},
-            location="preserved message selection",
-        )
-        source_ref = _required_string(item, "source_ref")
-        reason = _required_string(item, "reason")
-        source = source_refs.get(source_ref)
-        if source is None:
-            raise _single_issue(
-                "unknown_preserved_source_ref",
-                f"Preserved message references unknown source {source_ref!r}.",
-            )
-        if isinstance(source, CompactionPreservedRecord):
-            record = replace(source, reason=reason)
-        else:
-            if source.role not in {"user", "assistant"} or not source.content.strip():
-                raise _single_issue(
-                    "invalid_preserved_source",
-                    f"{source_ref} is not a non-empty user or assistant message.",
-                    source_event_ids=(source.event_id,),
-                )
-            record = CompactionPreservedRecord(
-                record_id=source.record_id,
-                source_session_id=source.session_id,
-                created_at=source.created_at,
-                role=source.role,  # type: ignore[arg-type]
-                content=source.content,
-                content_sha256=_sha256_text(source.content),
-                reason=reason,
-                chronology=source.chronology,
-            )
-        if record.record_id in seen_record_ids:
-            continue
-        seen_record_ids.add(record.record_id)
-        preserved.append(record)
-    return tuple(sorted(preserved, key=lambda item: item.chronology))
-
-
 def _episodes_from_draft(
     items: Sequence[Mapping[str, Any]],
     *,
@@ -822,7 +962,7 @@ def _state_entries_from_draft(payload: Mapping[str, Any]) -> tuple[CompactionSta
         ("uncertainty", "uncertainties"),
     ):
         for summary in _ordered_unique(
-            _required_string_tuple(payload, key, allow_empty=True)
+            _optional_string_tuple(payload, key)
         ):
             entries.append(
                 CompactionStateEntry(
@@ -831,7 +971,7 @@ def _state_entries_from_draft(payload: Mapping[str, Any]) -> tuple[CompactionSta
                     summary=summary,
                 )
             )
-    for item in _required_mapping_list(payload, "artifacts"):
+    for item in _optional_mapping_list(payload, "artifacts"):
         _require_exact_keys(
             item,
             {"summary", "locator", "last_observed_state", "needs_verification"},
@@ -864,7 +1004,7 @@ def _state_entries_from_draft(payload: Mapping[str, Any]) -> tuple[CompactionSta
                 needs_verification=needs_verification,
             )
         )
-    for item in _required_mapping_list(payload, "open_loops"):
+    for item in _optional_mapping_list(payload, "open_loops"):
         _require_exact_keys(
             item,
             {"summary", "next_action", "blocker"},
@@ -961,6 +1101,13 @@ def _render_handover(handover: CompactionHandover) -> str:
     return "\n".join(lines)
 
 
+def _is_placeholder_semantic_text(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in _PLACEHOLDER_SEMANTIC_VALUES:
+        return True
+    return not any(character.isalnum() for character in normalized)
+
+
 def _required_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = payload.get(key)
     if not isinstance(value, Mapping):
@@ -976,6 +1123,15 @@ def _required_mapping_list(
     if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
         raise _single_issue("invalid_field_type", f"{key} must be an array of objects.")
     return tuple(value)
+
+
+def _optional_mapping_list(
+    payload: Mapping[str, Any],
+    key: str,
+) -> tuple[Mapping[str, Any], ...]:
+    if key not in payload:
+        return ()
+    return _required_mapping_list(payload, key)
 
 
 def _required_string(
@@ -1040,6 +1196,15 @@ def _required_string_tuple(
     if not allow_empty and not normalized:
         raise _single_issue("empty_field", f"{key} must not be empty.")
     return tuple(normalized)
+
+
+def _optional_string_tuple(
+    payload: Mapping[str, Any],
+    key: str,
+) -> tuple[str, ...]:
+    if key not in payload:
+        return ()
+    return _required_string_tuple(payload, key, allow_empty=True)
 
 
 def _optional_string(value: Any) -> str | None:

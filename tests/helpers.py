@@ -70,7 +70,6 @@ def build_compaction_test_response(
     payload: dict[str, object] = {
         "objective": marker,
         "background": [],
-        "preserved_messages": [],
         "episodes": (
             [
                 {
@@ -132,7 +131,6 @@ def build_compaction_test_outcome() -> CompactionOutcome:
     draft = {
         "objective": "Preserve the current task context.",
         "background": [],
-        "preserved_messages": [],
         "episodes": [
             {
                 "summary": "The prior task context was compacted.",
@@ -156,8 +154,7 @@ def build_compaction_test_outcome() -> CompactionOutcome:
         bundle_id="bundle_test",
         created_at="2026-08-21T00:00:00+00:00",
         source_manifest=manifest,
-        source_events=(source_event,),
-        previous_bundle=None,
+        recent_records=(),
     )
     return CompactionOutcome(
         bundle=bundle,
@@ -165,8 +162,8 @@ def build_compaction_test_outcome() -> CompactionOutcome:
         draft_payload=draft,
         verification_payload={
             "valid": True,
-            "method": "jarvis_deterministic_contract",
-            "schema_version": 3,
+            "method": "jarvis_deterministic_bundle",
+            "schema_version": 4,
         },
         call_traces=(
             CompactionCallTrace(
@@ -179,7 +176,8 @@ def build_compaction_test_outcome() -> CompactionOutcome:
                 total_tokens=15,
             ),
         ),
-        repair_count=0,
+        semantic_status="accepted",
+        semantic_source="model",
     )
 
 

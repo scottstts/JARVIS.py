@@ -111,7 +111,7 @@ class AgentLoopRealLLMTests(unittest.IsolatedAsyncioTestCase):
                 old_records = storage.load_records(old_session_id)
                 self.assertTrue(any(record.kind == "compaction" for record in old_records))
                 audit_record = next(record for record in old_records if record.kind == "compaction")
-                self.assertIn("verified bundle", audit_record.content)
+                self.assertIn("deterministic bundle", audit_record.content)
                 self.assertTrue(audit_record.metadata["replacement_items"])
                 self.assertTrue(audit_record.metadata["bundle"])
                 self.assertEqual(audit_record.metadata["user_instruction"], "keep constraints and marker")

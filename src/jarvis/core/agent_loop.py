@@ -4474,11 +4474,6 @@ class AgentLoop:
                 compaction_operation_id=compaction_operation_id,
                 operation="llm_compaction",
             )
-            _assert_compaction_effective(
-                source_records=source_records,
-                outcome=outcome,
-                previous_bundle=previous_bundle,
-            )
         except (_TurnStopRequested, _CompactionStopRequested):
             LOGGER.info(
                 "Compaction interrupted for session %s (reason=%s, turn_id=%s).",
@@ -4533,7 +4528,7 @@ class AgentLoop:
             if compaction_operation_id is not None:
                 self._clear_compaction_control(compaction_operation_id)
 
-        # Activating the verified bundle is a short, consistency-sensitive commit. Stop is
+        # Activating the assembled bundle is a short, consistency-sensitive commit. Stop is
         # checked before it begins; once archival starts, the commit runs to completion.
         if turn_id is not None and self._stop_requested(turn_id):
             raise _TurnStopRequested
@@ -4568,12 +4563,13 @@ class AgentLoop:
         )
         LOGGER.info(
             "Compaction completed for session %s into session %s "
-            "(reason=%s, calls=%d, repairs=%d).",
+            "(reason=%s, calls=%d, semantic_status=%s, semantic_source=%s).",
             session.session_id,
             next_session.session_id,
             reason,
             len(outcome.call_traces),
-            outcome.repair_count,
+            outcome.semantic_status,
+            outcome.semantic_source,
         )
         return self._storage.get_session(next_session.session_id) or next_session
 
@@ -4691,7 +4687,9 @@ class AgentLoop:
             "bundle": outcome.bundle.to_dict(),
             "draft_payload": outcome.draft_payload,
             "verification_payload": outcome.verification_payload,
-            "repair_count": outcome.repair_count,
+            "semantic_status": outcome.semantic_status,
+            "semantic_source": outcome.semantic_source,
+            "semantic_issue_code": outcome.semantic_issue_code,
             "call_traces": [trace.to_dict() for trace in outcome.call_traces],
             "usage": {
                 "input_tokens": outcome.input_tokens,
@@ -4705,8 +4703,9 @@ class AgentLoop:
             created_at=_utc_now_iso(),
             role="system",
             content=(
-                f"Compaction activated verified bundle {outcome.bundle.bundle_id} with "
-                f"{len(outcome.items)} deterministic replay items."
+                f"Compaction activated deterministic bundle {outcome.bundle.bundle_id} with "
+                f"{len(outcome.items)} replay items (semantic_status="
+                f"{outcome.semantic_status})."
             ),
             kind="compaction",
             metadata=metadata,
@@ -6079,51 +6078,6 @@ def _compaction_source_revision(
     ).hexdigest()
 
 
-def _assert_compaction_effective(
-    *,
-    source_records: Sequence[ConversationRecord],
-    outcome: CompactionOutcome,
-    previous_bundle: CompactionBundle | None,
-) -> None:
-    source_payload = [
-        {
-            "role": record.role,
-            "content": record.content,
-            "metadata": record.metadata,
-        }
-        for record in source_records
-    ]
-    source_bytes = len(
-        json.dumps(source_payload, ensure_ascii=False, sort_keys=True, default=str).encode(
-            "utf-8"
-        )
-    )
-    replay_bytes = len(
-        json.dumps(
-            [item.to_dict() for item in outcome.items],
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        ).encode("utf-8")
-    )
-    if source_bytes >= 20_000 and replay_bytes >= int(source_bytes * 0.9):
-        raise ContextBudgetError(
-            "Compaction was parked because the verified replay did not materially reduce "
-            "the source history. Repeated cycles must be resolved before retrying."
-        )
-    if previous_bundle is None or not source_records:
-        return
-    prior = previous_bundle.to_dict()
-    current = outcome.bundle.to_dict()
-    for payload in (prior, current):
-        payload.pop("bundle_id", None)
-        payload.pop("created_at", None)
-        payload.pop("source_manifest", None)
-    if prior == current:
-        raise ContextBudgetError(
-            "Compaction was parked because it reproduced the prior semantic bundle despite "
-            "new source records. Inspect the unresolved repetition before retrying."
-        )
 
 
 def _collect_pending_detached_job_ids(

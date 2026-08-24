@@ -20,16 +20,19 @@ from jarvis.llm import (
     ToolChoice,
     ToolDefinition,
 )
-from jarvis.llm.errors import ProviderTimeoutError
 from jarvis.storage import ConversationRecord
 
 from .compaction_contract import (
     CompactionBundle,
+    CompactionChronology,
     CompactionContractError,
     CompactionContractIssue,
+    CompactionPreservedRecord,
     CompactionReplayItem,
+    CompactionSemanticProvenance,
     CompactionSourceEvent,
     apply_compaction_draft,
+    build_fallback_compaction_bundle,
     build_source_manifest,
     compile_compaction_replay,
 )
@@ -40,7 +43,6 @@ from .token_estimator import estimate_request_input_tokens
 
 _COMPACTION_PROMPT_PATH = Path(__file__).with_name("prompts") / "COMPACTION.md"
 _COMPACTION_SYSTEM_PROMPT = _COMPACTION_PROMPT_PATH.read_text(encoding="utf-8").strip()
-_MAX_COMPACTION_REPAIR_ATTEMPTS = 2
 _COMPACTION_INPUT_SAFETY_PERCENT = 70
 _COMPACTION_SOURCE_EVENT_LIMITS: tuple[int | None, ...] = (
     None,
@@ -52,29 +54,32 @@ _COMPACTION_SOURCE_EVENT_LIMITS: tuple[int | None, ...] = (
 )
 _COMPACTION_RENDER_TOKEN_MARGIN = 512
 _COMPACTION_MIN_EVENT_BODY_CHARS = 256
+_RECENT_CONTEXT_MIN_TOKENS = 2_000
+_RECENT_CONTEXT_MAX_TOKENS = 12_000
+_RECENT_CONTEXT_PREFLIGHT_PERCENT = 10
+_RECENT_RECORD_OVERHEAD_CHARS = 256
 _COMPACTION_TOOL_NAME = "submit_compaction"
+_COMPACTION_SEMANTIC_FIELDS = {
+    "objective",
+    "background",
+    "episodes",
+    "constraints",
+    "decisions",
+    "artifacts",
+    "open_loops",
+    "uncertainties",
+    "handover",
+}
 _COMPACTION_TOOL = ToolDefinition(
     name=_COMPACTION_TOOL_NAME,
     description="Submit the complete semantic continuation record for this compaction.",
-    strict=True,
+    strict=False,
     input_schema={
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "objective": {"type": "string"},
             "background": {"type": "array", "items": {"type": "string"}},
-            "preserved_messages": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "source_ref": {"type": "string"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["source_ref", "reason"],
-                },
-            },
             "episodes": {
                 "type": "array",
                 "items": {
@@ -136,22 +141,11 @@ _COMPACTION_TOOL = ToolDefinition(
                 },
                 "required": [
                     "current_focus",
-                    "next_actions",
-                    "do_not_repeat",
-                    "verification_needed",
                 ],
             },
         },
         "required": [
             "objective",
-            "background",
-            "preserved_messages",
-            "episodes",
-            "constraints",
-            "decisions",
-            "artifacts",
-            "open_loops",
-            "uncertainties",
             "handover",
         ],
     },
@@ -208,7 +202,7 @@ LOGGER = get_application_logger(__name__)
 
 @dataclass(slots=True, frozen=True)
 class CompactionCallTrace:
-    phase: Literal["generate", "repair"]
+    phase: Literal["generate"]
     provider: str
     model: str
     response_id: str | None
@@ -234,22 +228,24 @@ class CompactionCallTrace:
 class CompactionOutcome:
     bundle: CompactionBundle
     items: tuple[CompactionReplayItem, ...]
-    draft_payload: dict[str, Any]
+    draft_payload: dict[str, Any] | None
     verification_payload: dict[str, Any]
     call_traces: tuple[CompactionCallTrace, ...]
-    repair_count: int
+    semantic_status: Literal["accepted", "fallback"]
+    semantic_source: Literal["model", "previous_snapshot", "minimal"]
+    semantic_issue_code: str | None = None
 
     @property
-    def provider(self) -> str:
-        return self.call_traces[0].provider
+    def provider(self) -> str | None:
+        return self.call_traces[0].provider if self.call_traces else None
 
     @property
-    def model(self) -> str:
-        return self.call_traces[0].model
+    def model(self) -> str | None:
+        return self.call_traces[0].model if self.call_traces else None
 
     @property
     def response_id(self) -> str | None:
-        return self.call_traces[0].response_id
+        return self.call_traces[0].response_id if self.call_traces else None
 
     @property
     def input_tokens(self) -> int | None:
@@ -294,31 +290,18 @@ class ContextCompactor:
             "operation": "compaction",
             "compaction_phase": "prepare",
             "compaction_draft_attempt": 0,
-            "compaction_max_draft_attempts": _MAX_COMPACTION_REPAIR_ATTEMPTS + 1,
+            "compaction_max_draft_attempts": 1,
             "compaction_call_count": 0,
             "compaction_call_traces": [],
             "compaction_deadline_seconds": self._deadline_seconds,
         }
         try:
-            if self._deadline_seconds is None:
-                return await self._compact_bounded(
-                    records,
-                    previous_bundle=previous_bundle,
-                    user_instruction=user_instruction,
-                    diagnostics=diagnostics,
-                )
-            async with asyncio.timeout(self._deadline_seconds):
-                return await self._compact_bounded(
-                    records,
-                    previous_bundle=previous_bundle,
-                    user_instruction=user_instruction,
-                    diagnostics=diagnostics,
-                )
-        except TimeoutError as exc:
-            raise ProviderTimeoutError(
-                "Compaction exceeded its total request deadline.",
-                metadata=dict(diagnostics),
-            ) from exc
+            return await self._compact_bounded(
+                records,
+                previous_bundle=previous_bundle,
+                user_instruction=user_instruction,
+                diagnostics=diagnostics,
+            )
         except Exception as exc:
             _attach_compaction_error_metadata(exc, diagnostics)
             raise
@@ -343,87 +326,139 @@ class ContextCompactor:
             source_events=source_events,
         )
         instruction = user_instruction.strip() if user_instruction else ""
-
+        recent_records = _select_recent_records(
+            source_events=source_events,
+            previous_bundle=previous_bundle,
+            char_budget=_recent_context_char_budget(self._context_policy),
+        )
+        diagnostics.update(
+            {
+                "compaction_recent_record_count": len(recent_records),
+                "compaction_recent_context_chars": sum(
+                    len(record.content) for record in recent_records
+                ),
+                "compaction_draft_attempt": 1,
+            }
+        )
         call_traces: list[CompactionCallTrace] = []
-        repair_issues: tuple[CompactionContractIssue, ...] = ()
-        rejected_payload: dict[str, Any] | None = None
-        rejected_raw_text: str | None = None
+        draft_payload: dict[str, Any] | None = None
+        semantic_issue_code: str | None = None
+        bundle_id = uuid4().hex
+        created_at = _utc_now_iso()
 
-        for attempt in range(_MAX_COMPACTION_REPAIR_ATTEMPTS + 1):
-            phase: Literal["generate", "repair"] = "generate" if attempt == 0 else "repair"
-            diagnostics.update(
-                {
-                    "compaction_phase": phase,
-                    "compaction_draft_attempt": attempt + 1,
-                }
-            )
-            LOGGER.info(
-                "Compaction %s request started (draft attempt %d/%d).",
-                phase,
-                attempt + 1,
-                _MAX_COMPACTION_REPAIR_ATTEMPTS + 1,
-            )
+        semantic_error: Exception | None = None
+        response: LLMResponse | None = None
+        try:
+            diagnostics["compaction_phase"] = "generate"
+            LOGGER.info("Compaction semantic refresh request started (single best-effort pass).")
             request = self._build_bounded_request(
                 source_events=source_events,
                 previous_bundle=previous_bundle,
                 user_instruction=instruction or None,
-                repair_issues=repair_issues if attempt > 0 else (),
-                rejected_payload=rejected_payload if attempt > 0 else None,
-                rejected_raw_text=(
-                    rejected_raw_text
-                    if attempt > 0 and rejected_payload is None
-                    else None
-                ),
                 diagnostics=diagnostics,
             )
-            response = await self._llm_service.generate(request)
-            call_trace = _trace_response(response, phase=phase)
+            if self._deadline_seconds is None:
+                response = await self._llm_service.generate(request)
+            else:
+                async with asyncio.timeout(self._deadline_seconds):
+                    response = await self._llm_service.generate(request)
+        except Exception as exc:
+            semantic_error = exc
+
+        if response is not None:
+            call_trace = _trace_response(response, phase="generate")
             call_traces.append(call_trace)
             _update_call_trace_diagnostics(diagnostics, call_traces)
             _log_completed_call(call_trace)
-            rejected_raw_text = response.text
-            draft_payload: dict[str, Any] | None = None
             try:
                 draft_payload = _extract_compaction_submission(response)
+                ignored_fields = sorted(set(draft_payload) - _COMPACTION_SEMANTIC_FIELDS)
+                if ignored_fields:
+                    diagnostics["compaction_semantic_ignored_fields"] = ignored_fields
+                    LOGGER.info(
+                        "Ignored non-semantic compaction submission fields: %s.",
+                        ", ".join(ignored_fields),
+                    )
                 bundle = apply_compaction_draft(
                     draft_payload,
-                    bundle_id=uuid4().hex,
-                    created_at=_utc_now_iso(),
+                    bundle_id=bundle_id,
+                    created_at=created_at,
                     source_manifest=source_manifest,
-                    source_events=source_events,
-                    previous_bundle=previous_bundle,
+                    recent_records=recent_records,
+                    semantic_provenance=CompactionSemanticProvenance(
+                        status="accepted",
+                        source="model",
+                    ),
                 )
             except (ValueError, CompactionContractError) as exc:
-                rejected_payload = draft_payload
-                repair_issues = _issues_from_exception(exc)
-                diagnostics["compaction_last_issues"] = [
-                    issue.to_dict() for issue in repair_issues
-                ]
-                LOGGER.warning(
-                    "Compaction %s response rejected (draft attempt %d/%d, issues=%s).",
-                    phase,
-                    attempt + 1,
-                    _MAX_COMPACTION_REPAIR_ATTEMPTS + 1,
-                    _canonical_json(diagnostics["compaction_last_issues"]),
+                semantic_error = exc
+            else:
+                verification_payload = {
+                    "valid": True,
+                    "method": "jarvis_deterministic_bundle",
+                    "schema_version": bundle.schema_version,
+                    "semantic_status": "accepted",
+                    "semantic_source": "model",
+                    "ignored_semantic_fields": ignored_fields,
+                }
+                return CompactionOutcome(
+                    bundle=bundle,
+                    items=compile_compaction_replay(bundle),
+                    draft_payload=draft_payload,
+                    verification_payload=verification_payload,
+                    call_traces=tuple(call_traces),
+                    semantic_status="accepted",
+                    semantic_source="model",
                 )
-                if attempt >= _MAX_COMPACTION_REPAIR_ATTEMPTS:
-                    raise CompactionContractError(repair_issues) from exc
-                continue
-            verification_payload = {
-                "valid": True,
-                "method": "jarvis_deterministic_contract",
-                "schema_version": bundle.schema_version,
-            }
-            return CompactionOutcome(
-                bundle=bundle,
-                items=compile_compaction_replay(bundle),
-                draft_payload=draft_payload,
-                verification_payload=verification_payload,
-                call_traces=tuple(call_traces),
-                repair_count=attempt,
+
+        if semantic_error is not None:
+            issues = _issues_from_exception(semantic_error)
+            semantic_issue_code = issues[0].code
+            diagnostics["compaction_last_issues"] = [issue.to_dict() for issue in issues]
+            LOGGER.warning(
+                "Compaction semantic refresh unavailable or rejected; using deterministic "
+                "fallback (issue=%s).",
+                semantic_issue_code,
+            )
+            LOGGER.debug(
+                "Semantic refresh failure detail.",
+                exc_info=(
+                    type(semantic_error),
+                    semantic_error,
+                    semantic_error.__traceback__,
+                ),
             )
 
-        raise RuntimeError("Compaction ended without a valid canonical bundle.")
+        bundle = build_fallback_compaction_bundle(
+            bundle_id=bundle_id,
+            created_at=created_at,
+            source_manifest=source_manifest,
+            recent_records=recent_records,
+            previous_bundle=previous_bundle,
+            issue_code=semantic_issue_code or "semantic_refresh_unavailable",
+        )
+        verification_payload = {
+            "valid": True,
+            "method": "jarvis_deterministic_fallback",
+            "schema_version": bundle.schema_version,
+            "semantic_status": "fallback",
+            "semantic_source": bundle.semantic_provenance.source,
+            "semantic_issue_code": bundle.semantic_provenance.issue_code,
+        }
+        return CompactionOutcome(
+            bundle=bundle,
+            items=compile_compaction_replay(bundle),
+            draft_payload=draft_payload,
+            verification_payload=verification_payload,
+            call_traces=tuple(call_traces),
+            semantic_status="fallback",
+            semantic_source=(
+                "previous_snapshot"
+                if bundle.semantic_provenance.source == "previous_snapshot"
+                else "minimal"
+            ),
+            semantic_issue_code=bundle.semantic_provenance.issue_code,
+        )
 
     def _build_bounded_request(
         self,
@@ -431,9 +466,6 @@ class ContextCompactor:
         source_events: Sequence[CompactionSourceEvent],
         previous_bundle: CompactionBundle | None,
         user_instruction: str | None,
-        repair_issues: Sequence[CompactionContractIssue],
-        rejected_payload: Mapping[str, Any] | None,
-        rejected_raw_text: str | None,
         diagnostics: dict[str, Any],
     ) -> LLMRequest:
         safe_input_limit = max(
@@ -448,9 +480,6 @@ class ContextCompactor:
             source_events=(),
             previous_bundle=previous_bundle,
             user_instruction=user_instruction,
-            repair_issues=repair_issues,
-            rejected_payload=rejected_payload,
-            rejected_raw_text=rejected_raw_text,
             event_content_limit=0,
             source_char_budget=0,
         )
@@ -489,9 +518,6 @@ class ContextCompactor:
                     source_events=source_events,
                     previous_bundle=previous_bundle,
                     user_instruction=user_instruction,
-                    repair_issues=repair_issues,
-                    rejected_payload=rejected_payload,
-                    rejected_raw_text=rejected_raw_text,
                     event_content_limit=event_content_limit,
                     source_char_budget=source_char_budget,
                 )
@@ -626,6 +652,84 @@ def build_compaction_bundle_record(
     )
 
 
+def _recent_context_char_budget(context_policy: ContextPolicySettings) -> int:
+    tokens = max(
+        _RECENT_CONTEXT_MIN_TOKENS,
+        (
+            context_policy.preflight_limit_tokens
+            * _RECENT_CONTEXT_PREFLIGHT_PERCENT
+        )
+        // 100,
+    )
+    return min(tokens, _RECENT_CONTEXT_MAX_TOKENS) * 4
+
+
+def _select_recent_records(
+    *,
+    source_events: Sequence[CompactionSourceEvent],
+    previous_bundle: CompactionBundle | None,
+    char_budget: int,
+) -> tuple[CompactionPreservedRecord, ...]:
+    """Select a bounded causal tail without asking the model to author references."""
+
+    previous = list(previous_bundle.recent_records) if previous_bundle is not None else []
+    current: list[CompactionPreservedRecord] = []
+    turn_keys: list[str] = []
+    for event in source_events:
+        if event.role not in {"user", "assistant"} or not event.content.strip():
+            continue
+        turn_key = event.turn_id or f"record:{event.record_id}"
+        current.append(
+            CompactionPreservedRecord(
+                record_id=event.record_id,
+                source_session_id=event.session_id,
+                created_at=event.created_at,
+                role=event.role,  # type: ignore[arg-type]
+                content=event.content,
+                content_sha256=_sha256_text(event.content),
+                reason="deterministic_recent_context",
+                chronology=CompactionChronology(
+                    generation=event.generation,
+                    sequence=event.sequence,
+                ),
+                causal_group_id=turn_key,
+            )
+        )
+        turn_keys.append(turn_key)
+
+    groups: list[list[CompactionPreservedRecord]] = []
+    for record in previous:
+        if groups and groups[-1][-1].causal_group_id == record.causal_group_id:
+            groups[-1].append(record)
+        else:
+            groups.append([record])
+    current_groups: list[list[CompactionPreservedRecord]] = []
+    current_group_keys: list[str] = []
+    for record, turn_key in zip(current, turn_keys, strict=True):
+        if current_group_keys and current_group_keys[-1] == turn_key:
+            current_groups[-1].append(record)
+        else:
+            current_group_keys.append(turn_key)
+            current_groups.append([record])
+    groups.extend(current_groups)
+
+    selected_groups: list[list[CompactionPreservedRecord]] = []
+    used_chars = 0
+    for group in reversed(groups):
+        group_chars = sum(
+            len(record.content) + _RECENT_RECORD_OVERHEAD_CHARS for record in group
+        )
+        if used_chars + group_chars > char_budget:
+            break
+        selected_groups.append(group)
+        used_chars += group_chars
+    selected = [record for group in reversed(selected_groups) for record in group]
+    unique: dict[str, CompactionPreservedRecord] = {}
+    for record in selected:
+        unique[record.record_id] = record
+    return tuple(sorted(unique.values(), key=lambda item: item.chronology))
+
+
 def _should_drop_source_record(record: ConversationRecord) -> bool:
     metadata = record.metadata
     if record.kind != "message":
@@ -728,9 +832,6 @@ def _render_compaction_input(
     source_events: Sequence[CompactionSourceEvent],
     previous_bundle: CompactionBundle | None,
     user_instruction: str | None,
-    repair_issues: Sequence[CompactionContractIssue],
-    rejected_payload: Mapping[str, Any] | None,
-    rejected_raw_text: str | None,
     event_content_limit: int | None,
     source_char_budget: int | None = None,
 ) -> tuple[str, int]:
@@ -758,22 +859,6 @@ def _render_compaction_input(
         "NEW ORDERED TRANSCRIPT EVIDENCE:",
         transcript or "none",
     ]
-    if repair_issues:
-        sections.extend(
-            [
-                "",
-                "THE PREVIOUS SUBMISSION FAILED DETERMINISTIC VALIDATION:",
-                _canonical_json([issue.to_dict() for issue in repair_issues]),
-                "",
-                "REJECTED SUBMISSION:",
-                (
-                    _canonical_json(rejected_payload)
-                    if rejected_payload is not None
-                    else (rejected_raw_text or "unavailable")
-                ),
-                "Return a complete corrected submission, not a patch.",
-            ]
-        )
     return "\n".join(sections), truncated_event_count
 
 
@@ -810,17 +895,9 @@ def _previous_bundle_semantics(bundle: CompactionBundle) -> dict[str, Any]:
                 }
             )
     return {
+        "semantic_provenance": bundle.semantic_provenance.to_dict(),
         "objective": bundle.objective.summary,
         "background": list(bundle.background),
-        "preserved_messages": [
-            {
-                "source_ref": f"P{index}",
-                "role": record.role,
-                "content": record.content,
-                "reason": record.reason,
-            }
-            for index, record in enumerate(bundle.preserved_records, start=1)
-        ],
         "episodes": [
             {"summary": episode.summary, "outcomes": list(episode.outcomes)}
             for episode in bundle.episodes
@@ -999,9 +1076,8 @@ def _render_source_event_block(
 
 
 def _source_event_requires_exact_render(event: CompactionSourceEvent) -> bool:
-    if event.role == "user":
-        return True
-    return event.role == "assistant" and event.event_type == "assistant_message"
+    _ = event
+    return False
 
 
 def _duplicate_system_event_refs(
@@ -1213,7 +1289,7 @@ def _extract_first_json_object(text: str) -> str | None:
 def _trace_response(
     response: LLMResponse,
     *,
-    phase: Literal["generate", "repair"],
+    phase: Literal["generate"],
 ) -> CompactionCallTrace:
     usage = response.usage
     return CompactionCallTrace(
@@ -1230,9 +1306,17 @@ def _trace_response(
 def _issues_from_exception(exc: Exception) -> tuple[CompactionContractIssue, ...]:
     if isinstance(exc, CompactionContractError):
         return exc.issues
+    if isinstance(exc, TimeoutError):
+        code = "semantic_refresh_timeout"
+    elif isinstance(exc, ContextBudgetError):
+        code = "semantic_input_budget_exceeded"
+    elif isinstance(exc, (ValueError, json.JSONDecodeError)):
+        code = "invalid_compaction_json"
+    else:
+        code = "semantic_provider_failure"
     return (
         CompactionContractIssue(
-            code="invalid_compaction_json",
+            code=code,
             message=str(exc) or exc.__class__.__name__,
         ),
     )

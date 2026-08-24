@@ -1541,8 +1541,9 @@ class CodexActorRuntime:
                 created_at=_utc_now_iso(),
                 role="system",
                 content=(
-                    f"Compaction activated verified bundle {outcome.bundle.bundle_id} with "
-                    f"{len(outcome.items)} deterministic replay items."
+                    f"Compaction activated deterministic bundle {outcome.bundle.bundle_id} with "
+                    f"{len(outcome.items)} replay items (semantic_status="
+                    f"{outcome.semantic_status})."
                 ),
                 kind="compaction",
                 metadata={
@@ -1555,7 +1556,9 @@ class CodexActorRuntime:
                     "bundle": outcome.bundle.to_dict(),
                     "draft_payload": outcome.draft_payload,
                     "verification_payload": outcome.verification_payload,
-                    "repair_count": outcome.repair_count,
+                    "semantic_status": outcome.semantic_status,
+                    "semantic_source": outcome.semantic_source,
+                    "semantic_issue_code": outcome.semantic_issue_code,
                     "call_traces": [trace.to_dict() for trace in outcome.call_traces],
                     "usage": {
                         "input_tokens": outcome.input_tokens,
@@ -2071,9 +2074,9 @@ def _render_compaction_input_text(record: ConversationRecord) -> str:
     kind = str(metadata.get("compaction_kind", "episode")).strip()
     if kind == "history_boundary":
         return record.content
-    if kind == "preserved_message" and record.role == "user":
+    if kind == "recent_message" and record.role == "user":
         return "Exact prior user message:\n\n" + record.content
-    if kind == "preserved_message" and record.role == "assistant":
+    if kind == "recent_message" and record.role == "assistant":
         return "Exact prior assistant message:\n\n" + record.content
     return "Evidence-backed prior-session assistant context:\n\n" + record.content
 

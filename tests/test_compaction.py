@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import unittest
 from typing import Any
@@ -16,13 +17,14 @@ from jarvis.core.compaction import (
 )
 from jarvis.core.compaction_contract import (
     CompactionBundle,
+    CompactionChronology,
     CompactionContractError,
+    CompactionPreservedRecord,
     apply_compaction_draft,
     build_source_manifest,
     compile_compaction_replay,
 )
 from jarvis.core.config import ContextPolicySettings
-from jarvis.core.errors import ContextBudgetError
 from jarvis.core.token_estimator import estimate_request_input_tokens
 from jarvis.llm import (
     LLMRequest,
@@ -32,7 +34,6 @@ from jarvis.llm import (
     ToolCall,
     ToolChoiceMode,
 )
-from jarvis.llm.errors import ProviderTimeoutError
 from jarvis.storage import ConversationRecord
 
 
@@ -59,15 +60,10 @@ def _record(
 def _draft(
     *,
     objective: str = "Continue the current task.",
-    preserved_refs: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     return {
         "objective": objective,
         "background": ["The task has prior implementation context."],
-        "preserved_messages": [
-            {"source_ref": source_ref, "reason": "Exact wording is material."}
-            for source_ref in preserved_refs
-        ],
         "episodes": [
             {
                 "summary": "The prior work was inspected and advanced.",
@@ -158,6 +154,16 @@ class _BlockingCompactionLLMService:
         raise AssertionError("Blocked compaction unexpectedly resumed.")
 
 
+class _FailingCompactionLLMService:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        self.requests.append(request)
+        raise self.error
+
+
 def _request_user_text(request: LLMRequest) -> str:
     return "\n".join(
         part.text
@@ -181,13 +187,30 @@ def _bundle_from_draft(
         previous_bundle=previous_bundle,
         source_events=events,
     )
+    recent_records = tuple(
+        CompactionPreservedRecord(
+            record_id=event.record_id,
+            source_session_id=event.session_id,
+            created_at=event.created_at,
+            role=event.role,  # type: ignore[arg-type]
+            content=event.content,
+            content_sha256=hashlib.sha256(event.content.encode("utf-8")).hexdigest(),
+            reason="deterministic_recent_context",
+            chronology=CompactionChronology(
+                generation=event.generation,
+                sequence=event.sequence,
+            ),
+            causal_group_id=event.turn_id or f"record:{event.record_id}",
+        )
+        for event in events
+        if event.role in {"user", "assistant"} and event.content.strip()
+    )
     return apply_compaction_draft(
         draft,
         bundle_id=f"bundle_{generation}",
         created_at="2026-08-21T00:00:00+00:00",
         source_manifest=manifest,
-        source_events=events,
-        previous_bundle=previous_bundle,
+        recent_records=recent_records,
     )
 
 
@@ -286,7 +309,7 @@ class PruneCompactionSourceRecordsTests(unittest.TestCase):
 
 
 class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_total_deadline_covers_the_entire_workflow(self) -> None:
+    async def test_semantic_timeout_uses_first_compaction_fallback(self) -> None:
         service = _BlockingCompactionLLMService()
         compactor = ContextCompactor(
             llm_service=service,  # type: ignore[arg-type]
@@ -294,15 +317,16 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
             deadline_seconds=0.01,
         )
 
-        with self.assertRaises(ProviderTimeoutError) as raised:
-            await compactor.compact(
-                (_record(record_id="user_1", role="user", content="Continue."),)
-            )
+        outcome = await compactor.compact(
+            (_record(record_id="user_1", role="user", content="Continue."),)
+        )
 
         self.assertTrue(service.started.is_set())
         self.assertTrue(service.cancelled.is_set())
-        self.assertEqual(raised.exception.metadata["compaction_phase"], "generate")
-        self.assertEqual(raised.exception.metadata["compaction_call_count"], 0)
+        self.assertEqual(outcome.semantic_status, "fallback")
+        self.assertEqual(outcome.semantic_source, "minimal")
+        self.assertEqual(outcome.semantic_issue_code, "semantic_refresh_timeout")
+        self.assertEqual(outcome.bundle.recent_records[0].content, "Continue.")
 
     async def test_normal_compaction_is_one_schema_constrained_model_call(self) -> None:
         service = _QueuedCompactionLLMService([_response(_draft())])
@@ -323,17 +347,14 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([tool.name for tool in request.tools], ["submit_compaction"])
         self.assertFalse(request.parallel_tool_calls)
         self.assertEqual([trace.phase for trace in outcome.call_traces], ["generate"])
-        self.assertEqual(outcome.repair_count, 0)
         self.assertEqual(
             outcome.verification_payload["method"],
-            "jarvis_deterministic_contract",
+            "jarvis_deterministic_bundle",
         )
 
-    async def test_exact_message_selection_uses_short_ref_and_jarvis_copies_bytes(self) -> None:
+    async def test_recent_message_selection_is_harness_owned_and_copies_bytes(self) -> None:
         exact_text = "Use Jarvis’s exact punctuation and trailing space. "
-        service = _QueuedCompactionLLMService(
-            [_response(_draft(preserved_refs=("E1",)))]
-        )
+        service = _QueuedCompactionLLMService([_response(_draft())])
         compactor = ContextCompactor(
             llm_service=service,  # type: ignore[arg-type]
             context_policy=ContextPolicySettings(context_window_tokens=100_000),
@@ -343,10 +364,10 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
             (_record(record_id="internal_record_uuid", role="user", content=exact_text),)
         )
 
-        preserved = outcome.bundle.preserved_records[0]
+        preserved = outcome.bundle.recent_records[0]
         self.assertEqual(preserved.content, exact_text)
         self.assertEqual(preserved.record_id, "internal_record_uuid")
-        replay = next(item for item in outcome.items if item.kind == "preserved_message")
+        replay = next(item for item in outcome.items if item.kind == "recent_message")
         self.assertEqual(replay.content, exact_text)
         self.assertTrue(replay.exact_copy)
         request_text = _request_user_text(service.requests[0])
@@ -519,30 +540,29 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("source characters omitted", _request_user_text(request))
 
-    async def test_oversized_non_tool_evidence_fails_before_calling_provider(self) -> None:
-        service = _QueuedCompactionLLMService([])
+    async def test_oversized_non_tool_evidence_is_bounded_and_rolls_over(self) -> None:
+        service = _FailingCompactionLLMService(RuntimeError("provider unavailable"))
         compactor = ContextCompactor(
             llm_service=service,  # type: ignore[arg-type]
             context_policy=ContextPolicySettings(context_window_tokens=100_000),
         )
 
-        with self.assertRaises(ContextBudgetError) as raised:
-            await compactor.compact(
-                (_record(record_id="user_1", role="user", content="x" * 400_000),)
-            )
-
-        self.assertEqual(service.requests, [])
-        self.assertGreater(
-            raised.exception.metadata["compaction_estimated_input_tokens"],
-            raised.exception.metadata["compaction_safe_input_limit_tokens"],
+        outcome = await compactor.compact(
+            (_record(record_id="user_1", role="user", content="x" * 400_000),)
         )
 
-    async def test_invalid_short_ref_gets_exceptional_targeted_retry(self) -> None:
-        invalid = _draft(preserved_refs=("E999",))
-        repaired = _draft(preserved_refs=("E1",))
-        service = _QueuedCompactionLLMService(
-            [_response(invalid), _response(repaired)]
+        self.assertEqual(len(service.requests), 1)
+        self.assertLess(
+            estimate_request_input_tokens(service.requests[0]),
+            100_000,
         )
+        self.assertEqual(outcome.semantic_status, "fallback")
+        self.assertEqual(outcome.bundle.recent_records, ())
+
+    async def test_bogus_model_reference_is_ignored_without_retry(self) -> None:
+        payload = _draft()
+        payload["preserved_messages"] = [{"source_ref": "E999", "reason": "bogus"}]
+        service = _QueuedCompactionLLMService([_response(payload)])
         compactor = ContextCompactor(
             llm_service=service,  # type: ignore[arg-type]
             context_policy=ContextPolicySettings(context_window_tokens=100_000),
@@ -552,32 +572,147 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
             (_record(record_id="user_1", role="user", content="Keep this."),)
         )
 
-        self.assertEqual(len(service.requests), 2)
-        self.assertEqual([trace.phase for trace in outcome.call_traces], ["generate", "repair"])
-        self.assertEqual(outcome.repair_count, 1)
-        retry_text = _request_user_text(service.requests[1])
-        self.assertIn("unknown_preserved_source_ref", retry_text)
-        self.assertIn("REJECTED SUBMISSION", retry_text)
+        self.assertEqual(len(service.requests), 1)
+        self.assertEqual(outcome.semantic_status, "accepted")
+        self.assertEqual(outcome.bundle.recent_records[0].content, "Keep this.")
+        self.assertEqual(
+            outcome.verification_payload["ignored_semantic_fields"],
+            ["preserved_messages"],
+        )
 
-    async def test_invalid_submissions_are_strictly_bounded(self) -> None:
-        invalid = _draft(preserved_refs=("missing",))
-        service = _QueuedCompactionLLMService([_response(invalid) for _ in range(3)])
+    async def test_malformed_submission_uses_fallback_without_retry(self) -> None:
+        service = _QueuedCompactionLLMService([_response({"objective": "."})])
         compactor = ContextCompactor(
             llm_service=service,  # type: ignore[arg-type]
             context_policy=ContextPolicySettings(context_window_tokens=100_000),
         )
 
-        with self.assertRaises(CompactionContractError) as raised:
-            await compactor.compact(
-                (_record(record_id="user_1", role="user", content="Continue."),)
-            )
+        outcome = await compactor.compact(
+            (_record(record_id="user_1", role="user", content="Continue."),)
+        )
 
-        self.assertEqual(len(service.requests), 3)
-        self.assertEqual(raised.exception.metadata["compaction_call_count"], 3)
-        self.assertEqual(raised.exception.metadata["compaction_draft_attempt"], 3)
+        self.assertEqual(len(service.requests), 1)
+        self.assertEqual(outcome.semantic_status, "fallback")
+        self.assertEqual(outcome.semantic_source, "minimal")
+        self.assertEqual(outcome.semantic_issue_code, "invalid_field_set")
+
+    async def test_placeholder_semantic_output_is_rejected_without_retry(self) -> None:
+        placeholder = {
+            "objective": ".",
+            "handover": {
+                "current_focus": "unused",
+                "next_actions": ["desc"],
+            },
+        }
+        service = _QueuedCompactionLLMService([_response(placeholder)])
+        compactor = ContextCompactor(
+            llm_service=service,  # type: ignore[arg-type]
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
+        )
+
+        outcome = await compactor.compact(
+            (_record(record_id="user_1", role="user", content="Continue safely."),)
+        )
+
+        self.assertEqual(len(service.requests), 1)
+        self.assertEqual(outcome.semantic_status, "fallback")
+        self.assertEqual(outcome.semantic_issue_code, "inadequate_semantic_payload")
+        self.assertNotEqual(outcome.bundle.objective.summary, ".")
+        self.assertEqual(outcome.bundle.recent_records[0].content, "Continue safely.")
+
+    async def test_sparse_but_useful_semantic_payload_is_accepted(self) -> None:
+        sparse = {
+            "objective": "Finish the reliability redesign and verify the result.",
+            "handover": {
+                "current_focus": "Run the remaining verification and address real failures."
+            },
+        }
+        service = _QueuedCompactionLLMService([_response(sparse)])
+        compactor = ContextCompactor(
+            llm_service=service,  # type: ignore[arg-type]
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
+        )
+
+        outcome = await compactor.compact(
+            (_record(record_id="user_1", role="user", content="Continue."),)
+        )
+
+        self.assertEqual(outcome.semantic_status, "accepted")
+        self.assertEqual(outcome.bundle.background, ())
+        self.assertEqual(outcome.bundle.handover.next_actions, ())
+
+    async def test_provider_failure_reuses_previous_semantic_snapshot(self) -> None:
+        first_service = _QueuedCompactionLLMService([_response(_draft())])
+        first_compactor = ContextCompactor(
+            llm_service=first_service,  # type: ignore[arg-type]
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
+        )
+        first = await first_compactor.compact(
+            (_record(record_id="user_1", role="user", content="Original requirement."),)
+        )
+        failing_service = _FailingCompactionLLMService(RuntimeError("provider unavailable"))
+        second_compactor = ContextCompactor(
+            llm_service=failing_service,  # type: ignore[arg-type]
+            context_policy=ContextPolicySettings(context_window_tokens=100_000),
+        )
+
+        second = await second_compactor.compact(
+            (_record(record_id="user_2", role="user", content="Latest correction."),),
+            previous_bundle=first.bundle,
+        )
+
+        self.assertEqual(second.semantic_status, "fallback")
+        self.assertEqual(second.semantic_source, "previous_snapshot")
+        self.assertEqual(second.bundle.objective, first.bundle.objective)
         self.assertEqual(
-            [trace["phase"] for trace in raised.exception.metadata["compaction_call_traces"]],
-            ["generate", "repair", "repair"],
+            [record.content for record in second.bundle.recent_records],
+            ["Original requirement.", "Latest correction."],
+        )
+
+    async def test_later_tail_eviction_does_not_split_a_prior_causal_turn(self) -> None:
+        policy = ContextPolicySettings(context_window_tokens=30_000)
+        first_service = _QueuedCompactionLLMService([_response(_draft())])
+        first_compactor = ContextCompactor(
+            llm_service=first_service,  # type: ignore[arg-type]
+            context_policy=policy,
+        )
+        first = await first_compactor.compact(
+            (
+                _record(
+                    record_id="user_1",
+                    role="user",
+                    content="u" * 2_800,
+                    metadata={"turn_id": "turn_1"},
+                ),
+                _record(
+                    record_id="assistant_1",
+                    role="assistant",
+                    content="a" * 2_800,
+                    metadata={"turn_id": "turn_1"},
+                ),
+            )
+        )
+        second_service = _QueuedCompactionLLMService([_response(_draft())])
+        second_compactor = ContextCompactor(
+            llm_service=second_service,  # type: ignore[arg-type]
+            context_policy=policy,
+        )
+
+        second = await second_compactor.compact(
+            (
+                _record(
+                    record_id="user_2",
+                    role="user",
+                    content="latest" * 400,
+                    metadata={"turn_id": "turn_2"},
+                ),
+            ),
+            previous_bundle=first.bundle,
+        )
+
+        self.assertEqual(
+            [record.record_id for record in second.bundle.recent_records],
+            ["user_2"],
         )
 
     async def test_valid_json_text_is_accepted_as_provider_fallback(self) -> None:
@@ -595,9 +730,7 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(service.requests), 1)
 
     async def test_later_generation_receives_semantic_prior_state_and_delta_only(self) -> None:
-        first_service = _QueuedCompactionLLMService(
-            [_response(_draft(preserved_refs=("E1",)))]
-        )
+        first_service = _QueuedCompactionLLMService([_response(_draft())])
         first_compactor = ContextCompactor(
             llm_service=first_service,  # type: ignore[arg-type]
             context_policy=ContextPolicySettings(context_window_tokens=100_000),
@@ -605,10 +738,7 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         first = await first_compactor.compact(
             (_record(record_id="user_1", role="user", content="Keep this exact."),)
         )
-        second_draft = _draft(
-            objective="Continue with the correction.",
-            preserved_refs=("P1",),
-        )
+        second_draft = _draft(objective="Continue with the correction.")
         second_service = _QueuedCompactionLLMService([_response(second_draft)])
         second_compactor = ContextCompactor(
             llm_service=second_service,  # type: ignore[arg-type]
@@ -621,12 +751,13 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         request_text = _request_user_text(second_service.requests[0])
-        self.assertIn('"source_ref":"P1"', request_text)
+        self.assertNotIn("source_ref", request_text)
+        self.assertIn('"semantic_provenance"', request_text)
         self.assertIn("[EVENT E1 |", request_text)
         self.assertNotIn("user_1", request_text)
         self.assertNotIn("user_2", request_text)
         self.assertEqual(second.bundle.generation, 2)
-        self.assertEqual(second.bundle.preserved_records[0].content, "Keep this exact.")
+        self.assertEqual(second.bundle.recent_records[0].content, "Keep this exact.")
         self.assertEqual(second.bundle.source_manifest.cumulative_record_count, 2)
         self.assertEqual(second.bundle.source_manifest.delta_record_ids, ("user_2",))
 
@@ -634,7 +765,7 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
 class CompactionContractTests(unittest.TestCase):
     def test_draft_builds_rich_structured_state_with_jarvis_owned_ids(self) -> None:
         bundle = _bundle_from_draft(
-            _draft(preserved_refs=("E1",)),
+            _draft(),
             (_record(record_id="user_1", role="user", content="Exact Ω text. "),),
         )
 
@@ -647,7 +778,7 @@ class CompactionContractTests(unittest.TestCase):
         artifact = next(entry for entry in bundle.state_entries if entry.category == "artifact")
         self.assertEqual(artifact.locator, "/workspace/project/example.py")
         self.assertTrue(artifact.needs_verification)
-        self.assertEqual(bundle.preserved_records[0].content, "Exact Ω text. ")
+        self.assertEqual(bundle.recent_records[0].content, "Exact Ω text. ")
 
     def test_duplicate_semantic_items_are_deduplicated_deterministically(self) -> None:
         draft = _draft()
@@ -684,9 +815,9 @@ class CompactionContractTests(unittest.TestCase):
             first.source_manifest.cumulative_content_sha256,
         )
 
-    def test_invalid_field_set_is_rejected_atomically(self) -> None:
+    def test_missing_semantic_field_is_rejected(self) -> None:
         draft = _draft()
-        draft["coverage"] = []
+        draft.pop("handover")
         events = build_compaction_source_events(
             (_record(record_id="user_1", role="user", content="Continue."),),
             generation=1,
@@ -703,15 +834,14 @@ class CompactionContractTests(unittest.TestCase):
                 bundle_id="bundle_1",
                 created_at="2026-08-21T00:00:00+00:00",
                 source_manifest=manifest,
-                source_events=events,
-                previous_bundle=None,
+                recent_records=(),
             )
 
         self.assertEqual(raised.exception.issues[0].code, "invalid_field_set")
 
     def test_bundle_anchor_round_trip_and_replay_authority_are_deterministic(self) -> None:
         bundle = _bundle_from_draft(
-            _draft(preserved_refs=("E1",)),
+            _draft(),
             (_record(record_id="user_1", role="user", content="Keep me exact."),),
         )
         anchor = build_compaction_bundle_record(session_id="new_session", bundle=bundle)
@@ -730,7 +860,7 @@ class CompactionContractTests(unittest.TestCase):
             [item.kind for item in replay],
             [
                 "history_boundary",
-                "preserved_message",
+                "recent_message",
                 "episode",
                 "state_snapshot",
                 "handover",
@@ -738,18 +868,23 @@ class CompactionContractTests(unittest.TestCase):
         )
         self.assertEqual(replay[1].source_record_ids, ("user_1",))
 
-    def test_historical_schema_is_intentionally_not_accepted(self) -> None:
+    def test_older_bundle_schemas_are_rejected(self) -> None:
         bundle = _bundle_from_draft(
             _draft(),
             (_record(record_id="user_1", role="user", content="Continue."),),
         )
-        payload = bundle.to_dict()
-        payload["schema_version"] = 2
+        for schema_version in (2, 3):
+            with self.subTest(schema_version=schema_version):
+                payload = bundle.to_dict()
+                payload["schema_version"] = schema_version
 
-        with self.assertRaises(CompactionContractError) as raised:
-            CompactionBundle.from_dict(payload)
+                with self.assertRaises(CompactionContractError) as raised:
+                    CompactionBundle.from_dict(payload)
 
-        self.assertEqual(raised.exception.issues[0].code, "unsupported_compaction_schema")
+                self.assertEqual(
+                    raised.exception.issues[0].code,
+                    "unsupported_compaction_schema",
+                )
 
 
 if __name__ == "__main__":

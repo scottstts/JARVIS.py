@@ -21,7 +21,6 @@ from jarvis.core import (
     AgentRuntimeMessage,
     AgentToolCallEvent,
     AgentTurnDoneEvent,
-    ContextBudgetError,
 )
 from jarvis.core.agent_loop import _collect_pending_detached_job_ids
 from jarvis.llm import (
@@ -2486,7 +2485,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 first_contract.metadata["task_contract_revision"],
             )
 
-    async def test_automatic_compaction_failure_is_latched_for_unchanged_source(
+    async def test_semantic_provider_failure_rolls_over_without_failure_latch(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2511,17 +2510,23 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
             session = storage.get_session(session_id)
             assert session is not None
 
-            with self.assertRaisesRegex(RuntimeError, "deterministic compaction failure"):
-                await loop._compact_session(session, reason="reactive")
-            with self.assertRaises(ContextBudgetError) as raised:
-                await loop._compact_session(session, reason="reactive")
+            compacted = await loop._compact_session(session, reason="reactive")
 
+            assert compacted is not None
+            self.assertNotEqual(compacted.session_id, session_id)
             self.assertEqual(llm_service.generate_calls, 1)
-            self.assertTrue(raised.exception.metadata["compaction_retry_suppressed"])
             refreshed = storage.get_session(session_id)
             assert refreshed is not None
+            self.assertEqual(refreshed.status, "archived")
             self.assertFalse(refreshed.pending_reactive_compaction)
-            self.assertIn("compaction_failure_latch", refreshed.backend_state)
+            self.assertNotIn("compaction_failure_latch", refreshed.backend_state)
+            audit = next(
+                record
+                for record in storage.load_records(session_id, include_all_turns=True)
+                if record.kind == "compaction"
+            )
+            self.assertEqual(audit.metadata["semantic_status"], "fallback")
+            self.assertEqual(audit.metadata["semantic_source"], "minimal")
 
     def test_terminal_bash_progress_metadata_is_not_treated_as_pending_work(self) -> None:
         terminal_update = AgentRuntimeMessage(

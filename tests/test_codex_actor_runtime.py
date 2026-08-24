@@ -226,7 +226,13 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(
                 [record.metadata["compaction_kind"] for record in compaction_records],
-                ["history_boundary", "episode", "state_snapshot", "handover"],
+                [
+                    "history_boundary",
+                    "recent_message",
+                    "episode",
+                    "state_snapshot",
+                    "handover",
+                ],
             )
             self.assertTrue(
                 any(record.metadata.get("compaction_bundle_anchor") for record in new_records)
@@ -303,9 +309,10 @@ class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(seed_input), 2)
             self.assertIn("Historical context from an earlier Jarvis session", seed_input[0]["text"])
             self.assertIn(
-                "Evidence-backed prior-session assistant context:",
+                "Exact prior user message:",
                 seed_input[1]["text"],
             )
+            self.assertIn("Keep marker CODE-12345.", seed_input[1]["text"])
             self.assertEqual(seed_input[-1]["text"], "continue")
 
             await runtime.handle_notification(
