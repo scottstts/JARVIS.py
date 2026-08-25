@@ -1711,7 +1711,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 agent_kind="subagent",
                 agent_name="Edith",
                 subagent_id="sub_edith",
-                tool_names=("acceptance_run",),
+                tool_names=("bash",),
             )
         )
         await session.emit(
@@ -1729,7 +1729,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 agent_kind="subagent",
                 agent_name="Edith",
                 subagent_id="sub_edith",
-                tool_names=("acceptance_run",),
+                tool_names=("bash",),
             )
         )
         await session.emit(
@@ -1749,7 +1749,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             [message.text for message in telegram.sent_messages],
             [
                 "🔧 <b>Friday</b>:\n• used <b>bash</b>",
-                "🔧 <b>Edith</b>:\n• used <b>acceptance_run</b>",
+                "🔧 <b>Edith</b>:\n• used <b>bash</b>",
             ],
         )
         self.assertEqual(
@@ -1762,7 +1762,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 "🔧 <b>Friday</b>:\n"
                 "• used <b>bash</b>\n"
                 "• used <b>file_patch</b>",
-                "🔧 <b>Edith</b>:\n• used <b>acceptance_run</b> ×2",
+                "🔧 <b>Edith</b>:\n• used <b>bash</b> ×2",
             ],
         )
 

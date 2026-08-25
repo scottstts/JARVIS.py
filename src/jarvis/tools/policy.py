@@ -34,9 +34,6 @@ class ToolPolicy:
         arguments: dict[str, object],
         context: ToolExecutionContext,
     ) -> ToolPolicyDecision:
-        if tool_name in {"acceptance_record", "acceptance_run"}:
-            return ToolPolicyDecision(allowed=True)
-
         if tool_name == "bash":
             settings = ToolSettings.from_workspace_dir(context.workspace_dir)
             return BashCommandPolicy(settings).authorize(
@@ -143,8 +140,6 @@ class ToolPolicy:
             )
 
         if tool_name not in {
-            "acceptance_record",
-            "acceptance_run",
             "bash",
             "file_patch",
             "file_write",

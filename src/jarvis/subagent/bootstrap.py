@@ -7,6 +7,8 @@ from pathlib import Path
 from jarvis.core.agent_loop import AgentRuntimeMessage
 from jarvis.llm import LLMMessage
 
+from .acceptance_notes import AcceptanceNotes
+
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
@@ -141,4 +143,14 @@ def _render_assignment_text(
                 deliverable.strip(),
             ]
         )
+    lines.extend(
+        [
+            "",
+            AcceptanceNotes(
+                instructions=instructions,
+                user_constraints=user_constraints,
+                deliverable=deliverable,
+            ).render(),
+        ]
+    )
     return "\n".join(lines)

@@ -82,11 +82,7 @@ from .config import CoreSettings
 from .errors import ContextBudgetError
 from .identities import IdentityBootstrapLoader
 from .token_estimator import estimate_request_input_tokens
-from .task_contract import (
-    TaskContract,
-    build_assignment_task_contract,
-    build_task_contract,
-    merge_task_contract,
+from .task_lifecycle import (
     user_message_explicitly_replaces_task,
     user_message_explicitly_resumes_task,
     user_message_is_side_query,
@@ -131,12 +127,6 @@ _ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
 _TOOL_BOOTSTRAP_METADATA_KEY = "tool_bootstrap"
 _SKILLS_BOOTSTRAP_METADATA_KEY = "skills_bootstrap"
 _TASK_COMPLETION_DEFERRED_METADATA_KEY = "task_completion_deferred"
-_ACCEPTANCE_CONTINUATION_TEXT = (
-    "The task cannot finish yet because workspace mutations do not have current acceptance "
-    "evidence. Continue autonomously: run the required acceptance gates with explicit material "
-    "revision paths, record the resolved acceptance ledger, fix any failures, and only then "
-    "provide the final answer."
-)
 _TOOL_ROUND_CONTINUATION_EMPTY_TEXT = (
     "I could not produce a continuation after the tool execution slice boundary."
 )
@@ -145,7 +135,6 @@ _TOOL_LIVENESS_EXHAUSTED_TEXT = (
     "unchanged actions have been suppressed; a new instruction or materially changed runtime "
     "state is needed before this task can continue."
 )
-_ACCEPTANCE_CONTINUATION_METADATA_KEY = "acceptance_continuation_required"
 _FOLLOWUP_COMPACTION_FAILED_TEXT = (
     "Follow-up request overflow occurred and compaction could not proceed."
 )
@@ -386,7 +375,6 @@ class AgentLoop:
         tool_executor: ToolExecutorCallable | None = None,
         runtime_messages_provider: RuntimeMessagesProvider | None = None,
         local_notice_callback: LocalNoticeCallback | None = None,
-        task_contract_seed_texts: tuple[str, ...] = (),
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
@@ -422,11 +410,6 @@ class AgentLoop:
         )
         self._tool_executor = tool_executor or self._default_execute_tool_call
         self._local_notice_callback = local_notice_callback
-        self._task_contract_seed_texts = tuple(
-            normalized
-            for text in task_contract_seed_texts
-            if (normalized := text.strip())
-        )
         self._tool_context = ToolExecutionContext(
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
@@ -879,19 +862,6 @@ class AgentLoop:
             if overflow_compacted:
                 did_compaction = True
 
-            if (
-                not response.tool_calls
-                and not initial_pending_detached_job_ids
-                and not initial_pending_subagent_ids
-            ):
-                _rounds, persisted_tool_safety = self._load_tool_task_state(
-                    session.session_id
-                )
-                response = _enforce_acceptance_handoff(
-                    response,
-                    tool_safety=persisted_tool_safety,
-                )
-
             assistant_record = self._build_assistant_record(
                 session.session_id,
                 response,
@@ -1074,7 +1044,6 @@ class AgentLoop:
                     observation = None
                     if tool_safety is not None and not tool_call_suppressed:
                         observation = tool_safety.record(tool_call, tool_result)
-                        tool_result = tool_safety.reconcile_acceptance_record(tool_result)
                         tool_result = _with_tool_safety_replan_notice(
                             tool_result,
                             observation=observation,
@@ -2044,14 +2013,7 @@ class AgentLoop:
         interrupted_response_text = ""
         interrupted_stream_fragment_text = ""
         interrupted_unexecuted_tool_names: tuple[str, ...] = ()
-        _initial_rounds, initial_tool_safety = self._load_tool_task_state(
-            session.session_id
-        )
-        suppress_initial_text_stream = (
-            initial_tool_safety.unverified_workspace_mutation
-            and not initial_pending_detached_job_ids
-            and not initial_pending_subagent_ids
-        )
+        suppress_initial_text_stream = False
         try:
             overflow_compacted = False
             overflow_retry_attempted = False
@@ -2172,19 +2134,6 @@ class AgentLoop:
             if overflow_compacted:
                 did_compaction = True
 
-            if (
-                not initial_response.tool_calls
-                and not initial_pending_detached_job_ids
-                and not initial_pending_subagent_ids
-            ):
-                _rounds, persisted_tool_safety = self._load_tool_task_state(
-                    session.session_id
-                )
-                initial_response = _enforce_acceptance_handoff(
-                    initial_response,
-                    tool_safety=persisted_tool_safety,
-                )
-
             final_initial_record = self._build_final_stream_assistant_record(
                 session_id=session.session_id,
                 response=initial_response,
@@ -2255,9 +2204,7 @@ class AgentLoop:
             turn_yielded = False
             pending_detached_job_ids = initial_pending_detached_job_ids
             pending_subagent_ids = initial_pending_subagent_ids
-            while current_response.tool_calls or _response_requires_acceptance_continuation(
-                current_response
-            ):
+            while current_response.tool_calls:
                 if self._stop_requested(turn_id):
                     interrupted = self._interrupt_turn(
                         session_id=session.session_id,
@@ -2306,23 +2253,6 @@ class AgentLoop:
                     interrupted_response_text = current_response.text
                     interrupted_unexecuted_tool_names = ()
                     break
-                if _response_requires_acceptance_continuation(current_response):
-                    self._append_turn_record(
-                        session_id=session.session_id,
-                        pending_records=pending_records,
-                        record=self._build_runtime_message_record(
-                            session_id=session.session_id,
-                            message=AgentRuntimeMessage(
-                                role="system",
-                                content=_ACCEPTANCE_CONTINUATION_TEXT,
-                                metadata={
-                                    _ACCEPTANCE_CONTINUATION_METADATA_KEY: True,
-                                    "automatic_continuation": True,
-                                },
-                            ),
-                            turn_id=turn_id,
-                        ),
-                    )
                 round_progress_epoch = tool_safety.progress_epoch
                 if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                     tool_safety.consume_slice_progress()
@@ -2421,9 +2351,6 @@ class AgentLoop:
                                     observation = tool_safety.record(
                                         tool_call,
                                         tool_result,
-                                    )
-                                    tool_result = tool_safety.reconcile_acceptance_record(
-                                        tool_result
                                     )
                                     tool_result = _with_tool_safety_replan_notice(
                                         tool_result,
@@ -2697,9 +2624,7 @@ class AgentLoop:
                     emitted_any = False
                     streamed_followup_text = ""
                     deferred_committed = False
-                    suppress_followup_text_stream = (
-                        tool_safety.unverified_workspace_mutation
-                    )
+                    suppress_followup_text_stream = False
                     try:
                         async for event in self._stream_generate_with_stop(
                             request, turn_id=turn_id
@@ -2940,15 +2865,6 @@ class AgentLoop:
                     )
 
                 current_response = streamed_response
-                if (
-                    not current_response.tool_calls
-                    and not pending_detached_job_ids
-                    and not pending_subagent_ids
-                ):
-                    current_response = _enforce_acceptance_handoff(
-                        current_response,
-                        tool_safety=tool_safety,
-                    )
                 interrupted_response_text = current_response.text
                 interrupted_unexecuted_tool_names = tuple(
                     call.name for call in current_response.tool_calls
@@ -3148,34 +3064,11 @@ class AgentLoop:
             session_id=session.session_id,
             pre_turn_messages=pre_turn_messages,
         )
-        task_contract = self._prepare_tool_task(
+        self._prepare_tool_activity_task(
             session_id=session.session_id,
             proposed_task_id=task_id,
             user_text=user_text,
         )
-        if task_contract is not None:
-            rendered_contract = task_contract.render()
-            contract_prompt_hash = hashlib.sha256(
-                rendered_contract.encode("utf-8")
-            ).hexdigest()
-            contract_already_persisted = any(
-                record.metadata.get("task_contract_revision") == contract_prompt_hash
-                for record in records
-            )
-            if not contract_already_persisted:
-                turn_runtime_messages = (
-                    *turn_runtime_messages,
-                    AgentRuntimeMessage(
-                        role="system",
-                        content=rendered_contract,
-                        metadata={
-                            "task_contract": True,
-                            "task_id": task_contract.task_id,
-                            "task_contract_revision": contract_prompt_hash,
-                            "user_message_sha256": task_contract.user_message_sha256,
-                        },
-                    ),
-                )
         self._record_tool_task_runtime_progress(
             session_id=session.session_id,
             runtime_messages=turn_runtime_messages,
@@ -3308,19 +3201,28 @@ class AgentLoop:
                 if active_task_id
                 else None
             )
+            if not (
+                isinstance(active_state, dict)
+                and _safe_non_negative_int(active_state.get("schema_version")) == 3
+            ):
+                active_state = None
             restore_parent_task_id = (
                 str(active_state.get("restore_parent_task_id", "")).strip()
                 if isinstance(active_state, dict)
                 else ""
             )
+            restore_parent_state = (
+                self._storage.load_tool_task_state(restore_parent_task_id)
+                if restore_parent_task_id
+                else None
+            )
             if (
-                restore_parent_task_id
-                and self._storage.load_tool_task_state(restore_parent_task_id) is not None
+                isinstance(restore_parent_state, dict)
+                and _safe_non_negative_int(restore_parent_state.get("schema_version")) == 3
             ):
                 backend_state["active_tool_task_id"] = restore_parent_task_id
             else:
                 backend_state.pop("active_tool_task_id", None)
-            backend_state.pop("tool_task_state", None)
         self._storage.update_session(
             session_id,
             pending_interruption_notice=False,
@@ -3332,16 +3234,22 @@ class AgentLoop:
             backend_state=backend_state,
         )
 
-    def _prepare_tool_task(
+    def _prepare_tool_activity_task(
         self,
         *,
         session_id: str,
         proposed_task_id: str,
         user_text: str | None,
-    ) -> TaskContract | None:
+    ) -> None:
+        """Prepare liveness-only task state for this turn.
+
+        The state tracks retry suppression across turns. It carries no semantic
+        requirements and has no authority over whether an agent may finish.
+        """
+
         session = self._storage.get_session(session_id)
         if session is None:
-            return None
+            return
         backend_state = dict(session.backend_state)
         active_task_id = str(backend_state.get("active_tool_task_id", "")).strip()
         active_state = (
@@ -3349,12 +3257,15 @@ class AgentLoop:
             if active_task_id
             else None
         )
-        active_contract = TaskContract.from_state(
-            active_state.get("contract") if isinstance(active_state, dict) else None
-        )
+        if not (
+            isinstance(active_state, dict)
+            and _safe_non_negative_int(active_state.get("schema_version")) == 3
+        ):
+            active_state = None
 
         if user_text is None:
-            return active_contract
+            return
+
         explicit_resume = user_message_explicitly_resumes_task(user_text)
         if explicit_resume and isinstance(active_state, dict):
             parent_task_id = str(active_state.get("restore_parent_task_id", "")).strip()
@@ -3363,83 +3274,73 @@ class AgentLoop:
                 if parent_task_id
                 else None
             )
-            parent_contract = TaskContract.from_state(
-                parent_state.get("contract") if isinstance(parent_state, dict) else None
-            )
-            if parent_contract is not None and isinstance(parent_state, dict):
+            if not (
+                isinstance(parent_state, dict)
+                and _safe_non_negative_int(parent_state.get("schema_version")) == 3
+            ):
+                parent_state = None
+            if isinstance(parent_state, dict):
                 active_task_id = parent_task_id
                 active_state = parent_state
-                active_contract = parent_contract
                 backend_state["active_tool_task_id"] = parent_task_id
+
         if (
-            active_contract is not None
+            active_task_id
             and isinstance(active_state, dict)
             and (
                 explicit_resume
                 or (
-                    session.pending_interruption_notice_reason
-                    == "superseded_by_user_message"
+                    session.pending_interruption_notice_reason == "superseded_by_user_message"
                     and not user_message_explicitly_replaces_task(user_text)
                     and not user_message_is_side_query(user_text)
                 )
             )
         ):
-            contract = merge_task_contract(
-                active_contract,
-                user_text=user_text,
-            )
             tracker = ToolActivityTracker.from_state(
                 active_state.get("tracker"),
                 actor_kind=self._identity.kind,
             )
-            tracker.seed_contract_requirements(contract.requirements)
             self._storage.write_tool_task_state(
-                contract.task_id,
+                active_task_id,
                 {
-                    **active_state,
-                    "schema_version": 2,
-                    "contract": contract.to_state(),
+                    "schema_version": 3,
+                    "task_id": active_task_id,
+                    "origin_session_id": str(
+                        active_state.get("origin_session_id", session_id)
+                    ),
                     "stalled_rounds": 0,
                     "round_progress_epoch": tracker.progress_epoch,
+                    **(
+                        {"restore_parent_task_id": parent}
+                        if (parent := str(active_state.get("restore_parent_task_id", "")).strip())
+                        else {}
+                    ),
                     "tracker": tracker.to_state(),
                 },
             )
             if backend_state != session.backend_state:
                 self._storage.update_session(session_id, backend_state=backend_state)
-            return contract
+            return
 
         restore_parent_task_id = ""
         if (
-            active_contract is not None
+            active_task_id
             and isinstance(active_state, dict)
             and user_message_is_side_query(user_text)
             and not user_message_explicitly_replaces_task(user_text)
         ):
             restore_parent_task_id = (
                 str(active_state.get("restore_parent_task_id", "")).strip()
-                or active_contract.task_id
+                or active_task_id
             )
-        if self._identity.kind == "subagent" and self._task_contract_seed_texts:
-            contract = build_assignment_task_contract(
-                task_id=proposed_task_id,
-                origin_turn_id=proposed_task_id,
-                assignment_texts=self._task_contract_seed_texts,
-            )
-        else:
-            contract = build_task_contract(
-                task_id=proposed_task_id,
-                origin_turn_id=proposed_task_id,
-                user_text=user_text,
-            )
+
         tracker = ToolActivityTracker(_actor_kind=self._identity.kind)
-        tracker.seed_contract_requirements(contract.requirements)
         self._storage.write_tool_task_state(
-            contract.task_id,
+            proposed_task_id,
             {
-                "schema_version": 2,
-                "task_id": contract.task_id,
+                "schema_version": 3,
+                "task_id": proposed_task_id,
                 "origin_session_id": session_id,
-                "contract": contract.to_state(),
                 "stalled_rounds": 0,
                 "round_progress_epoch": tracker.progress_epoch,
                 **(
@@ -3450,11 +3351,9 @@ class AgentLoop:
                 "tracker": tracker.to_state(),
             },
         )
-        backend_state["active_tool_task_id"] = contract.task_id
-        backend_state.pop("tool_task_state", None)
+        backend_state["active_tool_task_id"] = proposed_task_id
         if backend_state != session.backend_state:
             self._storage.update_session(session_id, backend_state=backend_state)
-        return contract
 
     def _load_tool_task_state(self, session_id: str) -> tuple[int, ToolActivityTracker]:
         session = self._storage.get_session(session_id)
@@ -3462,24 +3361,18 @@ class AgentLoop:
             return 0, ToolActivityTracker(_actor_kind=self._identity.kind)
         task_id = str(session.backend_state.get("active_tool_task_id", "")).strip()
         raw = self._storage.load_tool_task_state(task_id) if task_id else None
-        if not isinstance(raw, dict):
-            # Read the old inline shape during rolling upgrades, but never persist it again.
-            raw = session.backend_state.get("tool_task_state")
-        if not isinstance(raw, dict):
+        if not isinstance(raw, dict) or _safe_non_negative_int(raw.get("schema_version")) != 3:
             return 0, ToolActivityTracker(_actor_kind=self._identity.kind)
         tracker = ToolActivityTracker.from_state(
             raw.get("tracker"),
             actor_kind=self._identity.kind,
         )
-        schema_version = _safe_non_negative_int(raw.get("schema_version"))
         persisted_epoch = _safe_non_negative_int(raw.get("round_progress_epoch"))
-        if schema_version < 2 or persisted_epoch != tracker.progress_epoch:
-            rounds = 0
-        else:
-            rounds = _safe_non_negative_int(raw.get("stalled_rounds"))
-        contract = TaskContract.from_state(raw.get("contract"))
-        if contract is not None:
-            tracker.seed_contract_requirements(contract.requirements)
+        rounds = (
+            _safe_non_negative_int(raw.get("stalled_rounds"))
+            if persisted_epoch == tracker.progress_epoch
+            else 0
+        )
         return rounds, tracker
 
     def _persist_tool_task_state(
@@ -3495,15 +3388,25 @@ class AgentLoop:
         task_id = str(session.backend_state.get("active_tool_task_id", "")).strip()
         if not task_id:
             return
-        existing = self._storage.load_tool_task_state(task_id) or {}
+        existing = self._storage.load_tool_task_state(task_id)
+        if not (
+            isinstance(existing, dict)
+            and _safe_non_negative_int(existing.get("schema_version")) == 3
+        ):
+            existing = {}
         self._storage.write_tool_task_state(
             task_id,
             {
-                **existing,
-                "schema_version": 2,
+                "schema_version": 3,
                 "task_id": task_id,
+                "origin_session_id": str(existing.get("origin_session_id", session_id)),
                 "stalled_rounds": max(0, rounds),
                 "round_progress_epoch": tracker.progress_epoch,
+                **(
+                    {"restore_parent_task_id": parent}
+                    if (parent := str(existing.get("restore_parent_task_id", "")).strip())
+                    else {}
+                ),
                 "tracker": tracker.to_state(),
             },
         )
@@ -3760,9 +3663,7 @@ class AgentLoop:
         current_session = session
         current_base_records = list(base_records)
 
-        while current_response.tool_calls or _response_requires_acceptance_continuation(
-            current_response
-        ):
+        while current_response.tool_calls:
             if self._stop_requested(turn_id):
                 return (
                     current_session,
@@ -3805,23 +3706,6 @@ class AgentLoop:
                         (),
                     )
                 break
-            if _response_requires_acceptance_continuation(current_response):
-                self._append_turn_record(
-                    session_id=current_session.session_id,
-                    pending_records=pending_records,
-                    record=self._build_runtime_message_record(
-                        session_id=current_session.session_id,
-                        message=AgentRuntimeMessage(
-                            role="system",
-                            content=_ACCEPTANCE_CONTINUATION_TEXT,
-                            metadata={
-                                _ACCEPTANCE_CONTINUATION_METADATA_KEY: True,
-                                "automatic_continuation": True,
-                            },
-                        ),
-                        turn_id=turn_id,
-                    ),
-                )
             round_progress_epoch = tool_safety.progress_epoch
             if tool_rounds > self._tool_settings.max_tool_rounds_per_turn:
                 tool_safety.consume_slice_progress()
@@ -4124,15 +4008,6 @@ class AgentLoop:
                 did_compaction = True
                 followup_compaction_attempted = True
 
-            if (
-                not current_response.tool_calls
-                and not pending_detached_job_ids
-                and not pending_subagent_ids
-            ):
-                current_response = _enforce_acceptance_handoff(
-                    current_response,
-                    tool_safety=tool_safety,
-                )
             assistant_record = self._build_assistant_record(
                 current_session.session_id,
                 current_response,
@@ -6482,23 +6357,6 @@ def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
     return normalized or None
 
 
-def _enforce_acceptance_handoff(
-    response: LLMResponse,
-    *,
-    tool_safety: ToolActivityTracker,
-) -> LLMResponse:
-    if not tool_safety.unverified_workspace_mutation:
-        return response
-    return replace(
-        response,
-        provider_metadata={
-            **response.provider_metadata,
-            "acceptance_required": True,
-            _ACCEPTANCE_CONTINUATION_METADATA_KEY: True,
-        },
-    )
-
-
 def _response_completion_blocked(response: LLMResponse) -> bool:
     return bool(response.provider_metadata.get("completion_blocked", False))
 
@@ -6509,12 +6367,6 @@ def _response_completion_block_reason(response: LLMResponse) -> str | None:
     value = response.provider_metadata.get("completion_block_reason")
     normalized = str(value).strip() if value is not None else ""
     return normalized or "external_blocked"
-
-
-def _response_requires_acceptance_continuation(response: LLMResponse) -> bool:
-    return bool(
-        response.provider_metadata.get(_ACCEPTANCE_CONTINUATION_METADATA_KEY, False)
-    )
 
 
 def _mark_task_completion_deferred(response: LLMResponse) -> LLMResponse:

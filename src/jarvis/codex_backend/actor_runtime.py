@@ -1822,7 +1822,9 @@ class CodexActorRuntime:
             session.backend_state.get("last_synced_external_record_id")
         )
         eligible_records = [
-            record for record in records if _is_external_runtime_record(record)
+            record
+            for record in records
+            if _is_external_runtime_record(record)
         ]
         if not eligible_records:
             return (), None

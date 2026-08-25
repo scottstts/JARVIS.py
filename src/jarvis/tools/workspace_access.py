@@ -71,6 +71,10 @@ def with_workspace_observation(
         metadata["workspace_revision_before"] = observation.revision_before
     if observation.revision_after is not None:
         metadata["workspace_revision_after"] = observation.revision_after
+    if observation.revision_paths:
+        metadata["workspace_revision_paths"] = [
+            str(path) for path in observation.revision_paths
+        ]
     if observation.may_mutate:
         metadata["workspace_changed"] = observation.changed
     return replace(result, metadata=metadata)
@@ -272,6 +276,7 @@ class WorkspaceAccessCoordinator:
                 mode=request.mode,
                 scope="workspace",
                 revision_before=workspace_revision(self._workspace_dir),
+                revision_paths=(self._workspace_dir,),
             )
         if request.mode == "path_write":
             return WorkspaceAccessObservation(
@@ -281,6 +286,7 @@ class WorkspaceAccessCoordinator:
                     self._workspace_dir,
                     request.write_paths,
                 ),
+                revision_paths=request.write_paths,
             )
         return WorkspaceAccessObservation(mode=request.mode)
 
@@ -471,8 +477,6 @@ def _access_request(
         if mode == "cancel":
             return _AccessRequest(mode="read")
         return _AccessRequest(mode="actor_workspace")
-    if tool_call.name == "acceptance_run":
-        return _AccessRequest(mode="actor_workspace")
     if tool_call.name == "tool_register":
         manifest = tool_call.arguments.get("manifest")
         name = str(manifest.get("name", "")).strip() if isinstance(manifest, dict) else ""
@@ -493,8 +497,6 @@ def _access_request(
     if tool_call.name == "memory_write":
         return _AccessRequest(mode="global_write")
     if tool_call.name == "email":
-        return _AccessRequest(mode="exclusive_read")
-    if tool_call.name == "acceptance_record":
         return _AccessRequest(mode="exclusive_read")
     if tool_call.name in {"send_file", "view_image"}:
         raw_path = str(tool_call.arguments.get("path", "")).strip()

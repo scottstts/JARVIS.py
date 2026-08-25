@@ -1,19 +1,15 @@
-"""Task-scoped liveness and acceptance accounting for tool activity."""
+"""Task-scoped liveness accounting for tool activity."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
 import json
-from pathlib import Path
-import re
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 
 from jarvis.llm import ToolCall
 from jarvis.llm.validation import TOOL_CALL_VALIDATION_ERROR_METADATA_KEY
 from jarvis.tools import ToolExecutionResult
-
-from .task_contract import TaskRequirement
 
 
 _FILE_EDIT_TOOL_NAMES = frozenset({"file_patch", "file_write", "file_replace"})
@@ -35,7 +31,12 @@ class ToolActivityObservation:
 
 @dataclass(slots=True)
 class ToolActivityTracker:
-    """Track exact repeated calls, material progress, and acceptance evidence."""
+    """Track exact repeated calls and material progress.
+
+    This tracker deliberately has no semantic-completion authority. It exists only to
+    stop unchanged invalid/no-progress tool loops and to reset those counters when new
+    runtime evidence appears.
+    """
 
     _actor_kind: Literal["main", "subagent"] = "main"
     _invalid_counts: dict[str, int] = field(default_factory=dict)
@@ -47,36 +48,7 @@ class ToolActivityTracker:
     _blocked_call_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     _progress_epoch: int = 0
     _progress_since_slice: bool = False
-    _workspace_mutated: bool = False
-    _acceptance_recorded: bool = False
-    _passed_acceptance_run_call_ids: set[str] = field(default_factory=set)
-    _passed_acceptance_run_scopes: dict[str, dict[str, Any]] = field(
-        default_factory=dict
-    )
-    _acceptance_items: dict[str, dict[str, Any]] = field(default_factory=dict)
-    _acceptance_blockers: tuple[str, ...] = ()
-    _contract_requirements: dict[str, dict[str, str]] = field(default_factory=dict)
-    _subagent_invocation_count: int = 0
-    _test_review_subagent_ids: set[str] = field(default_factory=set)
-    _test_review_subagent_paths: dict[str, set[str]] = field(default_factory=dict)
-    _completed_test_review_subagent_ids: set[str] = field(default_factory=set)
-    _completed_test_review_paths: set[str] = field(default_factory=set)
-    _passed_acceptance_gates: dict[str, str] = field(default_factory=dict)
-    _visual_inspection_paths: set[str] = field(default_factory=set)
     _runtime_progress_signatures: list[str] = field(default_factory=list)
-
-    def seed_contract_requirements(
-        self,
-        requirements: tuple[TaskRequirement, ...],
-    ) -> None:
-        """Install immutable user-owned acceptance requirements for this task."""
-
-        supplied = {item.item_id: item.to_state() for item in requirements}
-        if not self._contract_requirements:
-            self._contract_requirements = supplied
-            return
-        for item_id, requirement in supplied.items():
-            self._contract_requirements.setdefault(item_id, requirement)
 
     def blocked_call_reason(self, tool_call: ToolCall) -> str | None:
         return self._blocked_call_reasons.get(_tool_call_signature(tool_call))
@@ -85,22 +57,8 @@ class ToolActivityTracker:
         return dict(self._blocked_call_details.get(_tool_call_signature(tool_call), {}))
 
     def record(self, tool_call: ToolCall, result: ToolExecutionResult) -> ToolActivityObservation:
-        delegated_direct_added = self._track_delegated_test_artifacts_from_metadata(
-            result.metadata
-        )
-        delegated_nested_added = self._track_delegated_test_artifacts_from_subagents(
-            result.metadata.get("subagents")
-        )
-        delegated_requirement_added = delegated_direct_added or delegated_nested_added
-        workspace_mutated = _result_mutated_workspace(tool_call, result)
-        if workspace_mutated:
-            self._advance_progress_epoch(invalidate_acceptance=True)
-            self._workspace_mutated = True
-            self._track_changed_test_artifacts(tool_call, result)
-        elif delegated_requirement_added:
-            self._advance_progress_epoch(invalidate_acceptance=False)
-        elif _result_is_material_progress(result):
-            self._advance_progress_epoch(invalidate_acceptance=False)
+        if _result_mutated_workspace(tool_call, result) or _result_is_material_progress(result):
+            self._advance_progress_epoch()
 
         invalid_signature = _invalid_signature(tool_call, result)
         if invalid_signature is not None:
@@ -125,7 +83,7 @@ class ToolActivityTracker:
                     "progress_epoch": self._progress_epoch,
                 }
             return ToolActivityObservation(
-                repeated_invalid_call=count >= 2,
+                repeated_invalid_call=blocked,
                 blocked_invalid_signature=blocked,
                 signature_id=invalid_signature,
                 occurrence_count=count,
@@ -133,57 +91,8 @@ class ToolActivityTracker:
                 first_call_id=first_call_id,
             )
 
-        if result.name == "acceptance_run" and result.ok:
-            self._passed_acceptance_run_call_ids.add(result.call_id)
-            run_scope = _acceptance_run_scope(result)
-            if run_scope is not None:
-                self._passed_acceptance_run_scopes[result.call_id] = run_scope
-            self._passed_acceptance_gates.update(_passed_acceptance_gates(result))
-        if result.name == "subagent_invoke" and result.ok:
-            self._subagent_invocation_count += 1
-            review_requirement = self._contract_requirements.get(
-                "system-test-change-review"
-            )
-            if review_requirement is not None and _is_test_review_assignment(
-                tool_call,
-                review_requirement,
-            ):
-                subagent_id = str(result.metadata.get("subagent_id", "")).strip()
-                if subagent_id:
-                    self._test_review_subagent_ids.add(subagent_id)
-                    self._test_review_subagent_paths[subagent_id] = (
-                        _test_paths_from_requirement(review_requirement)
-                    )
-        if result.name == "subagent_monitor" and result.ok:
-            self._record_completed_test_reviews(result)
-        if result.name == "view_image" and result.ok:
-            paths = {
-                str(result.metadata.get("path", "")).strip(),
-                str(tool_call.arguments.get("path", "")).strip(),
-            }
-            self._visual_inspection_paths.update(path for path in paths if path)
-        if result.name == "acceptance_record" and result.ok:
-            self._acceptance_items.update(_acceptance_ledger_items(result))
-            (
-                self._acceptance_recorded,
-                self._acceptance_blockers,
-            ) = _acceptance_ledger_resolution(
-                result,
-                valid_gate_call_ids=self._passed_acceptance_run_call_ids,
-                valid_gate_scopes=self._passed_acceptance_run_scopes,
-                durable_items=self._acceptance_items,
-                contract_requirements=self._contract_requirements,
-                subagent_invocation_count=self._subagent_invocation_count,
-                completed_test_review_subagent_ids=(
-                    self._completed_test_review_subagent_ids
-                ),
-                completed_test_review_paths=self._completed_test_review_paths,
-                visual_inspection_paths=self._visual_inspection_paths,
-            )
-
         activity_signature = _tool_result_signature(tool_call, result)
-        no_progress = _is_no_progress_result(result)
-        if no_progress:
+        if _is_no_progress_result(result):
             count = self._no_progress_counts.get(activity_signature, 0) + 1
             self._no_progress_counts[activity_signature] = count
             repeated = count >= 3
@@ -224,7 +133,7 @@ class ToolActivityTracker:
             progress_epoch=self._progress_epoch,
         )
 
-    def _advance_progress_epoch(self, *, invalidate_acceptance: bool) -> None:
+    def _advance_progress_epoch(self) -> None:
         self._progress_epoch += 1
         self._invalid_counts.clear()
         self._no_progress_counts.clear()
@@ -234,15 +143,6 @@ class ToolActivityTracker:
         self._blocked_call_reasons.clear()
         self._blocked_call_details.clear()
         self._progress_since_slice = True
-        if invalidate_acceptance:
-            self._invalidate_acceptance_evidence()
-
-    def _invalidate_acceptance_evidence(self) -> None:
-        self._acceptance_recorded = False
-        self._acceptance_blockers = ()
-        self._passed_acceptance_run_call_ids.clear()
-        self._passed_acceptance_run_scopes.clear()
-        self._passed_acceptance_gates.clear()
 
     @property
     def progress_epoch(self) -> int:
@@ -256,19 +156,6 @@ class ToolActivityTracker:
     ) -> bool:
         """Advance progress once for each materially distinct orchestrator update."""
 
-        delegated_requirement_added = self._track_delegated_test_artifacts_from_metadata(
-            metadata
-        )
-        delegated_requirement_added = (
-            self._track_delegated_test_artifacts_from_subagents(
-                metadata.get("subagents")
-            )
-            or delegated_requirement_added
-        )
-        self._record_completed_test_review_from_metadata(metadata)
-        self._record_completed_test_reviews_from_subagents(
-            metadata.get("subagents")
-        )
         signature_payload: dict[str, Any]
         if metadata.get("bash_job_progress_update"):
             signature_payload = {
@@ -278,10 +165,7 @@ class ToolActivityTracker:
                 "running_ids": metadata.get("bash_job_running_ids", []),
                 "terminal_ids": metadata.get("bash_job_terminal_ids", []),
                 "recommended_action": metadata.get("recommended_action"),
-                "progress_fingerprints": metadata.get(
-                    "bash_job_progress_fingerprints",
-                    [],
-                ),
+                "progress_fingerprints": metadata.get("bash_job_progress_fingerprints", []),
             }
         elif metadata.get("subagent_progress_update"):
             signature_payload = {
@@ -291,21 +175,19 @@ class ToolActivityTracker:
                 "pending_ids": metadata.get("pending_subagent_ids", []),
                 "recommended_action": metadata.get("recommended_action"),
                 "report_complete": metadata.get("latest_subagent_report_complete"),
-                "changed_test_artifact_paths": metadata.get(
-                    "changed_test_artifact_paths", []
-                ),
+                "changed_test_artifact_paths": metadata.get("changed_test_artifact_paths", []),
                 "subagents": metadata.get("subagents", []),
                 "content": content,
             }
         else:
-            return delegated_requirement_added
+            return False
 
         signature = _digest(signature_payload)
         if signature in self._runtime_progress_signatures:
             return False
         self._runtime_progress_signatures.append(signature)
         del self._runtime_progress_signatures[:-256]
-        self._advance_progress_epoch(invalidate_acceptance=False)
+        self._advance_progress_epoch()
         return True
 
     def consume_slice_progress(self) -> bool:
@@ -314,214 +196,15 @@ class ToolActivityTracker:
         return made_progress
 
     def checkpoint_lines(self) -> tuple[str, ...]:
-        """Return a compact model-visible checkpoint of unmet hard obligations."""
-
-        lines = [
-            f"progress_epoch: {self._progress_epoch}",
-            f"subagents_invoked: {self._subagent_invocation_count}",
-            f"passing_acceptance_gates: {len(self._passed_acceptance_gates)}",
-            f"visual_artifacts_inspected: {len(self._visual_inspection_paths)}",
-        ]
-        outstanding = [
-            requirement
-            for item_id, requirement in self._contract_requirements.items()
-            if str(self._acceptance_items.get(item_id, {}).get("outcome", ""))
-            not in {"fixed", "passed"}
-        ]
-        if outstanding:
-            lines.append("Outstanding hard requirements:")
-            lines.extend(
-                f"- {item['item_id']} [{item['evidence_kind']}]: {item['criterion']}"
-                for item in outstanding
-            )
-        else:
-            lines.append("Outstanding hard requirements: none recorded.")
-        return tuple(lines)
-
-    def _track_changed_test_artifacts(
-        self,
-        tool_call: ToolCall,
-        result: ToolExecutionResult,
-    ) -> None:
-        paths = {
-            str(result.metadata.get("path", "")).strip(),
-            *(
-                str(path).strip()
-                for path in result.metadata.get("workspace_changed_paths", [])
-                if str(path).strip()
-            ),
-            str(tool_call.arguments.get("path", "")).strip(),
-        }
-        if self._actor_kind != "main":
-            return
-        self._merge_test_change_review_requirement(
-            path for path in paths if path and _path_is_test_artifact(path)
-        )
-
-    def _track_delegated_test_artifacts_from_subagents(
-        self,
-        raw_subagents: object,
-    ) -> bool:
-        if not isinstance(raw_subagents, list):
-            return False
-        paths = {
-            str(path).strip()
-            for raw_subagent in raw_subagents
-            if isinstance(raw_subagent, dict)
-            for path in raw_subagent.get("changed_test_artifact_paths", [])
-            if str(path).strip()
-        }
-        return self._merge_test_change_review_requirement(paths)
-
-    def _track_delegated_test_artifacts_from_metadata(
-        self,
-        metadata: dict[str, Any],
-    ) -> bool:
-        raw_paths = metadata.get("changed_test_artifact_paths")
-        if not isinstance(raw_paths, list):
-            return False
-        return self._merge_test_change_review_requirement(
-            str(path).strip() for path in raw_paths if str(path).strip()
-        )
-
-    def _merge_test_change_review_requirement(self, paths: Iterable[object]) -> bool:
-        if self._actor_kind != "main":
-            return False
-        normalized_paths = {
-            str(path).strip().removeprefix("/workspace/")
-            for path in paths
-            if str(path).strip() and _path_is_test_artifact(str(path))
-        }
-        if not normalized_paths:
-            return False
-        item_id = "system-test-change-review"
-        existing = self._contract_requirements.get(item_id)
-        existing_paths = (
-            _test_paths_from_requirement(existing) if existing is not None else set()
-        )
-        merged_paths = existing_paths | normalized_paths
-        if existing is not None and merged_paths == existing_paths:
-            return False
-        self._contract_requirements[item_id] = {
-            "item_id": item_id,
-            "criterion": (
-                "Independently review semantic changes to test artifacts: "
-                + ", ".join(sorted(merged_paths))
-            ),
-            "evidence_kind": "test_change_review",
-        }
-        self._workspace_mutated = True
-        self._invalidate_acceptance_evidence()
-        return True
-
-    def _record_completed_test_reviews(self, result: ToolExecutionResult) -> None:
-        self._record_completed_test_reviews_from_subagents(
-            result.metadata.get("subagents")
-        )
-
-    def _record_completed_test_reviews_from_subagents(
-        self,
-        raw_subagents: object,
-    ) -> None:
-        if not isinstance(raw_subagents, list):
-            return
-        for raw_subagent in raw_subagents:
-            if not isinstance(raw_subagent, dict):
-                continue
-            subagent_id = str(raw_subagent.get("subagent_id", "")).strip()
-            if (
-                subagent_id in self._test_review_subagent_ids
-                and str(raw_subagent.get("status", "")).strip() == "completed"
-                and bool(raw_subagent.get("report_complete", False))
-                and not self._reviewer_changed_required_tests(raw_subagent)
-            ):
-                self._completed_test_review_subagent_ids.add(subagent_id)
-                self._completed_test_review_paths.update(
-                    self._test_review_subagent_paths.get(subagent_id, set())
-                )
-
-    def _record_completed_test_review_from_metadata(
-        self,
-        metadata: dict[str, Any],
-    ) -> None:
-        subagent_id = str(metadata.get("subagent_id", "")).strip()
-        if (
-            subagent_id in self._test_review_subagent_ids
-            and str(metadata.get("subagent_status", "")).strip() == "completed"
-            and bool(metadata.get("latest_subagent_report_complete", False))
-            and not self._reviewer_changed_required_tests(metadata)
-        ):
-            self._completed_test_review_subagent_ids.add(subagent_id)
-            self._completed_test_review_paths.update(
-                self._test_review_subagent_paths.get(subagent_id, set())
-            )
-
-    def _reviewer_changed_required_tests(self, payload: dict[str, Any]) -> bool:
-        requirement = self._contract_requirements.get("system-test-change-review")
-        if requirement is None:
-            return False
-        required_paths = _test_paths_from_requirement(requirement)
-        raw_paths = payload.get("changed_test_artifact_paths")
-        if not isinstance(raw_paths, list):
-            return False
-        changed_paths = {
-            str(path).strip().removeprefix("/workspace/")
-            for path in raw_paths
-            if str(path).strip()
-        }
-        return bool(required_paths & changed_paths)
-
-    @property
-    def unverified_workspace_mutation(self) -> bool:
-        """Whether a child may hand mutated work back without acceptance evidence.
-
-        Main-agent completion is intentionally not an acceptance boundary.  The main
-        agent may use the tools voluntarily, but only a subagent is held at the
-        deterministic handoff gate.
-        """
+        """Return compact liveness state for an automatic continuation checkpoint."""
 
         return (
-            self._actor_kind == "subagent"
-            and self._workspace_mutated
-            and not self._acceptance_recorded
-        )
-
-    def reconcile_acceptance_record(
-        self,
-        result: ToolExecutionResult,
-    ) -> ToolExecutionResult:
-        """Make a subagent's visible ledger result match the handoff decision."""
-
-        if self._actor_kind != "subagent" or result.name != "acceptance_record" or not result.ok:
-            return result
-        ledger = result.metadata.get("acceptance_ledger")
-        if not isinstance(ledger, dict):
-            return result
-        complete = self._acceptance_recorded
-        blockers = self._acceptance_blockers
-        if bool(ledger.get("complete")) == complete and not blockers:
-            return result
-        metadata = dict(result.metadata)
-        metadata["acceptance_ledger"] = {
-            **ledger,
-            "complete": complete,
-            "completion_blockers": list(blockers),
-        }
-        lines = [result.content, f"completion: {'complete' if complete else 'incomplete'}"]
-        if blockers:
-            lines.append("completion_blockers:")
-            lines.extend(f"- {blocker}" for blocker in blockers)
-        return ToolExecutionResult(
-            call_id=result.call_id,
-            name=result.name,
-            ok=result.ok,
-            content="\n".join(lines),
-            metadata=metadata,
-            turn_disposition=result.turn_disposition,
+            f"progress_epoch: {self._progress_epoch}",
+            "Semantic completion is not runtime-gated; choose the next action from the task state.",
         )
 
     def to_state(self) -> dict[str, Any]:
-        """Return the bounded durable state needed to resume safety accounting."""
+        """Return bounded durable liveness state."""
 
         return {
             "invalid_counts": dict(self._invalid_counts),
@@ -533,31 +216,6 @@ class ToolActivityTracker:
             "blocked_call_details": dict(self._blocked_call_details),
             "progress_epoch": self._progress_epoch,
             "progress_since_slice": self._progress_since_slice,
-            "workspace_mutated": self._workspace_mutated,
-            "acceptance_recorded": self._acceptance_recorded,
-            "passed_acceptance_run_call_ids": sorted(
-                self._passed_acceptance_run_call_ids
-            ),
-            "passed_acceptance_run_scopes": dict(
-                self._passed_acceptance_run_scopes
-            ),
-            "acceptance_items": dict(self._acceptance_items),
-            "acceptance_blockers": list(self._acceptance_blockers),
-            "contract_requirements": dict(self._contract_requirements),
-            "subagent_invocation_count": self._subagent_invocation_count,
-            "test_review_subagent_ids": sorted(self._test_review_subagent_ids),
-            "test_review_subagent_paths": {
-                subagent_id: sorted(paths)
-                for subagent_id, paths in self._test_review_subagent_paths.items()
-            },
-            "completed_test_review_subagent_ids": sorted(
-                self._completed_test_review_subagent_ids
-            ),
-            "completed_test_review_paths": sorted(
-                self._completed_test_review_paths
-            ),
-            "passed_acceptance_gates": dict(self._passed_acceptance_gates),
-            "visual_inspection_paths": sorted(self._visual_inspection_paths),
             "runtime_progress_signatures": list(self._runtime_progress_signatures),
         }
 
@@ -568,83 +226,26 @@ class ToolActivityTracker:
         *,
         actor_kind: Literal["main", "subagent"] = "main",
     ) -> "ToolActivityTracker":
-        """Restore validated state; malformed persisted data starts empty."""
+        """Restore bounded durable liveness state."""
 
         if not isinstance(value, dict):
             return cls(_actor_kind=actor_kind)
-        tracker = cls(
+        return cls(
             _actor_kind=actor_kind,
             _invalid_counts=_bounded_count_map(value.get("invalid_counts")),
             _no_progress_counts=_bounded_count_map(value.get("no_progress_counts")),
-            _seen_activity_signatures=_bounded_string_set(
-                value.get("seen_activity_signatures")
-            ),
-            _invalid_first_call_ids=_bounded_string_map(
-                value.get("invalid_first_call_ids")
-            ),
-            _no_progress_first_call_ids=_bounded_string_map(
-                value.get("no_progress_first_call_ids")
-            ),
-            _blocked_call_reasons=_bounded_string_map(
-                value.get("blocked_call_reasons")
-            ),
-            _blocked_call_details=_bounded_detail_map(
-                value.get("blocked_call_details")
-            ),
+            _seen_activity_signatures=_bounded_string_set(value.get("seen_activity_signatures")),
+            _invalid_first_call_ids=_bounded_string_map(value.get("invalid_first_call_ids")),
+            _no_progress_first_call_ids=_bounded_string_map(value.get("no_progress_first_call_ids")),
+            _blocked_call_reasons=_bounded_string_map(value.get("blocked_call_reasons")),
+            _blocked_call_details=_bounded_detail_map(value.get("blocked_call_details")),
             _progress_epoch=_bounded_non_negative_int(value.get("progress_epoch")),
             _progress_since_slice=bool(value.get("progress_since_slice", False)),
-            _workspace_mutated=bool(value.get("workspace_mutated", False)),
-            _acceptance_recorded=bool(value.get("acceptance_recorded", False)),
-            _passed_acceptance_run_call_ids=_bounded_string_set(
-                value.get("passed_acceptance_run_call_ids")
-            ),
-            _passed_acceptance_run_scopes=_bounded_acceptance_run_scopes(
-                value.get("passed_acceptance_run_scopes")
-            ),
-            _acceptance_items=_bounded_acceptance_items(
-                value.get("acceptance_items")
-            ),
-            _acceptance_blockers=tuple(
-                _bounded_string_list(value.get("acceptance_blockers"), limit=32)
-            ),
-            _contract_requirements=_bounded_contract_requirements(
-                value.get("contract_requirements")
-            ),
-            _subagent_invocation_count=_bounded_non_negative_int(
-                value.get("subagent_invocation_count")
-            ),
-            _test_review_subagent_ids=_bounded_string_set(
-                value.get("test_review_subagent_ids"),
-                limit=64,
-            ),
-            _test_review_subagent_paths=_bounded_string_set_map(
-                value.get("test_review_subagent_paths"),
-                limit=64,
-            ),
-            _completed_test_review_subagent_ids=_bounded_string_set(
-                value.get("completed_test_review_subagent_ids"),
-                limit=64,
-            ),
-            _completed_test_review_paths=_bounded_string_set(
-                value.get("completed_test_review_paths"),
-                limit=256,
-            ),
-            _passed_acceptance_gates=_bounded_string_map(
-                value.get("passed_acceptance_gates"),
-                limit=64,
-            ),
-            _visual_inspection_paths=_bounded_string_set(
-                value.get("visual_inspection_paths"),
-                limit=64,
-            ),
             _runtime_progress_signatures=_bounded_string_list(
                 value.get("runtime_progress_signatures"),
                 limit=256,
             ),
         )
-        if actor_kind == "subagent":
-            tracker._contract_requirements.pop("system-test-change-review", None)
-        return tracker
 
 
 def build_suppressed_repetition_result(
@@ -683,8 +284,7 @@ def _invalid_signature(tool_call: ToolCall, result: ToolExecutionResult) -> str 
     metadata = result.metadata
     if not (
         not result.ok
-        or
-        metadata.get("tool_call_validation_failed")
+        or metadata.get("tool_call_validation_failed")
         or metadata.get("policy_denied")
         or metadata.get("execution_failed")
         or (tool_call.name in _FILE_EDIT_TOOL_NAMES and not result.ok)
@@ -717,12 +317,7 @@ def _tool_result_signature(tool_call: ToolCall, result: ToolExecutionResult) -> 
 
 
 def _tool_call_signature(tool_call: ToolCall) -> str:
-    return _digest(
-        {
-            "tool": tool_call.name,
-            "arguments": _normalized_tool_arguments(tool_call),
-        }
-    )
+    return _digest({"tool": tool_call.name, "arguments": _normalized_tool_arguments(tool_call)})
 
 
 def _normalized_tool_arguments(tool_call: ToolCall) -> Any:
@@ -751,11 +346,7 @@ def _stable_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return _stable_mapping(metadata, volatile_keys=volatile_keys)
 
 
-def _stable_mapping(
-    value: dict[Any, Any],
-    *,
-    volatile_keys: set[str],
-) -> dict[str, Any]:
+def _stable_mapping(value: dict[Any, Any], *, volatile_keys: set[str]) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for raw_key, raw_value in value.items():
         key = str(raw_key)
@@ -789,17 +380,14 @@ def _stable_result_content(result: ToolExecutionResult) -> Any:
 
 
 def _is_no_progress_result(result: ToolExecutionResult) -> bool:
-    if not result.ok:
-        return False
-    if result.turn_disposition == "yield_turn":
+    if not result.ok or result.turn_disposition == "yield_turn":
         return False
     if result.name in _FILE_EDIT_TOOL_NAMES:
         return not bool(result.metadata.get("changed"))
     if result.name == "bash":
         return (
             not bool(result.metadata.get("workspace_changed", False))
-            and
-            result.metadata.get("mode") == "foreground"
+            and result.metadata.get("mode") == "foreground"
             and result.metadata.get("exit_code") == 0
             and result.metadata.get("status") != "running"
         )
@@ -811,25 +399,14 @@ def _result_mutated_workspace(tool_call: ToolCall, result: ToolExecutionResult) 
         return bool(result.metadata.get("workspace_changed"))
     if tool_call.name in _FILE_EDIT_TOOL_NAMES:
         return bool(result.metadata.get("changed"))
-    if tool_call.name == "acceptance_run":
-        return bool(result.ok and result.metadata.get("changed"))
     if tool_call.name in {"generate_edit_image", "memory_write", "tool_register"}:
         return result.ok
     return False
 
 
-# Compatibility aliases for persisted-state consumers and external imports. New runtime code
-# uses the functional names above; removing the aliases would needlessly invalidate extensions.
-ToolSafetyObservation = ToolActivityObservation
-ToolSafetyTracker = ToolActivityTracker
-build_blocked_repetition_result = build_suppressed_repetition_result
-
-
 def _result_is_material_progress(result: ToolExecutionResult) -> bool:
     if not result.ok:
         return False
-    if result.name == "acceptance_run":
-        return True
     if bool(result.metadata.get("changed", False)):
         return True
     return result.name in {
@@ -837,455 +414,6 @@ def _result_is_material_progress(result: ToolExecutionResult) -> bool:
         "subagent_step_in",
         "subagent_stop",
         "subagent_dispose",
-    }
-
-
-def _acceptance_ledger_resolution(
-    result: ToolExecutionResult,
-    *,
-    valid_gate_call_ids: set[str],
-    valid_gate_scopes: dict[str, dict[str, Any]],
-    durable_items: dict[str, dict[str, Any]],
-    contract_requirements: dict[str, dict[str, str]],
-    subagent_invocation_count: int,
-    completed_test_review_subagent_ids: set[str],
-    completed_test_review_paths: set[str],
-    visual_inspection_paths: set[str],
-) -> tuple[bool, tuple[str, ...]]:
-    """Resolve a child handoff ledger against runtime-observed evidence.
-
-    Tool-call and contract-item IDs are internal bookkeeping.  A subagent never
-    needs to reproduce either: the tracker associates a ledger with the passing
-    run whose revision scope matches, then binds each contract requirement to a
-    compatible durable check and observed evidence.
-    """
-
-    blockers: list[str] = []
-    ledger = result.metadata.get("acceptance_ledger")
-    if not isinstance(ledger, dict):
-        return False, ("The acceptance ledger payload is missing.",)
-    if not bool(ledger.get("workspace_revision_verified", False)):
-        blockers.append("The ledger workspace revision was not verified.")
-    checks = ledger.get("checks")
-    if not isinstance(checks, list) or not checks:
-        blockers.append("Record at least one concrete acceptance check.")
-    resolved = bool(durable_items) and all(
-        not bool(item.get("required", True))
-        or str(item.get("outcome", "")).strip()
-        in {"fixed", "passed", "not_a_bug", "user_waived"}
-        for item in durable_items.values()
-    )
-    if not resolved:
-        blockers.append("Required ledger items are still open or unresolved.")
-    ledger_paths = _string_list(ledger.get("revision_paths"))
-    ledger_revision = str(ledger.get("workspace_revision", "")).strip()
-    if not ledger_paths or not ledger_revision:
-        blockers.append("The ledger is missing its revision paths or workspace revision.")
-    matching_gate_scopes = [
-        scope
-        for call_id in valid_gate_call_ids
-        if (scope := valid_gate_scopes.get(call_id)) is not None
-        if scope.get("revision_paths") == ledger_paths
-        and scope.get("workspace_revision") == ledger_revision
-    ]
-    if not matching_gate_scopes:
-        blockers.append(
-            "Run acceptance_run for this exact revision_paths and workspace_revision."
-        )
-    scoped_gates: dict[str, str] = {}
-    for scope in matching_gate_scopes:
-        raw_gates = scope.get("passed_gates")
-        if isinstance(raw_gates, dict):
-            scoped_gates.update(
-                {
-                    str(gate_id): str(evidence)
-                    for gate_id, evidence in raw_gates.items()
-                    if str(gate_id).strip() and str(evidence).strip()
-                }
-            )
-    resolved_items = [
-        (item_id, item)
-        for item_id, item in durable_items.items()
-        if str(item.get("outcome", "")).strip() in {"fixed", "passed"}
-    ]
-    bound_item_ids: set[str] = set()
-    for requirement in contract_requirements.values():
-        bound_item_id = next(
-            (
-                item_id
-                for item_id, item in resolved_items
-                if item_id not in bound_item_ids
-                and _contract_machine_evidence_resolved(
-                    requirement,
-                    item=item,
-                    subagent_invocation_count=subagent_invocation_count,
-                    completed_test_review_subagent_ids=(
-                        completed_test_review_subagent_ids
-                    ),
-                    completed_test_review_paths=completed_test_review_paths,
-                    passed_gates=scoped_gates,
-                    visual_inspection_paths=visual_inspection_paths,
-                )
-            ),
-            None,
-        )
-        if bound_item_id is None:
-            blockers.append(
-                "Missing observed evidence for required contract item: "
-                f"{requirement.get('criterion', 'unnamed requirement')}"
-            )
-        else:
-            bound_item_ids.add(bound_item_id)
-    return not blockers, tuple(blockers)
-
-
-def _acceptance_ledger_items(result: ToolExecutionResult) -> dict[str, dict[str, Any]]:
-    ledger = result.metadata.get("acceptance_ledger")
-    if not isinstance(ledger, dict):
-        return {}
-    checks = ledger.get("checks")
-    if not isinstance(checks, list):
-        return {}
-    output: dict[str, dict[str, Any]] = {}
-    for check in checks:
-        if not isinstance(check, dict):
-            continue
-        item_id = str(check.get("item_id", "")).strip()
-        outcome = str(check.get("outcome", "")).strip()
-        if not item_id or not outcome:
-            continue
-        output[item_id] = {
-            "criterion": str(check.get("criterion", "")).strip(),
-            "required": bool(check.get("required", True)),
-            "outcome": outcome,
-            "evidence_kind": str(check.get("evidence_kind", "")).strip(),
-            "source_tool_call_ids": _string_list(check.get("source_tool_call_ids")),
-            "artifact_paths": _string_list(check.get("artifact_paths")),
-        }
-    return output
-
-
-def _bounded_count_map(value: object, *, limit: int = 64) -> dict[str, int]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, int] = {}
-    for raw_key, raw_count in list(value.items())[-limit:]:
-        key = str(raw_key).strip()
-        if not key:
-            continue
-        try:
-            count = int(raw_count)
-        except (TypeError, ValueError):
-            continue
-        if count > 0:
-            output[key] = min(count, 1_000_000)
-    return output
-
-
-def _bounded_string_set(value: object, *, limit: int = 64) -> set[str]:
-    if not isinstance(value, list):
-        return set()
-    return {str(item).strip() for item in value[-limit:] if str(item).strip()}
-
-
-def _bounded_string_list(value: object, *, limit: int = 64) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value[-limit:] if str(item).strip()]
-
-
-def _bounded_acceptance_items(
-    value: object,
-    *,
-    limit: int = 128,
-) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, dict[str, Any]] = {}
-    for raw_item_id, raw_item in list(value.items())[-limit:]:
-        item_id = str(raw_item_id).strip()
-        if not item_id or not isinstance(raw_item, dict):
-            continue
-        outcome = str(raw_item.get("outcome", "")).strip()
-        if not outcome:
-            continue
-        output[item_id] = {
-            "criterion": str(raw_item.get("criterion", "")).strip(),
-            "required": bool(raw_item.get("required", True)),
-            "outcome": outcome,
-            "evidence_kind": str(raw_item.get("evidence_kind", "")).strip(),
-            "source_tool_call_ids": _string_list(raw_item.get("source_tool_call_ids")),
-            "artifact_paths": _string_list(raw_item.get("artifact_paths")),
-        }
-    return output
-
-
-def _bounded_acceptance_run_scopes(
-    value: object,
-    *,
-    limit: int = 64,
-) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, dict[str, Any]] = {}
-    for raw_call_id, raw_scope in list(value.items())[-limit:]:
-        call_id = str(raw_call_id).strip()
-        if not call_id or not isinstance(raw_scope, dict):
-            continue
-        revision_paths = _bounded_string_list(raw_scope.get("revision_paths"))
-        workspace_revision = str(raw_scope.get("workspace_revision", "")).strip()
-        if revision_paths and workspace_revision:
-            output[call_id] = {
-                "revision_paths": revision_paths,
-                "workspace_revision": workspace_revision,
-                "passed_gates": _bounded_string_map(
-                    raw_scope.get("passed_gates"), limit=64
-                ),
-            }
-    return output
-
-
-def _bounded_string_map(value: object, *, limit: int = 64) -> dict[str, str]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, str] = {}
-    for raw_key, raw_value in list(value.items())[-limit:]:
-        key = str(raw_key).strip()
-        item = str(raw_value).strip()
-        if key and item:
-            output[key] = item
-    return output
-
-
-def _bounded_string_set_map(
-    value: object,
-    *,
-    limit: int = 64,
-) -> dict[str, set[str]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, set[str]] = {}
-    for raw_key, raw_values in list(value.items())[-limit:]:
-        key = str(raw_key).strip()
-        if not key:
-            continue
-        values = _bounded_string_set(raw_values, limit=256)
-        if values:
-            output[key] = values
-    return output
-
-
-def _bounded_contract_requirements(
-    value: object,
-    *,
-    limit: int = 64,
-) -> dict[str, dict[str, str]]:
-    if not isinstance(value, dict):
-        return {}
-    output: dict[str, dict[str, str]] = {}
-    for raw_item_id, raw_requirement in list(value.items())[-limit:]:
-        item_id = str(raw_item_id).strip()
-        if not item_id or not isinstance(raw_requirement, dict):
-            continue
-        criterion = str(raw_requirement.get("criterion", "")).strip()
-        evidence_kind = str(raw_requirement.get("evidence_kind", "general")).strip()
-        if criterion:
-            output[item_id] = {
-                "item_id": item_id,
-                "criterion": criterion,
-                "evidence_kind": evidence_kind or "general",
-            }
-    return output
-
-
-def _passed_acceptance_gates(result: ToolExecutionResult) -> dict[str, str]:
-    run = result.metadata.get("acceptance_run")
-    if not isinstance(run, dict):
-        return {}
-    gates = run.get("gates")
-    if not isinstance(gates, list):
-        return {}
-    output: dict[str, str] = {}
-    for gate in gates:
-        if not isinstance(gate, dict) or not bool(gate.get("passed")):
-            continue
-        gate_id = str(gate.get("gate_id", "")).strip()
-        if not gate_id:
-            continue
-        metric = gate.get("source_line_count")
-        if isinstance(metric, dict):
-            output[gate_id] = (
-                f"authored_source_lines={metric.get('line_count')} "
-                f"minimum={metric.get('minimum')} files={metric.get('file_count')}"
-            )
-            continue
-        command = str(gate.get("command", "")).strip()
-        if command:
-            output[gate_id] = command
-    return output
-
-
-def _acceptance_run_scope(result: ToolExecutionResult) -> dict[str, Any] | None:
-    run = result.metadata.get("acceptance_run")
-    if not isinstance(run, dict) or not bool(run.get("passed", False)):
-        return None
-    revision_paths = _string_list(run.get("revision_paths"))
-    workspace_revision = str(run.get("workspace_revision_after", "")).strip()
-    if not revision_paths or not workspace_revision:
-        return None
-    return {
-        "revision_paths": revision_paths,
-        "workspace_revision": workspace_revision,
-        "passed_gates": _passed_acceptance_gates(result),
-    }
-
-
-def _contract_machine_evidence_resolved(
-    requirement: dict[str, str],
-    *,
-    item: dict[str, Any],
-    subagent_invocation_count: int,
-    completed_test_review_subagent_ids: set[str],
-    completed_test_review_paths: set[str],
-    passed_gates: dict[str, str],
-    visual_inspection_paths: set[str],
-) -> bool:
-    kind = requirement.get("evidence_kind", "general")
-    if not _criteria_correspond(
-        requirement.get("criterion", ""),
-        str(item.get("criterion", "")),
-    ):
-        return False
-    if kind == "delegation":
-        return (
-            subagent_invocation_count > 0
-            and item.get("evidence_kind") == "runtime_observation"
-        )
-    if kind == "verification_gate":
-        if item.get("evidence_kind") not in {"test_result", "runtime_observation"}:
-            return False
-        criterion = requirement.get("criterion", "").casefold()
-        required_words = {
-            word
-            for word in ("test", "lint", "typecheck", "build")
-            if word in criterion
-        }
-        commands = "\n".join(passed_gates.values()).casefold()
-        return all(word in commands for word in required_words)
-    if kind == "visual_inspection":
-        artifact_paths = {
-            str(path).strip() for path in item.get("artifact_paths", []) if str(path).strip()
-        }
-        inspected = {
-            path.removeprefix("/workspace/") for path in visual_inspection_paths
-        } | visual_inspection_paths
-        normalized_artifacts = {
-            path.removeprefix("/workspace/") for path in artifact_paths
-        } | artifact_paths
-        return bool(normalized_artifacts & inspected) and item.get("evidence_kind") in {
-            "artifact_inspection",
-            "runtime_observation",
-        }
-    if kind == "source_line_count":
-        if item.get("evidence_kind") not in {"test_result", "runtime_observation"}:
-            return False
-        required_lines = _required_source_lines(requirement.get("criterion", ""))
-        observed_counts = [
-            int(match.group(1))
-            for evidence in passed_gates.values()
-            if (match := re.search(r"authored_source_lines=(\d+)", evidence)) is not None
-        ]
-        return bool(observed_counts) and (
-            required_lines is None or max(observed_counts) >= required_lines
-        )
-    if kind == "test_change_review":
-        required_paths = _test_paths_from_requirement(requirement)
-        cited_paths = {
-            str(path).strip().removeprefix("/workspace/")
-            for path in item.get("artifact_paths", [])
-            if str(path).strip()
-        }
-        return (
-            bool(completed_test_review_subagent_ids)
-            and required_paths.issubset(completed_test_review_paths)
-            and bool(required_paths)
-            and required_paths.issubset(cited_paths)
-            and item.get("evidence_kind") == "artifact_inspection"
-        )
-    return True
-
-
-def _criteria_correspond(requirement: str, recorded: str) -> bool:
-    ignored = {
-        "a",
-        "all",
-        "an",
-        "and",
-        "be",
-        "must",
-        "should",
-        "the",
-        "to",
-    }
-    required_words = {
-        word
-        for word in re.findall(r"[a-z0-9]+", requirement.casefold())
-        if word not in ignored
-    }
-    recorded_words = {
-        word
-        for word in re.findall(r"[a-z0-9]+", recorded.casefold())
-        if word not in ignored
-    }
-    return bool(required_words) and required_words.issubset(recorded_words)
-
-
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _required_source_lines(criterion: str) -> int | None:
-    match = re.search(
-        r"(?P<number>\d[\d,]*(?:\.\d+)?)\s*(?P<suffix>[km])?\s*(?:loc|lines?)",
-        criterion.casefold(),
-    )
-    if match is None:
-        return None
-    value = float(match.group("number").replace(",", ""))
-    suffix = match.group("suffix")
-    if suffix == "k":
-        value *= 1_000
-    elif suffix == "m":
-        value *= 1_000_000
-    return int(value)
-
-
-def _is_test_review_assignment(
-    tool_call: ToolCall,
-    requirement: dict[str, str],
-) -> bool:
-    assignment = "\n".join(
-        str(tool_call.arguments.get(key, ""))
-        for key in ("task_label", "instructions", "deliverable")
-    ).casefold()
-    required_paths = _test_paths_from_requirement(requirement)
-    return "review" in assignment and bool(required_paths) and all(
-        path.casefold() in assignment or Path(path).name.casefold() in assignment
-        for path in required_paths
-    )
-
-
-def _test_paths_from_requirement(requirement: dict[str, str]) -> set[str]:
-    criterion = requirement.get("criterion", "")
-    _, separator, raw_paths = criterion.partition(":")
-    if not separator:
-        return set()
-    return {
-        path.strip().removeprefix("/workspace/")
-        for path in raw_paths.split(",")
-        if path.strip()
     }
 
 
@@ -1302,9 +430,7 @@ def _path_is_test_artifact(path: str) -> bool:
     )
 
 
-def changed_test_artifact_paths_from_result(
-    result: ToolExecutionResult,
-) -> tuple[str, ...]:
+def changed_test_artifact_paths_from_result(result: ToolExecutionResult) -> tuple[str, ...]:
     """Return normalized test artifacts observed as changed by a tool result."""
 
     candidates = {
@@ -1324,6 +450,40 @@ def changed_test_artifact_paths_from_result(
     )
 
 
+def _bounded_count_map(value: object, *, limit: int = 64) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, int] = {}
+    for raw_key, raw_count in list(value.items())[-limit:]:
+        key = str(raw_key).strip()
+        count = _bounded_non_negative_int(raw_count)
+        if key and count:
+            output[key] = count
+    return output
+
+
+def _bounded_string_set(value: object, *, limit: int = 64) -> set[str]:
+    return set(_bounded_string_list(value, limit=limit))
+
+
+def _bounded_string_list(value: object, *, limit: int = 64) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [normalized for item in list(value)[-limit:] if (normalized := str(item).strip())]
+
+
+def _bounded_string_map(value: object, *, limit: int = 64) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, str] = {}
+    for raw_key, raw_value in list(value.items())[-limit:]:
+        key = str(raw_key).strip()
+        normalized = str(raw_value).strip()
+        if key and normalized:
+            output[key] = normalized
+    return output
+
+
 def _bounded_non_negative_int(value: object) -> int:
     if not isinstance(value, (int, str)):
         return 0
@@ -1333,11 +493,7 @@ def _bounded_non_negative_int(value: object) -> int:
         return 0
 
 
-def _bounded_detail_map(
-    value: object,
-    *,
-    limit: int = 64,
-) -> dict[str, dict[str, Any]]:
+def _bounded_detail_map(value: object, *, limit: int = 64) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict):
         return {}
     output: dict[str, dict[str, Any]] = {}

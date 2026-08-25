@@ -25,6 +25,8 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 - `/new` hard-stops and disposes route subagents.
 - Ordinary user messages supersede only the active main turn; they never redirect, pause, or stop a child.
 - Jarvis decides whether to continue independent main-task work, inspect a child, step in, stop it, or wait.
+- Subagents receive passive Acceptance Notes derived from assignment instructions, user constraints, and the requested deliverable; the notes are reminders for self-checking and reporting, never a completion gate.
+- A subagent may always hand work back, including partial or blocked work. Jarvis decides whether to accept the report, inspect the changes, or step the child back in.
 
 ## Architecture
 
@@ -110,7 +112,7 @@ Returns:
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
 
-A successful `subagent_invoke` itself satisfies the main task's decision to delegate; delegation is not re-imposed as an impossible child requirement. The child's acceptance contract is built from its assignment instructions, user constraints, and deliverable. Semantic edits to test artifacts are reported upward for visibility. A child that mutates the workspace must complete its own deterministic acceptance handoff; the main task is not completion-blocked by acceptance evidence or by the reported test paths.
+A successful `subagent_invoke` delegates the task. The child bootstrap includes passive Acceptance Notes covering the assignment, constraints, deliverable, useful self-checking, and explicit reporting of anything unverified or blocked. Semantic edits to test artifacts are reported upward for visibility only; they do not create a runtime acceptance obligation.
 
 ### `subagent_monitor`
 
@@ -196,9 +198,9 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 ## Tool Execution Coordination
 
-Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background, service, and acceptance-gate Bash without model-declared paths or lease generations.
+Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background and service Bash without model-declared paths or lease generations.
 
-Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A silent-job attention notice first resumes the owning child and remains routine from Jarvis's perspective; the main agent is escalated only if that child subsequently cannot recover, pauses, fails, needs approval, or reports an unresolved blocker. A child waiting on detached work stays `waiting_background`; if an earlier acceptance handoff paused it without a user stop reason, terminal bash evidence may resume that same child so it can complete verification. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
+Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A silent-job attention notice first resumes the owning child and remains routine from Jarvis's perspective; the main agent is escalated only if that child subsequently cannot recover, pauses, fails, needs approval, or reports an unresolved blocker. A child waiting on detached work stays `waiting_background`; terminal bash evidence may resume that same child when it was waiting on the job. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
 
 ## Storage
 

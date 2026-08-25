@@ -624,7 +624,7 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 message.metadata["changed_test_artifact_paths"],
                 ["src/vehicles/__tests__/vehicle.test.ts"],
             )
-            self.assertIn("Jarvis-owned acceptance obligation", message.content)
+            self.assertIn("Subagent changed test artifacts", message.content)
 
     async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

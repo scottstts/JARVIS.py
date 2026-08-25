@@ -9,7 +9,7 @@ import socket
 import tempfile
 import unittest
 
-from jarvis.core.tool_safety import ToolSafetyTracker
+from jarvis.core.tool_safety import ToolActivityTracker
 from jarvis.llm import ToolCall
 from jarvis.tools import (
     ToolExecutionContext,
@@ -23,12 +23,7 @@ from jarvis.tools import (
 )
 from jarvis.tools.basic.bash.local_executor import DirectBashToolExecutor
 from jarvis.tools.basic.bash.tool import BashToolExecutor
-from jarvis.tools.basic.acceptance_run.tool import (
-    AcceptanceRunToolExecutor,
-    _source_line_count_gate,
-    _top_level_compound_operator,
-)
-from jarvis.tools.workspace_revision import scoped_workspace_revision, workspace_revision
+from jarvis.tools.workspace_revision import workspace_revision
 
 
 def _tool_call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -> ToolCall:
@@ -137,72 +132,6 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(main_denied.ok)
             self.assertEqual((workspace_dir / "main.txt").read_text(), "main")
             self.assertFalse((owned_dir / "main.txt").exists())
-
-    async def test_flat_file_edits_and_acceptance_ledger_are_durable_tool_results(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace_dir = Path(tmp) / "workspace"
-            workspace_dir.mkdir()
-            runtime = ToolRuntime(
-                registry=ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
-            )
-            context = ToolExecutionContext(workspace_dir=workspace_dir)
-
-            write_result = await runtime.execute(
-                tool_call=_tool_call(
-                    "file_write",
-                    {"path": "report.txt", "content": "before\n"},
-                    call_id="write_1",
-                ),
-                context=context,
-            )
-            replace_result = await runtime.execute(
-                tool_call=_tool_call(
-                    "file_replace",
-                    {"path": "report.txt", "match": "before", "replacement": "after"},
-                    call_id="replace_1",
-                ),
-                context=context,
-            )
-            acceptance_result = await runtime.execute(
-                tool_call=_tool_call(
-                    "acceptance_record",
-                    {
-                        "scope": "report rewrite",
-                        "workspace_revision": scoped_workspace_revision(
-                            workspace_dir,
-                            ("report.txt",),
-                        ),
-                        "revision_paths": ["report.txt"],
-                        "checks": [
-                            {
-                                "criterion": "report contains the requested replacement",
-                                "outcome": "passed",
-                                "evidence_kind": "artifact_inspection",
-                                "evidence": "report.txt contains 'after'.",
-                                "artifact_paths": ["report.txt"],
-                            },
-                            {
-                                "criterion": "focused edit command completed",
-                                "outcome": "passed",
-                                "evidence_kind": "test_result",
-                                "evidence": "file_replace returned a changed file digest.",
-                            },
-                        ],
-                    },
-                    call_id="acceptance_1",
-                ),
-                context=context,
-            )
-
-            self.assertTrue(write_result.ok)
-            self.assertTrue(replace_result.ok)
-            self.assertEqual((workspace_dir / "report.txt").read_text(), "after\n")
-            self.assertTrue(acceptance_result.ok)
-            self.assertIn("Acceptance ledger recorded", acceptance_result.content)
-            self.assertEqual(
-                acceptance_result.metadata["acceptance_ledger"]["summary"]["passed"],
-                2,
-            )
 
     async def test_workspace_revision_ignores_runtime_transcripts_but_tracks_artifacts(
         self,
@@ -432,56 +361,8 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.ok)
             self.assertNotIn("masked", str(result.metadata["stdout"]))
 
-    async def test_acceptance_gate_rejects_nested_shell_failure_masking(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace_dir = Path(tmp) / "workspace"
-            workspace_dir.mkdir()
-            executor = AcceptanceRunToolExecutor(
-                ToolSettings.from_workspace_dir(workspace_dir)
-            )
-            result = await executor(
-                call_id="acceptance",
-                arguments={
-                    "scope": "verification",
-                    "revision_paths": ["."],
-                    "gates": [
-                        {
-                            "gate_id": "masked",
-                            "command": "bash -lc 'false; true'",
-                        }
-                    ],
-                },
-                context=ToolExecutionContext(workspace_dir=workspace_dir),
-            )
-
-            self.assertFalse(result.ok)
-            self.assertIn("shell command wrapper", result.content)
-
-    async def test_acceptance_gate_allows_descriptor_redirection(self) -> None:
-        self.assertIsNone(_top_level_compound_operator("printf passed 2>&1"))
-        self.assertIsNone(_top_level_compound_operator("printf passed >| result.txt"))
-
-    async def test_source_line_count_excludes_vendor_generated_tests_and_probes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace_dir = Path(tmp) / "workspace"
-            for relative in ("src", "vendor", "generated", "tests", "probes"):
-                (workspace_dir / relative).mkdir(parents=True)
-            (workspace_dir / "src" / "main.ts").write_text("one\ntwo\nthree\n")
-            for relative in ("vendor", "generated", "tests", "probes"):
-                (workspace_dir / relative / "ignored.ts").write_text("ignored\n" * 20)
-
-            metric, reason = _source_line_count_gate(
-                {"include_paths": ["."], "minimum": 3},
-                workspace_dir=workspace_dir,
-            )
-
-            self.assertIsNone(reason)
-            self.assertTrue(metric["passed"])
-            self.assertEqual(metric["line_count"], 3)
-            self.assertEqual(metric["file_count"], 1)
-
     async def test_tool_safety_stops_third_identical_no_progress_result(self) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolActivityTracker()
         tool_call = _tool_call("bash", {"command": "true"})
         result = ToolExecutionResult(
             call_id="call_1",
@@ -496,7 +377,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tracker.record(tool_call, result).repeated_no_progress)
 
     async def test_tool_safety_blocks_exact_call_after_second_identical_failure(self) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolActivityTracker()
         tool_call = _tool_call("bash", {"command": "false"})
         result = ToolExecutionResult(
             call_id="call_1",
@@ -513,7 +394,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_tool_liveness_does_not_merge_varied_workspace_conflicts(self) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolActivityTracker()
         first_call = _tool_call("bash", {"command": "write a.py"}, call_id="lease_1")
         second_call = _tool_call(
             "file_write",
@@ -566,44 +447,23 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(distinct.repeated_invalid_call)
 
-    async def test_scoped_revision_ignores_runtime_files_outside_material_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace_dir = Path(tmp) / "workspace"
-            source_dir = workspace_dir / "project" / "src"
-            runtime_dir = workspace_dir / "runtime-logs"
-            source_dir.mkdir(parents=True)
-            runtime_dir.mkdir(parents=True)
-            source_file = source_dir / "main.ts"
-            source_file.write_text("export const value = 1;\n")
-            runtime_log = runtime_dir / "npm-debug.log"
-            runtime_log.write_text("first\n")
-
-            before = scoped_workspace_revision(workspace_dir, ("project",))
-            runtime_log.write_text("second\n")
-            after_runtime_change = scoped_workspace_revision(workspace_dir, ("project",))
-            source_file.write_text("export const value = 2;\n")
-            after_source_change = scoped_workspace_revision(workspace_dir, ("project",))
-
-            self.assertEqual(after_runtime_change, before)
-            self.assertNotEqual(after_source_change, before)
-
     async def test_workspace_root_revision_ignores_archive_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
             workspace_dir.mkdir()
             source_file = workspace_dir / "main.py"
             source_file.write_text("value = 1\n")
-            before = scoped_workspace_revision(workspace_dir, (".",))
+            before = workspace_revision(workspace_dir)
 
             error_dir = workspace_dir / "archive" / "error_logs"
             error_dir.mkdir(parents=True)
             (error_dir / "session.jsonl").write_text("runtime error\n")
-            after_archive_change = scoped_workspace_revision(workspace_dir, (".",))
+            after_archive_change = workspace_revision(workspace_dir)
 
             self.assertEqual(after_archive_change, before)
 
     async def test_tool_safety_forgets_stale_failure_after_workspace_mutation(self) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolActivityTracker()
         failed_call = _tool_call("bash", {"command": "npx vitest run 2>&1"})
         failed_result = ToolExecutionResult(
             call_id="failed_1",
@@ -634,209 +494,6 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(observation.repeated_invalid_call)
         self.assertEqual(observation.progress_epoch, 1)
         self.assertIsNone(tracker.blocked_call_reason(failed_call))
-
-    async def test_completion_requires_a_revision_bound_gate_ledger(self) -> None:
-        tracker = ToolSafetyTracker(_actor_kind="subagent")
-        tracker.record(
-            _tool_call("file_write", {"path": "a.py", "content": "x"}),
-            ToolExecutionResult(
-                call_id="write_1",
-                name="file_write",
-                ok=True,
-                content="changed",
-                metadata={"changed": True},
-            ),
-        )
-        acceptance = ToolExecutionResult(
-            call_id="accept_1",
-            name="acceptance_record",
-            ok=True,
-            content="recorded",
-            metadata={
-                "acceptance_ledger": {
-                    "workspace_revision_verified": True,
-                    "workspace_revision": "revision-1",
-                    "revision_paths": ["src"],
-                    "complete": True,
-                    "checks": [
-                        {
-                            "item_id": "implementation",
-                            "outcome": "fixed",
-                            "source_tool_call_ids": ["acceptance_run"],
-                        }
-                    ],
-                }
-            },
-        )
-        tracker.record(_tool_call("acceptance_record", {}), acceptance)
-        incomplete = tracker.reconcile_acceptance_record(acceptance)
-        self.assertFalse(incomplete.metadata["acceptance_ledger"]["complete"])
-        self.assertIn("completion_blockers", incomplete.metadata["acceptance_ledger"])
-        self.assertTrue(tracker.unverified_workspace_mutation)
-        tracker.record(
-            _tool_call("acceptance_run", {}),
-            ToolExecutionResult(
-                call_id="gate_1",
-                name="acceptance_run",
-                ok=True,
-                content="passed",
-                metadata={
-                    "changed": False,
-                    "acceptance_run": {
-                        "passed": True,
-                        "revision_paths": ["src"],
-                        "workspace_revision_after": "revision-1",
-                        "gates": [],
-                    },
-                },
-            ),
-        )
-        tracker.record(_tool_call("acceptance_record", {}), acceptance)
-        complete = tracker.reconcile_acceptance_record(acceptance)
-        self.assertTrue(complete.metadata["acceptance_ledger"]["complete"])
-        self.assertFalse(tracker.unverified_workspace_mutation)
-
-        tracker.record(
-            _tool_call("file_write", {"path": "a.py", "content": "y"}),
-            ToolExecutionResult(
-                call_id="write_2",
-                name="file_write",
-                ok=True,
-                content="changed again",
-                metadata={"changed": True},
-            ),
-        )
-        tracker.record(_tool_call("acceptance_record", {}), acceptance)
-        self.assertTrue(tracker.unverified_workspace_mutation)
-
-    async def test_acceptance_ledger_keeps_prior_required_items_open(self) -> None:
-        tracker = ToolSafetyTracker(_actor_kind="subagent")
-        tracker.record(
-            _tool_call("file_write", {"path": "a.py", "content": "x"}),
-            ToolExecutionResult(
-                call_id="write_1",
-                name="file_write",
-                ok=True,
-                content="changed",
-                metadata={"changed": True},
-            ),
-        )
-        tracker.record(
-            _tool_call("acceptance_run", {}),
-            ToolExecutionResult(
-                call_id="gate_1",
-                name="acceptance_run",
-                ok=True,
-                content="passed",
-                metadata={
-                    "changed": False,
-                    "acceptance_run": {
-                        "passed": True,
-                        "revision_paths": ["src"],
-                        "workspace_revision_after": "revision-1",
-                        "gates": [],
-                    },
-                },
-            ),
-        )
-
-        def ledger(call_id: str, item_id: str, outcome: str) -> ToolExecutionResult:
-            return ToolExecutionResult(
-                call_id=call_id,
-                name="acceptance_record",
-                ok=True,
-                content="recorded",
-                metadata={
-                    "acceptance_ledger": {
-                        "workspace_revision_verified": True,
-                        "workspace_revision": "revision-1",
-                        "revision_paths": ["src"],
-                        "complete": outcome != "open",
-                        "checks": [
-                            {
-                                "item_id": item_id,
-                                "required": True,
-                                "outcome": outcome,
-                                "source_tool_call_ids": ["gate_1"],
-                            }
-                        ],
-                    }
-                },
-            )
-
-        tracker.record(
-            _tool_call("acceptance_record", {}),
-            ledger("open_ledger", "issue-1", "open"),
-        )
-        tracker.record(
-            _tool_call("acceptance_record", {}),
-            ledger("other_ledger", "issue-2", "fixed"),
-        )
-        self.assertTrue(tracker.unverified_workspace_mutation)
-        tracker.record(
-            _tool_call("acceptance_record", {}),
-            ledger("fixed_ledger", "issue-1", "fixed"),
-        )
-        self.assertFalse(tracker.unverified_workspace_mutation)
-
-    async def test_acceptance_ledger_rejects_cited_gate_from_different_revision_scope(
-        self,
-    ) -> None:
-        tracker = ToolSafetyTracker(_actor_kind="subagent")
-        tracker.record(
-            _tool_call("file_write", {"path": "src/a.py", "content": "x"}),
-            ToolExecutionResult(
-                call_id="write_1",
-                name="file_write",
-                ok=True,
-                content="changed",
-                metadata={"changed": True},
-            ),
-        )
-        tracker.record(
-            _tool_call("acceptance_run", {}),
-            ToolExecutionResult(
-                call_id="gate_1",
-                name="acceptance_run",
-                ok=True,
-                content="passed",
-                metadata={
-                    "acceptance_run": {
-                        "passed": True,
-                        "revision_paths": ["src"],
-                        "workspace_revision_after": "revision-1",
-                        "gates": [],
-                    }
-                },
-            ),
-        )
-        tracker.record(
-            _tool_call("acceptance_record", {}),
-            ToolExecutionResult(
-                call_id="accept_1",
-                name="acceptance_record",
-                ok=True,
-                content="recorded",
-                metadata={
-                    "acceptance_ledger": {
-                        "workspace_revision_verified": True,
-                        "workspace_revision": "revision-1",
-                        "revision_paths": ["tests"],
-                        "complete": True,
-                        "checks": [
-                            {
-                                "item_id": "implementation",
-                                "required": True,
-                                "outcome": "fixed",
-                                "source_tool_call_ids": ["gate_1"],
-                            }
-                        ],
-                    }
-                },
-            ),
-        )
-
-        self.assertTrue(tracker.unverified_workspace_mutation)
 
     async def test_managed_service_allocates_owned_port_and_can_be_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

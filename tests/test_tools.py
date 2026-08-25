@@ -1478,8 +1478,6 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(
                 basic_names,
                 [
-                    "acceptance_record",
-                    "acceptance_run",
                     "bash",
                     "file_patch",
                     "file_write",

@@ -198,26 +198,19 @@
 - Context sizing deliberately retains the lightweight four-characters-per-token estimate. `JARVIS_CONTEXT_WINDOW_TOKENS` remains an operator-selected safety budget rather than a provider-tokenizer measurement.
 - Task activity/recovery state survives compaction; exact identical failures are individually suppressed, unchanged detached jobs do not generate model turns, and provider failures use durable checkpoints plus a shared bulkhead/backoff/circuit breaker.
 - Reliability review follow-up: managed services own their process group, port, readiness probe, logs, command hash, and launch revision; workspace leases reject overlapping/stale writes and require observed generation/content preconditions.
-- Reliability review follow-up: independent acceptance gates produce revision-bound evidence, unresolved required ledger items block completion claims, subagent skill decisions are recorded, and transcript tool payloads use canonical/content-addressed storage.
-- Diff audit follow-up: acceptance gate IDs are invalidated by later mutations, ledger items accumulate by stable ID, nested shell background/failure masking is rejected, route provenance survives websocket serialization, and exact workspace reads now coordinate with overlapping writes.
 - Provider recovery turns retain the original client message identity; recovery exhaustion pauses automatic follow-ups and emits a blocked terminal event so route consumers cannot hang.
 - Tool repetition state must be task-scoped and progress-epoch-aware; observed workspace revisions outrank tool-declared mutation metadata, and blocked runtime diagnostics stay persisted/logged rather than appearing in Telegram.
-- Waiting on orchestrator-owned work is deferred completion, not acceptance failure or task completion; retain the active task contract until pending bash/subagent IDs become terminal.
 - App and `tool_runtime` do not share a PID namespace, so all detached-job status and cancellation decisions must use remote result metadata or the shared route supervisor, never local PID inspection.
 - Accepted detached-job notices need a delivery latch until owner state records them; unchanged jobs emit no model heartbeats, and healthy managed services are route resources rather than pending task work.
 - Durable actionable orchestrator notes advance task progress when persisted; routine bash output-growth observations remain supervisor-only and do not reset model task-liveness state or create prompt records.
 - `orchestrator_wait` is general across any pending child/job set: main chooses a bounded liveness timer, exponential backoff limits unchanged reviews, and material events wake it immediately.
 - Compaction keeps the four-characters-per-token heuristic and 70% semantic-input ceiling; semantic/provider failures use deterministic fallback and never latch rollover, while only fundamental harness failures may latch an unchanged source.
-- Task contracts are content-addressed prompt records injected once per session/revision and re-injected after compaction, never duplicated on every continuation.
-- Acceptance evidence must bind to explicit material `revision_paths`; runtime archives/caches are ignored, and `acceptance_record` must reuse the exact run scope and revision.
 - Workspace conflict keys remain diagnostic only; liveness suppression keys exact normalized tool arguments and stable results, never broad semantic conflict classes.
 - Bash admission is permit-by-default inside `tool_runtime`; only functional-malfunction commands, unmanaged detachment, broad recursive root deletion, and destructive repository erasure are restricted.
-- Unverified workspace mutation now auto-continues through acceptance instead of parking, while terminal blocks carry a structured `completion_block_reason`.
 - OpenRouter empty-response recovery is post-acceptance retry-safe only when no semantic delta escaped; a partial malformed tool delta must fail without replay to avoid duplicate side effects.
-- Child test mutations must transfer an independent-review obligation to the owning main task; children may never receive acceptance requirements that require unavailable subagent primitives.
 - `orchestrator_wait` is a persisted first-class turn yield, consumes routine/stale queued notices atomically, and returns material notices once for review without spending another provider call or liveness round.
 - Subagent skills are selected only by Jarvis through exact top-level skill IDs or same-turn inheritance; the harness never infers them from assignment text or skill resource paths.
 - The real-gateway headless runner is development-only under `tests/headless/`, uses the workspace Ox Alpha settings unchanged, and must recognize command-only `/new` completion before cleaning its unique test workspace.
 
 - Telegram wrench notices aggregate bold raw tool names into one editable per-agent count stack ordered by recency; every user-facing Jarvis message partitions all current stacks, including subagents, while system notices do not partition them.
-- Acceptance is a deterministic subagent-only handoff gate: child contracts come from actual assignments, each requirement consumes one compatible revision-scoped check, legacy unscoped evidence fails closed, and the main agent is never completion-blocked.
+- Subagent acceptance is passive Acceptance Notes only: children may always hand back complete, partial, or blocked work; Jarvis owns semantic completion, and task sidecars read only the current liveness schema.

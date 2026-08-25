@@ -444,7 +444,6 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
     async def test_long_session_shape_is_globally_bounded_and_semantically_coalesced(
         self,
     ) -> None:
-        contract = "Task contract\ntask_id: long-task\nRequired acceptance items:\n- run tests"
         records: list[ConversationRecord] = [
             _record(record_id="user_1", role="user", content="Implement the full repair."),
             _record(
@@ -453,20 +452,7 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
                 content="I am coordinating the workstreams.",
             ),
         ]
-        records.extend(
-            _record(
-                record_id=f"contract_{index}",
-                role="system",
-                content=contract,
-                metadata={
-                    "task_contract": True,
-                    "task_id": "long-task",
-                    "task_contract_revision": "revision-1",
-                },
-            )
-            for index in range(131)
-        )
-        for index in range(40):
+        for index in range(171):
             records.append(
                 _record(
                     record_id=f"bash_progress_{index}",
@@ -490,7 +476,6 @@ class ContextCompactorTests(unittest.IsolatedAsyncioTestCase):
 
         request = service.requests[0]
         request_text = _request_user_text(request)
-        self.assertEqual(request_text.count(contract), 1)
         self.assertIn("Earlier coalesced lifecycle or repeated evidence", request_text)
         self.assertLess(
             estimate_request_input_tokens(request),

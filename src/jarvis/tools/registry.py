@@ -7,8 +7,6 @@ from collections.abc import Iterable
 from jarvis.llm import ToolDefinition
 from jarvis.skills import SkillsSettings
 
-from .basic.acceptance_record import build_acceptance_record_tool
-from .basic.acceptance_run import build_acceptance_run_tool
 from .basic.bash import build_bash_tool
 from .basic.file_patch import (
     build_file_patch_tool,
@@ -223,8 +221,6 @@ class ToolRegistry:
     @classmethod
     def default(cls, settings: ToolSettings) -> "ToolRegistry":
         registry = cls()
-        registry.register(build_acceptance_record_tool())
-        registry.register(build_acceptance_run_tool(settings))
         registry.register(build_bash_tool(settings))
         registry.register(build_file_patch_tool(settings))
         registry.register(build_file_write_tool(settings))

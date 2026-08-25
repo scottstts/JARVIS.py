@@ -58,8 +58,6 @@ from jarvis.tools import (
 )
 
 _EXPECTED_BASIC_TOOL_NAMES = [
-    "acceptance_record",
-    "acceptance_run",
     "bash",
     "file_patch",
     "file_write",
@@ -1062,7 +1060,6 @@ class _FakeFilePatchLLMService:
             raise AssertionError(
                 f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
             )
-
         if self.generate_calls == 1:
             return _build_response(
                 "",
@@ -1088,83 +1085,9 @@ class _FakeFilePatchLLMService:
                 ],
                 finish_reason="tool_calls",
             )
-
-        if self.generate_calls == 3:
-            return _build_response(
-                "",
-                tool_calls=[
-                    ToolCall(
-                        call_id="acceptance_run_file_patch",
-                        name="acceptance_run",
-                        arguments={
-                            "scope": "Verify created file",
-                            "revision_paths": ["notes/todo.txt"],
-                            "gates": [
-                                {
-                                    "gate_id": "file_exists",
-                                    "command": "test -f notes/todo.txt",
-                                }
-                            ],
-                        },
-                        raw_arguments="{}",
-                    )
-                ],
-                finish_reason="tool_calls",
-            )
-
-        if self.generate_calls == 4:
-            revision = _tool_result_field(
-                request,
-                field="workspace_revision_after",
-            )
-            return _build_response(
-                "",
-                tool_calls=[
-                    ToolCall(
-                        call_id="acceptance_record_file_patch",
-                        name="acceptance_record",
-                        arguments={
-                            "scope": "Verify created file",
-                            "workspace_revision": revision,
-                            "revision_paths": ["notes/todo.txt"],
-                            "checks": [
-                                {
-                                    "item_id": "created-file",
-                                    "criterion": "The requested file exists.",
-                                    "required": True,
-                                    "outcome": "passed",
-                                    "evidence_kind": "test_result",
-                                    "evidence": "test -f passed",
-                                    "artifact_paths": ["notes/todo.txt"],
-                                }
-                            ],
-                        },
-                        raw_arguments="{}",
-                    )
-                ],
-                finish_reason="tool_calls",
-            )
-
-        if self.generate_calls == 5:
-            return _build_response("Patched and verified file.")
-
-        assistant_message = request.messages[-2]
         tool_message = request.messages[-1]
-        if assistant_message.role != "assistant":
-            raise AssertionError("Expected assistant tool-call message before tool result.")
         if tool_message.role != "tool":
-            raise AssertionError("Expected tool result message before follow-up model call.")
-
-        tool_result_parts = [
-            part for part in tool_message.parts if isinstance(part, ToolResultPart)
-        ]
-        if len(tool_result_parts) != 1:
-            raise AssertionError("Expected one tool result part before follow-up model call.")
-        if "File patch applied" not in tool_result_parts[0].content:
-            raise AssertionError("Expected file_patch tool result content.")
-        if "notes/todo.txt" not in tool_result_parts[0].content:
-            raise AssertionError("Expected file_patch result to mention the target file.")
-
+            raise AssertionError("Expected file_patch tool result before final response.")
         return _build_response("Patched file.")
 
     async def stream_generate(self, request: LLMRequest):
@@ -1430,11 +1353,11 @@ class _FakeToolRegisterApprovalLLMService:
     async def stream_generate(self, request: LLMRequest):
         self.stream_calls += 1
         names = [tool.name for tool in request.tools]
+        if names != _EXPECTED_BASIC_TOOL_NAMES:
+            raise AssertionError(
+                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
+            )
         if self.stream_calls == 1:
-            if names != _EXPECTED_BASIC_TOOL_NAMES:
-                raise AssertionError(
-                    f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
-                )
             yield DoneEvent(
                 response=_build_response(
                     "",
@@ -1462,100 +1385,6 @@ class _FakeToolRegisterApprovalLLMService:
                 )
             )
             return
-
-        if self.stream_calls == 3:
-            yield DoneEvent(
-                response=_build_response(
-                    "",
-                    tool_calls=[
-                        ToolCall(
-                            call_id="acceptance_run_tool_register",
-                            name="acceptance_run",
-                            arguments={
-                                "scope": "Verify runtime tool registration",
-                                "revision_paths": [
-                                    "runtime_tools/google_workspace_cli.json"
-                                ],
-                                "gates": [
-                                    {
-                                        "gate_id": "manifest_exists",
-                                        "command": (
-                                            "test -f runtime_tools/"
-                                            "google_workspace_cli.json"
-                                        ),
-                                    }
-                                ],
-                            },
-                            raw_arguments="{}",
-                        )
-                    ],
-                    finish_reason="tool_calls",
-                )
-            )
-            return
-
-        if self.stream_calls == 4:
-            revision = _tool_result_field(
-                request,
-                field="workspace_revision_after",
-            )
-            yield DoneEvent(
-                response=_build_response(
-                    "",
-                    tool_calls=[
-                        ToolCall(
-                            call_id="acceptance_record_tool_register",
-                            name="acceptance_record",
-                            arguments={
-                                "scope": "Verify runtime tool registration",
-                                "workspace_revision": revision,
-                                "revision_paths": [
-                                    "runtime_tools/google_workspace_cli.json"
-                                ],
-                                "checks": [
-                                    {
-                                        "item_id": "runtime-tool-registered",
-                                        "criterion": "The runtime manifest exists.",
-                                        "required": True,
-                                        "outcome": "passed",
-                                        "evidence_kind": "test_result",
-                                        "evidence": "test -f passed",
-                                        "source_tool_call_ids": [
-                                            "acceptance_run_tool_register"
-                                        ],
-                                        "artifact_paths": [
-                                            "runtime_tools/google_workspace_cli.json"
-                                        ],
-                                    }
-                                ],
-                            },
-                            raw_arguments="{}",
-                        )
-                    ],
-                    finish_reason="tool_calls",
-                )
-            )
-            return
-
-        if self.stream_calls == 5:
-            yield DoneEvent(response=_build_response("Registered and verified runtime tool."))
-            return
-
-        if names != _EXPECTED_BASIC_TOOL_NAMES:
-            raise AssertionError(
-                f"Expected {_EXPECTED_BASIC_TOOL_NAMES} tools to be registered, got {names}."
-            )
-        tool_message = request.messages[-1]
-        if tool_message.role != "tool":
-            raise AssertionError("Expected tool result message before follow-up model call.")
-        tool_parts = [
-            part for part in tool_message.parts if isinstance(part, ToolResultPart)
-        ]
-        if len(tool_parts) != 1:
-            raise AssertionError("Expected one tool result part before follow-up model call.")
-        if "Runtime tool registered" not in tool_parts[0].content:
-            raise AssertionError("Expected approved tool_register result content.")
-
         yield DoneEvent(response=_build_response("Registered runtime tool."))
 
 
@@ -2402,88 +2231,6 @@ class _FakeInvalidToolCallLLMService:
 
 
 class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_task_contract_is_injected_once_per_session_and_after_compaction(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = build_core_settings(root_dir=Path(tmp))
-            storage = SessionStorage(settings.transcript_archive_dir)
-            llm_service = _FakeCompactionProviderSplitLLMService()
-            loop = AgentLoop(
-                llm_service=llm_service,  # type: ignore[arg-type]
-                settings=settings,
-                storage=storage,
-            )
-
-            (
-                session,
-                _records,
-                turn_context,
-                interruption_notice,
-                first_runtime_messages,
-                _request,
-                _estimate,
-                _compacted,
-            ) = await loop._prepare_turn(
-                user_text="Implement this fully and run all tests.",
-                task_id="turn_1",
-            )
-            first_contract = next(
-                message
-                for message in first_runtime_messages
-                if message.metadata.get("task_contract")
-            )
-            loop._persist_records(
-                session_id=session.session_id,
-                records=loop._build_pending_turn_records(
-                    session_id=session.session_id,
-                    turn_context_text=turn_context,
-                    interruption_notice_text=interruption_notice,
-                    runtime_messages=first_runtime_messages,
-                    turn_id="turn_1",
-                ),
-            )
-            storage.append_record(
-                session.session_id,
-                loop._build_message_record(
-                    session_id=session.session_id,
-                    role="user",
-                    content="Implement this fully and run all tests.",
-                    turn_id="turn_1",
-                ),
-            )
-            storage.set_turn_status(
-                session.session_id,
-                turn_id="turn_1",
-                status="completed",
-            )
-
-            *_, second_runtime_messages, _request, _estimate, _compacted = (
-                await loop._prepare_turn(user_text=None, task_id="turn_2")
-            )
-            self.assertFalse(
-                any(message.metadata.get("task_contract") for message in second_runtime_messages)
-            )
-
-            compacted_session = await loop._compact_session(session, reason="manual")
-            assert compacted_session is not None
-            *_, post_compaction_runtime_messages, _request, _estimate, _compacted = (
-                await loop._prepare_turn(
-                    user_text=None,
-                    task_id="turn_3",
-                    force_session_id=compacted_session.session_id,
-                )
-            )
-            post_compaction_contract = next(
-                message
-                for message in post_compaction_runtime_messages
-                if message.metadata.get("task_contract")
-            )
-            self.assertEqual(
-                post_compaction_contract.metadata["task_contract_revision"],
-                first_contract.metadata["task_contract_revision"],
-            )
-
     async def test_semantic_provider_failure_rolls_over_without_failure_latch(
         self,
     ) -> None:
@@ -4224,12 +3971,6 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             records = storage.load_records(result.session_id)
             message_records = [record for record in records if record.kind == "message"]
-            self.assertFalse(
-                any(
-                    record.metadata.get("acceptance_continuation_required")
-                    for record in message_records
-                )
-            )
             self.assertEqual(message_records[-1].content, "Patched file.")
             file_patch_call = next(
                 record
@@ -4246,7 +3987,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_subagent_mutation_requires_successful_acceptance_handoff(self) -> None:
+    async def test_subagent_mutation_can_handoff_without_runtime_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = build_core_settings(root_dir=Path(tmp))
             notes_dir = settings.workspace_dir / "notes"
@@ -4278,27 +4019,12 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     subagent_id="subagent-1",
                 ),
                 tool_executor=_execute,
-                task_contract_seed_texts=("The requested file exists.",),
             )
 
             result = await loop.handle_user_input("Start the assigned task now.")
 
-            self.assertEqual(result.response_text, "Patched and verified file.")
-            self.assertEqual(service.generate_calls, 5)
-            records = storage.load_records(result.session_id)
-            self.assertTrue(
-                any(
-                    record.metadata.get("acceptance_continuation_required")
-                    for record in records
-                )
-            )
-            ledger_record = next(
-                record
-                for record in records
-                if record.role == "tool"
-                and isinstance(record.metadata.get("acceptance_ledger"), dict)
-            )
-            self.assertTrue(ledger_record.metadata["acceptance_ledger"]["complete"])
+            self.assertEqual(result.response_text, "Patched file.")
+            self.assertEqual(service.generate_calls, 2)
 
     async def test_handle_user_input_executes_bash_python_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

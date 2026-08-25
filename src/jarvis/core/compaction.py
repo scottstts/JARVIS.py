@@ -12,6 +12,7 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 from uuid import uuid4
 
 from jarvis.logging_setup import get_application_logger
+
 from jarvis.llm import (
     LLMMessage,
     LLMRequest,
@@ -185,10 +186,6 @@ _SOURCE_METADATA_KEYS = {
     "carry_forward_compacted",
     "carry_forward_compaction_strength",
     "image_input",
-    "task_contract",
-    "task_contract_revision",
-    "task_id",
-    "user_message_sha256",
     "bash_job_progress_update",
     "bash_job_notice_kinds",
     "bash_job_running_ids",
@@ -1088,13 +1085,7 @@ def _duplicate_system_event_refs(
         metadata = event.metadata or {}
         key: tuple[str, str] | None = None
         if event.role == "system" and event.content.strip():
-            if bool(metadata.get("task_contract")):
-                revision = _optional_string(metadata.get("task_contract_revision"))
-                key = (
-                    "task_contract",
-                    revision or _sha256_text(event.content),
-                )
-            elif event.event_type == "system_event":
+            if event.event_type == "system_event":
                 key = ("system_event", _sha256_text(event.content))
         if bool(metadata.get("bash_job_progress_update")):
             job_id_set: set[str] = set()
