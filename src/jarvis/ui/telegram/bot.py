@@ -59,6 +59,7 @@ _SENTENCE_BREAK_PATTERN = re.compile(r'[.!?](?:["\')\]]+)?(?:\s+|$)')
 _WHITESPACE_BREAK_PATTERN = re.compile(r"\s+")
 _TYPING_ACTION = "typing"
 _TYPING_INITIAL_DELAY_SECONDS = 0.5
+_ACTIVE_TURN_RUNTIME_ERROR_TEXT = "❌ Error occurred. Try again."
 
 
 class GatewayClientLike(Protocol):
@@ -732,6 +733,11 @@ class TelegramGatewayBridge:
     ) -> None:
         output_paused = self._chat_output_paused(chat_id)
         if isinstance(event, GatewayErrorEvent):
+            if not output_paused and _is_terminal_main_loop_error(event):
+                await self._send_final_text(
+                    chat_id=chat_id,
+                    text=_ACTIVE_TURN_RUNTIME_ERROR_TEXT,
+                )
             self._finish_submitted_turn(
                 chat_id=chat_id,
                 client_message_id=active_turn.client_message_id,
@@ -1269,6 +1275,11 @@ class TelegramGatewayBridge:
             self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewayErrorEvent):
+            if _is_terminal_main_loop_error(event):
+                await self._send_final_text(
+                    chat_id=chat_id,
+                    text=_ACTIVE_TURN_RUNTIME_ERROR_TEXT,
+                )
             return
 
     async def handle_message(self, message: IncomingTelegramMessage) -> None:
@@ -1488,7 +1499,7 @@ class TelegramGatewayBridge:
         self._pause_chat_output(message.chat_id)
         try:
             route_session = await self._ensure_route_session(message.chat_id)
-            stop_requested = await route_session.request_stop()
+            await route_session.request_stop()
         except GatewayBridgeError as exc:
             if not output_was_paused:
                 self._output_pause_state_by_chat.pop(message.chat_id, None)
@@ -1503,13 +1514,10 @@ class TelegramGatewayBridge:
                 self._output_pause_state_by_chat.pop(message.chat_id, None)
             raise
 
-        if stop_requested:
-            await self._send_html_message(
-                chat_id=message.chat_id,
-                html_text=_format_local_system_notice("Session stopped."),
-            )
-        elif not output_was_paused:
-            self._output_pause_state_by_chat.pop(message.chat_id, None)
+        await self._send_html_message(
+            chat_id=message.chat_id,
+            html_text=_format_local_system_notice("Session stopped."),
+        )
         return
 
     async def _handle_ui_command(self, message: IncomingTelegramMessage) -> bool:
@@ -2109,6 +2117,10 @@ def _format_local_system_notice(message: str) -> str:
     if normalized_message:
         return f"⚙️ <b>System:</b> {normalized_message}"
     return "⚙️ <b>System:</b>"
+
+
+def _is_terminal_main_loop_error(event: GatewayErrorEvent) -> bool:
+    return event.agent_kind == "main" and event.turn_kind in {"user", "runtime"}
 
 
 def _format_auth_required_message(event: GatewayAuthRequiredEvent) -> str:

@@ -177,6 +177,7 @@
 - `workspace/migrate.sh --all` now excludes `node_modules/` so workspace exports do not balloon from frontend dependency trees.
 - Same-process main-loop failures now immediately normalize the active turn with the same orphaned-turn recovery records used on later session reconciliation, instead of leaving it `in_progress`.
 - Telegram never sends runtime/internal error fallback text; gateway errors finish local submission bookkeeping while diagnostics remain in persisted error logs and server output.
+- Telegram sends `❌ Error occurred. Try again.` for terminal main-loop errors tied to user/runtime turns while keeping error details and unbound gateway/transport failures log-only; `/stop` always confirms after its gateway acknowledgement even if the route won the race to idle.
 - Runtime exceptions use one central de-duplicating JSONL recorder under `/workspace/archive/error_logs/<session_id>.jsonl`, so lower and upper catch layers reuse the same traceback record.
 - Telegram typing now follows route `task_status` control events rather than only active submitted user turns, so it stays alive while the original task is parked on subagents or detached bash follow-ups.
 - Telegram `/models` renders the immutable startup provider/model snapshot locally in the bridge and never enters the gateway, transcript, persistence, or agent context.

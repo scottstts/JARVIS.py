@@ -1434,7 +1434,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.08)
 
         self.assertGreater(len(telegram.sent_chat_actions), actions_after_error)
-        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["❌ Error occurred. Try again."],
+        )
 
         await session.emit(
             GatewayTaskStatusEvent(
@@ -2730,7 +2733,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.stop_calls, ["tg_777"])
         self.assertEqual(telegram.sent_messages, [])
 
-    async def test_stop_command_without_active_turn_is_silent(self) -> None:
+    async def test_stop_command_without_active_turn_still_confirms(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient(stop_requested=False)
         bridge = TelegramGatewayBridge(
@@ -2744,7 +2747,10 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(gateway.stop_calls, ["tg_777"])
-        self.assertEqual(telegram.sent_messages, [])
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["⚙️ <b>System:</b> Session stopped."],
+        )
 
     async def test_draft_rate_limit_disables_drafts_for_current_and_next_turn(self) -> None:
         telegram = _FakeTelegramClient(
@@ -2864,7 +2870,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             "Ultron finished. I verified the result and cleaned it up.",
         )
 
-    async def test_background_gateway_error_is_suppressed(self) -> None:
+    async def test_background_runtime_turn_error_sends_generic_notice(self) -> None:
         telegram = _FakeTelegramClient()
         bridge = TelegramGatewayBridge(
             settings=_settings(),
@@ -2879,7 +2885,33 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
                 session_id="session_1",
                 agent_kind="main",
                 agent_name="Jarvis",
+                turn_kind="runtime",
                 code="internal_error",
+                message="gateway failed",
+            ),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["❌ Error occurred. Try again."],
+        )
+
+    async def test_unbound_gateway_error_is_suppressed(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+
+        await bridge._handle_background_route_event(
+            chat_id=777,
+            event=GatewayErrorEvent(
+                route_id="route_1",
+                session_id="session_1",
+                agent_kind="main",
+                agent_name="Jarvis",
+                code="gateway_unavailable",
                 message="gateway failed",
             ),
         )
