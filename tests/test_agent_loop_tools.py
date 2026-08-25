@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 import sys
@@ -17,6 +18,7 @@ from jarvis import settings as app_settings
 from jarvis.core import (
     AgentApprovalRequestEvent,
     AgentAssistantMessageEvent,
+    AgentIdentity,
     AgentLoop,
     AgentRuntimeMessage,
     AgentToolCallEvent,
@@ -1133,9 +1135,6 @@ class _FakeFilePatchLLMService:
                                     "outcome": "passed",
                                     "evidence_kind": "test_result",
                                     "evidence": "test -f passed",
-                                    "source_tool_call_ids": [
-                                        "acceptance_run_file_patch"
-                                    ],
                                     "artifact_paths": ["notes/todo.txt"],
                                 }
                             ],
@@ -4212,7 +4211,7 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             result = await loop.handle_user_input("Create notes/todo.txt with hello.")
 
-            self.assertEqual(result.response_text, "Patched and verified file.")
+            self.assertEqual(result.response_text, "Patched file.")
             self.assertFalse(result.completion_blocked)
             session = storage.get_session(result.session_id)
             self.assertIsNotNone(session)
@@ -4225,13 +4224,13 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
 
             records = storage.load_records(result.session_id)
             message_records = [record for record in records if record.kind == "message"]
-            self.assertTrue(
+            self.assertFalse(
                 any(
                     record.metadata.get("acceptance_continuation_required")
                     for record in message_records
                 )
             )
-            self.assertEqual(message_records[-1].content, "Patched and verified file.")
+            self.assertEqual(message_records[-1].content, "Patched file.")
             file_patch_call = next(
                 record
                 for record in message_records
@@ -4246,6 +4245,60 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                     for record in message_records
                 )
             )
+
+    async def test_subagent_mutation_requires_successful_acceptance_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = build_core_settings(root_dir=Path(tmp))
+            notes_dir = settings.workspace_dir / "notes"
+            notes_dir.mkdir(parents=True, exist_ok=True)
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(settings.workspace_dir))
+            runtime = ToolRuntime(registry=registry)
+
+            async def _execute(tool_call, context):
+                return await runtime.execute(
+                    tool_call=tool_call,
+                    context=replace(
+                        context,
+                        workspace_write_allowed_paths=(settings.workspace_dir,),
+                        workspace_lease_generation=1,
+                    ),
+                )
+
+            service = _FakeFilePatchLLMService()
+            storage = SessionStorage(settings.transcript_archive_dir)
+            loop = AgentLoop(
+                llm_service=service,
+                settings=settings,
+                storage=storage,
+                tool_registry=registry,
+                tool_runtime=runtime,
+                identity=AgentIdentity(
+                    kind="subagent",
+                    name="Edith",
+                    subagent_id="subagent-1",
+                ),
+                tool_executor=_execute,
+                task_contract_seed_texts=("The requested file exists.",),
+            )
+
+            result = await loop.handle_user_input("Start the assigned task now.")
+
+            self.assertEqual(result.response_text, "Patched and verified file.")
+            self.assertEqual(service.generate_calls, 5)
+            records = storage.load_records(result.session_id)
+            self.assertTrue(
+                any(
+                    record.metadata.get("acceptance_continuation_required")
+                    for record in records
+                )
+            )
+            ledger_record = next(
+                record
+                for record in records
+                if record.role == "tool"
+                and isinstance(record.metadata.get("acceptance_ledger"), dict)
+            )
+            self.assertTrue(ledger_record.metadata["acceptance_ledger"]["complete"])
 
     async def test_handle_user_input_executes_bash_python_tool_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4534,13 +4587,13 @@ class AgentLoopToolTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("Expected streamed turn to finish with AgentTurnDoneEvent.")
             self.assertEqual(
                 final_event.response_text,
-                "Registered and verified runtime tool.",
+                "Registered runtime tool.",
             )
             self.assertFalse(final_event.completion_blocked)
             self.assertTrue(
                 any(
                     isinstance(event, AgentAssistantMessageEvent)
-                    and event.text == "Registered and verified runtime tool."
+                    and event.text == "Registered runtime tool."
                     for event in events
                 )
             )

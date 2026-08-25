@@ -186,7 +186,6 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                                 "outcome": "passed",
                                 "evidence_kind": "test_result",
                                 "evidence": "file_replace returned a changed file digest.",
-                                "source_tool_call_ids": ["replace_1"],
                             },
                         ],
                     },
@@ -637,7 +636,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(tracker.blocked_call_reason(failed_call))
 
     async def test_completion_requires_a_revision_bound_gate_ledger(self) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolSafetyTracker(_actor_kind="subagent")
         tracker.record(
             _tool_call("file_write", {"path": "a.py", "content": "x"}),
             ToolExecutionResult(
@@ -663,13 +662,16 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "item_id": "implementation",
                             "outcome": "fixed",
-                            "source_tool_call_ids": ["gate_1"],
+                            "source_tool_call_ids": ["acceptance_run"],
                         }
                     ],
                 }
             },
         )
         tracker.record(_tool_call("acceptance_record", {}), acceptance)
+        incomplete = tracker.reconcile_acceptance_record(acceptance)
+        self.assertFalse(incomplete.metadata["acceptance_ledger"]["complete"])
+        self.assertIn("completion_blockers", incomplete.metadata["acceptance_ledger"])
         self.assertTrue(tracker.unverified_workspace_mutation)
         tracker.record(
             _tool_call("acceptance_run", {}),
@@ -690,6 +692,8 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         tracker.record(_tool_call("acceptance_record", {}), acceptance)
+        complete = tracker.reconcile_acceptance_record(acceptance)
+        self.assertTrue(complete.metadata["acceptance_ledger"]["complete"])
         self.assertFalse(tracker.unverified_workspace_mutation)
 
         tracker.record(
@@ -706,7 +710,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tracker.unverified_workspace_mutation)
 
     async def test_acceptance_ledger_keeps_prior_required_items_open(self) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolSafetyTracker(_actor_kind="subagent")
         tracker.record(
             _tool_call("file_write", {"path": "a.py", "content": "x"}),
             ToolExecutionResult(
@@ -778,7 +782,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_acceptance_ledger_rejects_cited_gate_from_different_revision_scope(
         self,
     ) -> None:
-        tracker = ToolSafetyTracker()
+        tracker = ToolSafetyTracker(_actor_kind="subagent")
         tracker.record(
             _tool_call("file_write", {"path": "src/a.py", "content": "x"}),
             ToolExecutionResult(

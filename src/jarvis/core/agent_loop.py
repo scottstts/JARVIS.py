@@ -84,9 +84,9 @@ from .identities import IdentityBootstrapLoader
 from .token_estimator import estimate_request_input_tokens
 from .task_contract import (
     TaskContract,
+    build_assignment_task_contract,
     build_task_contract,
     merge_task_contract,
-    user_message_explicitly_replaces_requirements,
     user_message_explicitly_replaces_task,
     user_message_explicitly_resumes_task,
     user_message_is_side_query,
@@ -386,6 +386,7 @@ class AgentLoop:
         tool_executor: ToolExecutorCallable | None = None,
         runtime_messages_provider: RuntimeMessagesProvider | None = None,
         local_notice_callback: LocalNoticeCallback | None = None,
+        task_contract_seed_texts: tuple[str, ...] = (),
     ) -> None:
         self._llm_service = llm_service
         self._settings = settings or CoreSettings.from_env()
@@ -421,6 +422,11 @@ class AgentLoop:
         )
         self._tool_executor = tool_executor or self._default_execute_tool_call
         self._local_notice_callback = local_notice_callback
+        self._task_contract_seed_texts = tuple(
+            normalized
+            for text in task_contract_seed_texts
+            if (normalized := text.strip())
+        )
         self._tool_context = ToolExecutionContext(
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
@@ -1068,6 +1074,7 @@ class AgentLoop:
                     observation = None
                     if tool_safety is not None and not tool_call_suppressed:
                         observation = tool_safety.record(tool_call, tool_result)
+                        tool_result = tool_safety.reconcile_acceptance_record(tool_result)
                         tool_result = _with_tool_safety_replan_notice(
                             tool_result,
                             observation=observation,
@@ -2415,6 +2422,9 @@ class AgentLoop:
                                         tool_call,
                                         tool_result,
                                     )
+                                    tool_result = tool_safety.reconcile_acceptance_record(
+                                        tool_result
+                                    )
                                     tool_result = _with_tool_safety_replan_notice(
                                         tool_result,
                                         observation=observation,
@@ -3370,7 +3380,6 @@ class AgentLoop:
                     session.pending_interruption_notice_reason
                     == "superseded_by_user_message"
                     and not user_message_explicitly_replaces_task(user_text)
-                    and not user_message_explicitly_replaces_requirements(user_text)
                     and not user_message_is_side_query(user_text)
                 )
             )
@@ -3410,11 +3419,18 @@ class AgentLoop:
                 str(active_state.get("restore_parent_task_id", "")).strip()
                 or active_contract.task_id
             )
-        contract = build_task_contract(
-            task_id=proposed_task_id,
-            origin_turn_id=proposed_task_id,
-            user_text=user_text,
-        )
+        if self._identity.kind == "subagent" and self._task_contract_seed_texts:
+            contract = build_assignment_task_contract(
+                task_id=proposed_task_id,
+                origin_turn_id=proposed_task_id,
+                assignment_texts=self._task_contract_seed_texts,
+            )
+        else:
+            contract = build_task_contract(
+                task_id=proposed_task_id,
+                origin_turn_id=proposed_task_id,
+                user_text=user_text,
+            )
         tracker = ToolActivityTracker(_actor_kind=self._identity.kind)
         tracker.seed_contract_requirements(contract.requirements)
         self._storage.write_tool_task_state(

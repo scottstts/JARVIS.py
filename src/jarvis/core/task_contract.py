@@ -20,7 +20,7 @@ _RESUME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _REQUIREMENT_REPLACEMENT_PATTERN = re.compile(
-    r"\b(?:waive|drop|remove)\b.*\brequirement\b|\b(?:no longer|do not|don't)\s+need\b",
+    r"\b(?:waive|drop|remove)\b.*\brequirement\b|\b(?:no longer|do not|don't|no)\s+need\b",
     re.IGNORECASE,
 )
 _TASK_REPLACEMENT_PATTERN = re.compile(
@@ -38,6 +38,21 @@ _SIDE_QUERY_PATTERN = re.compile(
 )
 _MAX_REQUIREMENTS = 64
 _MAX_CRITERION_CHARS = 1_000
+_WITHDRAWAL_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "i",
+        "it",
+        "mean",
+        "need",
+        "no",
+        "requirement",
+        "requirements",
+        "the",
+        "to",
+    }
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -124,38 +139,73 @@ class TaskContract:
 def build_task_contract(*, task_id: str, origin_turn_id: str, user_text: str) -> TaskContract:
     normalized_text = user_text.strip()
     message_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
-    requirements: list[TaskRequirement] = []
-    seen: set[str] = set()
-    for raw_fragment in _SENTENCE_BOUNDARY.split(normalized_text):
-        fragment = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw_fragment).strip()
-        fragment = re.sub(r"\s+", " ", fragment)
-        if (
-            not fragment
-            or _REQUIREMENT_REPLACEMENT_PATTERN.search(fragment)
-            or not _REQUIREMENT_MARKER.search(fragment)
-        ):
-            continue
-        criterion = fragment[:_MAX_CRITERION_CHARS].rstrip()
-        normalized_criterion = criterion.casefold()
-        if normalized_criterion in seen:
-            continue
-        seen.add(normalized_criterion)
-        item_hash = hashlib.sha256(normalized_criterion.encode("utf-8")).hexdigest()[:12]
-        requirements.append(
-            TaskRequirement(
-                item_id=f"user-{item_hash}",
-                criterion=criterion,
-                evidence_kind=_classify_evidence_kind(criterion),
-            )
-        )
-        if len(requirements) >= _MAX_REQUIREMENTS:
-            break
+    requirements = _extract_requirements((normalized_text,), require_marker=True)
     return TaskContract(
         task_id=task_id,
         origin_turn_id=origin_turn_id,
         user_message_sha256=message_hash,
-        requirements=tuple(requirements),
+        requirements=requirements,
     )
+
+
+def build_assignment_task_contract(
+    *,
+    task_id: str,
+    origin_turn_id: str,
+    assignment_texts: tuple[str, ...],
+) -> TaskContract:
+    """Build a child contract from its actual assignment rather than kickoff prose."""
+
+    normalized_texts = tuple(
+        normalized
+        for text in assignment_texts
+        if (normalized := text.strip())
+    )
+    message_hash = hashlib.sha256("\n".join(normalized_texts).encode("utf-8")).hexdigest()
+    return TaskContract(
+        task_id=task_id,
+        origin_turn_id=origin_turn_id,
+        user_message_sha256=message_hash,
+        requirements=_extract_requirements(normalized_texts, require_marker=False),
+    )
+
+
+def _extract_requirements(
+    source_texts: tuple[str, ...],
+    *,
+    require_marker: bool,
+) -> tuple[TaskRequirement, ...]:
+    requirements: list[TaskRequirement] = []
+    seen: set[str] = set()
+    for source_text in source_texts:
+        for raw_fragment in _SENTENCE_BOUNDARY.split(source_text):
+            fragment = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw_fragment).strip()
+            fragment = re.sub(r"\s+", " ", fragment)
+            if (
+                not fragment
+                or _REQUIREMENT_REPLACEMENT_PATTERN.search(fragment)
+                or (require_marker and not _REQUIREMENT_MARKER.search(fragment))
+            ):
+                continue
+            criterion = fragment[:_MAX_CRITERION_CHARS].rstrip()
+            normalized_criterion = criterion.casefold()
+            if normalized_criterion in seen:
+                continue
+            seen.add(normalized_criterion)
+            item_hash = hashlib.sha256(normalized_criterion.encode("utf-8")).hexdigest()[:12]
+            evidence_kind = _classify_evidence_kind(criterion)
+            if not require_marker and evidence_kind == "delegation":
+                evidence_kind = "general"
+            requirements.append(
+                TaskRequirement(
+                    item_id=f"user-{item_hash}",
+                    criterion=criterion,
+                    evidence_kind=evidence_kind,
+                )
+            )
+            if len(requirements) >= _MAX_REQUIREMENTS:
+                return tuple(requirements)
+    return tuple(requirements)
 
 
 def user_message_explicitly_resumes_task(user_text: str) -> bool:
@@ -191,6 +241,14 @@ def merge_task_contract(
     *,
     user_text: str,
 ) -> TaskContract:
+    if user_message_explicitly_replaces_requirements(user_text):
+        remaining = _withdraw_requirements(contract.requirements, user_text=user_text)
+        return TaskContract(
+            task_id=contract.task_id,
+            origin_turn_id=contract.origin_turn_id,
+            user_message_sha256=contract.user_message_sha256,
+            requirements=remaining,
+        )
     supplemental = build_task_contract(
         task_id=contract.task_id,
         origin_turn_id=contract.origin_turn_id,
@@ -204,6 +262,40 @@ def merge_task_contract(
         user_message_sha256=contract.user_message_sha256,
         requirements=tuple(merged_requirements.values()),
     )
+
+
+def _withdraw_requirements(
+    requirements: tuple[TaskRequirement, ...],
+    *,
+    user_text: str,
+) -> tuple[TaskRequirement, ...]:
+    if not requirements:
+        return ()
+    target_words = {
+        word
+        for word in re.findall(r"[a-z0-9]+", user_text.casefold())
+        if word not in _WITHDRAWAL_STOP_WORDS
+    }
+    if not target_words:
+        return requirements[:-1]
+    scored = [
+        (
+            len(
+                target_words
+                & {
+                    word
+                    for word in re.findall(r"[a-z0-9]+", item.criterion.casefold())
+                    if word not in _WITHDRAWAL_STOP_WORDS
+                }
+            ),
+            index,
+        )
+        for index, item in enumerate(requirements)
+    ]
+    score, index = max(scored, key=lambda candidate: (candidate[0], candidate[1]))
+    if score == 0:
+        index = len(requirements) - 1
+    return requirements[:index] + requirements[index + 1 :]
 
 
 def _classify_evidence_kind(criterion: str) -> str:

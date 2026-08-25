@@ -110,7 +110,7 @@ Returns:
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
 
-When the user explicitly requires delegation, task acceptance is coupled to an observed successful `subagent_invoke`; merely claiming delegation in `acceptance_record` is insufficient. Semantic edits to test artifacts create a changed-test-review obligation. A child reports its changed test paths upward and can finish its own bounded assignment after normal acceptance; the owning main task inherits the independent-review obligation and remains incomplete until a different, non-editing reviewer finishes and the artifact evidence is cited.
+A successful `subagent_invoke` itself satisfies the main task's decision to delegate; delegation is not re-imposed as an impossible child requirement. The child's acceptance contract is built from its assignment instructions, user constraints, and deliverable. Semantic edits to test artifacts are reported upward for visibility. A child that mutates the workspace must complete its own deterministic acceptance handoff; the main task is not completion-blocked by acceptance evidence or by the reported test paths.
 
 ### `subagent_monitor`
 

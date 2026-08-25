@@ -8,7 +8,11 @@ import tempfile
 import unittest
 
 from jarvis.core import AgentLoop
-from jarvis.core.task_contract import TaskRequirement, build_task_contract
+from jarvis.core.task_contract import (
+    TaskRequirement,
+    build_assignment_task_contract,
+    build_task_contract,
+)
 from jarvis.core.tool_safety import ToolSafetyTracker
 from jarvis.llm import LLMResponse, ToolCall
 from jarvis.storage import SessionStorage
@@ -47,6 +51,27 @@ class TaskContractTests(unittest.TestCase):
             },
         )
         self.assertIn("user_message_sha256", contract.render())
+
+    def test_assignment_contract_uses_all_assignment_sentences(self) -> None:
+        contract = build_assignment_task_contract(
+            task_id="child-task",
+            origin_turn_id="child-turn",
+            assignment_texts=(
+                "Implement the parser.\n- Run tests and lint.",
+                "Do not change the public API.",
+                "Return a concise report.",
+            ),
+        )
+
+        self.assertEqual(
+            [item.criterion for item in contract.requirements],
+            [
+                "Implement the parser.",
+                "Run tests and lint.",
+                "Do not change the public API.",
+                "Return a concise report.",
+            ],
+        )
 
     def test_superseding_clarification_and_side_query_preserve_active_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,7 +194,7 @@ class TaskContractTests(unittest.TestCase):
             first = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
                 session_id=session.session_id,
                 proposed_task_id="task-one",
-                user_text="You must use subagents and finish the implementation.",
+                user_text="You must use subagents. All tests must pass.",
             )
             storage.update_session(
                 session.session_id,
@@ -179,12 +204,13 @@ class TaskContractTests(unittest.TestCase):
             replacement = loop._prepare_tool_task(  # pyright: ignore[reportPrivateUsage]
                 session_id=session.session_id,
                 proposed_task_id="task-two",
-                user_text="Continue, but I no longer need the subagent requirement.",
+                user_text="No need I mean.",
             )
 
             assert first is not None and replacement is not None
-            self.assertNotEqual(first.task_id, replacement.task_id)
-            self.assertEqual(replacement.requirements, ())
+            self.assertEqual(first.task_id, replacement.task_id)
+            self.assertEqual(len(replacement.requirements), 1)
+            self.assertIn("subagents", replacement.requirements[0].criterion)
 
     def test_contract_acceptance_requires_runtime_observed_evidence(self) -> None:
         requirements = (
@@ -205,7 +231,7 @@ class TaskContractTests(unittest.TestCase):
                 "visual_inspection",
             ),
         )
-        tracker = ToolSafetyTracker()
+        tracker = ToolSafetyTracker(_actor_kind="subagent")
         tracker.seed_contract_requirements(requirements)
         tracker.record(
             _call("file_write", {"path": "src/main.ts"}, "write"),
@@ -276,7 +302,8 @@ class TaskContractTests(unittest.TestCase):
         )
         checks = [
             {
-                "item_id": requirement.item_id,
+                "item_id": f"criterion-{index}",
+                "criterion": requirement.criterion,
                 "required": True,
                 "outcome": "passed",
                 "evidence_kind": (
@@ -284,14 +311,13 @@ class TaskContractTests(unittest.TestCase):
                     if requirement.item_id == "visual"
                     else "runtime_observation"
                 ),
-                "source_tool_call_ids": ["gates"],
                 "artifact_paths": (
                     ["/workspace/renders/final.png"]
                     if requirement.item_id == "visual"
                     else []
                 ),
             }
-            for requirement in requirements
+            for index, requirement in enumerate(requirements, start=1)
         ]
         tracker.record(
             _call("acceptance_record", {}, "record"),
@@ -314,7 +340,7 @@ class TaskContractTests(unittest.TestCase):
 
         self.assertFalse(tracker.unverified_workspace_mutation)
 
-        missing_delegation = ToolSafetyTracker()
+        missing_delegation = ToolSafetyTracker(_actor_kind="subagent")
         missing_delegation.seed_contract_requirements(requirements[:1])
         missing_delegation.record(
             _call("file_write", {"path": "src/main.ts"}, "write"),
@@ -365,6 +391,147 @@ class TaskContractTests(unittest.TestCase):
             ),
         )
         self.assertTrue(missing_delegation.unverified_workspace_mutation)
+
+    def test_contract_items_require_distinct_corresponding_ledger_checks(self) -> None:
+        tracker = ToolSafetyTracker(_actor_kind="subagent")
+        tracker.seed_contract_requirements(
+            (
+                TaskRequirement("first", "Implement the parser.", "general"),
+                TaskRequirement("second", "Document the parser.", "general"),
+            )
+        )
+        tracker.record(
+            _call("file_write", {"path": "src/parser.py"}, "write"),
+            ToolExecutionResult(
+                call_id="write",
+                name="file_write",
+                ok=True,
+                content="changed",
+                metadata={"changed": True},
+            ),
+        )
+        tracker.record(
+            _call("acceptance_run", {}, "gates"),
+            ToolExecutionResult(
+                call_id="gates",
+                name="acceptance_run",
+                ok=True,
+                content="passed",
+                metadata={
+                    "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["src"],
+                        "workspace_revision_after": "revision-1",
+                        "gates": [
+                            {"gate_id": "tests", "command": "pytest", "passed": True}
+                        ],
+                    }
+                },
+            ),
+        )
+        tracker.record(
+            _call("acceptance_record", {}, "record"),
+            ToolExecutionResult(
+                call_id="record",
+                name="acceptance_record",
+                ok=True,
+                content="recorded",
+                metadata={
+                    "acceptance_ledger": {
+                        "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["src"],
+                        "complete": True,
+                        "checks": [
+                            {
+                                "item_id": "parser-implemented",
+                                "criterion": "Implement the parser.",
+                                "required": True,
+                                "outcome": "passed",
+                                "evidence_kind": "runtime_observation",
+                            }
+                        ],
+                    }
+                },
+            ),
+        )
+
+        self.assertTrue(tracker.unverified_workspace_mutation)
+
+    def test_legacy_run_scope_without_scoped_gates_fails_closed(self) -> None:
+        tracker = ToolSafetyTracker(_actor_kind="subagent")
+        tracker.seed_contract_requirements(
+            (
+                TaskRequirement(
+                    "quality",
+                    "All tests must pass.",
+                    "verification_gate",
+                ),
+            )
+        )
+        tracker.record(
+            _call("file_write", {"path": "src/app.py"}, "write"),
+            ToolExecutionResult(
+                call_id="write",
+                name="file_write",
+                ok=True,
+                content="changed",
+                metadata={"changed": True},
+            ),
+        )
+        tracker.record(
+            _call("acceptance_run", {}, "gates"),
+            ToolExecutionResult(
+                call_id="gates",
+                name="acceptance_run",
+                ok=True,
+                content="passed",
+                metadata={
+                    "acceptance_run": {
+                        "passed": True,
+                        "revision_paths": ["src"],
+                        "workspace_revision_after": "revision-1",
+                        "gates": [
+                            {"gate_id": "tests", "command": "pytest", "passed": True}
+                        ],
+                    }
+                },
+            ),
+        )
+        legacy_state = tracker.to_state()
+        legacy_state["passed_acceptance_run_scopes"]["gates"].pop(
+            "passed_gates",
+            None,
+        )
+        restored = ToolSafetyTracker.from_state(legacy_state, actor_kind="subagent")
+        restored.record(
+            _call("acceptance_record", {}, "record"),
+            ToolExecutionResult(
+                call_id="record",
+                name="acceptance_record",
+                ok=True,
+                content="recorded",
+                metadata={
+                    "acceptance_ledger": {
+                        "workspace_revision_verified": True,
+                        "workspace_revision": "revision-1",
+                        "revision_paths": ["src"],
+                        "complete": True,
+                        "checks": [
+                            {
+                                "item_id": "quality-check",
+                                "criterion": "All tests must pass.",
+                                "required": True,
+                                "outcome": "passed",
+                                "evidence_kind": "test_result",
+                            }
+                        ],
+                    }
+                },
+            ),
+        )
+
+        self.assertTrue(restored.unverified_workspace_mutation)
 
     def test_tool_task_sidecar_skips_identical_rewrites(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -701,7 +868,7 @@ class TaskContractTests(unittest.TestCase):
 
         checkpoint = "\n".join(main_tracker.checkpoint_lines())
         self.assertTrue(made_progress)
-        self.assertTrue(main_tracker.unverified_workspace_mutation)
+        self.assertFalse(main_tracker.unverified_workspace_mutation)
         self.assertIn("system-test-change-review", checkpoint)
         self.assertIn("tests/vehicle.test.ts", checkpoint)
         self.assertIn("src/physics/__tests__/physics.test.ts", checkpoint)
@@ -882,7 +1049,7 @@ class TaskContractTests(unittest.TestCase):
         )
 
         state = tracker.to_state()
-        self.assertTrue(tracker.unverified_workspace_mutation)
+        self.assertFalse(tracker.unverified_workspace_mutation)
         self.assertIn(
             "tests/vehicle.test.ts",
             state["contract_requirements"]["system-test-change-review"][

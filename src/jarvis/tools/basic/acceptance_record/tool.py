@@ -151,7 +151,10 @@ def build_acceptance_record_tool() -> RegisteredTool:
                 "Record explicit acceptance evidence before claiming implementation work is "
                 "complete. Each check must state its actual outcome and evidence; an exit code "
                 "alone does not prove semantic success. Copy both workspace_revision and the "
-                "exact revision_paths from the matching acceptance_run."
+                "exact revision_paths from acceptance_run. For subagent handoff, the runtime "
+                "associates that run and contract evidence deterministically. Record one "
+                "compatible check per required contract criterion using its criterion text; "
+                "do not supply opaque tool-call or contract-item IDs."
             ),
             input_schema={
                 "type": "object",
@@ -264,8 +267,6 @@ def _normalize_check(
         return {}, "a fixed implementation check needs test, artifact, or runtime evidence."
     if outcome == "user_waived" and evidence_kind != "user_confirmation":
         return {}, "user_waived requires user_confirmation evidence."
-    if evidence_kind in {"test_result", "runtime_observation"} and not source_tool_call_ids:
-        return {}, "test_result and runtime_observation evidence require source_tool_call_ids."
     return (
         {
             "criterion": criterion,

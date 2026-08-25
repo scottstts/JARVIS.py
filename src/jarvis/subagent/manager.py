@@ -184,6 +184,11 @@ class SubagentManager:
                 deliverable=deliverable,
             )
         )
+        task_contract_seed_texts = tuple(
+            normalized
+            for text in (normalized_instructions, user_constraints, deliverable)
+            if text is not None and (normalized := text.strip())
+        )
         runtime = SubagentRuntime(
             subagent_id=subagent_id,
             codename=codename,
@@ -192,6 +197,7 @@ class SubagentManager:
                 codename=codename,
                 storage=storage,
                 bootstrap_loader=bootstrap_loader,
+                task_contract_seed_texts=task_contract_seed_texts,
             ),
             storage=storage,
             owner_main_session_id=owner_main_session_id,
@@ -1121,6 +1127,7 @@ class SubagentManager:
         codename: str,
         storage: SessionStorage,
         bootstrap_loader: SubagentBootstrapLoader,
+        task_contract_seed_texts: tuple[str, ...],
     ) -> ActorRuntime:
         filtered_registry = self._tool_registry.filtered_view(
             agent_kind="subagent",
@@ -1209,6 +1216,7 @@ class SubagentManager:
             ),
             llm_provider=resolved_provider,
             tool_executor=_execute,
+            task_contract_seed_texts=task_contract_seed_texts,
         )
 
     def _resolved_provider(self) -> str:

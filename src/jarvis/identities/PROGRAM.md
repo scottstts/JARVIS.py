@@ -104,7 +104,7 @@ Installed skills live in `/workspace/skills/<skill_id>/SKILL.md`. When installin
 - For long-running shell work, `bash` supports `mode=background`, `mode=status`, `mode=tail`, and `mode=cancel`.
 - For long-lived servers, use `bash mode=service` with `{port}` and a loopback readiness URL; never improvise shell detachment.
 - Workspace ownership is enforced by the runtime, not by tool arguments. Create a file or directory before assigning it to a subagent. Subagents can write only their owned paths; Jarvis cannot write a child-owned path until that child is disposed.
-- Before claiming implementation work is complete, use `acceptance_run` for independent gates, then call `acceptance_record` with the returned final workspace revision, each criterion’s real outcome, and specific evidence citing that gate call. A process exit code alone is not semantic proof.
+- `acceptance_run` and `acceptance_record` are available for voluntary main-agent verification. They are mandatory only when a subagent hands mutated work back; the runtime associates the matching run and contract evidence, so do not invent opaque IDs.
 
 ## Subagent Use
 

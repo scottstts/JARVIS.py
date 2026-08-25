@@ -54,6 +54,7 @@ class ToolActivityTracker:
         default_factory=dict
     )
     _acceptance_items: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _acceptance_blockers: tuple[str, ...] = ()
     _contract_requirements: dict[str, dict[str, str]] = field(default_factory=dict)
     _subagent_invocation_count: int = 0
     _test_review_subagent_ids: set[str] = field(default_factory=set)
@@ -163,7 +164,10 @@ class ToolActivityTracker:
             self._visual_inspection_paths.update(path for path in paths if path)
         if result.name == "acceptance_record" and result.ok:
             self._acceptance_items.update(_acceptance_ledger_items(result))
-            self._acceptance_recorded = _acceptance_ledger_resolved(
+            (
+                self._acceptance_recorded,
+                self._acceptance_blockers,
+            ) = _acceptance_ledger_resolution(
                 result,
                 valid_gate_call_ids=self._passed_acceptance_run_call_ids,
                 valid_gate_scopes=self._passed_acceptance_run_scopes,
@@ -174,7 +178,6 @@ class ToolActivityTracker:
                     self._completed_test_review_subagent_ids
                 ),
                 completed_test_review_paths=self._completed_test_review_paths,
-                passed_gates=self._passed_acceptance_gates,
                 visual_inspection_paths=self._visual_inspection_paths,
             )
 
@@ -236,6 +239,7 @@ class ToolActivityTracker:
 
     def _invalidate_acceptance_evidence(self) -> None:
         self._acceptance_recorded = False
+        self._acceptance_blockers = ()
         self._passed_acceptance_run_call_ids.clear()
         self._passed_acceptance_run_scopes.clear()
         self._passed_acceptance_gates.clear()
@@ -469,7 +473,52 @@ class ToolActivityTracker:
 
     @property
     def unverified_workspace_mutation(self) -> bool:
-        return self._workspace_mutated and not self._acceptance_recorded
+        """Whether a child may hand mutated work back without acceptance evidence.
+
+        Main-agent completion is intentionally not an acceptance boundary.  The main
+        agent may use the tools voluntarily, but only a subagent is held at the
+        deterministic handoff gate.
+        """
+
+        return (
+            self._actor_kind == "subagent"
+            and self._workspace_mutated
+            and not self._acceptance_recorded
+        )
+
+    def reconcile_acceptance_record(
+        self,
+        result: ToolExecutionResult,
+    ) -> ToolExecutionResult:
+        """Make a subagent's visible ledger result match the handoff decision."""
+
+        if self._actor_kind != "subagent" or result.name != "acceptance_record" or not result.ok:
+            return result
+        ledger = result.metadata.get("acceptance_ledger")
+        if not isinstance(ledger, dict):
+            return result
+        complete = self._acceptance_recorded
+        blockers = self._acceptance_blockers
+        if bool(ledger.get("complete")) == complete and not blockers:
+            return result
+        metadata = dict(result.metadata)
+        metadata["acceptance_ledger"] = {
+            **ledger,
+            "complete": complete,
+            "completion_blockers": list(blockers),
+        }
+        lines = [result.content, f"completion: {'complete' if complete else 'incomplete'}"]
+        if blockers:
+            lines.append("completion_blockers:")
+            lines.extend(f"- {blocker}" for blocker in blockers)
+        return ToolExecutionResult(
+            call_id=result.call_id,
+            name=result.name,
+            ok=result.ok,
+            content="\n".join(lines),
+            metadata=metadata,
+            turn_disposition=result.turn_disposition,
+        )
 
     def to_state(self) -> dict[str, Any]:
         """Return the bounded durable state needed to resume safety accounting."""
@@ -493,6 +542,7 @@ class ToolActivityTracker:
                 self._passed_acceptance_run_scopes
             ),
             "acceptance_items": dict(self._acceptance_items),
+            "acceptance_blockers": list(self._acceptance_blockers),
             "contract_requirements": dict(self._contract_requirements),
             "subagent_invocation_count": self._subagent_invocation_count,
             "test_review_subagent_ids": sorted(self._test_review_subagent_ids),
@@ -553,6 +603,9 @@ class ToolActivityTracker:
             ),
             _acceptance_items=_bounded_acceptance_items(
                 value.get("acceptance_items")
+            ),
+            _acceptance_blockers=tuple(
+                _bounded_string_list(value.get("acceptance_blockers"), limit=32)
             ),
             _contract_requirements=_bounded_contract_requirements(
                 value.get("contract_requirements")
@@ -787,7 +840,7 @@ def _result_is_material_progress(result: ToolExecutionResult) -> bool:
     }
 
 
-def _acceptance_ledger_resolved(
+def _acceptance_ledger_resolution(
     result: ToolExecutionResult,
     *,
     valid_gate_call_ids: set[str],
@@ -797,63 +850,93 @@ def _acceptance_ledger_resolved(
     subagent_invocation_count: int,
     completed_test_review_subagent_ids: set[str],
     completed_test_review_paths: set[str],
-    passed_gates: dict[str, str],
     visual_inspection_paths: set[str],
-) -> bool:
+) -> tuple[bool, tuple[str, ...]]:
+    """Resolve a child handoff ledger against runtime-observed evidence.
+
+    Tool-call and contract-item IDs are internal bookkeeping.  A subagent never
+    needs to reproduce either: the tracker associates a ledger with the passing
+    run whose revision scope matches, then binds each contract requirement to a
+    compatible durable check and observed evidence.
+    """
+
+    blockers: list[str] = []
     ledger = result.metadata.get("acceptance_ledger")
     if not isinstance(ledger, dict):
-        return False
+        return False, ("The acceptance ledger payload is missing.",)
     if not bool(ledger.get("workspace_revision_verified", False)):
-        return False
-    if not bool(ledger.get("complete", False)):
-        return False
+        blockers.append("The ledger workspace revision was not verified.")
     checks = ledger.get("checks")
     if not isinstance(checks, list) or not checks:
-        return False
+        blockers.append("Record at least one concrete acceptance check.")
     resolved = bool(durable_items) and all(
         not bool(item.get("required", True))
         or str(item.get("outcome", "")).strip()
         in {"fixed", "passed", "not_a_bug", "user_waived"}
         for item in durable_items.values()
     )
-    if not resolved or not valid_gate_call_ids:
-        return False
-    for item_id, requirement in contract_requirements.items():
-        item = durable_items.get(item_id)
-        if item is None or str(item.get("outcome", "")) not in {
-            "fixed",
-            "passed",
-        }:
-            return False
-        if not _contract_machine_evidence_resolved(
-            requirement,
-            item=item,
-            subagent_invocation_count=subagent_invocation_count,
-            completed_test_review_subagent_ids=completed_test_review_subagent_ids,
-            completed_test_review_paths=completed_test_review_paths,
-            passed_gates=passed_gates,
-            visual_inspection_paths=visual_inspection_paths,
-        ):
-            return False
-    supplied_source_ids = {
-        str(call_id)
-        for check in checks
-        if isinstance(check, dict)
-        for call_id in check.get("source_tool_call_ids", [])
-    }
-    cited_valid_ids = supplied_source_ids & valid_gate_call_ids
-    if not cited_valid_ids:
-        return False
+    if not resolved:
+        blockers.append("Required ledger items are still open or unresolved.")
     ledger_paths = _string_list(ledger.get("revision_paths"))
     ledger_revision = str(ledger.get("workspace_revision", "")).strip()
     if not ledger_paths or not ledger_revision:
-        return False
-    return any(
-        scope.get("revision_paths") == ledger_paths
-        and scope.get("workspace_revision") == ledger_revision
-        for call_id in cited_valid_ids
+        blockers.append("The ledger is missing its revision paths or workspace revision.")
+    matching_gate_scopes = [
+        scope
+        for call_id in valid_gate_call_ids
         if (scope := valid_gate_scopes.get(call_id)) is not None
-    )
+        if scope.get("revision_paths") == ledger_paths
+        and scope.get("workspace_revision") == ledger_revision
+    ]
+    if not matching_gate_scopes:
+        blockers.append(
+            "Run acceptance_run for this exact revision_paths and workspace_revision."
+        )
+    scoped_gates: dict[str, str] = {}
+    for scope in matching_gate_scopes:
+        raw_gates = scope.get("passed_gates")
+        if isinstance(raw_gates, dict):
+            scoped_gates.update(
+                {
+                    str(gate_id): str(evidence)
+                    for gate_id, evidence in raw_gates.items()
+                    if str(gate_id).strip() and str(evidence).strip()
+                }
+            )
+    resolved_items = [
+        (item_id, item)
+        for item_id, item in durable_items.items()
+        if str(item.get("outcome", "")).strip() in {"fixed", "passed"}
+    ]
+    bound_item_ids: set[str] = set()
+    for requirement in contract_requirements.values():
+        bound_item_id = next(
+            (
+                item_id
+                for item_id, item in resolved_items
+                if item_id not in bound_item_ids
+                and _contract_machine_evidence_resolved(
+                    requirement,
+                    item=item,
+                    subagent_invocation_count=subagent_invocation_count,
+                    completed_test_review_subagent_ids=(
+                        completed_test_review_subagent_ids
+                    ),
+                    completed_test_review_paths=completed_test_review_paths,
+                    passed_gates=scoped_gates,
+                    visual_inspection_paths=visual_inspection_paths,
+                )
+            ),
+            None,
+        )
+        if bound_item_id is None:
+            blockers.append(
+                "Missing observed evidence for required contract item: "
+                f"{requirement.get('criterion', 'unnamed requirement')}"
+            )
+        else:
+            bound_item_ids.add(bound_item_id)
+    return not blockers, tuple(blockers)
 
 
 def _acceptance_ledger_items(result: ToolExecutionResult) -> dict[str, dict[str, Any]]:
@@ -872,6 +955,7 @@ def _acceptance_ledger_items(result: ToolExecutionResult) -> dict[str, dict[str,
         if not item_id or not outcome:
             continue
         output[item_id] = {
+            "criterion": str(check.get("criterion", "")).strip(),
             "required": bool(check.get("required", True)),
             "outcome": outcome,
             "evidence_kind": str(check.get("evidence_kind", "")).strip(),
@@ -926,6 +1010,7 @@ def _bounded_acceptance_items(
         if not outcome:
             continue
         output[item_id] = {
+            "criterion": str(raw_item.get("criterion", "")).strip(),
             "required": bool(raw_item.get("required", True)),
             "outcome": outcome,
             "evidence_kind": str(raw_item.get("evidence_kind", "")).strip(),
@@ -953,6 +1038,9 @@ def _bounded_acceptance_run_scopes(
             output[call_id] = {
                 "revision_paths": revision_paths,
                 "workspace_revision": workspace_revision,
+                "passed_gates": _bounded_string_map(
+                    raw_scope.get("passed_gates"), limit=64
+                ),
             }
     return output
 
@@ -1048,6 +1136,7 @@ def _acceptance_run_scope(result: ToolExecutionResult) -> dict[str, Any] | None:
     return {
         "revision_paths": revision_paths,
         "workspace_revision": workspace_revision,
+        "passed_gates": _passed_acceptance_gates(result),
     }
 
 
@@ -1062,9 +1151,19 @@ def _contract_machine_evidence_resolved(
     visual_inspection_paths: set[str],
 ) -> bool:
     kind = requirement.get("evidence_kind", "general")
+    if not _criteria_correspond(
+        requirement.get("criterion", ""),
+        str(item.get("criterion", "")),
+    ):
+        return False
     if kind == "delegation":
-        return subagent_invocation_count > 0
+        return (
+            subagent_invocation_count > 0
+            and item.get("evidence_kind") == "runtime_observation"
+        )
     if kind == "verification_gate":
+        if item.get("evidence_kind") not in {"test_result", "runtime_observation"}:
+            return False
         criterion = requirement.get("criterion", "").casefold()
         required_words = {
             word
@@ -1088,6 +1187,8 @@ def _contract_machine_evidence_resolved(
             "runtime_observation",
         }
     if kind == "source_line_count":
+        if item.get("evidence_kind") not in {"test_result", "runtime_observation"}:
+            return False
         required_lines = _required_source_lines(requirement.get("criterion", ""))
         observed_counts = [
             int(match.group(1))
@@ -1112,6 +1213,31 @@ def _contract_machine_evidence_resolved(
             and item.get("evidence_kind") == "artifact_inspection"
         )
     return True
+
+
+def _criteria_correspond(requirement: str, recorded: str) -> bool:
+    ignored = {
+        "a",
+        "all",
+        "an",
+        "and",
+        "be",
+        "must",
+        "should",
+        "the",
+        "to",
+    }
+    required_words = {
+        word
+        for word in re.findall(r"[a-z0-9]+", requirement.casefold())
+        if word not in ignored
+    }
+    recorded_words = {
+        word
+        for word in re.findall(r"[a-z0-9]+", recorded.casefold())
+        if word not in ignored
+    }
+    return bool(required_words) and required_words.issubset(recorded_words)
 
 
 def _string_list(value: object) -> list[str]:

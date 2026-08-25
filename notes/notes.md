@@ -220,3 +220,4 @@
 - The real-gateway headless runner is development-only under `tests/headless/`, uses the workspace Ox Alpha settings unchanged, and must recognize command-only `/new` completion before cleaning its unique test workspace.
 
 - Telegram wrench notices aggregate bold raw tool names into one editable per-agent count stack ordered by recency; every user-facing Jarvis message partitions all current stacks, including subagents, while system notices do not partition them.
+- Acceptance is a deterministic subagent-only handoff gate: child contracts come from actual assignments, each requirement consumes one compatible revision-scoped check, legacy unscoped evidence fails closed, and the main agent is never completion-blocked.
