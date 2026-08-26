@@ -434,7 +434,7 @@ class CompositeMainBootstrapLoaderTests(unittest.TestCase):
         self.assertIn("Continue independent work after invoking", subagent_text)
         self.assertIn("stable `task_label`", subagent_text)
         self.assertIn("minimal seam contract", subagent_text)
-        self.assertIn("Stage dependent work", subagent_text)
+        self.assertIn("stage dependent work", subagent_text)
         self.assertIn("subagent_handoff", subagent_text)
         self.assertIn("changed paths", subagent_text)
         self.assertIn("not live prompt injection", subagent_text)
@@ -442,6 +442,17 @@ class CompositeMainBootstrapLoaderTests(unittest.TestCase):
         self.assertNotIn("Arguments:", subagent_text)
         self.assertNotIn("Subagent runtime control reference:", subagent_text)
         self.assertLess(len(subagent_text), 2_000)
+
+    def test_program_contains_generic_subagent_coordination_sop(self) -> None:
+        program_path = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "identities" / "PROGRAM.md"
+        program_text = program_path.read_text(encoding="utf-8")
+
+        self.assertIn("## Subagent Coordination", program_text)
+        self.assertIn("thin working vertical slice", program_text)
+        self.assertIn("semantic seams", program_text)
+        self.assertIn("producer, seam, and consumer", program_text)
+        self.assertIn("routing skill helps choose expertise", program_text)
+        self.assertNotIn("mandatory vertical-slice phase", program_text)
 
 
 class RouteRuntimeToolResultTests(unittest.TestCase):

@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime, timezone
 import json
 import traceback
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 from uuid import uuid4
 
 from jarvis.actor_backends import ActorRuntime, backend_kind_for_provider
@@ -96,6 +96,22 @@ _MAX_TRACKED_CHANGED_PATHS = 256
 _IN_FLIGHT_SUBAGENT_STATUSES = frozenset(
     {"running", "awaiting_approval", "waiting_background"}
 )
+_COORDINATION_FANOUT_NUDGE = (
+    "Coordination reminder: this delegation may be coupled to existing work. "
+    "Before expanding this wave further, confirm that the baseline and semantic seams are real; "
+    "parallelize only independent work and surface missing canonical dependencies instead "
+    "of inventing competing substitutes."
+)
+_COORDINATION_UPSTREAM_NUDGE = (
+    "Integration reminder: inspect the producer's actual changes, its boundary, and its "
+    "consumers before relying on this work. The report and local checks are evidence, not "
+    "product acceptance."
+)
+_COORDINATION_FINAL_NUDGE = (
+    "Final integration reminder: delegated work is local evidence, not product acceptance. "
+    "Review the assembled result and trace the important end-to-end paths before claiming "
+    "completion."
+)
 
 
 class SubagentManager:
@@ -147,6 +163,8 @@ class SubagentManager:
         self._pending_bash_job_notices: dict[str, dict[str, BashJobNotice]] = {}
         self._last_monitor_signatures: dict[str, str] = {}
         self._last_main_context_signature: tuple[str, str] | None = None
+        self._coordination_fanout_nudge_sessions: set[str] = set()
+        self._coordination_final_nudge_sessions: set[str] = set()
         self._restore_lock = asyncio.Lock()
         self._restored = False
 
@@ -595,7 +613,15 @@ class SubagentManager:
             name=f"jarvis-subagent-{codename}-{subagent_id}",
             run_generation=runtime.run_generation,
         )
-        return {
+        self._coordination_final_nudge_sessions.discard(owner_main_session_id.strip())
+        coordination_nudge = self._take_fanout_coordination_nudge(
+            owner_main_session_id=owner_main_session_id,
+            active=active,
+            phase=normalized_phase,
+            depends_on=normalized_depends_on,
+            shared_context=shared_context,
+        )
+        payload = {
             "subagent_id": subagent_id,
             "codename": codename,
             "task_label": normalized_task_label,
@@ -614,6 +640,10 @@ class SubagentManager:
             "workspace_lease_generation": lease_generation,
             "active_count": len(self._non_disposed_runtimes()),
         }
+        if coordination_nudge is not None:
+            payload["coordination_nudge_kind"] = "before_meaningful_fanout"
+            payload["coordination_nudge"] = coordination_nudge
+        return payload
 
     async def _begin_workspace_snapshot(self, runtime: SubagentRuntime) -> None:
         """Start an exact change-capture segment after a child lease is held."""
@@ -868,6 +898,11 @@ class SubagentManager:
         runtime.pause_reason = None
         runtime.status = "running"
         runtime.report_complete = False
+        # A step-in can happen after main-session compaction, so the runtime's
+        # original owner session is not necessarily the session whose final
+        # reminder was most recently emitted. Re-arm the reminder for the next
+        # settled result regardless of which main-session key was active.
+        self._coordination_final_nudge_sessions.clear()
         self._sync_catalog(runtime)
         self._append_notable_event(runtime, kind="step_in", summary="Jarvis stepped in with new direction.")
         self._launch_runtime_task(
@@ -967,12 +1002,65 @@ class SubagentManager:
 
         self._last_monitor_signatures.clear()
         self._last_main_context_signature = None
+        self._coordination_fanout_nudge_sessions.clear()
+        self._coordination_final_nudge_sessions.clear()
         return {
             "disposed_subagent_ids": disposed_subagent_ids,
             "cancelled_job_ids": [],
             "disposed_count": len(disposed_subagent_ids),
             "cancelled_job_count": 0,
         }
+
+    def _take_fanout_coordination_nudge(
+        self,
+        *,
+        owner_main_session_id: str,
+        active: Sequence[SubagentRuntime],
+        phase: str | None,
+        depends_on: tuple[str, ...],
+        shared_context: str | None,
+    ) -> str | None:
+        session_id = owner_main_session_id.strip()
+        if not session_id or session_id in self._coordination_fanout_nudge_sessions:
+            return None
+        existing = tuple(
+            runtime
+            for runtime in active
+            if runtime.owner_main_session_id == session_id
+        )
+        if not existing:
+            return None
+        has_related_signal = bool(depends_on)
+        if phase is not None and any(runtime.phase == phase for runtime in existing):
+            has_related_signal = True
+        normalized_context = (shared_context or "").strip()
+        if normalized_context and any(
+            (runtime.shared_context or "").strip() == normalized_context
+            for runtime in existing
+        ):
+            has_related_signal = True
+        if not has_related_signal:
+            return None
+        self._coordination_fanout_nudge_sessions.add(session_id)
+        return _COORDINATION_FANOUT_NUDGE
+
+    def _take_final_coordination_nudge(
+        self,
+        *,
+        session_id: str,
+        runtimes: Sequence[SubagentRuntime],
+    ) -> str | None:
+        normalized_session_id = session_id.strip()
+        if (
+            not normalized_session_id
+            or normalized_session_id in self._coordination_final_nudge_sessions
+            or not runtimes
+            or any(runtime.status in _IN_FLIGHT_SUBAGENT_STATUSES for runtime in runtimes)
+            or not any(runtime.status in {"completed", "failed"} for runtime in runtimes)
+        ):
+            return None
+        self._coordination_final_nudge_sessions.add(normalized_session_id)
+        return _COORDINATION_FINAL_NUDGE
 
     def main_turn_runtime_messages(self, *, session_id: str) -> tuple[AgentRuntimeMessage, ...]:
         runtimes = self._non_disposed_runtimes()
@@ -1038,17 +1126,40 @@ class SubagentManager:
             for codename, kind, summary in recent_events[-self._settings.main_context_event_limit :]:
                 lines.append(f"- {codename} [{kind}]: {summary}")
 
-        return self._deduplicate_main_context_message(
+        final_nudge = self._take_final_coordination_nudge(
             session_id=session_id,
-            message=AgentRuntimeMessage(
-                role="system",
-                metadata={
-                    "subagent_status_snapshot": True,
-                    "pending_subagent_ids": pending_subagent_ids,
-                },
-                content="\n".join(lines),
-            )
+            runtimes=runtimes,
         )
+        base_content = "\n".join(lines)
+        metadata: dict[str, Any] = {
+            "subagent_status_snapshot": True,
+            "pending_subagent_ids": pending_subagent_ids,
+        }
+        if final_nudge is not None:
+            lines.extend(["", final_nudge])
+            metadata["coordination_nudge"] = "before_final_completion"
+
+        message = AgentRuntimeMessage(
+            role="system",
+            metadata=metadata,
+            content="\n".join(lines),
+        )
+        deduplicated = self._deduplicate_main_context_message(
+            session_id=session_id,
+            message=message,
+        )
+        if final_nudge is not None and deduplicated:
+            base_metadata = dict(metadata)
+            base_metadata.pop("coordination_nudge", None)
+            self._last_main_context_signature = self._main_context_message_signature(
+                session_id=session_id,
+                message=AgentRuntimeMessage(
+                    role="system",
+                    metadata=base_metadata,
+                    content=base_content,
+                ),
+            )
+        return deduplicated
 
     def active_snapshots(self) -> tuple[SubagentSnapshot, ...]:
         return tuple(runtime.snapshot() for runtime in self._non_disposed_runtimes())
@@ -1111,6 +1222,7 @@ class SubagentManager:
             self._build_main_progress_lines(
                 parts=parts,
                 recommendation=recommendation,
+                notice_kind=notice_kind,
                 latest_report=rendered_report,
                 report_complete=snapshot.report_complete,
                 report_truncated=report_truncated,
@@ -1118,35 +1230,38 @@ class SubagentManager:
                 changed_test_artifact_paths=snapshot.changed_test_artifact_paths,
             )
         )
+        metadata = {
+            "subagent_progress_update": True,
+            "notice_kind": "subagent_progress_update",
+            "subagent_id": snapshot.subagent_id,
+            "subagent_notice_kind": notice_kind,
+            "subagent_status": snapshot.status,
+            "recommended_action": recommendation,
+            "latest_subagent_report_included": bool(latest_report),
+            "latest_subagent_report_complete": snapshot.report_complete,
+            "latest_subagent_report_truncated": report_truncated,
+            "phase": snapshot.phase,
+            "depends_on": list(snapshot.depends_on),
+            "workspace_lease_status": snapshot.workspace_lease_status,
+            "changed_paths": list(snapshot.changed_paths),
+            "changed_paths_complete": snapshot.changed_paths_complete,
+            "changed_paths_source": snapshot.changed_paths_source,
+            "changed_test_artifact_paths": list(
+                snapshot.changed_test_artifact_paths
+            ),
+            "pending_subagent_ids": (
+                [snapshot.subagent_id]
+                if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
+                else []
+            ),
+        }
+        if notice_kind == "subagent_completed":
+            metadata["coordination_nudge"] = "upstream_available"
         return (
             snapshot.owner_main_session_id,
             AgentRuntimeMessage(
                 role="system",
-                metadata={
-                    "subagent_progress_update": True,
-                    "notice_kind": "subagent_progress_update",
-                    "subagent_id": snapshot.subagent_id,
-                    "subagent_notice_kind": notice_kind,
-                    "subagent_status": snapshot.status,
-                    "recommended_action": recommendation,
-                    "latest_subagent_report_included": bool(latest_report),
-                    "latest_subagent_report_complete": snapshot.report_complete,
-                    "latest_subagent_report_truncated": report_truncated,
-                    "phase": snapshot.phase,
-                    "depends_on": list(snapshot.depends_on),
-                    "workspace_lease_status": snapshot.workspace_lease_status,
-                    "changed_paths": list(snapshot.changed_paths),
-                    "changed_paths_complete": snapshot.changed_paths_complete,
-                    "changed_paths_source": snapshot.changed_paths_source,
-                    "changed_test_artifact_paths": list(
-                        snapshot.changed_test_artifact_paths
-                    ),
-                    "pending_subagent_ids": (
-                        [snapshot.subagent_id]
-                        if snapshot.status in {"running", "waiting_background", "awaiting_approval"}
-                        else []
-                    ),
-                },
+                metadata=metadata,
                 content=content,
             ),
         )
@@ -1156,6 +1271,7 @@ class SubagentManager:
         *,
         parts: list[str],
         recommendation: str,
+        notice_kind: str,
         latest_report: str | None,
         report_complete: bool,
         report_truncated: bool,
@@ -1196,14 +1312,8 @@ class SubagentManager:
                     "`subagent_monitor(detail=\"full\")` before relying on it or deciding how to "
                     "continue."
                 )
-        else:
-            lines.append(
-                "This is a system update from the orchestrator, not a new user message. "
-                "Subagent progress is orchestrator-monitored; react to this update and "
-                "update the user accordingly instead of polling unless immediate detail is "
-                "required."
-            )
-            return lines
+        if notice_kind == "subagent_completed":
+            lines.append(_COORDINATION_UPSTREAM_NUDGE)
         lines.append(
             "This is a system update from the orchestrator, not a new user message. "
             "Subagent progress is orchestrator-monitored; react to this update and "
@@ -2462,17 +2572,28 @@ class SubagentManager:
         session_id: str,
         message: AgentRuntimeMessage,
     ) -> tuple[AgentRuntimeMessage, ...]:
+        cache_key = self._main_context_message_signature(
+            session_id=session_id,
+            message=message,
+        )
+        if cache_key == self._last_main_context_signature:
+            return ()
+        self._last_main_context_signature = cache_key
+        return (message,)
+
+    def _main_context_message_signature(
+        self,
+        *,
+        session_id: str,
+        message: AgentRuntimeMessage,
+    ) -> tuple[str, str]:
         signature = json.dumps(
             {"metadata": message.metadata, "content": message.content},
             ensure_ascii=False,
             sort_keys=True,
             default=str,
         )
-        cache_key = (session_id, signature)
-        if cache_key == self._last_main_context_signature:
-            return ()
-        self._last_main_context_signature = cache_key
-        return (message,)
+        return session_id, signature
 
     async def _wait_for_turn_settle(self, runtime: SubagentRuntime) -> None:
         task = runtime.task

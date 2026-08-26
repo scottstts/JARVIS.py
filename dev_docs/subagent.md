@@ -27,8 +27,11 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 - On the next route initialization, non-disposed contracts belonging to the active main session or its compaction ancestors are reconstituted without automatically starting child turns.
 - Ordinary user messages supersede only the active main turn; they never redirect, pause, or stop a child.
 - Jarvis decides whether to continue independent main-task work, inspect a child, step in, stop it, or wait.
-- Delegation is a coordination decision, not a parallelism target. Jarvis should identify prerequisites, stage dependent work after its boundary exists, and review a completed child before integrating it.
-- A useful assignment defines a seam rather than prescribing implementation: ownership, consumed interfaces, provided interfaces, lifecycle assumptions, invariants, verification scope, and non-goals.
+- Delegation is a coordination decision, not a parallelism target. For coupled work, Jarvis should establish enough shared reality before broad fan-out, use a thin vertical slice when useful, identify prerequisites, stage dependent work after its boundary exists, and review producer, seam, and consumer before integrating it.
+- A useful assignment defines how work fits rather than prescribing implementation: ownership, canonical sources, consumed and provided interfaces, downstream expectations, lifecycle/data-flow assumptions, invariants, verification scope, and non-goals.
+- If a required canonical dependency or seam is missing or inadequate, the child should surface the gap or use an explicitly temporary stub rather than silently inventing a competing substitute.
+- The child performing specialized work should receive the relevant specialist skills. A routing skill helps select expertise but does not replace specialist skills.
+- Runtime coordination reminders are sparse and advisory: one before meaningful coupled fan-out, one when upstream work becomes available for review, and one before final completion after delegation. They never decide semantic readiness or acceptance.
 - Subagents receive passive Acceptance Notes derived from assignment instructions, user constraints, and the requested deliverable; the notes are reminders for self-checking and reporting, never a completion gate.
 - A subagent may always hand work back, including partial or blocked work. Jarvis decides whether to accept the report, inspect the changes, or step the child back in.
 
@@ -85,7 +88,7 @@ The dynamic assignment includes:
 
 The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited, and explicit `skill_ids` can add exact top-level installed skill IDs, up to four total. Same-turn inheritance is only a convenience; Jarvis should explicitly repeat skill ids for later orchestration turns. The harness never infers skills from assignment prose, `SKILL.md`, referenced resources, or file/directory names. Every child records whether Jarvis selected skills or selected none.
 
-The main agent receives high-level subagent usage guidance through `PROGRAM.md` and detailed primitive docs from `src/jarvis/subagent/primitives.py`.
+The main agent receives the coordination SOP through `PROGRAM.md`, detailed primitive docs from `src/jarvis/subagent/primitives.py`, and sparse runtime reminders at meaningful delegation, upstream-review, and final-integration moments.
 
 ## Control Primitives
 
@@ -117,17 +120,18 @@ Returns:
 - session id
 - selected skill ids and owned paths
 - coordination metadata and workspace lease status
+- an optional coordination reminder when related work is being fanned out
 - active count
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
 
-A successful `subagent_invoke` delegates the task. The child bootstrap includes passive Acceptance Notes covering the assignment, constraints, deliverable, useful self-checking, and explicit reporting of anything unverified or blocked. Semantic edits to test artifacts are reported upward for visibility only; they do not create a runtime acceptance obligation. Coordination metadata is informational runtime state; Jarvis decides whether dependencies are satisfied.
+A successful `subagent_invoke` delegates the task. For coupled work, Jarvis should establish enough shared reality before broad fan-out and should stage work with prerequisites. The child bootstrap includes passive Acceptance Notes covering the assignment, constraints, deliverable, useful self-checking, and explicit reporting of anything unverified or blocked. Semantic edits to test artifacts are reported upward for visibility only; they do not create a runtime acceptance obligation. Coordination metadata is informational runtime state; Jarvis decides whether dependencies are satisfied. An advisory coordination reminder may be included in the result when observable assignment metadata indicates related work is being fanned out; it never blocks or rejects the invocation.
 
 ### `subagent_monitor`
 
 Inspects current subagent state without side effects.
 
-It accepts an optional codename or `subagent_id`. Omitted `agent` summarizes all non-disposed subagents. Full output includes the durable assignment, coordination metadata, selected skills, owned paths, workspace lease status, changed paths, changed-path completeness/source, recent activity, pause reason, complete report or latest checkpoint, report-completeness flag, provider error metadata, error-log path, transcript path, and `pending_background_job_ids`. For lease-backed children, settled lifecycle snapshots report exact net changes within the owned paths; otherwise changed paths are tool-result evidence and may be incomplete. A report is self-reported evidence, not semantic acceptance; inspect changed paths and the seam before integrating implementation work.
+It accepts an optional codename or `subagent_id`. Omitted `agent` summarizes all non-disposed subagents. Full output includes the durable assignment, coordination metadata, selected skills, owned paths, workspace lease status, changed paths, changed-path completeness/source, recent activity, pause reason, complete report or latest checkpoint, report-completeness flag, provider error metadata, error-log path, transcript path, and `pending_background_job_ids`. For lease-backed children, settled lifecycle snapshots report exact net changes within the owned paths; otherwise changed paths are tool-result evidence and may be incomplete. A report is self-reported evidence, not semantic acceptance; inspect the producer changes, seam, consumer-side use, and assumptions before integrating implementation work.
 
 Repeated unchanged monitor calls return a minimal no-delta nudge instead of another full snapshot. Automatic main-context status snapshots are also suppressed while unchanged within one main session, but a fresh snapshot is emitted after `/new` or compaction because compaction prunes older status records.
 
@@ -147,7 +151,7 @@ Step-in is stop, settle, then new turn. It is not mid-token prompt injection.
 
 ### `subagent_handoff`
 
-Releases a settled (completed, paused, or failed) child's workspace write lease while preserving its transcript, report, status, and monitoring state for main-agent review and integration. It does not decide whether the work is correct and does not dispose the child. A later `subagent_step_in` reacquires the lease if it is still available.
+Releases a settled (completed, paused, or failed) child's workspace write lease while preserving its transcript, report, status, and monitoring state for main-agent review and integration. It does not decide whether the work is correct and does not dispose the child. A later `subagent_step_in` reacquires the lease if it is still available. Handoff evidence supports review; it is not product acceptance.
 
 ### `subagent_dispose`
 

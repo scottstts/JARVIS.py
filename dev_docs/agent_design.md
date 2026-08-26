@@ -123,6 +123,8 @@ Repeated-result limits are evaluated inside progress epochs. A real workspace mu
 
 Subagent semantic completion is not decided by the runtime. The subagent bootstrap contains passive Acceptance Notes derived directly from the assignment instructions, user constraints, and deliverable. The notes remind the child to self-check where useful and to report anything unverified, environment-limited, partial, or blocked. They create no criterion IDs, evidence kinds, revision checks, or completion state. Test changes made by a child are reported to Jarvis for visibility only. Delegation metadata can describe a coordination phase, dependencies, and a minimal seam contract; these are context for Jarvis's scheduling and review decisions, not a static acceptance gate.
 
+The main-agent coordination SOP is the primary guidance for delegated work. It teaches Jarvis to establish enough shared reality before parallelizing coupled work, define semantic seams without prescribing implementation, stage dependency waves, surface missing canonical dependencies, review producer/seam/consumer integration, and judge the assembled result. The runtime adds only sparse, non-blocking reminders at meaningful fan-out, upstream-work availability, and final-integration moments; it never determines whether an architecture or result is semantically correct.
+
 Slice rollover follows the same unresolved-call normalization rule:
 
 1. persist the unexecuted-tool-call notice

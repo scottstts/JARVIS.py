@@ -503,9 +503,14 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 "The report is self-reported completion, not semantic acceptance.",
                 message.content,
             )
+            self.assertIn(
+                "inspect the producer's actual changes, its boundary, and its consumers",
+                message.content,
+            )
             self.assertIn("recommendation=inspect", message.content)
             self.assertEqual(message.metadata["latest_subagent_report_included"], True)
             self.assertEqual(message.metadata["latest_subagent_report_complete"], True)
+            self.assertEqual(message.metadata["coordination_nudge"], "upstream_available")
 
     async def test_paused_subagent_checkpoint_requires_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -610,10 +615,113 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(first), 1)
             self.assertIn("Inspect runtime", first[0].content)
+            self.assertNotIn("coordination_nudge", first[0].metadata)
             self.assertEqual(unchanged, ())
             self.assertEqual(len(compacted_session), 1)
             self.assertEqual(len(changed), 1)
             self.assertIn("Inspected the runtime interface.", changed[0].content)
+
+    async def test_coordination_fanout_nudge_is_advisory_and_not_for_unrelated_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            first = await manager.invoke(
+                requester_kind="main",
+                task_label="Independent one",
+                instructions="Complete the first independent task.",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            second = await manager.invoke(
+                requester_kind="main",
+                task_label="Independent two",
+                instructions="Complete the second independent task.",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+
+            self.assertNotIn("coordination_nudge", first)
+            self.assertNotIn("coordination_nudge", second)
+
+            related = await manager.invoke(
+                requester_kind="main",
+                task_label="Dependent work",
+                instructions="Build on the completed foundation.",
+                phase="feature",
+                depends_on=(first["subagent_id"],),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            self.assertEqual(related["coordination_nudge_kind"], "before_meaningful_fanout")
+            self.assertIn("surface missing canonical dependencies", related["coordination_nudge"])
+
+            fourth = await manager.invoke(
+                requester_kind="main",
+                task_label="Another dependent task",
+                instructions="Continue the dependent work.",
+                phase="feature",
+                depends_on=(second["subagent_id"],),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            self.assertNotIn("coordination_nudge", fourth)
+
+            for payload in (first, second, related, fourth):
+                runtime = manager._subagents[payload["subagent_id"]]
+                if runtime.task is not None:
+                    await asyncio.wait_for(runtime.task, timeout=1)
+
+    async def test_final_coordination_nudge_is_emitted_once_after_delegated_work_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            runtime = SubagentRuntime(
+                subagent_id="sub_completed",
+                codename="Friday",
+                loop=_FakeSubagentLoop([], session_id="child_session"),  # type: ignore[arg-type]
+                storage=manager._catalog.session_storage(
+                    owner_main_session_id="main_session",
+                    subagent_id="sub_completed",
+                ),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+                status="completed",
+                created_at="2026-04-07T00:00:00+00:00",
+                updated_at="2026-04-07T00:00:00+00:00",
+                task_label="Completed foundation",
+                latest_report="The foundation is locally verified.",
+                report_complete=True,
+            )
+            manager._subagents[runtime.subagent_id] = runtime
+
+            first = manager.main_turn_runtime_messages(session_id="main_session")
+            second = manager.main_turn_runtime_messages(session_id="main_session")
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0].metadata["coordination_nudge"], "before_final_completion")
+            self.assertIn("Review the assembled result", first[0].content)
+            self.assertEqual(second, ())
 
     async def test_invoke_returns_session_id_and_catalog_owner_linkage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
