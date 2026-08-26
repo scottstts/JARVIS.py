@@ -38,6 +38,9 @@ def build_assignment_message(
     shared_context: str | None = None,
     owned_paths: tuple[str, ...] = (),
     skill_documents: tuple[tuple[str, str], ...] = (),
+    phase: str | None = None,
+    depends_on: tuple[str, ...] = (),
+    seam_contract: str | None = None,
     deliverable: str | None = None,
 ) -> LLMMessage:
     return LLMMessage.text(
@@ -51,6 +54,9 @@ def build_assignment_message(
             shared_context=shared_context,
             owned_paths=owned_paths,
             skill_documents=skill_documents,
+            phase=phase,
+            depends_on=depends_on,
+            seam_contract=seam_contract,
             deliverable=deliverable,
         ),
     )
@@ -89,6 +95,9 @@ def _render_assignment_text(
     shared_context: str | None,
     owned_paths: tuple[str, ...],
     skill_documents: tuple[tuple[str, str], ...],
+    phase: str | None,
+    depends_on: tuple[str, ...],
+    seam_contract: str | None,
     deliverable: str | None,
 ) -> str:
     lines = [
@@ -118,6 +127,15 @@ def _render_assignment_text(
     if owned_paths:
         lines.extend(["", "owned_paths:"])
         lines.extend(f"- {path}" for path in owned_paths)
+    if phase or depends_on or (seam_contract is not None and seam_contract.strip()):
+        lines.extend(["", "coordination:"])
+        if phase:
+            lines.append(f"phase: {phase.strip()}")
+        if depends_on:
+            lines.append("depends_on:")
+            lines.extend(f"- {dependency}" for dependency in depends_on)
+        if seam_contract is not None and seam_contract.strip():
+            lines.extend(["seam_contract:", seam_contract.strip()])
     if skill_documents:
         lines.extend(
             [

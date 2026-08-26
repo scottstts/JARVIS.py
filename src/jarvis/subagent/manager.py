@@ -39,7 +39,11 @@ from jarvis.llm import (
 )
 from jarvis.logging_setup import get_application_logger
 from jarvis.skills import SkillsSettings, get_skill
-from jarvis.core.tool_safety import changed_test_artifact_paths_from_result
+from jarvis.core.tool_safety import (
+    changed_test_artifact_paths_from_result,
+    changed_workspace_paths_from_result,
+    test_artifact_paths_from_paths,
+)
 from jarvis.skills.catalog import read_skill_markdown
 from jarvis.storage import SessionStorage
 from jarvis.storage.layout import transcript_archive_root_from_runtime_path
@@ -57,6 +61,11 @@ from jarvis.tools.basic.bash.jobs import (
     BashJobError,
     mark_job_progress_notified,
     mark_job_terminal_notice_dispatched,
+)
+from jarvis.tools.workspace_revision import (
+    WorkspaceSnapshotError,
+    diff_workspace_snapshots,
+    workspace_snapshot_paths,
 )
 
 from .bootstrap import (
@@ -79,6 +88,7 @@ from .types import (
 
 LOGGER = get_application_logger(__name__)
 _MAX_SUBAGENT_PROVIDER_RECOVERY_ATTEMPTS = 3
+_MAX_TRACKED_CHANGED_PATHS = 256
 
 
 class SubagentManager:
@@ -140,6 +150,9 @@ class SubagentManager:
         shared_context: str | None = None,
         owned_paths: tuple[str, ...] = (),
         skill_ids: tuple[str, ...] = (),
+        phase: str | None = None,
+        depends_on: tuple[str, ...] = (),
+        seam_contract: str | None = None,
         deliverable: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_main_requester(requester_kind)
@@ -151,6 +164,9 @@ class SubagentManager:
             raise ValueError("Subagent instructions cannot be empty.")
         normalized_owned_paths = _normalize_unique_strings(owned_paths)
         normalized_skill_ids = _normalize_unique_strings(skill_ids)
+        normalized_phase = _normalize_optional_string(phase)
+        normalized_depends_on = _normalize_unique_strings(depends_on)
+        normalized_seam_contract = _normalize_optional_string(seam_contract)
         skill_selection_reason = (
             "main_selected" if normalized_skill_ids else "none:not_selected_by_main"
         )
@@ -181,6 +197,9 @@ class SubagentManager:
                 shared_context=shared_context,
                 owned_paths=normalized_owned_paths,
                 skill_documents=skill_documents,
+                phase=normalized_phase,
+                depends_on=normalized_depends_on,
+                seam_contract=normalized_seam_contract,
                 deliverable=deliverable,
             )
         )
@@ -206,6 +225,14 @@ class SubagentManager:
             owned_paths=normalized_owned_paths,
             skill_ids=normalized_skill_ids,
             skill_selection_reason=skill_selection_reason,
+            phase=normalized_phase,
+            depends_on=normalized_depends_on,
+            seam_contract=normalized_seam_contract,
+            workspace_lease_status=(
+                "held"
+                if self._workspace_access is not None and normalized_owned_paths
+                else "not_applicable"
+            ),
             deliverable=deliverable,
             notable_events=deque(),
         )
@@ -226,6 +253,8 @@ class SubagentManager:
                 )
                 lease_claimed = True
                 lease_generation = await self._workspace_access.lease_generation()
+                runtime.workspace_lease_status = "held"
+                await self._begin_workspace_snapshot(runtime)
                 runtime.loop.append_system_note(
                     (
                         "Workspace ownership established. You may read the shared workspace and "
@@ -265,6 +294,12 @@ class SubagentManager:
                     owned_paths=normalized_owned_paths,
                     skill_ids=normalized_skill_ids,
                     skill_selection_reason=skill_selection_reason,
+                    phase=normalized_phase,
+                    depends_on=normalized_depends_on,
+                    seam_contract=normalized_seam_contract,
+                    changed_paths_complete=runtime.changed_paths_complete,
+                    changed_paths_source=runtime.changed_paths_source,
+                    workspace_lease_status=runtime.workspace_lease_status,
                     deliverable=deliverable,
                     current_subagent_session_id=session_id,
                     run_generation=runtime.run_generation,
@@ -308,10 +343,95 @@ class SubagentManager:
             "session_id": session_id,
             "skill_ids": list(normalized_skill_ids),
             "skill_selection_reason": skill_selection_reason,
+            "phase": normalized_phase,
+            "depends_on": list(normalized_depends_on),
+            "seam_contract": normalized_seam_contract,
+            "workspace_lease_status": runtime.workspace_lease_status,
+            "changed_paths": list(runtime.changed_paths),
+            "changed_paths_complete": runtime.changed_paths_complete,
+            "changed_paths_source": runtime.changed_paths_source,
             "owned_paths": list(normalized_owned_paths),
             "workspace_lease_generation": lease_generation,
             "active_count": len(self._non_disposed_runtimes()),
         }
+
+    async def _begin_workspace_snapshot(self, runtime: SubagentRuntime) -> None:
+        """Start an exact change-capture segment after a child lease is held."""
+
+        if (
+            self._workspace_access is None
+            or runtime.workspace_lease_status != "held"
+            or not runtime.owned_paths
+        ):
+            runtime.workspace_snapshot_baseline = None
+            return
+        try:
+            runtime.workspace_snapshot_baseline = await asyncio.to_thread(
+                workspace_snapshot_paths,
+                self._core_settings.workspace_dir,
+                runtime.owned_paths,
+            )
+        except WorkspaceSnapshotError as exc:
+            runtime.workspace_snapshot_baseline = None
+            runtime.workspace_snapshot_incomplete = True
+            runtime.changed_paths_complete = False
+            runtime.changed_paths_source = "snapshot_unavailable"
+            self._append_notable_event(
+                runtime,
+                kind="workspace_snapshot_unavailable",
+                summary=f"Could not capture the child workspace baseline: {exc}",
+            )
+            LOGGER.warning(
+                "Could not capture workspace snapshot baseline for subagent %s: %s",
+                runtime.subagent_id,
+                exc,
+            )
+            return
+        runtime.changed_paths_complete = False
+        runtime.changed_paths_source = "scoped_workspace_snapshot_pending"
+
+    async def _finalize_workspace_snapshot(self, runtime: SubagentRuntime) -> bool:
+        """Record exact net changes for the currently held lease segment."""
+
+        baseline = runtime.workspace_snapshot_baseline
+        if baseline is None:
+            return runtime.changed_paths_complete
+        try:
+            current = await asyncio.to_thread(
+                workspace_snapshot_paths,
+                self._core_settings.workspace_dir,
+                runtime.owned_paths,
+            )
+        except WorkspaceSnapshotError as exc:
+            runtime.workspace_snapshot_baseline = None
+            runtime.workspace_snapshot_incomplete = True
+            runtime.changed_paths_complete = False
+            runtime.changed_paths_source = "snapshot_unavailable"
+            self._append_notable_event(
+                runtime,
+                kind="workspace_snapshot_unavailable",
+                summary=f"Could not capture the child workspace result: {exc}",
+            )
+            LOGGER.warning(
+                "Could not capture workspace snapshot result for subagent %s: %s",
+                runtime.subagent_id,
+                exc,
+            )
+            return False
+
+        changed_paths = diff_workspace_snapshots(baseline, current)
+        runtime.changed_paths.update(changed_paths)
+        runtime.changed_test_artifact_paths.update(
+            test_artifact_paths_from_paths(changed_paths)
+        )
+        runtime.workspace_snapshot_baseline = None
+        runtime.changed_paths_complete = not runtime.workspace_snapshot_incomplete
+        runtime.changed_paths_source = (
+            "scoped_workspace_snapshot"
+            if runtime.changed_paths_complete
+            else "scoped_workspace_snapshot_incomplete"
+        )
+        return True
 
     async def monitor(
         self,
@@ -408,6 +528,7 @@ class SubagentManager:
                 runtime.pending_pause_reason = None
             runtime.pending_background_job_ids.clear()
             self._pending_bash_job_notices.pop(runtime.subagent_id, None)
+            await self._finalize_workspace_snapshot(runtime)
             self._sync_catalog(runtime)
             settled.append(runtime.snapshot())
         return tuple(settled)
@@ -447,6 +568,11 @@ class SubagentManager:
             runtime.pending_pause_reason = "main_stop"
             runtime.loop.request_stop()
             await self._wait_for_turn_settle(runtime)
+        if runtime.workspace_lease_status == "held":
+            await self._finalize_workspace_snapshot(runtime)
+        await self._reacquire_workspace_lease_if_needed(runtime)
+        if runtime.workspace_lease_status == "held" and runtime.workspace_snapshot_baseline is None:
+            await self._begin_workspace_snapshot(runtime)
         runtime.pause_reason = None
         runtime.status = "running"
         runtime.report_complete = False
@@ -466,10 +592,53 @@ class SubagentManager:
             "changed": True,
         }
 
+    async def handoff(self, *, agent: str) -> dict[str, Any]:
+        """Release a settled child's write lease without disposing its state."""
+
+        runtime = self._require_runtime(agent)
+        if runtime.status == "disposed":
+            raise ValueError(f"Subagent {agent} has already been disposed.")
+        if (
+            runtime.status in {"running", "awaiting_approval", "waiting_background"}
+            or runtime.pending_background_job_ids
+            or (runtime.task is not None and not runtime.task.done())
+        ):
+            raise ValueError("Cannot hand off a running subagent. Stop it first.")
+
+        await self._finalize_workspace_snapshot(runtime)
+        changed = runtime.workspace_lease_status == "held"
+        if changed and self._workspace_access is not None:
+            await self._workspace_access.release_owner(
+                owner=f"subagent:{runtime.subagent_id}"
+            )
+            runtime.workspace_lease_status = "released"
+            self._append_notable_event(
+                runtime,
+                kind="handoff",
+                summary="Released workspace ownership for main-agent integration.",
+            )
+            self._sync_catalog(runtime)
+        return {
+            "subagent_id": runtime.subagent_id,
+            "codename": runtime.codename,
+            "status": runtime.status,
+            "changed": changed,
+            "handoff_ready": True,
+            "workspace_lease_status": runtime.workspace_lease_status,
+            "changed_paths": sorted(runtime.changed_paths),
+            "changed_paths_complete": runtime.changed_paths_complete,
+            "changed_paths_source": runtime.changed_paths_source,
+            "changed_test_artifact_paths": sorted(
+                runtime.changed_test_artifact_paths
+            ),
+        }
+
     async def dispose(self, *, agent: str) -> dict[str, Any]:
         runtime = self._require_runtime(agent)
-        if runtime.status in {"running", "awaiting_approval", "waiting_background"} or (
-            runtime.task is not None and not runtime.task.done()
+        if (
+            runtime.status in {"running", "awaiting_approval", "waiting_background"}
+            or runtime.pending_background_job_ids
+            or (runtime.task is not None and not runtime.task.done())
         ):
             raise ValueError("Cannot dispose a running subagent. Stop it first.")
         return await self._dispose_runtime(runtime, public_notice=True)
@@ -552,6 +721,14 @@ class SubagentManager:
                 extras.append(f"last_tool={snapshot.last_tool_name}")
             if snapshot.last_activity_at is not None:
                 extras.append(f"last_activity_at={snapshot.last_activity_at}")
+            if snapshot.phase is not None:
+                extras.append(f"phase={snapshot.phase}")
+            if snapshot.workspace_lease_status != "not_applicable":
+                extras.append(f"workspace_lease={snapshot.workspace_lease_status}")
+            if snapshot.changed_paths_complete:
+                extras.append("changed_paths_complete=true")
+            if snapshot.changed_paths_source != "tool_result_metadata":
+                extras.append(f"changed_paths_source={snapshot.changed_paths_source}")
             extras.append(f"report_complete={str(snapshot.report_complete).lower()}")
             if snapshot.last_error is not None:
                 extras.append(f"last_error={snapshot.last_error}")
@@ -626,6 +803,14 @@ class SubagentManager:
                 "changed_test_artifacts="
                 + ",".join(snapshot.changed_test_artifact_paths)
             )
+        if snapshot.changed_paths:
+            parts.append("changed_paths=" + ",".join(snapshot.changed_paths))
+        if snapshot.changed_paths_source != "tool_result_metadata":
+            parts.append(f"changed_paths_evidence={snapshot.changed_paths_source}")
+        if snapshot.phase is not None:
+            parts.append(f"phase={snapshot.phase}")
+        if snapshot.workspace_lease_status != "not_applicable":
+            parts.append(f"workspace_lease={snapshot.workspace_lease_status}")
         if notice_text.strip():
             parts.append(f'note="{self._truncate_for_notice(notice_text, max_length=140)}"')
         latest_report = snapshot.latest_report
@@ -637,6 +822,7 @@ class SubagentManager:
                 latest_report=rendered_report,
                 report_complete=snapshot.report_complete,
                 report_truncated=report_truncated,
+                changed_paths=snapshot.changed_paths,
                 changed_test_artifact_paths=snapshot.changed_test_artifact_paths,
             )
         )
@@ -654,6 +840,12 @@ class SubagentManager:
                     "latest_subagent_report_included": bool(latest_report),
                     "latest_subagent_report_complete": snapshot.report_complete,
                     "latest_subagent_report_truncated": report_truncated,
+                    "phase": snapshot.phase,
+                    "depends_on": list(snapshot.depends_on),
+                    "workspace_lease_status": snapshot.workspace_lease_status,
+                    "changed_paths": list(snapshot.changed_paths),
+                    "changed_paths_complete": snapshot.changed_paths_complete,
+                    "changed_paths_source": snapshot.changed_paths_source,
                     "changed_test_artifact_paths": list(
                         snapshot.changed_test_artifact_paths
                     ),
@@ -675,6 +867,7 @@ class SubagentManager:
         latest_report: str | None,
         report_complete: bool,
         report_truncated: bool,
+        changed_paths: tuple[str, ...],
         changed_test_artifact_paths: tuple[str, ...],
     ) -> list[str]:
         lines = [
@@ -686,6 +879,8 @@ class SubagentManager:
             lines.append(
                 "Subagent changed test artifacts: " + ",".join(changed_test_artifact_paths)
             )
+        if changed_paths:
+            lines.append("Subagent changed paths: " + ",".join(changed_paths))
         if recommendation in {"finalize", "inspect"} and latest_report is not None:
             report_heading = (
                 "Complete subagent report:"
@@ -700,8 +895,8 @@ class SubagentManager:
             )
             if report_complete and not report_truncated:
                 lines.append(
-                    "The complete report is included above. Use it directly unless verification "
-                    "or contradictory evidence requires inspection."
+                    "The report is self-reported completion, not semantic acceptance. Review the "
+                    "changed paths and seam before integrating this child."
                 )
             else:
                 lines.append(
@@ -757,6 +952,25 @@ class SubagentManager:
         ]
         if snapshot.current_subagent_session_id is not None:
             lines.append(f"- current_subagent_session_id: {snapshot.current_subagent_session_id}")
+        if snapshot.phase is not None:
+            lines.append(f"- phase: {snapshot.phase}")
+        if snapshot.depends_on:
+            lines.append(f"- depends_on: {', '.join(snapshot.depends_on)}")
+        if snapshot.seam_contract is not None:
+            lines.extend(["- seam_contract:", snapshot.seam_contract])
+        if snapshot.workspace_lease_status != "not_applicable":
+            lines.append(f"- workspace_lease_status: {snapshot.workspace_lease_status}")
+        if snapshot.changed_paths:
+            lines.append(f"- changed_paths: {', '.join(snapshot.changed_paths)}")
+        lines.append(
+            f"- changed_paths_complete: {str(snapshot.changed_paths_complete).lower()}"
+        )
+        lines.append(f"- changed_paths_source: {snapshot.changed_paths_source}")
+        if snapshot.changed_test_artifact_paths:
+            lines.append(
+                "- changed_test_artifact_paths: "
+                + ", ".join(snapshot.changed_test_artifact_paths)
+            )
         if snapshot.pause_reason is not None:
             lines.append(f"- pause_reason: {snapshot.pause_reason}")
         if snapshot.last_error is not None:
@@ -948,6 +1162,8 @@ class SubagentManager:
                             kind="paused",
                             summary=f"Paused ({runtime.pause_reason}).",
                         )
+                        if not runtime.pending_background_job_ids:
+                            await self._finalize_workspace_snapshot(runtime)
                         await self._publish_lifecycle_notice(
                             runtime,
                             notice_kind="subagent_paused",
@@ -971,6 +1187,8 @@ class SubagentManager:
                                 f"{block_reason}."
                             ),
                         )
+                        if not runtime.pending_background_job_ids:
+                            await self._finalize_workspace_snapshot(runtime)
                         await self._publish_lifecycle_notice(
                             runtime,
                             notice_kind="subagent_needs_attention",
@@ -986,6 +1204,8 @@ class SubagentManager:
                             kind="approval_rejected",
                             summary="Approval was rejected and the subagent paused.",
                         )
+                        if not runtime.pending_background_job_ids:
+                            await self._finalize_workspace_snapshot(runtime)
                         await self._publish_lifecycle_notice(
                             runtime,
                             notice_kind="subagent_approval_rejected",
@@ -1023,6 +1243,7 @@ class SubagentManager:
                                 kind="completed",
                                 summary="Completed the assigned turn.",
                             )
+                            await self._finalize_workspace_snapshot(runtime)
                             await self._publish_lifecycle_notice(
                                 runtime,
                                 notice_kind="subagent_completed",
@@ -1101,6 +1322,8 @@ class SubagentManager:
                 kind="failed",
                 summary=runtime.last_error,
             )
+            if not runtime.pending_background_job_ids:
+                await self._finalize_workspace_snapshot(runtime)
             self._sync_catalog(runtime)
             LOGGER.exception(
                 "Subagent %s (%s) failed.",
@@ -1231,6 +1454,13 @@ class SubagentManager:
         if runtime is None:
             return
         runtime.last_tool_name = result.name
+        changed_paths = changed_workspace_paths_from_result(result)
+        if changed_paths and runtime.workspace_snapshot_baseline is None:
+            runtime.changed_paths.update(changed_paths)
+            if len(runtime.changed_paths) > _MAX_TRACKED_CHANGED_PATHS:
+                runtime.changed_paths = set(
+                    sorted(runtime.changed_paths)[-_MAX_TRACKED_CHANGED_PATHS:]
+                )
         changed_test_paths = changed_test_artifact_paths_from_result(result)
         if changed_test_paths:
             runtime.changed_test_artifact_paths.update(changed_test_paths)
@@ -1504,11 +1734,11 @@ class SubagentManager:
         if notice_kind in {"subagent_approval_rejected", "subagent_paused"}:
             return "inspect"
         if notice_kind == "subagent_completed":
-            return "finalize" if snapshot.report_complete and snapshot.latest_report else "inspect"
+            return "inspect"
         if snapshot.status in {"paused", "failed"}:
             return "inspect"
         if snapshot.status == "completed":
-            return "finalize" if snapshot.report_complete and snapshot.latest_report else "inspect"
+            return "inspect"
         if snapshot.status == "disposed":
             return "finalize"
         if snapshot.status in {"running", "waiting_background", "awaiting_approval"}:
@@ -1636,6 +1866,7 @@ class SubagentManager:
                 "status": runtime.status,
                 "changed": False,
             }
+        await self._finalize_workspace_snapshot(runtime)
         runtime.status = "disposed"
         runtime.pause_reason = None
         runtime.pending_pause_reason = None
@@ -1652,10 +1883,11 @@ class SubagentManager:
                     active_session_id,
                 )
         await runtime.loop.aclose()
-        if self._workspace_access is not None:
+        if self._workspace_access is not None and runtime.workspace_lease_status == "held":
             await self._workspace_access.release_owner(
                 owner=f"subagent:{runtime.subagent_id}"
             )
+            runtime.workspace_lease_status = "released"
         self._sync_catalog(runtime, disposed_at=disposed_at)
         self._pending_bash_job_notices.pop(runtime.subagent_id, None)
         self._append_notable_event(runtime, kind="disposed", summary=f"Disposed {runtime.codename}.")
@@ -1680,7 +1912,44 @@ class SubagentManager:
             "codename": runtime.codename,
             "status": runtime.status,
             "changed": True,
+            "changed_paths": sorted(runtime.changed_paths),
+            "changed_paths_complete": runtime.changed_paths_complete,
+            "changed_paths_source": runtime.changed_paths_source,
+            "changed_test_artifact_paths": sorted(
+                runtime.changed_test_artifact_paths
+            ),
         }
+
+    async def _reacquire_workspace_lease_if_needed(
+        self,
+        runtime: SubagentRuntime,
+    ) -> None:
+        if runtime.workspace_lease_status != "released":
+            return
+        if self._workspace_access is None:
+            runtime.workspace_lease_status = "not_applicable"
+            return
+        await self._workspace_access.claim_paths(
+            owner=f"subagent:{runtime.subagent_id}",
+            paths=runtime.owned_paths,
+        )
+        runtime.workspace_lease_status = "held"
+        await self._begin_workspace_snapshot(runtime)
+        session_id = runtime.loop.active_session_id()
+        if session_id is not None:
+            runtime.loop.append_system_note(
+                (
+                    "Workspace ownership was reacquired for this continuation. You may write "
+                    "your assigned paths; writes to another actor's paths remain blocked."
+                ),
+                session_id=session_id,
+                metadata={
+                    "workspace_lease": True,
+                    "workspace_lease_reacquired": True,
+                    "owned_paths": list(runtime.owned_paths),
+                },
+            )
+        self._sync_catalog(runtime)
 
     def _append_notable_event(self, runtime: SubagentRuntime, *, kind: str, summary: str) -> None:
         runtime.updated_at = _utc_now_iso()
@@ -1814,9 +2083,16 @@ class SubagentManager:
             last_error_metadata=runtime.last_error_metadata,
             error_log_path=runtime.error_log_path,
             run_generation=runtime.run_generation,
+            phase=runtime.phase,
+            depends_on=runtime.depends_on,
+            seam_contract=runtime.seam_contract,
+            changed_paths=tuple(sorted(runtime.changed_paths)),
+            changed_paths_complete=runtime.changed_paths_complete,
+            changed_paths_source=runtime.changed_paths_source,
             changed_test_artifact_paths=tuple(
                 sorted(runtime.changed_test_artifact_paths)
             ),
+            workspace_lease_status=runtime.workspace_lease_status,
             disposed_at=disposed_at,
         )
 
@@ -1843,6 +2119,12 @@ class SubagentManager:
             "pending_background_job_ids": list(snapshot.pending_background_job_ids),
             "run_generation": snapshot.run_generation,
             "skill_selection_reason": snapshot.skill_selection_reason,
+            "phase": snapshot.phase,
+            "depends_on": list(snapshot.depends_on),
+            "workspace_lease_status": snapshot.workspace_lease_status,
+            "changed_paths": list(snapshot.changed_paths),
+            "changed_paths_complete": snapshot.changed_paths_complete,
+            "changed_paths_source": snapshot.changed_paths_source,
             "changed_test_artifact_paths": list(
                 snapshot.changed_test_artifact_paths
             ),
@@ -1856,6 +2138,13 @@ class SubagentManager:
                     "owned_paths": list(snapshot.owned_paths),
                     "skill_ids": list(snapshot.skill_ids),
                     "skill_selection_reason": snapshot.skill_selection_reason,
+                    "phase": snapshot.phase,
+                    "depends_on": list(snapshot.depends_on),
+                    "seam_contract": snapshot.seam_contract,
+                    "workspace_lease_status": snapshot.workspace_lease_status,
+                    "changed_paths": list(snapshot.changed_paths),
+                    "changed_paths_complete": snapshot.changed_paths_complete,
+                    "changed_paths_source": snapshot.changed_paths_source,
                     "deliverable": snapshot.deliverable,
                     "latest_report": snapshot.latest_report,
                     "transcript_path": self._transcript_path(runtime),
@@ -1971,6 +2260,13 @@ def _normalize_unique_strings(values: tuple[str, ...]) -> tuple[str, ...]:
         seen.add(item)
         normalized.append(item)
     return tuple(normalized)
+
+
+def _normalize_optional_string(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 def _exception_metadata(exc: Exception) -> dict[str, Any]:

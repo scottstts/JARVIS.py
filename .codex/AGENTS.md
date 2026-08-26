@@ -119,6 +119,7 @@ The project is strict container-first:
 - `src/jarvis/settings.yml` should not be abused. only include actual settings that user will use. This file is user facing, so do NOT mindlessly include whatever configuable valiables in it. the non user facing configuable variables should be in respective module's (or even at a more granular level) configs.py file
 - agent system runtime settings live in `src/jarvis/settings.py`, and only secrets (api keys, bot tokens, etc.) need to be in `secrets/`
 - After testing, **clean up** any testing artifacts inside the ~/.jarvis/workspace/ dir. The artifacts i refer to are the folders inside workspace/ like this: `~/.jarvis/workspace/jarvis-test-_gmb1oo6/`
+- No need for backward compatibility or legacy migration when implementing new features unless explicitly told otherwise
 
 **Important:** A design related rule but i put it here because it's very important and applies globally: Jarvis should maximumly aim for cache hit when using LLM providers, so no transient messages, all messages need to be persisted in transcript for later context build to ensure cache hit. one exception is images, the raw image data bytes will not persist in transcript for storage reason. This does not mean transcript is exactly the same as what is sent out to providers. Provider-specific quirks are isolated in provider clients, the agent loop sees translated unified i/o. See `dev_docs/persistence_refector.md` for details of the persistence and cache hit design rules.
 

@@ -248,6 +248,7 @@ class GenerateEditImageToolExecutor:
             "requested_output_path": raw_output_path,
             "output_path": str(output_path),
             "output_dir": str(output_path.parent),
+            "workspace_changed_paths": [str(output_path)],
             "mime_type": generated.mime_type,
             "file_size_bytes": len(generated.image_bytes),
         }

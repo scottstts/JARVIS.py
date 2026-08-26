@@ -178,7 +178,7 @@ Important boundaries:
 - the environment is scrubbed
 - agent-facing Python resolves through `/opt/venv`
 
-Files written outside `/workspace` stay local to the long-lived `tool_runtime` container and are not durable Jarvis artifacts. Bash filesystem ownership is enforced in a per-execution mount namespace supplied by the route coordinator, independently of shell parsing: main actors see active child-owned paths read-only, and subagents see the workspace read-only except for their existing owned roots. Runtime-owned job directories are separately writable for supervised process bookkeeping.
+Files written outside `/workspace` stay local to the long-lived `tool_runtime` container and are not durable Jarvis artifacts. Bash filesystem ownership is enforced in a per-execution mount namespace supplied by the route coordinator, independently of shell parsing: main actors see active child-owned paths read-only, and subagents see the workspace read-only except for their existing owned roots. Runtime-owned job directories are separately writable for supervised process bookkeeping. Actor-isolated commands receive writable `HOME`, `TMPDIR`, `XDG_CACHE_HOME`, and `JARVIS_SCRATCH_DIR` locations for caches, generated configuration, and temporary output; use those locations instead of repo-managed paths.
 
 The app and isolated service share a versioned compatibility contract from `src/jarvis/tool_runtime_protocol.py`. `/health` declares the protocol version and supported tool capabilities; app startup fails with an actionable rebuild/restart error when the service is stale or missing a required mode. Remote status returned by `tool_runtime` is authoritative because app and tool containers do not share a PID namespace. Routine internal `httpx` request INFO records are context-locally suppressed, while warnings and failures remain logged.
 
@@ -239,7 +239,7 @@ Use `file_write(path, content)` for a whole-file create or rewrite, and `file_re
 
 ### Acceptance Notes
 
-Subagent acceptance is passive. Assignment bootstrap includes Acceptance Notes that restate the delegated work, constraints, and deliverable, remind the child to self-check where useful, and require transparent reporting of anything unverified or blocked. There are no acceptance tools, ledgers, revision-bound completion checks, retry counters, or runtime handoff gate. A child may always return complete, partial, or blocked work; Jarvis owns the semantic completion decision.
+Subagent acceptance is passive. Assignment bootstrap includes Acceptance Notes that restate the delegated work, constraints, and deliverable, remind the child to self-check where useful, and require transparent reporting of anything unverified or blocked. There are no acceptance tools, ledgers, revision-bound completion checks, retry counters, or semantic runtime handoff gate. A child may always return complete, partial, or blocked work; Jarvis owns the semantic completion decision. A completed implementation child is surfaced for main-agent review before integration. For a child with an active workspace lease, runtime change evidence is produced by diffing content/type snapshots of the owned paths at lease-segment boundaries; `changed_paths_complete=true` identifies that exact net evidence, while tool-reported paths remain explicitly incomplete fallback evidence.
 
 ### `view_image`
 

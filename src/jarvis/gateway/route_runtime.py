@@ -207,6 +207,7 @@ class RouteRuntime:
         self._tool_registry = tool_registry or ToolRegistry.default(tool_settings)
         self._main_storage = SessionStorage(core_settings.transcript_archive_dir)
         self._selected_skills_by_main_turn: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._selected_skills_by_main_session: dict[str, tuple[str, ...]] = {}
         self._tool_execution_guard = asyncio.Semaphore(1)
         self._workspace_access = WorkspaceAccessCoordinator(
             workspace_dir=core_settings.workspace_dir
@@ -483,6 +484,8 @@ class RouteRuntime:
     def _request_new_session_hard_reset(self) -> None:
         self._cancel_orchestrator_wait(reset_backoff=True)
         self._new_session_boundary_pending = True
+        self._selected_skills_by_main_session.clear()
+        self._selected_skills_by_main_turn.clear()
         self._main_loop.request_hard_stop(reason="new_session")
         self._subagent_manager.request_hard_stop_all_for_new_session()
         self._invalidate_stale_internal_followups()
@@ -543,6 +546,10 @@ class RouteRuntime:
     ) -> None:
         self._cancel_orchestrator_wait(reset_backoff=True)
         self._bash_job_supervisor.ensure_running()
+        # Skill choices belong to the current user request. Keep them available for
+        # later orchestration turns within that request, but do not let them leak into
+        # a new request where they may no longer be relevant.
+        self._selected_skills_by_main_session.clear()
         command = parse_user_command(user_text)
         if command.kind == "new":
             self._request_new_session_hard_reset()
@@ -1455,6 +1462,10 @@ class RouteRuntime:
         self._selected_skills_by_main_turn[key] = tuple(
             dict.fromkeys((*prior, skill_id))
         )[:4]
+        session_prior = self._selected_skills_by_main_session.get(context.session_id, ())
+        self._selected_skills_by_main_session[context.session_id] = tuple(
+            dict.fromkeys((*session_prior, skill_id))
+        )[:4]
 
     async def _execute_subagent_primitive(
         self,
@@ -1467,6 +1478,7 @@ class RouteRuntime:
                 (
                     review_required,
                     changed_test_artifact_paths,
+                    changed_paths,
                 ) = self._consume_orchestrator_wait_notices(
                     session_id=context.session_id,
                 )
@@ -1487,6 +1499,7 @@ class RouteRuntime:
                             "changed_test_artifact_paths": list(
                                 changed_test_artifact_paths
                             ),
+                            "changed_paths": list(changed_paths),
                         },
                     )
                 payload = self._register_orchestrator_wait(
@@ -1518,6 +1531,7 @@ class RouteRuntime:
                 turn_id = context.turn_id
                 if session_id is None or turn_id is None:
                     raise ValueError("Subagent invocation requires a main session and turn id.")
+                has_explicit_skill_ids = "skill_ids" in tool_call.arguments
                 requested_skill_ids = _optional_string_tuple(
                     tool_call.arguments.get("skill_ids")
                 )
@@ -1525,9 +1539,32 @@ class RouteRuntime:
                     (session_id, turn_id),
                     (),
                 )
-                skill_ids = tuple(
-                    dict.fromkeys((*requested_skill_ids, *inherited_skill_ids))
-                )[:4]
+                if has_explicit_skill_ids and not requested_skill_ids:
+                    # An explicit empty list is a deliberate opt-out from the
+                    # same-turn convenience inheritance.
+                    skill_ids = ()
+                else:
+                    skill_ids = tuple(
+                        dict.fromkeys((*requested_skill_ids, *inherited_skill_ids))
+                    )[:4]
+                skill_selection_warning = None
+                if (
+                    not has_explicit_skill_ids
+                    and not requested_skill_ids
+                    and not inherited_skill_ids
+                    and context.session_id is not None
+                ):
+                    available_skill_ids = self._selected_skills_by_main_session.get(
+                        context.session_id,
+                        (),
+                    )
+                    if available_skill_ids:
+                        skill_selection_warning = (
+                            "No skills were attached to this child. Skills selected earlier "
+                            "in this user request are available for explicit reuse; pass "
+                            "the exact skill ids if this assignment needs them. Available ids: "
+                            + ", ".join(available_skill_ids)
+                        )
                 payload = await self._subagent_manager.invoke(
                     requester_kind=context.agent_kind,
                     task_label=task_label,
@@ -1542,14 +1579,34 @@ class RouteRuntime:
                         tool_call.arguments.get("owned_paths")
                     ),
                     skill_ids=skill_ids,
+                    phase=_optional_string(tool_call.arguments.get("phase")),
+                    depends_on=_optional_string_tuple(
+                        tool_call.arguments.get("depends_on")
+                    ),
+                    seam_contract=_optional_string(
+                        tool_call.arguments.get("seam_contract")
+                    ),
                     deliverable=_optional_string(tool_call.arguments.get("deliverable")),
                     owner_main_session_id=session_id,
                     owner_main_turn_id=turn_id,
                 )
+                if skill_selection_warning is not None:
+                    payload["skill_selection_warning"] = skill_selection_warning
                 return _tool_result_for_payload(
                     call_id=tool_call.call_id,
                     name=tool_call.name,
                     title="Subagent invoked",
+                    payload=payload,
+                )
+            if tool_call.name == "subagent_handoff":
+                agent = str(tool_call.arguments.get("agent", "")).strip()
+                if not agent:
+                    raise ValueError("'agent' is required.")
+                payload = await self._subagent_manager.handoff(agent=agent)
+                return _tool_result_for_payload(
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    title="Subagent handoff",
                     payload=payload,
                 )
             if tool_call.name == "subagent_monitor":
@@ -1709,7 +1766,7 @@ class RouteRuntime:
         self,
         *,
         session_id: str | None,
-    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
         """Persist routine notices and return only material items needing model review."""
 
         target_session_id = session_id or self._main_loop.active_session_id()
@@ -1717,10 +1774,12 @@ class RouteRuntime:
             return (
                 ("No active main session is available for persisted notice handling.",),
                 (),
+                (),
             )
 
         review_items: list[str] = []
         changed_test_artifact_paths: set[str] = set()
+        changed_paths: set[str] = set()
         bash_notices = tuple(self._pending_main_bash_notices.values())
         if bash_notices:
             bash_message = self._build_main_bash_job_followup_message(bash_notices)
@@ -1733,7 +1792,11 @@ class RouteRuntime:
                     session_id=target_session_id,
                     metadata=bash_message.metadata,
                 ):
-                    return (("Routine detached-job notices could not be persisted.",), ())
+                    return (
+                        ("Routine detached-job notices could not be persisted.",),
+                        (),
+                        (),
+                    )
             else:
                 review_items.append(bash_message.content)
             self._pending_main_bash_notices.clear()
@@ -1769,21 +1832,28 @@ class RouteRuntime:
                     changed_test_artifact_paths.update(
                         snapshot.changed_test_artifact_paths
                     )
+                    changed_paths.update(snapshot.changed_paths)
                     return (
                         (
                             *review_items,
                             f"Routine notice for subagent {subagent_id} could not be persisted.",
                         ),
                         tuple(sorted(changed_test_artifact_paths)),
+                        tuple(sorted(changed_paths)),
                     )
             else:
                 review_items.append(message.content)
                 changed_test_artifact_paths.update(
                     snapshot.changed_test_artifact_paths
                 )
+                changed_paths.update(snapshot.changed_paths)
             self._pending_main_subagent_notices.pop(subagent_id, None)
 
-        return tuple(review_items), tuple(sorted(changed_test_artifact_paths))
+        return (
+            tuple(review_items),
+            tuple(sorted(changed_test_artifact_paths)),
+            tuple(sorted(changed_paths)),
+        )
 
     async def _orchestrator_wait_deadline(
         self,
@@ -1902,7 +1972,7 @@ class RouteRuntime:
         lines.extend(
             [
                 "",
-                "When you resume, inspect current subagent status, then decide whether to resume it, step in, dispose it, or otherwise handle it so no paused child is left orphaned.",
+                "When you resume, inspect current subagent status, then decide whether to resume it, step in, hand it off, dispose it, or otherwise handle it so no paused child is left orphaned.",
             ]
         )
         self._main_loop.append_system_note(
@@ -2089,14 +2159,11 @@ class RouteRuntime:
         bash_reset = BashJobResetResult()
         subagent_reset: dict[str, Any] = {}
         try:
-            try:
-                subagent_reset = await self._subagent_manager.reset_for_new_session()
-            finally:
-                # The isolated runtime owns process state. Always reach its route-wide
-                # cancellation path even if child shutdown or disposal fails first.
-                bash_reset = (
-                    await self._bash_job_supervisor.terminate_route_jobs_for_new_session()
-                )
+            # Cancel detached jobs before disposing children. Their writes must be included
+            # in the child's final lease-segment snapshot and must not continue after the
+            # child's lease is released for the replacement session.
+            bash_reset = await self._bash_job_supervisor.terminate_route_jobs_for_new_session()
+            subagent_reset = await self._subagent_manager.reset_for_new_session()
             self._append_new_session_reset_note(
                 previous_session_id=previous_session_id,
                 bash_reset=bash_reset,
@@ -2361,6 +2428,7 @@ class RouteRuntime:
         pending_subagent_ids: list[str] = []
         recommendations: list[str] = []
         subagent_updates: list[dict[str, Any]] = []
+        changed_paths: set[str] = set()
         changed_test_artifact_paths: set[str] = set()
         for notice in notices:
             if notice.subagent_id is None:
@@ -2390,12 +2458,24 @@ class RouteRuntime:
                 "changed_test_artifact_paths": list(
                     message.metadata.get("changed_test_artifact_paths", [])
                 ),
+                "changed_paths": list(message.metadata.get("changed_paths", [])),
+                "changed_paths_complete": bool(
+                    message.metadata.get("changed_paths_complete", False)
+                ),
+                "changed_paths_source": str(
+                    message.metadata.get("changed_paths_source", "tool_result_metadata")
+                ),
             }
             if update["subagent_id"]:
                 subagent_updates.append(update)
             changed_test_artifact_paths.update(
                 str(path).strip()
                 for path in update["changed_test_artifact_paths"]
+                if str(path).strip()
+            )
+            changed_paths.update(
+                str(path).strip()
+                for path in update["changed_paths"]
                 if str(path).strip()
             )
         if len(lines) == 1:
@@ -2411,6 +2491,14 @@ class RouteRuntime:
                 "subagents": subagent_updates,
                 "changed_test_artifact_paths": sorted(
                     changed_test_artifact_paths
+                ),
+                "changed_paths": sorted(changed_paths),
+                "changed_paths_complete": bool(
+                    subagent_updates
+                    and all(
+                        bool(update["changed_paths_complete"])
+                        for update in subagent_updates
+                    )
                 ),
             },
             content="\n".join(lines),

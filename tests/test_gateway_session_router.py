@@ -395,13 +395,17 @@ class CompositeMainBootstrapLoaderTests(unittest.TestCase):
         self.assertIsNotNone(subagent_text)
         if subagent_text is None:
             self.fail("Expected subagent control bootstrap text.")
-        self.assertIn("Continue independent main-task work after invoking", subagent_text)
+        self.assertIn("Continue independent work after invoking", subagent_text)
         self.assertIn("stable `task_label`", subagent_text)
+        self.assertIn("minimal seam contract", subagent_text)
+        self.assertIn("Stage dependent work", subagent_text)
+        self.assertIn("subagent_handoff", subagent_text)
+        self.assertIn("changed paths", subagent_text)
         self.assertIn("not live prompt injection", subagent_text)
         self.assertIn("detail=\"full\"", subagent_text)
         self.assertNotIn("Arguments:", subagent_text)
         self.assertNotIn("Subagent runtime control reference:", subagent_text)
-        self.assertLess(len(subagent_text), 1_500)
+        self.assertLess(len(subagent_text), 2_000)
 
 
 class RouteRuntimeToolResultTests(unittest.TestCase):
@@ -418,6 +422,13 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
         self.assertIn("shared_context", schema["properties"])
         self.assertIn("owned_paths", schema["properties"])
         self.assertIn("skill_ids", schema["properties"])
+        self.assertIn("phase", schema["properties"])
+        self.assertIn("depends_on", schema["properties"])
+        self.assertIn("seam_contract", schema["properties"])
+        self.assertIn(
+            "subagent_handoff",
+            {definition.name for definition in build_subagent_primitive_definitions()},
+        )
 
     def test_subagent_tool_results_mark_control_metadata(self) -> None:
         result = _tool_result_for_payload(
@@ -479,6 +490,72 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(runtime._orchestrator_wait_task)
             runtime._cancel_orchestrator_wait(reset_backoff=True)
 
+    async def test_subagent_invoke_warns_when_prior_skill_is_not_repeated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            runtime._selected_skills_by_main_session[session_id] = ("testing",)
+            invoke = AsyncMock(
+                side_effect=lambda **_kwargs: {
+                    "subagent_id": "sub_1",
+                    "codename": "Ultron",
+                    "skill_ids": [],
+                    "skill_selection_reason": "none:not_selected_by_main",
+                },
+            )
+            with patch.object(runtime._subagent_manager, "invoke", invoke):
+                result = await runtime._execute_subagent_primitive(
+                    ToolCall(
+                        call_id="invoke",
+                        name="subagent_invoke",
+                        arguments={
+                            "task_label": "Implement tests",
+                            "instructions": "Implement the assigned test boundary.",
+                        },
+                        raw_arguments="",
+                    ),
+                    ToolExecutionContext(
+                        workspace_dir=runtime._core_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                        turn_id="turn_1",
+                    ),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIn("skill_selection_warning", result.metadata)
+            self.assertIn("testing", result.content)
+            invoke.assert_awaited_once()
+            self.assertEqual(invoke.await_args.kwargs["skill_ids"], ())
+
+            with patch.object(runtime._subagent_manager, "invoke", invoke):
+                explicit_opt_out = await runtime._execute_subagent_primitive(
+                    ToolCall(
+                        call_id="invoke-no-skills",
+                        name="subagent_invoke",
+                        arguments={
+                            "task_label": "Implement without a skill",
+                            "instructions": "Implement the assigned boundary without skill context.",
+                            "skill_ids": [],
+                        },
+                        raw_arguments="",
+                    ),
+                    ToolExecutionContext(
+                        workspace_dir=runtime._core_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                        turn_id="turn_1",
+                    ),
+                )
+
+            self.assertTrue(explicit_opt_out.ok)
+            self.assertNotIn("skill_selection_warning", explicit_opt_out.metadata)
+            self.assertEqual(invoke.await_args.kwargs["skill_ids"], ())
+
     async def test_wait_consumes_routine_notices_but_returns_material_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(
@@ -531,7 +608,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                     runtime._consume_orchestrator_wait_notices(
                         session_id=session_id
                     ),
-                    ((), ()),
+                    ((), (), ()),
                 )
 
             self.assertEqual(runtime._pending_main_subagent_notices, {})
@@ -576,7 +653,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 review,
-                ((review_message.content,), ("tests/vehicle.test.ts",)),
+                ((review_message.content,), ("tests/vehicle.test.ts",), ()),
             )
             self.assertEqual(runtime._pending_main_subagent_notices, {})
 
@@ -1044,6 +1121,10 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                     "cancelled_job_count": 0,
                 }
 
+            async def _reset_bash_jobs() -> BashJobResetResult:
+                observed.append("bash_reset")
+                return BashJobResetResult()
+
             async def _stream_user_input(user_text: str):
                 observed.append(("user", user_text))
                 yield AgentTurnDoneEvent(
@@ -1056,7 +1137,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(
                 runtime._bash_job_supervisor,
                 "terminate_route_jobs_for_new_session",
-                return_value=BashJobResetResult(),
+                side_effect=_reset_bash_jobs,
             ) as reset_bash_jobs:
                 with patch.object(
                     runtime._subagent_manager,
@@ -1077,7 +1158,7 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
 
             reset_bash_jobs.assert_awaited_once_with()
 
-            self.assertEqual(observed, ["reset", ("user", "/new")])
+            self.assertEqual(observed, ["bash_reset", "reset", ("user", "/new")])
 
             worker = runtime._message_worker
             if worker is not None:
@@ -1904,6 +1985,9 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
                         "subagent_id": "sub_1",
                         "status": "waiting_background",
                         "report_complete": False,
+                        "changed_paths": [],
+                        "changed_paths_complete": False,
+                        "changed_paths_source": "tool_result_metadata",
                         "changed_test_artifact_paths": [
                             "tests/vehicle.test.ts"
                         ],

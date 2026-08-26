@@ -611,6 +611,34 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertEqual(environment["PIP_REQUIRE_VIRTUALENV"], "1")
         self.assertEqual(environment["PATH"], "/opt/venv/bin:/usr/bin:/bin")
 
+    def test_actor_isolated_bash_environment_exposes_private_scratch_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            settings = ToolSettings.from_workspace_dir(workspace_dir)
+
+        environment = _build_scrubbed_environment(
+            settings,
+            context=ToolExecutionContext(
+                workspace_dir=workspace_dir,
+                route_id="route_1",
+                session_id="session_1",
+                agent_kind="subagent",
+                subagent_id="sub_1",
+                workspace_lease_generation=1,
+            ),
+        )
+
+        self.assertIn("/tmp/jarvis-actors/", environment["HOME"])
+        self.assertTrue(Path(environment["HOME"]).is_dir())
+        self.assertTrue(Path(environment["TMPDIR"]).is_dir())
+        self.assertEqual(environment["JARVIS_SCRATCH_DIR"], environment["TMPDIR"])
+        self.assertEqual(
+            environment["XDG_CACHE_HOME"],
+            str(Path(environment["HOME"]) / ".cache"),
+        )
+        self.assertTrue(Path(environment["XDG_CACHE_HOME"]).is_dir())
+
     def test_bash_description_explains_central_python_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace_dir = Path(tmp) / "workspace"
@@ -638,6 +666,8 @@ class ToolSettingsTests(unittest.TestCase):
         self.assertIn("destructive repository-state erasure", description)
         self.assertIn("approval_summary", description)
         self.assertIn("use bare `python`/`python3`", description)
+        self.assertIn("jarvis_scratch_dir", description)
+        self.assertIn("writable per-actor scratch space", description)
         self.assertIn("optional `cwd`", description)
         self.assertIn("for that call only", description)
 

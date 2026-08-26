@@ -1086,6 +1086,7 @@ def _build_scrubbed_environment(
         temp = str(actor_root / "tmp")
         Path(home).mkdir(exist_ok=True)
         Path(temp).mkdir(exist_ok=True)
+        Path(home, ".cache").mkdir(parents=True, exist_ok=True)
     return {
         "PATH": path_value,
         "HOME": home,
@@ -1093,6 +1094,7 @@ def _build_scrubbed_environment(
         "TMPDIR": temp,
         "TMP": temp,
         "TEMP": temp,
+        "JARVIS_SCRATCH_DIR": temp,
         "XDG_CACHE_HOME": f"{home}/.cache",
         "LANG": "C",
         "LC_ALL": "C",
@@ -1181,7 +1183,10 @@ def format_bash_tool_description(settings: ToolSettings) -> str:
         "operations, broad workspace deletion, and destructive repository-state erasure are "
         "restricted. Project-local installs, builds, pipelines, redirects, and cleanup are allowed. "
         "When an explicitly destructive operation is required, provide clear "
-        "`approval_summary`, `approval_details`, and optional `inspection_url` context."
+        "`approval_summary`, `approval_details`, and optional `inspection_url` context. "
+        "For actor-isolated commands, `HOME`, `TMPDIR`, `XDG_CACHE_HOME`, and "
+        "`JARVIS_SCRATCH_DIR` point to writable per-actor scratch space; use that space for "
+        "caches, generated configs, and temporary output instead of repo-managed paths."
     )
 
 

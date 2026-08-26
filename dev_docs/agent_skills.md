@@ -207,6 +207,7 @@ Current behavior:
 - `subagent_invoke.skill_ids` lets Jarvis explicitly select up to four exact top-level installed skill IDs; Jarvis validates those IDs and embeds each selected `SKILL.md` into the child assignment bootstrap
 - the harness never chooses or fuzzy-resolves a child skill from assignment prose, `SKILL.md`, resource paths, or file/directory names
 - skills that the main agent opened earlier in the current turn are inherited automatically by a newly invoked child, subject to the same four-skill cap; explicit `skill_ids` take precedence
+- same-turn inheritance is only a convenience. Jarvis should explicitly repeat the exact skill ids for later orchestration turns; an empty `skill_ids` list is a deliberate no-skill choice for that child
 
 Codex-backed subagents receive skill context through their Codex developer-instructions path.
 

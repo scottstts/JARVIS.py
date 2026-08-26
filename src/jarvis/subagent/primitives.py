@@ -9,6 +9,7 @@ SUBAGENT_PRIMITIVE_NAMES = (
     "subagent_monitor",
     "subagent_stop",
     "subagent_step_in",
+    "subagent_handoff",
     "subagent_dispose",
     "orchestrator_wait",
 )
@@ -19,12 +20,14 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
         ToolDefinition(
             name="subagent_invoke",
             description=(
-                "Start a background subagent for bounded side work that can run independently "
-                "while you supervise. Supply a stable task label and only the context the child "
-                "needs: explicit user constraints, shared interfaces/environment, owned paths, "
-                "and selected skill ids. Only Jarvis may select skills: name the exact top-level "
-                "installed skill id, never infer one from SKILL.md, references, or other paths. "
-                "Skills opened by Jarvis in this turn are inherited automatically."
+                "Start a background subagent for bounded side work while you supervise. Use it "
+                "for genuinely independent work; if the work depends on another child, launch it "
+                "after the prerequisite boundary is available and inspected. Supply a stable task "
+                "label, explicit constraints, shared interfaces/environment, owned paths, a small "
+                "seam contract, and selected skill ids. Only Jarvis may select skills: name the "
+                "exact top-level installed skill id, never infer one from SKILL.md, references, or "
+                "other paths. Skills opened by Jarvis in this turn are inherited automatically; "
+                "explicitly repeat skill ids for later turns."
             ),
             input_schema={
                 "type": "object",
@@ -49,6 +52,32 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                         "description": (
                             "Relevant environment facts, shared interfaces, dependencies, and "
                             "coordination boundaries."
+                        ),
+                    },
+                    "phase": {
+                        "type": "string",
+                        "maxLength": 80,
+                        "description": (
+                            "Optional coordination phase, such as foundation, feature, integration, "
+                            "or review. This is recorded for supervision and does not schedule work."
+                        ),
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 16,
+                        "uniqueItems": True,
+                        "description": (
+                            "Optional task labels, codenames, or subagent ids whose boundary this "
+                            "work depends on. Jarvis decides when the dependency is satisfied."
+                        ),
+                    },
+                    "seam_contract": {
+                        "type": "string",
+                        "description": (
+                            "Optional minimal boundary contract: what the child owns, consumes, "
+                            "provides, assumes about lifecycle, and how the boundary will be checked. "
+                            "Do not turn this into an implementation plan."
                         ),
                     },
                     "owned_paths": {
@@ -83,7 +112,10 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
         ToolDefinition(
             name="subagent_monitor",
             description=(
-                "Inspect subagent status without changing it."
+                "Inspect subagent status without changing it. A child report is self-reported "
+                "evidence, not semantic acceptance. Use full detail to review the assignment, "
+                "seam, changed paths, validation scope, and remaining assumptions before "
+                "integrating code-producing work."
             ),
             input_schema={
                 "type": "object",
@@ -125,6 +157,23 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
                     "instructions": {"type": "string"},
                 },
                 "required": ["agent", "instructions"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolDefinition(
+            name="subagent_handoff",
+            description=(
+                "Release a settled subagent's workspace write lease while preserving "
+                "its transcript, report, and monitoring state so Jarvis can inspect and integrate "
+                "the work. Stop the child first if it is still running. This does not decide whether "
+                "the work is correct and does not dispose the child."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                },
+                "required": ["agent"],
                 "additionalProperties": False,
             },
         ),
@@ -180,21 +229,25 @@ def render_subagent_primitive_docs() -> str:
         "Use subagents only for bounded side work; Jarvis remains responsible for the final answer.",
         f"- `{definitions['subagent_invoke'].name}`: start bounded background side work. "
         "Give it a stable `task_label`, explicit constraints, shared interfaces, owned paths, "
-        "exact top-level `skill_ids` you selected, and a concrete deliverable. Never infer a "
-        "skill from a referenced skill file or directory. Continue independent main-task work "
-        "after invoking; do not poll, and let orchestrator updates drive supervision.",
+        "a minimal seam contract, phase/dependencies when useful, exact top-level `skill_ids`, "
+        "and a concrete deliverable. Stage dependent work after its prerequisite boundary is "
+        "available; choose waves by dependency, not a fixed fan-out count. Never infer skills "
+        "from referenced files. Continue independent work after invoking; do not poll.",
         f"- `{definitions['subagent_monitor'].name}`: inspect on demand. Omit `agent` to summarize all active "
         "subagents; use `detail=\"full\"` only when you need current internals.",
         f"- `{definitions['subagent_stop'].name}`: cooperatively pause a running or approval-blocked child.",
         f"- `{definitions['subagent_step_in'].name}`: stop, settle, then start a new child turn with updated "
         "instructions; it is not live prompt injection.",
+        f"- `{definitions['subagent_handoff'].name}`: release a settled child's workspace lease while "
+        "retaining its report and transcript for main-agent review and integration.",
         f"- `{definitions['subagent_dispose'].name}`: dispose completed, failed, or no-longer-needed children "
         "to free their slots.",
         f"- `{definitions['orchestrator_wait'].name}`: when route-owned work is still running but "
         "you have no actionable work, choose a liveness deadline and park. Material events wake "
         "you immediately; never create sleep jobs to poll.",
         "Subagents cannot spawn subagents.",
-        "A paused, rejected, or failed child requires inspection and a Jarvis decision; only a "
-        "completed child with a complete report is ready to finalize.",
+        "Review every completed implementation child's changed paths, seam, validation, and "
+        "assumptions before integrating; a report is evidence, not acceptance. Inspect paused, "
+        "rejected, or failed children and decide whether to continue, revise, or stop.",
     ]
     return "\n".join(lines)

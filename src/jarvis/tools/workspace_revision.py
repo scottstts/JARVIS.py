@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from hashlib import sha256
+import os
 from pathlib import Path
-from typing import Any, Iterable
+import stat
+from typing import Any
 
 _IGNORED_REVISION_PARTS = frozenset(
     {
@@ -24,6 +27,13 @@ _IGNORED_REVISION_PARTS = frozenset(
         "node_modules",
     }
 )
+_RUNTIME_MANAGED_SNAPSHOT_ROOTS = frozenset({"archive", ".jarvis_internal"})
+
+WorkspaceSnapshot = dict[str, str]
+
+
+class WorkspaceSnapshotError(RuntimeError):
+    """Raised when a workspace snapshot cannot be captured consistently."""
 
 
 def workspace_revision(workspace_dir: Path) -> str:
@@ -120,6 +130,190 @@ def workspace_paths_revision(workspace_dir: Path, paths: Iterable[Path]) -> str:
                 relative=candidate_relative,
             )
     return fingerprint.hexdigest()
+
+
+def workspace_snapshot_paths(
+    workspace_dir: Path,
+    paths: Iterable[Path | str],
+) -> WorkspaceSnapshot:
+    """Capture file-state fingerprints for bounded workspace paths.
+
+    The snapshot is deliberately independent of Git. It records material path shape and
+    content, including untracked files, so a later snapshot can identify net changes in a
+    lease scope even when the workspace was already dirty before the actor started. Runtime-
+    managed ``archive`` and ``.jarvis_internal`` roots are excluded from the manifest.
+    """
+
+    root = workspace_dir.resolve(strict=False)
+    resolved_paths: set[Path] = set()
+    for raw_path in paths:
+        candidate = Path(raw_path)
+        if candidate.is_absolute() and (
+            candidate == Path("/workspace")
+            or candidate.is_relative_to(Path("/workspace"))
+        ):
+            candidate = root / candidate.relative_to(Path("/workspace"))
+        elif not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise WorkspaceSnapshotError(
+                f"Could not resolve workspace snapshot path {candidate}: {exc}"
+            ) from exc
+        if resolved != root and not resolved.is_relative_to(root):
+            raise WorkspaceSnapshotError(
+                f"Workspace snapshot path escapes the workspace: {resolved}"
+            )
+        resolved_paths.add(resolved)
+
+    snapshot: WorkspaceSnapshot = {}
+    for path in sorted(resolved_paths):
+        relative = path.relative_to(root)
+        _capture_snapshot_entry(
+            path=path,
+            relative=relative,
+            snapshot=snapshot,
+        )
+    return snapshot
+
+
+def diff_workspace_snapshots(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Return sorted workspace-relative paths whose snapshot state changed."""
+
+    paths = set(before) | set(after)
+    return tuple(sorted(path for path in paths if before.get(path) != after.get(path)))
+
+
+def _capture_snapshot_entry(
+    *,
+    path: Path,
+    relative: Path,
+    snapshot: WorkspaceSnapshot,
+) -> None:
+    if _snapshot_path_is_ignored(relative):
+        return
+    key = str(relative)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        snapshot[key] = "missing"
+        return
+    except OSError as exc:
+        raise WorkspaceSnapshotError(
+            f"Could not inspect workspace snapshot path {path}: {exc}"
+        ) from exc
+
+    mode = info.st_mode
+    if stat.S_ISLNK(mode):
+        try:
+            target = os.readlink(path)
+            after = path.lstat()
+        except OSError as exc:
+            raise WorkspaceSnapshotError(
+                f"Could not read workspace snapshot symlink {path}: {exc}"
+            ) from exc
+        if _snapshot_entry_identity(info) != _snapshot_entry_identity(after):
+            raise WorkspaceSnapshotError(
+                f"Workspace snapshot symlink changed while being read: {path}"
+            )
+        snapshot[key] = f"symlink:{target}"
+        return
+    if stat.S_ISDIR(mode):
+        snapshot[key] = f"directory:{stat.S_IMODE(mode):o}"
+        try:
+            children = sorted(path.iterdir(), key=lambda child: child.name)
+        except OSError as exc:
+            raise WorkspaceSnapshotError(
+                f"Could not enumerate workspace snapshot directory {path}: {exc}"
+            ) from exc
+        for child in children:
+            _capture_snapshot_entry(
+                path=child,
+                relative=relative / child.name,
+                snapshot=snapshot,
+            )
+        try:
+            after = path.lstat()
+            children_after = sorted(path.iterdir(), key=lambda child: child.name)
+        except FileNotFoundError as exc:
+            raise WorkspaceSnapshotError(
+                f"Workspace snapshot directory disappeared while being read: {path}"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceSnapshotError(
+                f"Could not re-check workspace snapshot directory {path}: {exc}"
+            ) from exc
+        visible_children = tuple(
+            child.name
+            for child in children
+            if not _snapshot_path_is_ignored(relative / child.name)
+        )
+        visible_children_after = tuple(
+            child.name
+            for child in children_after
+            if not _snapshot_path_is_ignored(relative / child.name)
+        )
+        if (
+            _snapshot_directory_identity(info) != _snapshot_directory_identity(after)
+            or visible_children != visible_children_after
+        ):
+            raise WorkspaceSnapshotError(
+                f"Workspace snapshot directory changed while being read: {path}"
+            )
+        return
+    if stat.S_ISREG(mode):
+        snapshot[key] = _fingerprint_snapshot_file(path, info)
+        return
+    snapshot[key] = (
+        f"special:{stat.S_IFMT(mode):o}:{stat.S_IMODE(mode):o}:{info.st_size}"
+    )
+
+
+def _fingerprint_snapshot_file(path: Path, before: os.stat_result) -> str:
+    digest = sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        after = path.lstat()
+    except FileNotFoundError as exc:
+        raise WorkspaceSnapshotError(
+            f"Workspace snapshot file disappeared while being read: {path}"
+        ) from exc
+    except OSError as exc:
+        raise WorkspaceSnapshotError(
+            f"Could not read workspace snapshot file {path}: {exc}"
+        ) from exc
+
+    if _snapshot_entry_identity(before) != _snapshot_entry_identity(after):
+        raise WorkspaceSnapshotError(
+            f"Workspace snapshot file changed while being read: {path}"
+        )
+    return f"file:{stat.S_IMODE(before.st_mode):o}:{digest.hexdigest()}"
+
+
+def _snapshot_entry_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_mode,
+    )
+
+
+def _snapshot_directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode)
+
+
+def _snapshot_path_is_ignored(relative: Path) -> bool:
+    """Ignore only runtime-owned roots; all other owned content is material evidence."""
+
+    return bool(relative.parts) and relative.parts[0] in _RUNTIME_MANAGED_SNAPSHOT_ROOTS
 
 
 def _update_path_fingerprint(fingerprint: Any, *, path: Path, relative: Path) -> None:

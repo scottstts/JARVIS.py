@@ -23,7 +23,12 @@ from jarvis.tools import (
 )
 from jarvis.tools.basic.bash.local_executor import DirectBashToolExecutor
 from jarvis.tools.basic.bash.tool import BashToolExecutor
-from jarvis.tools.workspace_revision import workspace_revision
+from jarvis.tools.workspace_revision import (
+    WorkspaceSnapshotError,
+    diff_workspace_snapshots,
+    workspace_revision,
+    workspace_snapshot_paths,
+)
 
 
 def _tool_call(name: str, arguments: dict[str, object], *, call_id: str = "call_1") -> ToolCall:
@@ -149,6 +154,61 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
             artifact.parent.mkdir()
             artifact.write_text("result\n")
             self.assertNotEqual(workspace_revision(workspace_dir), initial)
+
+    async def test_workspace_snapshot_diff_tracks_net_file_state_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            source_dir = workspace_dir / "src"
+            source_dir.mkdir(parents=True)
+            (source_dir / "modified.txt").write_text("before", encoding="utf-8")
+            (source_dir / "deleted.txt").write_text("delete me", encoding="utf-8")
+            (source_dir / "unchanged.txt").write_text("same", encoding="utf-8")
+
+            before = workspace_snapshot_paths(workspace_dir, ("src",))
+            (source_dir / "modified.txt").write_text("after", encoding="utf-8")
+            (source_dir / "deleted.txt").unlink()
+            (source_dir / "created.txt").write_text("new", encoding="utf-8")
+            after = workspace_snapshot_paths(workspace_dir, ("src",))
+
+            self.assertEqual(
+                diff_workspace_snapshots(before, after),
+                (
+                    "src/created.txt",
+                    "src/deleted.txt",
+                    "src/modified.txt",
+                ),
+            )
+
+    async def test_workspace_snapshot_diff_ignores_runtime_state_and_rejects_escape(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            (workspace_dir / "src").mkdir()
+            (workspace_dir / "node_modules").mkdir()
+            before = workspace_snapshot_paths(workspace_dir, (workspace_dir,))
+            (workspace_dir / "archive").mkdir()
+            (workspace_dir / "archive" / "runtime.json").write_text(
+                "runtime",
+                encoding="utf-8",
+            )
+            (workspace_dir / "node_modules" / "result.txt").write_text(
+                "module result",
+                encoding="utf-8",
+            )
+            (workspace_dir / "src" / "result.txt").write_text(
+                "result",
+                encoding="utf-8",
+            )
+            after = workspace_snapshot_paths(workspace_dir, (workspace_dir,))
+
+            self.assertEqual(
+                diff_workspace_snapshots(before, after),
+                ("node_modules/result.txt", "src/result.txt"),
+            )
+            with self.assertRaises(WorkspaceSnapshotError):
+                workspace_snapshot_paths(workspace_dir, ("../outside",))
 
     async def test_workspace_leases_enforce_actor_filesystem_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from jarvis.llm import ToolCall
@@ -175,6 +176,7 @@ class ToolActivityTracker:
                 "pending_ids": metadata.get("pending_subagent_ids", []),
                 "recommended_action": metadata.get("recommended_action"),
                 "report_complete": metadata.get("latest_subagent_report_complete"),
+                "changed_paths": metadata.get("changed_paths", []),
                 "changed_test_artifact_paths": metadata.get("changed_test_artifact_paths", []),
                 "subagents": metadata.get("subagents", []),
                 "content": content,
@@ -413,6 +415,7 @@ def _result_is_material_progress(result: ToolExecutionResult) -> bool:
         "subagent_invoke",
         "subagent_step_in",
         "subagent_stop",
+        "subagent_handoff",
         "subagent_dispose",
     }
 
@@ -430,24 +433,46 @@ def _path_is_test_artifact(path: str) -> bool:
     )
 
 
-def changed_test_artifact_paths_from_result(result: ToolExecutionResult) -> tuple[str, ...]:
-    """Return normalized test artifacts observed as changed by a tool result."""
+def changed_workspace_paths_from_result(result: ToolExecutionResult) -> tuple[str, ...]:
+    """Return normalized workspace paths observed as changed by a tool result."""
 
-    candidates = {
-        str(result.metadata.get("path", "")).strip(),
-        *(
+    candidates: set[str] = set()
+    if bool(result.metadata.get("changed") or result.metadata.get("workspace_changed")):
+        path = str(result.metadata.get("path", "")).strip()
+        if path:
+            candidates.add(path)
+    raw_changed_paths = result.metadata.get("workspace_changed_paths", [])
+    if isinstance(raw_changed_paths, (list, tuple, set)):
+        candidates.update(
             str(path).strip()
-            for path in result.metadata.get("workspace_changed_paths", [])
+            for path in raw_changed_paths
             if str(path).strip()
-        ),
-    }
+        )
     return tuple(
         sorted(
             path.removeprefix("/workspace/")
             for path in candidates
-            if path and _path_is_test_artifact(path)
+            if path
         )
     )
+
+
+def test_artifact_paths_from_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    """Return normalized test-artifact paths from an already-normalized path set."""
+
+    return tuple(
+        sorted(
+            path
+            for raw_path in paths
+            if (path := str(raw_path).strip()) and _path_is_test_artifact(path)
+        )
+    )
+
+
+def changed_test_artifact_paths_from_result(result: ToolExecutionResult) -> tuple[str, ...]:
+    """Return normalized test artifacts observed as changed by a tool result."""
+
+    return test_artifact_paths_from_paths(changed_workspace_paths_from_result(result))
 
 
 def _bounded_count_map(value: object, *, limit: int = 64) -> dict[str, int]:

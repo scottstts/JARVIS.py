@@ -22,6 +22,7 @@ SubagentPauseReason = Literal[
     "provider_recovery_exhausted",
     "external_blocked",
 ]
+WorkspaceLeaseStatus = Literal["not_applicable", "held", "released"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -63,7 +64,14 @@ class SubagentCatalogEntry:
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
     skill_selection_reason: str = "none:not_selected_by_main"
+    phase: str | None = None
+    depends_on: tuple[str, ...] = field(default_factory=tuple)
+    seam_contract: str | None = None
+    changed_paths: tuple[str, ...] = field(default_factory=tuple)
+    changed_paths_complete: bool = False
+    changed_paths_source: str = "tool_result_metadata"
     changed_test_artifact_paths: tuple[str, ...] = field(default_factory=tuple)
+    workspace_lease_status: WorkspaceLeaseStatus = "not_applicable"
     deliverable: str | None = None
     current_subagent_session_id: str | None = None
     disposed_at: str | None = None
@@ -90,7 +98,14 @@ class SubagentCatalogEntry:
             "owned_paths": list(self.owned_paths),
             "skill_ids": list(self.skill_ids),
             "skill_selection_reason": self.skill_selection_reason,
+            "phase": self.phase,
+            "depends_on": list(self.depends_on),
+            "seam_contract": self.seam_contract,
+            "changed_paths": list(self.changed_paths),
+            "changed_paths_complete": self.changed_paths_complete,
+            "changed_paths_source": self.changed_paths_source,
             "changed_test_artifact_paths": list(self.changed_test_artifact_paths),
+            "workspace_lease_status": self.workspace_lease_status,
             "deliverable": self.deliverable,
             "current_subagent_session_id": self.current_subagent_session_id,
             "disposed_at": self.disposed_at,
@@ -128,6 +143,35 @@ class SubagentCatalogEntry:
         raw_changed_test_paths = payload.get("changed_test_artifact_paths", ())
         if not isinstance(raw_changed_test_paths, (list, tuple)):
             raw_changed_test_paths = ()
+        raw_changed_paths = payload.get("changed_paths", ())
+        if not isinstance(raw_changed_paths, (list, tuple)):
+            raw_changed_paths = ()
+        raw_changed_paths_complete = payload.get("changed_paths_complete", False)
+        changed_paths_complete = (
+            raw_changed_paths_complete
+            if isinstance(raw_changed_paths_complete, bool)
+            else False
+        )
+        raw_changed_paths_source = payload.get(
+            "changed_paths_source",
+            "tool_result_metadata",
+        )
+        changed_paths_source = (
+            raw_changed_paths_source.strip()
+            if isinstance(raw_changed_paths_source, str)
+            and raw_changed_paths_source.strip()
+            else "tool_result_metadata"
+        )
+        raw_depends_on = payload.get("depends_on", ())
+        if not isinstance(raw_depends_on, (list, tuple)):
+            raw_depends_on = ()
+        raw_lease_status = payload.get("workspace_lease_status", "not_applicable")
+        lease_status = (
+            raw_lease_status
+            if isinstance(raw_lease_status, str)
+            and raw_lease_status in {"not_applicable", "held", "released"}
+            else "not_applicable"
+        )
         return cls(
             subagent_id=str(payload.get("subagent_id", "")),
             codename=str(payload.get("codename", "")),
@@ -157,11 +201,36 @@ class SubagentCatalogEntry:
                     "none:not_selected_by_main",
                 )
             ),
+            phase=(
+                str(payload["phase"]).strip()
+                if isinstance(payload.get("phase"), str)
+                and payload["phase"].strip()
+                else None
+            ),
+            depends_on=tuple(
+                str(item).strip()
+                for item in raw_depends_on
+                if str(item).strip()
+            ),
+            seam_contract=(
+                str(payload["seam_contract"]).strip()
+                if isinstance(payload.get("seam_contract"), str)
+                and payload["seam_contract"].strip()
+                else None
+            ),
+            changed_paths=tuple(
+                str(item).strip()
+                for item in raw_changed_paths
+                if str(item).strip()
+            ),
+            changed_paths_complete=changed_paths_complete,
+            changed_paths_source=changed_paths_source,
             changed_test_artifact_paths=tuple(
                 str(item)
                 for item in raw_changed_test_paths
                 if str(item).strip()
             ),
+            workspace_lease_status=lease_status,  # type: ignore[arg-type]
             deliverable=(
                 str(payload["deliverable"])
                 if payload.get("deliverable") is not None
@@ -211,7 +280,14 @@ class SubagentSnapshot:
     owned_paths: tuple[str, ...] = field(default_factory=tuple)
     skill_ids: tuple[str, ...] = field(default_factory=tuple)
     skill_selection_reason: str = "none:not_selected_by_main"
+    phase: str | None = None
+    depends_on: tuple[str, ...] = field(default_factory=tuple)
+    seam_contract: str | None = None
+    changed_paths: tuple[str, ...] = field(default_factory=tuple)
+    changed_paths_complete: bool = False
+    changed_paths_source: str = "tool_result_metadata"
     changed_test_artifact_paths: tuple[str, ...] = field(default_factory=tuple)
+    workspace_lease_status: WorkspaceLeaseStatus = "not_applicable"
     deliverable: str | None = None
     current_subagent_session_id: str | None = None
     pause_reason: SubagentPauseReason | None = None

@@ -1045,7 +1045,7 @@ class CodexActorRuntime:
             "- For text file edits, use Jarvis tool `file_patch` or `bash`.\n"
             "- For delegation or subagent work, use Jarvis tools "
             "`subagent_invoke`, `subagent_monitor`, `subagent_stop`, "
-            "`subagent_step_in`, and `subagent_dispose`.\n"
+            "`subagent_step_in`, `subagent_handoff`, and `subagent_dispose`.\n"
             "- Never invoke native Codex command execution, native file changes, native MCP "
             "tools, native collaboration/subagent tools, or any other native Codex capability.\n"
             "- If a task seems to call for a native Codex capability, choose the Jarvis dynamic "

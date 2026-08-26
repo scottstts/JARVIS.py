@@ -25,6 +25,8 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 - `/new` hard-stops and disposes route subagents.
 - Ordinary user messages supersede only the active main turn; they never redirect, pause, or stop a child.
 - Jarvis decides whether to continue independent main-task work, inspect a child, step in, stop it, or wait.
+- Delegation is a coordination decision, not a parallelism target. Jarvis should identify prerequisites, stage dependent work after its boundary exists, and review a completed child before integrating it.
+- A useful assignment defines a seam rather than prescribing implementation: ownership, consumed interfaces, provided interfaces, lifecycle assumptions, invariants, verification scope, and non-goals.
 - Subagents receive passive Acceptance Notes derived from assignment instructions, user constraints, and the requested deliverable; the notes are reminders for self-checking and reporting, never a completion gate.
 - A subagent may always hand work back, including partial or blocked work. Jarvis decides whether to accept the report, inspect the changes, or step the child back in.
 
@@ -75,10 +77,11 @@ The dynamic assignment includes:
 - optional exact user constraints
 - optional shared environment, dependency, and interface context
 - optional owned workspace paths
+- optional coordination phase, dependency references, and seam contract
 - optional selected skill ids, whose full `SKILL.md` documents are embedded into bootstrap
 - optional deliverable or success criteria
 
-The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited, and explicit `skill_ids` can add exact top-level installed skill IDs, up to four total. The harness never infers skills from assignment prose, `SKILL.md`, referenced resources, or file/directory names. Every child records whether Jarvis selected skills or selected none.
+The assignment is injected after the static subagent prompts. Skills opened by the main agent earlier in the same turn are automatically inherited, and explicit `skill_ids` can add exact top-level installed skill IDs, up to four total. Same-turn inheritance is only a convenience; Jarvis should explicitly repeat skill ids for later orchestration turns. The harness never infers skills from assignment prose, `SKILL.md`, referenced resources, or file/directory names. Every child records whether Jarvis selected skills or selected none.
 
 The main agent receives high-level subagent usage guidance through `PROGRAM.md` and detailed primitive docs from `src/jarvis/subagent/primitives.py`.
 
@@ -96,6 +99,9 @@ Arguments:
 - `instructions`
 - optional `user_constraints`
 - optional `shared_context`
+- optional `phase`
+- optional `depends_on`
+- optional `seam_contract`
 - optional `owned_paths`
 - optional `skill_ids`
 - optional `deliverable`
@@ -108,17 +114,18 @@ Returns:
 - status
 - session id
 - selected skill ids and owned paths
+- coordination metadata and workspace lease status
 - active count
 
 It allocates a codename, creates child storage/catalog entries, starts the child turn asynchronously, and emits a public route notice.
 
-A successful `subagent_invoke` delegates the task. The child bootstrap includes passive Acceptance Notes covering the assignment, constraints, deliverable, useful self-checking, and explicit reporting of anything unverified or blocked. Semantic edits to test artifacts are reported upward for visibility only; they do not create a runtime acceptance obligation.
+A successful `subagent_invoke` delegates the task. The child bootstrap includes passive Acceptance Notes covering the assignment, constraints, deliverable, useful self-checking, and explicit reporting of anything unverified or blocked. Semantic edits to test artifacts are reported upward for visibility only; they do not create a runtime acceptance obligation. Coordination metadata is informational runtime state; Jarvis decides whether dependencies are satisfied.
 
 ### `subagent_monitor`
 
 Inspects current subagent state without side effects.
 
-It accepts an optional codename or `subagent_id`. Omitted `agent` summarizes all non-disposed subagents. Full output includes the durable assignment, selected skills, owned paths, recent activity, pause reason, complete report or latest checkpoint, report-completeness flag, provider error metadata, error-log path, transcript path, and `pending_background_job_ids`.
+It accepts an optional codename or `subagent_id`. Omitted `agent` summarizes all non-disposed subagents. Full output includes the durable assignment, coordination metadata, selected skills, owned paths, workspace lease status, changed paths, changed-path completeness/source, recent activity, pause reason, complete report or latest checkpoint, report-completeness flag, provider error metadata, error-log path, transcript path, and `pending_background_job_ids`. For lease-backed children, settled lifecycle snapshots report exact net changes within the owned paths; otherwise changed paths are tool-result evidence and may be incomplete. A report is self-reported evidence, not semantic acceptance; inspect changed paths and the seam before integrating implementation work.
 
 Repeated unchanged monitor calls return a minimal no-delta nudge instead of another full snapshot. Automatic main-context status snapshots are also suppressed while unchanged within one main session, but a fresh snapshot is emitted after `/new` or compaction because compaction prunes older status records.
 
@@ -136,11 +143,15 @@ If the target is running, Jarvis requests cooperative stop, waits for the turn t
 
 Step-in is stop, settle, then new turn. It is not mid-token prompt injection.
 
+### `subagent_handoff`
+
+Releases a settled (completed, paused, or failed) child's workspace write lease while preserving its transcript, report, status, and monitoring state for main-agent review and integration. It does not decide whether the work is correct and does not dispose the child. A later `subagent_step_in` reacquires the lease if it is still available.
+
 ### `subagent_dispose`
 
 Permanently closes and removes a non-running subagent from the active set.
 
-It releases the codename, marks the catalog entry disposed, closes the child loop resources, and emits a public route notice.
+It releases the codename, marks the catalog entry disposed, closes the child loop resources, and emits a public route notice. Use `subagent_handoff` when the main agent needs the files without destroying the child state.
 
 ### `orchestrator_wait`
 
@@ -170,13 +181,20 @@ Important metadata:
 - `last_activity_at`
 - `task_label`
 - `report_complete`
+- `phase`
+- `depends_on`
+- `seam_contract`
+- `changed_paths`
+- `changed_paths_complete`
+- `changed_paths_source`
+- `workspace_lease_status`
 - `owner_main_session_id`
 - `owner_main_turn_id`
 - `current_subagent_session_id`
 - `run_generation`
 - `pending_background_job_ids`
 
-Pause reasons distinguish user/orchestrator control (`main_stop`, `new_session`, `approval_rejected`) from typed runtime dispositions (`tool_liveness_exhausted`, `provider_recovery_exhausted`, `external_blocked`). Acceptance evidence does not pause a child; it triggers an automatic continuation inside that child loop.
+Pause reasons distinguish user/orchestrator control (`main_stop`, `new_session`, `approval_rejected`) from typed runtime dispositions (`tool_liveness_exhausted`, `provider_recovery_exhausted`, `external_blocked`). Acceptance Notes are informational only; they do not pause or automatically continue a child. A child may hand work back as complete, partial, or blocked, and Jarvis decides whether to inspect or continue it.
 
 ## Tool Access
 
@@ -198,7 +216,7 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 ## Tool Execution Coordination
 
-Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background and service Bash without model-declared paths or lease generations.
+Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until explicit handoff or disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background and service Bash without model-declared paths or lease generations. The subagent manager captures a content/type snapshot after acquiring a lease and diffs it when the lease segment settles, hands off, or is disposed; this produces exact net `changed_paths` for the owned scope, including Bash, untracked files, deletes, and renames. Runtime-managed `archive` and `.jarvis_internal` roots are excluded from this evidence; other directories, including project caches, remain material when they are explicitly owned. A resumed child starts a new snapshot segment so main-agent integration edits are not attributed to it. This is independent of Git and is evidence for review, not a semantic acceptance gate.
 
 Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A silent-job attention notice first resumes the owning child and remains routine from Jarvis's perspective; the main agent is escalated only if that child subsequently cannot recover, pauses, fails, needs approval, or reports an unresolved blocker. A child waiting on detached work stays `waiting_background`; terminal bash evidence may resume that same child when it was waiting on the job. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
 

@@ -37,7 +37,14 @@ from jarvis.subagent.settings import SubagentSettings
 from jarvis.subagent.storage import SubagentCatalogStorage
 from jarvis.subagent.types import SubagentCatalogEntry
 from tests.helpers import build_core_settings
-from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolRegistry, ToolSettings
+from jarvis.tools import (
+    ToolExecutionContext,
+    ToolExecutionResult,
+    ToolRegistry,
+    ToolSettings,
+    WorkspaceAccessCoordinator,
+    WorkspaceLeaseError,
+)
 from jarvis.tools.basic.bash.jobs import claim_job_owner, create_background_job, load_job
 
 
@@ -119,6 +126,37 @@ class _FakeSubagentLoop:
         self.closed = True
 
 
+class _WritingSubagentLoop(_FakeSubagentLoop):
+    def __init__(self, workspace_dir: Path) -> None:
+        super().__init__(
+            [
+                AgentTurnDoneEvent(
+                    session_id="subagent_session",
+                    response_text="done",
+                )
+            ]
+        )
+        self._workspace_dir = workspace_dir
+        self.turn_count = 0
+
+    async def stream_turn(self, *, user_text: str, force_session_id: str | None, pre_turn_messages):
+        _ = (user_text, force_session_id, pre_turn_messages)
+        self.turn_count += 1
+        source_dir = self._workspace_dir / "src"
+        if self.turn_count == 1:
+            (source_dir / "modified.txt").write_text("after", encoding="utf-8")
+            (source_dir / "deleted.txt").unlink()
+            (source_dir / "created.txt").write_text("new", encoding="utf-8")
+        else:
+            (source_dir / "continued.txt").write_text("continued", encoding="utf-8")
+        async for event in super().stream_turn(
+            user_text=user_text,
+            force_session_id=force_session_id,
+            pre_turn_messages=pre_turn_messages,
+        ):
+            yield event
+
+
 class _FailingSubagentLoop(_FakeSubagentLoop):
     async def stream_turn(self, *, user_text: str, force_session_id: str | None, pre_turn_messages):
         _ = (user_text, force_session_id, pre_turn_messages)
@@ -173,7 +211,7 @@ class SubagentSettingsTests(unittest.TestCase):
 
 
 class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_build_main_progress_message_includes_latest_subagent_report_for_finalize(self) -> None:
+    async def test_build_main_progress_message_includes_latest_subagent_report_for_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))
             tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
@@ -237,9 +275,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Complete subagent report:", message.content)
             self.assertIn("one\ntwo\nUsed bash.", message.content)
             self.assertIn(
-                "The complete report is included above.",
+                "The report is self-reported completion, not semantic acceptance.",
                 message.content,
             )
+            self.assertIn("recommendation=inspect", message.content)
             self.assertEqual(message.metadata["latest_subagent_report_included"], True)
             self.assertEqual(message.metadata["latest_subagent_report_complete"], True)
 
@@ -476,6 +515,12 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 shared_context="SessionStorage is the shared interface.",
                 owned_paths=("tests/test_storage.py",),
                 skill_ids=("review-check",),
+                phase="review",
+                depends_on=("storage-foundation",),
+                seam_contract=(
+                    "Consumes the storage interface; provides an evidence-backed review; "
+                    "does not edit production files."
+                ),
                 deliverable="A concise evidence-backed review.",
                 owner_main_session_id="main_session",
                 owner_main_turn_id="main_turn",
@@ -494,6 +539,9 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Do not edit production files.", bootstrap_text)
             self.assertIn("SessionStorage is the shared interface.", bootstrap_text)
             self.assertIn("- tests/test_storage.py", bootstrap_text)
+            self.assertIn("phase: review", bootstrap_text)
+            self.assertIn("- storage-foundation", bootstrap_text)
+            self.assertIn("Consumes the storage interface", bootstrap_text)
             self.assertIn("--- BEGIN SKILL review-check ---", bootstrap_text)
             self.assertIn("SKILL_FORWARDING_SENTINEL", bootstrap_text)
             self.assertEqual(payload["skill_ids"], ["review-check"])
@@ -507,6 +555,9 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry.skill_ids, ("review-check",))
             self.assertEqual(entry.skill_selection_reason, "main_selected")
             self.assertEqual(entry.owned_paths, ("tests/test_storage.py",))
+            self.assertEqual(entry.phase, "review")
+            self.assertEqual(entry.depends_on, ("storage-foundation",))
+            self.assertIn("Consumes the storage interface", entry.seam_contract or "")
 
     async def test_invoke_never_infers_skill_from_assignment_text_or_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -595,7 +646,10 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                     content="changed",
                     metadata={
                         "changed": True,
-                        "path": "/workspace/src/vehicles/__tests__/vehicle.test.ts",
+                        "path": "/workspace/src/vehicles/vehicle.ts",
+                        "workspace_changed_paths": [
+                            "/workspace/src/vehicles/__tests__/vehicle.test.ts",
+                        ],
                     },
                 ),
                 context=ToolExecutionContext(
@@ -611,6 +665,13 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 snapshot["changed_test_artifact_paths"],
                 ["src/vehicles/__tests__/vehicle.test.ts"],
             )
+            self.assertEqual(
+                snapshot["changed_paths"],
+                [
+                    "src/vehicles/__tests__/vehicle.test.ts",
+                    "src/vehicles/vehicle.ts",
+                ],
+            )
             progress = manager.build_main_progress_message(
                 agent=runtime.subagent_id,
                 notice_kind="subagent_completed",
@@ -624,7 +685,160 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 message.metadata["changed_test_artifact_paths"],
                 ["src/vehicles/__tests__/vehicle.test.ts"],
             )
+            self.assertEqual(
+                message.metadata["changed_paths"],
+                [
+                    "src/vehicles/__tests__/vehicle.test.ts",
+                    "src/vehicles/vehicle.ts",
+                ],
+            )
             self.assertIn("Subagent changed test artifacts", message.content)
+            self.assertIn("Subagent changed paths", message.content)
+
+    async def test_scoped_snapshot_reports_arbitrary_writes_and_resets_after_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            source_dir = core_settings.workspace_dir / "src"
+            source_dir.mkdir(parents=True)
+            (source_dir / "modified.txt").write_text("before", encoding="utf-8")
+            (source_dir / "deleted.txt").write_text("delete me", encoding="utf-8")
+
+            writing_loop = _WritingSubagentLoop(core_settings.workspace_dir)
+            workspace_access = WorkspaceAccessCoordinator(
+                workspace_dir=core_settings.workspace_dir
+            )
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                workspace_access=workspace_access,
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            with patch.object(manager, "_build_subagent_loop", return_value=writing_loop):
+                payload = await manager.invoke(
+                    requester_kind="main",
+                    task_label="Track arbitrary writes",
+                    instructions="Implement the assigned change and report what changed.",
+                    owned_paths=("src",),
+                    owner_main_session_id="main_session",
+                    owner_main_turn_id="main_turn",
+                )
+
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            self.assertEqual(
+                runtime.changed_paths,
+                {
+                    "src/created.txt",
+                    "src/deleted.txt",
+                    "src/modified.txt",
+                },
+            )
+            self.assertTrue(runtime.changed_paths_complete)
+            self.assertEqual(runtime.changed_paths_source, "scoped_workspace_snapshot")
+
+            handoff = await manager.handoff(agent=runtime.subagent_id)
+            self.assertTrue(handoff["handoff_ready"])
+            self.assertEqual(
+                handoff["changed_paths"],
+                [
+                    "src/created.txt",
+                    "src/deleted.txt",
+                    "src/modified.txt",
+                ],
+            )
+            self.assertTrue(handoff["changed_paths_complete"])
+            self.assertEqual(
+                handoff["changed_paths_source"],
+                "scoped_workspace_snapshot",
+            )
+            await workspace_access.claim_paths(owner="main", paths=("src",))
+            (source_dir / "main-integration.txt").write_text("main", encoding="utf-8")
+            await workspace_access.release_owner(owner="main")
+
+            await manager.step_in(
+                agent=runtime.subagent_id,
+                instructions="Continue from the integrated workspace state.",
+            )
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+
+            self.assertIn("src/continued.txt", runtime.changed_paths)
+            self.assertNotIn("src/main-integration.txt", runtime.changed_paths)
+            self.assertTrue(runtime.changed_paths_complete)
+            self.assertEqual(runtime.changed_paths_source, "scoped_workspace_snapshot")
+            await manager.dispose(agent=runtime.subagent_id)
+
+    async def test_handoff_releases_lease_and_step_in_reacquires_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            owned_dir = core_settings.workspace_dir / "src"
+            owned_dir.mkdir(parents=True)
+            (owned_dir / "contract.txt").write_text("contract", encoding="utf-8")
+            workspace_access = WorkspaceAccessCoordinator(
+                workspace_dir=core_settings.workspace_dir
+            )
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                workspace_access=workspace_access,
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Implement the contract",
+                instructions="Make the assigned change and report what was verified.",
+                owned_paths=("src",),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            self.assertEqual(runtime.status, "completed")
+            self.assertEqual(runtime.workspace_lease_status, "held")
+
+            with self.assertRaises(WorkspaceLeaseError):
+                await workspace_access.claim_paths(owner="main", paths=("src",))
+
+            handoff = await manager.handoff(agent=payload["subagent_id"])
+            self.assertTrue(handoff["handoff_ready"])
+            self.assertEqual(handoff["workspace_lease_status"], "released")
+            self.assertEqual(runtime.workspace_lease_status, "released")
+            entry = manager._catalog.get_entry(payload["subagent_id"])
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertEqual(entry.workspace_lease_status, "released")
+            await workspace_access.claim_paths(owner="main", paths=("src",))
+            await workspace_access.release_owner(owner="main")
+
+            await manager.step_in(
+                agent=payload["subagent_id"],
+                instructions="Recheck the contract and report the result.",
+            )
+            self.assertEqual(runtime.workspace_lease_status, "held")
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            self.assertEqual(runtime.status, "completed")
+            entry = manager._catalog.get_entry(payload["subagent_id"])
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertEqual(entry.workspace_lease_status, "held")
+            await manager.dispose(agent=payload["subagent_id"])
 
     async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

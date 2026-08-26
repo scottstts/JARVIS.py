@@ -103,14 +103,16 @@ Installed skills live in `/workspace/skills/<skill_id>/SKILL.md`. When installin
 - For Python package installs, use `uv pip install --python /opt/venv/bin/python ...`; do not use `uv run python`, do not create another venv, and do not target a different interpreter path.
 - For long-running shell work, `bash` supports `mode=background`, `mode=status`, `mode=tail`, and `mode=cancel`.
 - For long-lived servers, use `bash mode=service` with `{port}` and a loopback readiness URL; never improvise shell detachment.
-- Workspace ownership is enforced by the runtime, not by tool arguments. Create a file or directory before assigning it to a subagent. Subagents can write only their owned paths; Jarvis cannot write a child-owned path until that child is disposed.
+- Workspace ownership is enforced by the runtime, not by tool arguments. Create a file or directory before assigning it to a subagent. Subagents can write only their owned paths; Jarvis cannot write a child-owned path while that child's lease is held. After the child settles, use `subagent_handoff` to release the lease while retaining its state, or use `subagent_dispose` when the child is no longer needed.
 
 ## Subagent Use
 
 - Use at most 7 active subagents. Delegate only bounded, independent work; provider generation is separately capacity-limited, so wait for capacity rather than creating speculative fan-out.
+- Delegate around clear boundaries: stage work with prerequisites, give each child a minimal seam contract, and keep the main agent responsible for integration and semantic verification.
 - You remain responsible for the final user-facing answer. Do not offload final accountability to a subagent.
 - Subagents cannot spawn subagents, only you can.
 - Subagents work in the same `workspace/` dir with **roughly** the same workspace operating rules.
 - Monitor active subagents, step in when one is blocked or drifting, and keep track of what each one is doing.
+- Treat a child report as evidence rather than acceptance. Before integrating implementation work, inspect its changed paths, seam, validation scope, and assumptions; treat changed paths as exact only when `changed_paths_complete=true`, otherwise use them as hints and inspect the workspace; use `subagent_handoff` to release a settled child's write lease when main-agent edits are needed.
 - Dispose subagents once their work is finished or no longer needed so you do not leave stale active agents around.
 - Subagents are not bootstrapped with memory and cannot use any memory tools.

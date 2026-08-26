@@ -144,8 +144,8 @@ class WorkspaceAccessCoordinator:
     """Allows concurrent reads/disjoint writes while protecting assigned paths.
 
     The coordinator is route-local because all actors in a route share one workspace.
-    Child `owned_paths` are durable write leases until explicit disposal. Main-agent
-    writes require an explicit lease release through the existing child control flow.
+    Child `owned_paths` are durable write leases until explicit handoff or disposal. Main-agent
+    writes require an explicit lease release through the child control flow.
     """
 
     def __init__(self, *, workspace_dir: Path) -> None:
@@ -329,8 +329,8 @@ class WorkspaceAccessCoordinator:
                     if any(_paths_overlap(path, leased_path) for leased_path in lease_paths):
                         raise WorkspaceLeaseError(
                             f"Write denied for {_display_path(path, self._workspace_dir)}: "
-                            f"it is leased by {lease_owner}. Stop and dispose that subagent "
-                            "to revoke its lease before editing this path."
+                            f"it is leased by {lease_owner}. Stop and hand off, or dispose, "
+                            "that subagent to revoke its lease before editing this path."
                         )
 
     async def _actor_workspace_observation(
@@ -535,8 +535,8 @@ def _workspace_lease_conflict_class(message: str) -> str:
 def _workspace_lease_remediation(conflict_class: str) -> str:
     if conflict_class == "path_owned_by_other_actor":
         return (
-            "Wait for the owning actor, or explicitly stop and dispose it before editing its "
-            "leased path."
+            "Wait for the owning actor, or explicitly stop and hand it off (or dispose it) "
+            "before editing its leased path."
         )
     if conflict_class == "invalid_workspace_path":
         return "Use only normalized paths inside the shared workspace."

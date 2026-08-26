@@ -157,6 +157,7 @@ class ToolRegisterExecutor:
                 "status": status,
                 "manifest_hash": manifest.manifest_hash(),
                 "manifest_path": str(target_path),
+                "workspace_changed_paths": [str(target_path)],
                 "operator": manifest.operator,
                 "replace_existing": replace_existing,
             },
