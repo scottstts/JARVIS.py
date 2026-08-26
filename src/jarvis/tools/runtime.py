@@ -18,7 +18,7 @@ from jarvis.skills import (
 from jarvis.skills.catalog import is_valid_skill_id
 
 from .policy import ToolPolicy
-from .registry import ToolRegistry
+from .registry import ToolRegistry, ToolRegistryView
 from .types import ToolExecutionContext, ToolExecutionResult
 
 LOGGER = get_application_logger(__name__)
@@ -44,7 +44,7 @@ class ToolRuntime:
     def __init__(
         self,
         *,
-        registry: ToolRegistry,
+        registry: ToolRegistry | ToolRegistryView,
         policy: ToolPolicy | None = None,
     ) -> None:
         self._registry = registry

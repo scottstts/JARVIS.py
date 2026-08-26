@@ -283,6 +283,7 @@ JARVIS_EMBEDDING_PROVIDER: Final = _string("embedding.provider")
 JARVIS_EMBEDDING_MODEL: Final = _string("embedding.model")
 
 # Memory behavior settings.
+JARVIS_MEMORY_ENABLED: Final = _boolean("memory.enabled")
 JARVIS_MEMORY_MAINTENANCE_LLM_PROVIDER: Final = _string("memory.maintenance.provider")
 JARVIS_MEMORY_MAINTENANCE_LLM_MODEL: Final = _string("memory.maintenance.model")
 JARVIS_MEMORY_MAINTENANCE_LLM_MAX_OUTPUT_TOKENS: Final = _integer(

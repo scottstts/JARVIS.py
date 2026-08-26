@@ -47,6 +47,7 @@ from jarvis.llm import (
     ToolDefinition,
 )
 from jarvis.logging_setup import get_application_logger
+from jarvis.memory import MemorySettings
 from jarvis.runtime_errors import record_runtime_error
 from jarvis.storage import SessionStorage
 from jarvis.subagent import (
@@ -57,9 +58,11 @@ from jarvis.subagent import (
 )
 from jarvis.subagent.types import SubagentPauseReason, SubagentSnapshot
 from jarvis.tools import (
+    MEMORY_TOOL_NAMES,
     ToolExecutionContext,
     ToolExecutionResult,
     ToolRegistry,
+    ToolRegistryView,
     ToolRuntime,
     ToolSettings,
     WorkspaceAccessCoordinator,
@@ -199,13 +202,17 @@ class RouteRuntime:
         route_id: str,
         llm_service: LLMService,
         core_settings: CoreSettings,
-        tool_registry: ToolRegistry | None = None,
+        tool_registry: ToolRegistry | ToolRegistryView | None = None,
     ) -> None:
         self._route_id = route_id
         self._llm_service = llm_service
         self._core_settings = core_settings
         tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
-        self._tool_registry = tool_registry or ToolRegistry.default(tool_settings)
+        memory_settings = MemorySettings.from_workspace_dir(core_settings.workspace_dir)
+        resolved_tool_registry = tool_registry or ToolRegistry.default(tool_settings)
+        if not memory_settings.enabled:
+            resolved_tool_registry = resolved_tool_registry.with_hidden_tools(MEMORY_TOOL_NAMES)
+        self._tool_registry = resolved_tool_registry
         self._main_storage = SessionStorage(core_settings.transcript_archive_dir)
         self._selected_skills_by_main_turn: dict[tuple[str, str], tuple[str, ...]] = {}
         self._selected_skills_by_main_session: dict[str, tuple[str, ...]] = {}

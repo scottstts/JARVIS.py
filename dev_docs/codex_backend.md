@@ -373,6 +373,10 @@ When one Codex turn emits multiple assistant message items, the backend persists
 
 Main Codex actors still use the existing Jarvis memory stack.
 
+The user-facing `memory.enabled` master switch applies to Codex actors as well: when it is
+`false`, Codex actors receive no memory bootstrap or maintenance/reflection hooks, do not create
+the memory service/index, and do not receive memory tools through dynamic-tool definitions.
+
 That means:
 
 - bootstrap memory rendering still comes from `MemoryService`

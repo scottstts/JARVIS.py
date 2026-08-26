@@ -39,6 +39,7 @@ from jarvis.llm import (
     ProviderTemporaryError,
 )
 from jarvis.logging_setup import get_application_logger
+from jarvis.memory import MemorySettings
 from jarvis.skills import SkillsSettings, get_skill
 from jarvis.core.tool_safety import (
     changed_test_artifact_paths_from_result,
@@ -51,7 +52,9 @@ from jarvis.storage.layout import transcript_archive_root_from_runtime_path
 from jarvis.tools import (
     ToolExecutionContext,
     ToolExecutionResult,
+    MEMORY_TOOL_NAMES,
     ToolRegistry,
+    ToolRegistryView,
     ToolRuntime,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
@@ -104,7 +107,7 @@ class SubagentManager:
         route_id: str,
         llm_service: LLMService,
         core_settings: CoreSettings,
-        tool_registry: ToolRegistry,
+        tool_registry: ToolRegistry | ToolRegistryView,
         tool_execution_guard: asyncio.Semaphore,
         workspace_access: WorkspaceAccessCoordinator | None = None,
         publish_event: Callable[[object], Awaitable[None]],
@@ -125,6 +128,9 @@ class SubagentManager:
                 route_id=route_id,
             ),
         )
+        self._memory_enabled = MemorySettings.from_workspace_dir(
+            core_settings.workspace_dir
+        ).enabled
         self._tool_registry = tool_registry
         self._tool_execution_guard = tool_execution_guard
         self._workspace_access = workspace_access
@@ -1630,9 +1636,12 @@ class SubagentManager:
         storage: SessionStorage,
         bootstrap_loader: SubagentBootstrapLoader,
     ) -> ActorRuntime:
+        hidden_tool_names = self._settings.builtin_tool_blocklist
+        if not self._memory_enabled:
+            hidden_tool_names = (*hidden_tool_names, *MEMORY_TOOL_NAMES)
         filtered_registry = self._tool_registry.filtered_view(
             agent_kind="subagent",
-            hidden_tool_names=self._settings.builtin_tool_blocklist,
+            hidden_tool_names=hidden_tool_names,
         )
         tool_runtime = ToolRuntime(registry=filtered_registry)
 

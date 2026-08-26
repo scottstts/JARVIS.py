@@ -27,6 +27,15 @@ Canonical runtime memory files live under `/workspace/memory/`. The SQLite index
 9. Memory search supports lexical, graph, semantic, and hybrid retrieval with degraded fallback.
 10. Maintenance is mostly automatic, while manual admin stays available through `memory_admin`.
 
+## Master Switch
+
+The user-facing `memory.enabled` setting in `src/jarvis/settings.yml` is the master switch for
+the runtime memory subsystem. When it is `false`, agent runtimes disable memory bootstrap,
+maintenance, reflection, and pre-compaction flushes, do not construct `MemoryService` or its
+SQLite index, and hide the memory tools from model-visible tool definitions and discovery. It
+does not delete existing Markdown memory or derived index files; re-enabling the setting makes
+the normal subsystem available again.
+
 ## Memory Categories
 
 ### Core

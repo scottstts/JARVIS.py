@@ -9,7 +9,7 @@ from .basic.memory_get import MemoryGetPolicy
 from .basic.memory_search import MemorySearchPolicy
 from .basic.memory_write import MemoryWritePolicy
 from .policy import ToolPolicy
-from .registry import ToolRegistry
+from .registry import MEMORY_TOOL_NAMES, ToolRegistry, ToolRegistryView
 from .runtime import ToolRuntime
 from .workspace_access import (
     WorkspaceAccessCoordinator,
@@ -56,6 +56,7 @@ __all__ = [
     "ToolPolicy",
     "ToolPolicyDecision",
     "ToolRegistry",
+    "ToolRegistryView",
     "ToolRuntime",
     "WorkspaceAccessCoordinator",
     "WorkspaceLeaseError",
@@ -66,4 +67,5 @@ __all__ = [
     "WebFetchPolicy",
     "WebSearchPolicy",
     "ViewImagePolicy",
+    "MEMORY_TOOL_NAMES",
 ]

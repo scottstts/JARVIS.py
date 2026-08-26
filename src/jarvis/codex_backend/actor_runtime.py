@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
@@ -34,7 +34,7 @@ from jarvis.core.compaction import (
     prune_compaction_source_records,
 )
 from jarvis.core.commands import ParsedCommand, parse_user_command
-from jarvis.llm import LLMUsage, LLMMessage, LLMService
+from jarvis.llm import LLMMessage, LLMService, LLMUsage, ToolDefinition
 from jarvis.logging_setup import get_application_logger
 from jarvis.memory import MemoryService, MemorySettings
 from jarvis.runtime_errors import record_runtime_error
@@ -46,7 +46,12 @@ from jarvis.skills import (
     render_skill_search_guidance,
 )
 from jarvis.storage import ConversationRecord, SessionMetadata, SessionStorage
-from jarvis.tools import ToolExecutionContext, ToolExecutionResult, ToolSettings
+from jarvis.tools import (
+    MEMORY_TOOL_NAMES,
+    ToolExecutionContext,
+    ToolExecutionResult,
+    ToolSettings,
+)
 
 from .config import CodexBackendSettings
 from .path_mapping import CodexPathMapper
@@ -60,6 +65,22 @@ from .types import (
 )
 
 LOGGER = get_application_logger(__name__)
+
+
+def _without_memory_tool_definitions(
+    provider: Callable[[Sequence[str]], Sequence[ToolDefinition]],
+) -> Callable[[Sequence[str]], tuple[ToolDefinition, ...]]:
+    def filtered_provider(
+        activated_discoverable_tool_names: Sequence[str],
+    ) -> tuple[ToolDefinition, ...]:
+        return tuple(
+            definition
+            for definition in provider(activated_discoverable_tool_names)
+            if definition.name not in MEMORY_TOOL_NAMES
+        )
+
+    return filtered_provider
+
 
 _TURN_ID_METADATA_KEY = "turn_id"
 _ORPHANED_TURN_RECOVERY_METADATA_KEY = "orphaned_turn_recovery"
@@ -156,23 +177,42 @@ class CodexActorRuntime:
         self._core_settings = core_settings
         self._identity = identity
         self._bootstrap_loader = bootstrap_loader
-        self._memory_mode = memory_mode
         self._tool_registry = tool_registry
         self._tool_runtime = tool_runtime
-        self._tool_definitions_provider = tool_definitions_provider
         self._tool_executor = tool_executor
         self._runtime_messages_provider = runtime_messages_provider
         self._path_mapper = CodexPathMapper.from_settings(settings)
         self._tool_settings = ToolSettings.from_workspace_dir(core_settings.workspace_dir)
         self._skills_settings = SkillsSettings.from_workspace_dir(core_settings.workspace_dir)
         memory_settings = MemorySettings.from_workspace_dir(core_settings.workspace_dir)
-        memory_llm_service = llm_service if memory_mode.reflection else None
-        if memory_llm_service is None:
-            memory_settings = replace(memory_settings, enable_reflection=False)
-        self._memory_service = MemoryService(
-            settings=memory_settings,
-            llm_service=memory_llm_service,
+        self._memory_enabled = memory_settings.enabled
+        self._memory_mode = (
+            memory_mode
+            if self._memory_enabled
+            else AgentMemoryMode(bootstrap=False, maintenance=False, reflection=False)
         )
+        if not self._memory_enabled:
+            self._tool_registry = self._tool_registry.with_hidden_tools(MEMORY_TOOL_NAMES)
+        self._tool_definitions_provider = (
+            tool_definitions_provider
+            if self._memory_enabled
+            else _without_memory_tool_definitions(tool_definitions_provider)
+        )
+        self._memory_service: MemoryService | None = None
+        if any(
+            (
+                self._memory_mode.bootstrap,
+                self._memory_mode.maintenance,
+                self._memory_mode.reflection,
+            )
+        ):
+            memory_llm_service = llm_service if self._memory_mode.reflection else None
+            if memory_llm_service is None:
+                memory_settings = replace(memory_settings, enable_reflection=False)
+            self._memory_service = MemoryService(
+                settings=memory_settings,
+                llm_service=memory_llm_service,
+            )
         self._tool_context = ToolExecutionContext(
             workspace_dir=self._tool_settings.workspace_dir,
             route_id=route_id,
@@ -181,7 +221,7 @@ class CodexActorRuntime:
             subagent_id=self._identity.subagent_id,
             memory_service=(
                 self._memory_service
-                if any(
+                if self._memory_service is not None and any(
                     (
                         self._memory_mode.bootstrap,
                         self._memory_mode.maintenance,
@@ -192,7 +232,7 @@ class CodexActorRuntime:
             ),
         )
         self._tool_bridge = CodexToolBridge(
-            tool_definitions_provider=tool_definitions_provider,
+            tool_definitions_provider=self._tool_definitions_provider,
         )
         self._compactor = ContextCompactor(
             llm_service=self._llm_service,
@@ -895,10 +935,11 @@ class CodexActorRuntime:
         return await self._tool_executor(tool_call, approved_context)
 
     async def _maybe_run_due_maintenance(self) -> None:
-        if not self._memory_mode.maintenance:
+        memory_service = self._memory_service
+        if not self._memory_mode.maintenance or memory_service is None:
             return
         try:
-            await self._memory_service.run_due_maintenance()
+            await memory_service.run_due_maintenance()
         except Exception as exc:
             LOGGER.exception("Codex actor memory maintenance failed.")
             self._record_runtime_error(
@@ -1013,9 +1054,10 @@ class CodexActorRuntime:
             text = _message_text(message)
             if text:
                 sections.append(text)
-        if self._memory_mode.bootstrap:
+        memory_service = self._memory_service
+        if self._memory_mode.bootstrap and memory_service is not None:
             try:
-                core_text, ongoing_text = await self._memory_service.render_bootstrap_messages()
+                core_text, ongoing_text = await memory_service.render_bootstrap_messages()
             except Exception as exc:
                 LOGGER.exception("Codex actor memory bootstrap rendering failed.")
                 self._record_runtime_error(
@@ -1335,14 +1377,15 @@ class CodexActorRuntime:
             turn_id=visible_turn_id,
             status="completed" if status == "completed" else "interrupted",
         )
-        if self._memory_mode.reflection and response_text.strip():
+        memory_service = self._memory_service
+        if self._memory_mode.reflection and memory_service is not None and response_text.strip():
             records = tuple(
                 record
                 for record in self._storage.load_records(turn.session_id, include_all_turns=True)
                 if str(record.metadata.get(_TURN_ID_METADATA_KEY, "")).strip() == visible_turn_id
             )
             asyncio.create_task(
-                self._memory_service.reflect_completed_turn(
+                memory_service.reflect_completed_turn(
                     route_id=self._tool_context.route_id,
                     session_id=turn.session_id,
                     records=records,
@@ -1402,10 +1445,11 @@ class CodexActorRuntime:
         if not source_records and previous_bundle is None:
             return None
 
-        if self._memory_mode.maintenance:
+        memory_service = self._memory_service
+        if self._memory_mode.maintenance and memory_service is not None:
             try:
                 await self._await_manual_compaction_operation(
-                    self._memory_service.flush_before_compaction(
+                    memory_service.flush_before_compaction(
                         route_id=self._tool_context.route_id,
                         session_id=session.session_id,
                         records=tuple(records),

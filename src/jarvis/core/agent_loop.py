@@ -61,9 +61,11 @@ from jarvis.skills import (
 )
 from jarvis.storage import ConversationRecord, SessionMetadata, SessionStorage
 from jarvis.tools import (
+    MEMORY_TOOL_NAMES,
     ToolExecutionContext,
     ToolExecutionResult,
     ToolRegistry,
+    ToolRegistryView,
     ToolRuntime,
     ToolSettings,
 )
@@ -372,7 +374,7 @@ class AgentLoop:
         llm_service: LLMService,
         settings: CoreSettings | None = None,
         storage: SessionStorage | None = None,
-        tool_registry: ToolRegistry | None = None,
+        tool_registry: ToolRegistry | ToolRegistryView | None = None,
         tool_runtime: ToolRuntime | None = None,
         route_id: str | None = None,
         bootstrap_loader: BootstrapMessageLoader | None = None,
@@ -388,7 +390,6 @@ class AgentLoop:
         self._settings = settings or CoreSettings.from_env()
         self._storage = storage or SessionStorage(self._settings.transcript_archive_dir)
         self._identity = identity or AgentIdentity(kind="main", name="Jarvis")
-        self._memory_mode = memory_mode or AgentMemoryMode()
         self._llm_provider = (
             normalized if (normalized := (llm_provider or "").strip().lower()) else None
         )
@@ -400,18 +401,36 @@ class AgentLoop:
             provider=self._settings.compaction.provider,
         )
         memory_settings = MemorySettings.from_workspace_dir(self._settings.workspace_dir)
-        memory_llm_service = (
-            self._llm_service if isinstance(self._llm_service, LLMService) else None
+        self._memory_enabled = memory_settings.enabled
+        requested_memory_mode = memory_mode or AgentMemoryMode()
+        self._memory_mode = (
+            requested_memory_mode
+            if self._memory_enabled
+            else AgentMemoryMode(bootstrap=False, maintenance=False, reflection=False)
         )
-        if memory_llm_service is None or not self._memory_mode.reflection:
-            memory_settings = replace(memory_settings, enable_reflection=False)
-        self._memory_service = MemoryService(
-            settings=memory_settings,
-            llm_service=memory_llm_service,
-        )
+        self._memory_service: MemoryService | None = None
+        if any(
+            (
+                self._memory_mode.bootstrap,
+                self._memory_mode.maintenance,
+                self._memory_mode.reflection,
+            )
+        ):
+            memory_llm_service = (
+                self._llm_service if isinstance(self._llm_service, LLMService) else None
+            )
+            if memory_llm_service is None or not self._memory_mode.reflection:
+                memory_settings = replace(memory_settings, enable_reflection=False)
+            self._memory_service = MemoryService(
+                settings=memory_settings,
+                llm_service=memory_llm_service,
+            )
         self._tool_settings = ToolSettings.from_workspace_dir(self._settings.workspace_dir)
         self._skills_settings = SkillsSettings.from_workspace_dir(self._settings.workspace_dir)
-        self._tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
+        resolved_tool_registry = tool_registry or ToolRegistry.default(self._tool_settings)
+        if not self._memory_enabled:
+            resolved_tool_registry = resolved_tool_registry.with_hidden_tools(MEMORY_TOOL_NAMES)
+        self._tool_registry: ToolRegistry | ToolRegistryView = resolved_tool_registry
         self._tool_runtime = tool_runtime or ToolRuntime(registry=self._tool_registry)
         self._tool_definitions_provider = (
             tool_definitions_provider or self._default_tool_definitions
@@ -426,7 +445,7 @@ class AgentLoop:
             subagent_id=self._identity.subagent_id,
             memory_service=(
                 self._memory_service
-                if any(
+                if self._memory_service is not None and any(
                     (
                         self._memory_mode.bootstrap,
                         self._memory_mode.maintenance,
@@ -3570,7 +3589,14 @@ class AgentLoop:
         self,
         activated_discoverable_tool_names: Sequence[str],
     ) -> tuple[ToolDefinition, ...]:
-        return self._tool_definitions_provider(activated_discoverable_tool_names)
+        definitions = self._tool_definitions_provider(activated_discoverable_tool_names)
+        if self._memory_enabled:
+            return definitions
+        return tuple(
+            definition
+            for definition in definitions
+            if definition.name not in MEMORY_TOOL_NAMES
+        )
 
     def _build_turn_request(
         self,
@@ -4189,12 +4215,13 @@ class AgentLoop:
 
         self._append_skills_bootstrap(session.session_id)
 
-        if self._memory_mode.bootstrap:
+        memory_service = self._memory_service
+        if self._memory_mode.bootstrap and memory_service is not None:
             try:
                 (
                     core_memory_bootstrap,
                     ongoing_memory_bootstrap,
-                ) = await self._memory_service.render_bootstrap_messages()
+                ) = await memory_service.render_bootstrap_messages()
             except Exception as exc:
                 LOGGER.exception("Memory bootstrap rendering failed.")
                 self._record_runtime_error(
@@ -4337,10 +4364,11 @@ class AgentLoop:
                 notice_kind="compaction_started",
                 text="Compacting...",
             )
-            if self._memory_mode.maintenance:
+            memory_service = self._memory_service
+            if self._memory_mode.maintenance and memory_service is not None:
                 try:
                     await self._await_compaction_operation(
-                        self._memory_service.flush_before_compaction(
+                        memory_service.flush_before_compaction(
                             route_id=self._tool_context.route_id,
                             session_id=session.session_id,
                             records=tuple(records),
@@ -4500,11 +4528,12 @@ class AgentLoop:
         await callback(normalized_notice_kind, normalized_text)
 
     async def _ensure_memory_runtime_ready(self) -> None:
-        if not self._memory_mode.maintenance:
+        memory_service = self._memory_service
+        if not self._memory_mode.maintenance or memory_service is None:
             return
         try:
-            await self._memory_service.ensure_index_synced()
-            await self._memory_service.run_due_maintenance()
+            await memory_service.ensure_index_synced()
+            await memory_service.run_due_maintenance()
         except Exception as exc:
             LOGGER.exception("Memory runtime maintenance failed.")
             self._record_runtime_error(
@@ -4520,7 +4549,8 @@ class AgentLoop:
         session_id: str,
         turn_id: str,
     ) -> None:
-        if not self._memory_mode.reflection:
+        memory_service = self._memory_service
+        if not self._memory_mode.reflection or memory_service is None:
             return
         try:
             turn_records = tuple(
@@ -4530,7 +4560,7 @@ class AgentLoop:
             )
             if not turn_records:
                 return
-            await self._memory_service.reflect_completed_turn(
+            await memory_service.reflect_completed_turn(
                 route_id=self._tool_context.route_id,
                 session_id=session_id,
                 records=turn_records,

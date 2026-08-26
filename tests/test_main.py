@@ -193,6 +193,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
                 gemini=GeminiProviderSettings(chat_model="gemini-3.1-pro"),
             ),
             memory_settings=MemorySettings(
+                enabled=True,
                 workspace_dir=Path("/tmp/workspace"),
                 memory_dir=Path("/tmp/workspace/memory"),
                 index_dir=Path("/tmp/workspace/memory/.index"),

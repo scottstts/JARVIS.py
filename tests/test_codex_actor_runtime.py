@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from jarvis.codex_backend.actor_runtime import _dynamic_tools_signature
 from jarvis.codex_backend.actor_runtime import CodexActorRuntime
@@ -13,8 +15,9 @@ from jarvis.codex_backend.config import CodexBackendSettings
 from jarvis.codex_backend.types import CodexNativeCapabilityError
 from jarvis.core import AgentIdentity, AgentMemoryMode, AgentRuntimeMessage
 from jarvis.llm import LLMMessage, ToolDefinition
+from jarvis.memory import MemorySettings
 from jarvis.storage import ConversationRecord, SessionStorage
-from jarvis.tools import ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
+from jarvis.tools import MEMORY_TOOL_NAMES, ToolExecutionResult, ToolRegistry, ToolRuntime, ToolSettings
 from tests.helpers import build_compaction_test_response, build_core_settings
 
 
@@ -78,6 +81,7 @@ def _build_runtime(
     tool_executor=None,
     runtime_messages_provider=None,
     llm_service=None,
+    memory_mode=None,
 ) -> tuple[CodexActorRuntime, SessionStorage, _FakeCoordinator]:
     core_settings = build_core_settings(root_dir=root_dir)
     workspace_dir = root_dir / "workspace"
@@ -105,7 +109,8 @@ def _build_runtime(
         route_id="route_1",
         identity=AgentIdentity(kind="main", name="Jarvis"),
         bootstrap_loader=_FakeBootstrapLoader(),
-        memory_mode=AgentMemoryMode(
+        memory_mode=memory_mode
+        or AgentMemoryMode(
             bootstrap=False,
             maintenance=False,
             reflection=False,
@@ -147,6 +152,70 @@ class _BlockingCompactionLLMService:
 
 
 class CodexActorRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_memory_switch_skips_service_and_hides_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root_dir = Path(tmp)
+            core_settings = build_core_settings(root_dir=root_dir)
+            disabled_settings = MemorySettings.from_workspace_dir(
+                core_settings.workspace_dir
+            )
+            disabled_settings = replace(disabled_settings, enabled=False)
+
+            with patch.object(
+                MemorySettings,
+                "from_workspace_dir",
+                return_value=disabled_settings,
+            ):
+                runtime, _storage, _coordinator = _build_runtime(
+                    root_dir=root_dir,
+                    memory_mode=AgentMemoryMode(),
+                )
+
+            self.assertFalse(runtime._memory_mode.bootstrap)
+            self.assertFalse(runtime._memory_mode.maintenance)
+            self.assertFalse(runtime._memory_mode.reflection)
+            self.assertIsNone(runtime._memory_service)
+            self.assertTrue(
+                MEMORY_TOOL_NAMES.isdisjoint(runtime._tool_registry.registered_tool_names())
+            )
+
+    async def test_disabled_memory_switch_filters_custom_dynamic_tool_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root_dir = Path(tmp)
+            core_settings = build_core_settings(root_dir=root_dir)
+            disabled_settings = replace(
+                MemorySettings.from_workspace_dir(core_settings.workspace_dir),
+                enabled=False,
+            )
+            provider_registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            )
+
+            def tool_definitions_provider(activated_names):
+                return tuple(provider_registry.basic_definitions()) + tuple(
+                    provider_registry.resolve_discoverable_tool_definitions(activated_names)
+                )
+
+            with patch.object(
+                MemorySettings,
+                "from_workspace_dir",
+                return_value=disabled_settings,
+            ):
+                runtime, _storage, _coordinator = _build_runtime(
+                    root_dir=root_dir,
+                    memory_mode=AgentMemoryMode(),
+                    tool_definitions_provider=tool_definitions_provider,
+                )
+                dynamic_tools = runtime._tool_bridge.build_dynamic_tools(
+                    activated_discoverable_tool_names=["memory_admin"]
+                )
+
+            self.assertTrue(
+                MEMORY_TOOL_NAMES.isdisjoint(
+                    {str(tool["name"]) for tool in dynamic_tools}
+                )
+            )
+
     async def test_prepare_session_persists_bootstrap_and_codex_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime, storage, _coordinator = _build_runtime(

@@ -41,6 +41,15 @@ from .discoverable.transcribe import (
 )
 from .types import AgentToolAccess, DiscoverableTool, RegisteredTool
 
+MEMORY_TOOL_NAMES = frozenset(
+    {
+        "memory_search",
+        "memory_get",
+        "memory_write",
+        "memory_admin",
+    }
+)
+
 
 def _tool_visible_to_agent(
     tool: RegisteredTool,
@@ -83,11 +92,30 @@ class ToolRegistryView:
         hidden_tool_names: Iterable[str] = (),
     ) -> None:
         self._registry = registry
-        self._agent_kind = agent_kind
+        self._agent_kind: AgentToolAccess | None = agent_kind
         self._hidden_tool_names = frozenset(
             normalized
             for raw_name in hidden_tool_names
             if (normalized := str(raw_name).strip())
+        )
+
+    def with_hidden_tools(self, tool_names: Iterable[str]) -> "ToolRegistryView":
+        return ToolRegistryView(
+            self._registry,
+            agent_kind=self._agent_kind,
+            hidden_tool_names=(*self._hidden_tool_names, *tool_names),
+        )
+
+    def filtered_view(
+        self,
+        *,
+        agent_kind: AgentToolAccess | None = None,
+        hidden_tool_names: Iterable[str] = (),
+    ) -> "ToolRegistryView":
+        return ToolRegistryView(
+            self._registry,
+            agent_kind=self._agent_kind if agent_kind is None else agent_kind,
+            hidden_tool_names=(*self._hidden_tool_names, *hidden_tool_names),
         )
 
     def get(self, name: str) -> RegisteredTool | None:
@@ -287,6 +315,9 @@ class ToolRegistry:
             agent_kind=agent_kind,
             hidden_tool_names=hidden_tool_names,
         )
+
+    def with_hidden_tools(self, tool_names: Iterable[str]) -> ToolRegistryView:
+        return ToolRegistryView(self, hidden_tool_names=tool_names)
 
     def basic_definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(

@@ -56,6 +56,7 @@ class SettingsModuleTests(unittest.TestCase):
 
         self.assertEqual(module.SETTINGS_SOURCE_PATH, _PACKAGED_TEMPLATE_PATH.resolve())
         self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "openrouter")
+        self.assertTrue(module.JARVIS_MEMORY_ENABLED)
         self.assertFalse(module.JARVIS_SKILLS_BOOTSTRAP_HEADERS)
         self.assertEqual(module.JARVIS_GROK_REASONING_EFFORT, "high")
         self.assertEqual(module.JARVIS_OPENROUTER_REASONING_EFFORT, "high")
@@ -94,6 +95,34 @@ class SettingsModuleTests(unittest.TestCase):
         self.assertEqual(module.SETTINGS_SOURCE_PATH, workspace_settings_path.resolve())
         self.assertEqual(module.JARVIS_LLM_DEFAULT_PROVIDER, "grok")
         self.assertEqual(module.JARVIS_GROK_CHAT_MODEL, "grok-test")
+
+    def test_loads_disabled_memory_master_switch_from_workspace_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp)
+            settings_dir = workspace_dir / "settings"
+            settings_dir.mkdir(parents=True)
+            workspace_settings_path = settings_dir / "settings.yml"
+
+            payload = yaml.safe_load(_PACKAGED_TEMPLATE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                self.fail("Expected packaged settings template to be a mapping.")
+            _set_field_value(payload, ("memory", "fields", "enabled"), False)
+            workspace_settings_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_WORKSPACE": str(workspace_dir),
+                },
+                clear=True,
+            ):
+                module = importlib.reload(app_settings)
+
+        self.assertEqual(module.SETTINGS_SOURCE_PATH, workspace_settings_path.resolve())
+        self.assertFalse(module.JARVIS_MEMORY_ENABLED)
 
     def test_invalid_workspace_settings_fail_with_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

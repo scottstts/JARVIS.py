@@ -55,6 +55,7 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 
 @dataclass(slots=True, frozen=True)
 class MemorySettings:
+    enabled: bool
     workspace_dir: Path
     memory_dir: Path
     index_dir: Path
@@ -144,6 +145,7 @@ class MemorySettings:
             child_name="memory/.index",
         )
         return cls(
+            enabled=app_settings.JARVIS_MEMORY_ENABLED,
             workspace_dir=workspace_dir,
             memory_dir=memory_dir,
             index_dir=index_dir,

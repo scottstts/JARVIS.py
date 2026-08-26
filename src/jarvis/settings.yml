@@ -391,6 +391,12 @@ skills:
 memory:
   title: "Memory"
   description: "User-facing memory provider and behavior settings."
+  fields:
+    enabled:
+      label: "Enable Memory"
+      description: "Enable runtime memory bootstrap, maintenance, reflection, and tools."
+      type: "boolean"
+      value: true
   groups:
     maintenance:
       title: "Maintenance"
