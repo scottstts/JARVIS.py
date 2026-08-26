@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,14 @@ class TelegramAPIError(RuntimeError):
         message: str,
         status_code: int | None = None,
         retry_after_seconds: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(slots=True, frozen=True)
@@ -63,6 +66,29 @@ def _sanitize_request_error(
     if sanitized_message:
         exc.args = (sanitized_message,)
     return exc
+
+
+def _request_error_metadata(
+    exc: httpx.RequestError,
+    *,
+    method: str,
+    url: str,
+    timeout_seconds: float,
+    token: str,
+) -> dict[str, Any]:
+    request = getattr(exc, "request", None)
+    request_url = getattr(request, "url", None)
+    return {
+        "telegram_method": method,
+        "telegram_request_url": _redact_token(
+            str(request_url if request_url is not None else url),
+            token=token,
+        ),
+        "telegram_request_timeout_seconds": timeout_seconds,
+        "transport_exception_type": type(exc).__name__,
+        "transport_exception_module": type(exc).__module__,
+        "transport_exception_message": _redact_token(str(exc), token=token),
+    }
 
 
 class TelegramBotAPIClient:
@@ -184,6 +210,13 @@ class TelegramBotAPIClient:
                 message=(
                     f"Telegram file download failed for path '{remote_file_path}': "
                     f"{_describe_request_error(exc, token=self._token)}"
+                ),
+                metadata=_request_error_metadata(
+                    exc,
+                    method="download_file",
+                    url=url,
+                    timeout_seconds=self._file_transfer_timeout_seconds,
+                    token=self._token,
                 ),
             ) from _sanitize_request_error(exc, token=self._token)
         return destination
@@ -315,6 +348,13 @@ class TelegramBotAPIClient:
                         "Telegram request failed for method 'sendDocument': "
                         f"{_describe_request_error(exc, token=self._token)}"
                     ),
+                    metadata=_request_error_metadata(
+                        exc,
+                        method="sendDocument",
+                        url=url,
+                        timeout_seconds=self._file_transfer_timeout_seconds,
+                        token=self._token,
+                    ),
                 ) from _sanitize_request_error(exc, token=self._token)
 
         result = self._parse_method_response(response, method="sendDocument")
@@ -346,6 +386,13 @@ class TelegramBotAPIClient:
                 message=(
                     f"Telegram request failed for method '{method}': "
                     f"{_describe_request_error(exc, token=self._token)}"
+                ),
+                metadata=_request_error_metadata(
+                    exc,
+                    method=method,
+                    url=url,
+                    timeout_seconds=timeout,
+                    token=self._token,
                 ),
             ) from _sanitize_request_error(exc, token=self._token)
 

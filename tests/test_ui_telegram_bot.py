@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from collections.abc import AsyncIterator
@@ -103,12 +104,14 @@ class _FakeTelegramClient:
         download_payloads: dict[str, bytes] | None = None,
         draft_errors: list[TelegramAPIError] | None = None,
         message_errors: list[TelegramAPIError] | None = None,
+        get_me_error: TelegramAPIError | None = None,
     ) -> None:
         self._updates = updates or []
         self._remote_files = remote_files or {}
         self._download_payloads = download_payloads or {}
         self._draft_errors = draft_errors or []
         self._message_errors = message_errors or []
+        self._get_me_error = get_me_error
         self.sent_messages: list[_SentMessage] = []
         self.sent_drafts: list[_SentDraft] = []
         self.downloaded_files: list[_DownloadedFile] = []
@@ -121,6 +124,8 @@ class _FakeTelegramClient:
         self.closed = False
 
     async def get_me(self) -> dict[str, Any]:
+        if self._get_me_error is not None:
+            raise self._get_me_error
         return {"id": 1, "username": "jarvis_test_bot"}
 
     async def get_updates(
@@ -413,6 +418,52 @@ def _settings(**overrides: object) -> UISettings:
 
 
 class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_telegram_error_is_persisted_without_terminal_log(self) -> None:
+        startup_error = TelegramAPIError(
+            code="telegram_http_error",
+            message=(
+                "Telegram request failed for method 'getMe': "
+                "ConnectError: TLS handshake failed"
+            ),
+            metadata={
+                "telegram_method": "getMe",
+                "telegram_request_url": (
+                    "https://api.telegram.org/bot[REDACTED]/getMe"
+                ),
+                "transport_exception_type": "ConnectError",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = TelegramGatewayBridge(
+                settings=_settings(telegram_temp_dir=Path(tmp) / "temp"),
+                telegram_client=_FakeTelegramClient(get_me_error=startup_error),
+                gateway_client=_FakeGatewayClient(),
+            )
+
+            with self.assertNoLogs("ui.telegram.bot", level="ERROR"):
+                with self.assertRaises(TelegramAPIError):
+                    await bridge.run_forever()
+
+            error_log_path = Path(tmp) / "archive" / "error_logs" / (
+                "route_telegram_ui_unbound.jsonl"
+            )
+            entries = [
+                json.loads(line)
+                for line in error_log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["event"], "telegram_startup_failed")
+        self.assertEqual(entry["error_code"], "telegram_http_error")
+        self.assertEqual(entry["phase"], "get_me")
+        self.assertEqual(entry["telegram_method"], "getMe")
+        self.assertEqual(entry["exception_type"], "TelegramAPIError")
+        self.assertEqual(entry["exception_metadata"]["transport_exception_type"], "ConnectError")
+        self.assertEqual(entry["exception_chain"][0]["exception_type"], "TelegramAPIError")
+
     async def test_models_command_is_transient_and_bypasses_gateway(self) -> None:
         telegram = _FakeTelegramClient()
         gateway = _FakeGatewayClient()
@@ -3014,44 +3065,64 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.sent_messages[0].text, "**bold**")
         self.assertIsNone(telegram.sent_messages[0].parse_mode)
 
-    async def test_route_event_worker_logs_telegram_delivery_errors_without_relabeling_them(
+    async def test_route_event_worker_persists_telegram_delivery_errors_without_terminal_log(
         self,
     ) -> None:
-        telegram = _FakeTelegramClient()
-        session = _PersistentFakeRouteSession()
-        bridge = TelegramGatewayBridge(
-            settings=_settings(),
-            telegram_client=telegram,
-            gateway_client=_PersistentFakeGatewayClient(session),
-        )
-
-        await bridge.dispatch_message(
-            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="/new"),
-        )
-        client_message_id = session.sent_messages[0][1]
-        telegram._message_errors.append(
-            TelegramAPIError(
-                code="telegram_http_error",
-                message=(
-                    "Telegram request failed for method 'sendMessage': "
-                    "ReadTimeout: timed out"
-                ),
+        with tempfile.TemporaryDirectory() as tmp:
+            telegram = _FakeTelegramClient()
+            session = _PersistentFakeRouteSession()
+            bridge = TelegramGatewayBridge(
+                settings=_settings(telegram_temp_dir=Path(tmp) / "temp"),
+                telegram_client=telegram,
+                gateway_client=_PersistentFakeGatewayClient(session),
             )
-        )
 
-        with self.assertLogs("ui.telegram.bot", level="ERROR") as captured_logs:
-            await session.emit(
-                GatewayTurnStartedEvent(
-                    route_id="tg_777",
-                    session_id="session_1",
-                    turn_id="turn_1",
-                    turn_kind="user",
-                    client_message_id=client_message_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
+            await bridge.dispatch_message(
+                IncomingTextMessage(
+                    update_id=1,
+                    chat_id=777,
+                    chat_type="private",
+                    text="/new",
                 )
             )
-            await bridge.wait_for_chat_idle(777)
+            client_message_id = session.sent_messages[0][1]
+            telegram._message_errors.append(
+                TelegramAPIError(
+                    code="telegram_http_error",
+                    message=(
+                        "Telegram request failed for method 'sendMessage': "
+                        "ReadTimeout: timed out"
+                    ),
+                    metadata={
+                        "telegram_method": "sendMessage",
+                        "telegram_request_url": (
+                            "https://api.telegram.org/bot[REDACTED]/sendMessage"
+                        ),
+                        "transport_exception_type": "ReadTimeout",
+                    },
+                )
+            )
+
+            with self.assertNoLogs("ui.telegram.bot", level="ERROR"):
+                await session.emit(
+                    GatewayTurnStartedEvent(
+                        route_id="tg_777",
+                        session_id="session_1",
+                        turn_id="turn_1",
+                        turn_kind="user",
+                        client_message_id=client_message_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                    )
+                )
+                await bridge.wait_for_chat_idle(777)
+
+            error_log_path = Path(tmp) / "archive" / "error_logs" / "session_1.jsonl"
+            entries = [
+                json.loads(line)
+                for line in error_log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
 
         self.assertEqual(
             [message.text for message in telegram.sent_messages],
@@ -3059,18 +3130,20 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(777, bridge._active_turn_by_chat)
         self.assertNotIn(777, bridge._submitted_turns_by_chat)
-        self.assertTrue(
-            any(
-                "Telegram route event delivery failed for chat 777 "
-                "(code=telegram_http_error, message=Telegram request failed for method "
-                "'sendMessage': ReadTimeout: timed out)."
-                in line
-                for line in captured_logs.output
-            )
-        )
-        self.assertFalse(
-            any("gateway_unavailable" in line for line in captured_logs.output)
-        )
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["event"], "telegram_route_event_delivery_failed")
+        self.assertEqual(entry["error_code"], "telegram_http_error")
+        self.assertEqual(entry["route_id"], "tg_777")
+        self.assertEqual(entry["session_id"], "session_1")
+        self.assertEqual(entry["chat_id"], 777)
+        self.assertEqual(entry["event_type"], "GatewayTurnStartedEvent")
+        self.assertEqual(entry["wire_event_type"], "turn_started")
+        self.assertEqual(entry["exception_type"], "TelegramAPIError")
+        self.assertIn("sendMessage", entry["exception_message"])
+        self.assertEqual(entry["exception_metadata"]["transport_exception_type"], "ReadTimeout")
+        self.assertEqual(entry["exception_chain"][0]["exception_type"], "TelegramAPIError")
+        self.assertIn("TelegramAPIError", entry["traceback"])
 
     async def test_approval_callback_gateway_error_is_suppressed(self) -> None:
         telegram = _FakeTelegramClient()

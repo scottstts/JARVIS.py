@@ -176,7 +176,7 @@ Key responsibilities:
 - detached bash-job observation
 - route-wide hard-quiesce for `/stop` (preserve session) and destructive `/new` (replace session); both terminate owned jobs/services, while `/new` also disposes children and archives the old lineage
 - bounded adaptive `orchestrator_wait` timers and route-wide `task_status` snapshots for UI liveness
-- route-scoped runtime error capture, with full tracebacks persisted as JSONL entries under `/workspace/archive/error_logs/<session_id>.jsonl` and only a short Rich terminal reminder emitted inline
+- route-scoped runtime error capture, with full tracebacks and exception-chain metadata persisted as JSONL entries under `/workspace/archive/error_logs/<session_id>.jsonl`; Telegram/UI error boundaries keep those diagnostics out of terminal output and user-facing error text
 
 ### `src/jarvis/identities/`
 

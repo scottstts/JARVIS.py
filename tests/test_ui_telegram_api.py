@@ -452,6 +452,16 @@ class TelegramBotAPIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("123456:secret", str(context.exception))
         self.assertIsInstance(context.exception.__cause__, httpx.RequestError)
         self.assertEqual(str(context.exception.__cause__), "network down")
+        self.assertEqual(context.exception.metadata["telegram_method"], "sendMessage")
+        self.assertEqual(
+            context.exception.metadata["telegram_request_url"],
+            "https://api.telegram.org/bot[REDACTED]/sendMessage",
+        )
+        self.assertEqual(
+            context.exception.metadata["transport_exception_type"],
+            "RequestError",
+        )
+        self.assertNotIn("123456:secret", str(context.exception.metadata))
 
     async def test_download_file_preserves_transport_error_details_without_leaking_token(
         self,

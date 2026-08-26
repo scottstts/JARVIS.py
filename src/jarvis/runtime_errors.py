@@ -58,6 +58,7 @@ def record_runtime_error(
         "exception_module": type(exc).__module__,
         "exception_message": str(exc),
         "exception_metadata": _exception_metadata(exc),
+        "exception_chain": _exception_chain_metadata(exc),
         "traceback": "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__)
         ),
@@ -98,3 +99,25 @@ def _exception_metadata(exc: Exception) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
         return {}
     return json.loads(json.dumps(dict(metadata), ensure_ascii=False, default=str))
+
+
+def _exception_chain_metadata(exc: BaseException) -> list[dict[str, str]]:
+    chain: list[dict[str, str]] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(
+            {
+                "exception_type": type(current).__name__,
+                "exception_module": type(current).__module__,
+                "exception_message": str(current),
+            }
+        )
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return chain

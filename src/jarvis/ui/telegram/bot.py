@@ -9,7 +9,7 @@ import shutil
 import time
 import unicodedata
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -60,6 +60,49 @@ _WHITESPACE_BREAK_PATTERN = re.compile(r"\s+")
 _TYPING_ACTION = "typing"
 _TYPING_INITIAL_DELAY_SECONDS = 0.5
 _ACTIVE_TURN_RUNTIME_ERROR_TEXT = "❌ Error occurred. Try again."
+
+
+def _exception_error_code(exc: Exception, fallback: str) -> str:
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.strip():
+        return code
+    return fallback
+
+
+def _route_event_error_context(
+    *,
+    chat_id: int,
+    event: GatewayRouteEvent | None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {"chat_id": chat_id}
+    if event is None:
+        return context
+
+    context["event_type"] = type(event).__name__
+    wire_type = getattr(event, "type", None)
+    if isinstance(wire_type, str) and wire_type:
+        context["wire_event_type"] = wire_type
+    for field_name in (
+        "event_id",
+        "route_id",
+        "session_id",
+        "turn_id",
+        "turn_kind",
+        "client_message_id",
+        "agent_kind",
+        "agent_name",
+        "subagent_id",
+        "actor_id",
+        "actor_run_generation",
+        "actor_sequence",
+        "sequence",
+    ):
+        value = getattr(event, field_name, None)
+        if value is not None and value != "":
+            context[field_name] = value
+    if isinstance(event, GatewayToolCallEvent):
+        context["tool_names"] = list(event.tool_names)
+    return context
 
 
 class GatewayClientLike(Protocol):
@@ -224,6 +267,7 @@ class _SubmittedTelegramTurn:
 class _ActiveTelegramTurn:
     client_message_id: str
     turn_id: str
+    session_id: str | None
     completion: asyncio.Future[None]
     current_draft_id: int
     stream_transport: str
@@ -379,8 +423,88 @@ class TelegramGatewayBridge:
         self._typing_indicator_by_chat: dict[int, _ChatTypingIndicatorState] = {}
         self._task_status_active_by_chat: dict[int, bool] = {}
 
+    def _error_transcript_archive_dir(self) -> Path:
+        configured = self._settings.transcript_archive_dir
+        if configured is not None:
+            return configured
+        return self._settings.telegram_temp_dir.parent / "archive" / "transcripts"
+
+    def _record_runtime_error(
+        self,
+        exc: Exception,
+        *,
+        event: str,
+        error_code: str,
+        message: str,
+        chat_id: int | None = None,
+        route_id: str | None = None,
+        session_id: str | None = None,
+        agent_kind: str = "main",
+        context: Mapping[str, Any] | None = None,
+    ) -> Path:
+        resolved_route_id = route_id or (
+            route_id_for_chat(chat_id) if chat_id is not None else "telegram_ui"
+        )
+        error_context = dict(context or {})
+        if chat_id is not None:
+            error_context.setdefault("chat_id", chat_id)
+        return record_runtime_error(
+            transcript_archive_dir=self._error_transcript_archive_dir(),
+            route_id=resolved_route_id,
+            session_id=session_id,
+            component="ui.telegram.bot",
+            event=event,
+            agent_kind=agent_kind,
+            exc=exc,
+            error_code=error_code,
+            message=message,
+            context=error_context,
+        )
+
+    def _record_route_event_error(
+        self,
+        *,
+        chat_id: int,
+        event: GatewayRouteEvent | None,
+        exc: Exception,
+        error_event: str,
+        error_code: str,
+        message: str,
+    ) -> Path:
+        context = _route_event_error_context(chat_id=chat_id, event=event)
+        session_id = context.get("session_id")
+        agent_kind = context.get("agent_kind", "main")
+        return self._record_runtime_error(
+            exc,
+            event=error_event,
+            error_code=error_code,
+            message=message,
+            chat_id=chat_id,
+            route_id=route_id_for_chat(chat_id),
+            session_id=session_id if isinstance(session_id, str) else None,
+            agent_kind=agent_kind if isinstance(agent_kind, str) else "main",
+            context=context,
+        )
+
+    def _clear_route_event_delivery_state(self, chat_id: int) -> None:
+        self._task_status_active_by_chat.pop(chat_id, None)
+        self._stop_typing_indicator(chat_id)
+        self._finish_all_submitted_turns(chat_id=chat_id)
+
     async def run_forever(self) -> None:
-        bot_profile = await self._telegram.get_me()
+        try:
+            bot_profile = await self._telegram.get_me()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_startup_failed",
+                error_code=_exception_error_code(exc, "telegram_startup_failed"),
+                message="Telegram UI startup failed while validating the bot profile.",
+                context={"phase": "get_me", "telegram_method": "getMe"},
+            )
+            raise
         from rich.console import Console
         from rich.text import Text
 
@@ -394,12 +518,22 @@ class TelegramGatewayBridge:
                 next_offset = await self.poll_once(offset=next_offset)
             except asyncio.CancelledError:
                 raise
-            except TelegramAPIError:
-                LOGGER.exception("Telegram API polling failed; retrying after backoff.")
+            except TelegramAPIError as exc:
+                self._record_runtime_error(
+                    exc,
+                    event="telegram_poll_failed",
+                    error_code=_exception_error_code(exc, "telegram_poll_failed"),
+                    message="Telegram polling failed; retrying after backoff.",
+                    context={"phase": "polling"},
+                )
                 await asyncio.sleep(self._settings.poll_error_backoff_seconds)
-            except Exception:
-                LOGGER.exception(
-                    "Unexpected error in polling loop; retrying after backoff."
+            except Exception as exc:
+                self._record_runtime_error(
+                    exc,
+                    event="telegram_poll_failed",
+                    error_code="telegram_poll_failed",
+                    message="Unexpected Telegram polling failure; retrying after backoff.",
+                    context={"phase": "polling"},
                 )
                 await asyncio.sleep(self._settings.poll_error_backoff_seconds)
 
@@ -439,9 +573,19 @@ class TelegramGatewayBridge:
                 approval_id=callback.approval_id,
                 approved=callback.approved,
             )
-        except GatewayBridgeError:
-            LOGGER.exception(
-                "Failed to submit approval callback to the gateway; suppressing Telegram error text."
+        except GatewayBridgeError as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_approval_gateway_submit_failed",
+                error_code=_exception_error_code(exc, "telegram_approval_gateway_submit_failed"),
+                message="Failed to submit a Telegram approval callback to the gateway.",
+                chat_id=callback.chat_id,
+                route_id=route_id_for_chat(callback.chat_id),
+                context={
+                    "callback_query_id": callback.callback_query_id,
+                    "message_id": callback.message_id,
+                    "approval_id": callback.approval_id,
+                },
             )
             await self._telegram.answer_callback_query(
                 callback_query_id=callback.callback_query_id,
@@ -479,8 +623,20 @@ class TelegramGatewayBridge:
                 text=updated_text,
                 parse_mode=parse_mode,
             )
-        except TelegramAPIError:
-            LOGGER.exception("Failed to edit Telegram approval message status.")
+        except TelegramAPIError as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_approval_status_update_failed",
+                error_code=_exception_error_code(exc, "telegram_approval_status_update_failed"),
+                message="Failed to update the Telegram approval message status.",
+                chat_id=callback.chat_id,
+                route_id=route_id_for_chat(callback.chat_id),
+                context={
+                    "callback_query_id": callback.callback_query_id,
+                    "message_id": callback.message_id,
+                    "approval_id": callback.approval_id,
+                },
+            )
 
     async def dispatch_message(self, message: IncomingTelegramMessage) -> None:
         if message.chat_type != "private":
@@ -495,14 +651,36 @@ class TelegramGatewayBridge:
             if await self._handle_ui_command(message):
                 return
             await self._submit_message(message)
-        except GatewayBridgeError:
-            LOGGER.exception(
-                "Gateway bridge failed; suppressing Telegram error text."
+        except GatewayBridgeError as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_message_gateway_submit_failed",
+                error_code=_exception_error_code(exc, "telegram_message_gateway_submit_failed"),
+                message="Failed to submit a Telegram message to the gateway.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
+                context={"update_id": message.update_id},
             )
-        except TelegramAPIError:
-            LOGGER.exception("Telegram API send failed.")
-        except Exception:
-            LOGGER.exception("Unexpected bridge error; suppressing Telegram error text.")
+        except TelegramAPIError as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_message_delivery_failed",
+                error_code=_exception_error_code(exc, "telegram_message_delivery_failed"),
+                message="Telegram message delivery failed.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
+                context={"update_id": message.update_id},
+            )
+        except Exception as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_message_handler_failed",
+                error_code="telegram_message_handler_failed",
+                message="Unexpected Telegram message-handler failure.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
+                context={"update_id": message.update_id},
+            )
 
     async def _ensure_route_session(self, chat_id: int) -> GatewayRouteSessionLike:
         existing = self._route_sessions.get(chat_id)
@@ -533,53 +711,99 @@ class TelegramGatewayBridge:
         chat_id: int,
         session: GatewayRouteSessionLike,
     ) -> None:
+        latest_event: GatewayRouteEvent | None = None
         try:
             async for event in session.events():
+                latest_event = event
                 await self._handle_route_event(chat_id=chat_id, event=event)
         except asyncio.CancelledError:
             raise
         except GatewayBridgeError as exc:
-            LOGGER.exception("Persistent gateway route session failed.")
-            await self._handle_route_event(
+            self._record_route_event_error(
                 chat_id=chat_id,
-                event=GatewayErrorEvent(
-                    event_id="",
-                    created_at="",
-                    route_id=route_id_for_chat(chat_id),
-                    session_id=None,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    subagent_id=None,
-                    code=exc.code,
-                    message=exc.message,
-                )
+                event=latest_event,
+                exc=exc,
+                error_event="telegram_gateway_route_session_failed",
+                error_code=_exception_error_code(exc, "telegram_gateway_route_session_failed"),
+                message="Persistent Telegram gateway route session failed.",
             )
+            try:
+                await self._handle_route_event(
+                    chat_id=chat_id,
+                    event=GatewayErrorEvent(
+                        event_id="",
+                        created_at="",
+                        route_id=route_id_for_chat(chat_id),
+                        session_id=None,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        subagent_id=None,
+                        code=exc.code,
+                        message=exc.message,
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as delivery_exc:
+                self._record_route_event_error(
+                    chat_id=chat_id,
+                    event=latest_event,
+                    exc=delivery_exc,
+                    error_event="telegram_route_error_notice_delivery_failed",
+                    error_code=_exception_error_code(
+                        delivery_exc,
+                        "telegram_route_error_notice_delivery_failed",
+                    ),
+                    message="Failed to deliver the Telegram route error notice.",
+                )
         except TelegramAPIError as exc:
-            LOGGER.exception(
-                "Telegram route event delivery failed for chat %s (code=%s, message=%s).",
-                chat_id,
-                exc.code or "telegram_error",
-                exc.message or "",
-            )
-            self._task_status_active_by_chat.pop(chat_id, None)
-            self._stop_typing_indicator(chat_id)
-            self._finish_all_submitted_turns(chat_id=chat_id)
-        except Exception:
-            LOGGER.exception("Unexpected route event worker failure.")
-            await self._handle_route_event(
+            self._record_route_event_error(
                 chat_id=chat_id,
-                event=GatewayErrorEvent(
-                    event_id="",
-                    created_at="",
-                    route_id=route_id_for_chat(chat_id),
-                    session_id=None,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    subagent_id=None,
-                    code="gateway_unavailable",
-                    message="",
-                )
+                event=latest_event,
+                exc=exc,
+                error_event="telegram_route_event_delivery_failed",
+                error_code=_exception_error_code(exc, "telegram_route_event_delivery_failed"),
+                message="Telegram route event delivery failed.",
             )
+            self._clear_route_event_delivery_state(chat_id)
+        except Exception as exc:
+            self._record_route_event_error(
+                chat_id=chat_id,
+                event=latest_event,
+                exc=exc,
+                error_event="telegram_route_event_worker_failed",
+                error_code="telegram_route_event_worker_failed",
+                message="Unexpected Telegram route event worker failure.",
+            )
+            try:
+                await self._handle_route_event(
+                    chat_id=chat_id,
+                    event=GatewayErrorEvent(
+                        event_id="",
+                        created_at="",
+                        route_id=route_id_for_chat(chat_id),
+                        session_id=None,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        subagent_id=None,
+                        code="gateway_unavailable",
+                        message="",
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as delivery_exc:
+                self._record_route_event_error(
+                    chat_id=chat_id,
+                    event=latest_event,
+                    exc=delivery_exc,
+                    error_event="telegram_route_error_notice_delivery_failed",
+                    error_code=_exception_error_code(
+                        delivery_exc,
+                        "telegram_route_error_notice_delivery_failed",
+                    ),
+                    message="Failed to deliver the Telegram route error notice.",
+                )
         finally:
             tracked = self._route_sessions.get(chat_id)
             current_task = asyncio.current_task()
@@ -596,9 +820,15 @@ class TelegramGatewayBridge:
         if message.file_attachment is not None:
             try:
                 user_text = await self._build_file_turn_text(message)
-            except TelegramAPIError:
-                LOGGER.exception(
-                    "Telegram file download failed; suppressing Telegram error text."
+            except TelegramAPIError as exc:
+                self._record_runtime_error(
+                    exc,
+                    event="telegram_file_download_failed",
+                    error_code=_exception_error_code(exc, "telegram_file_download_failed"),
+                    message="Telegram file download failed.",
+                    chat_id=message.chat_id,
+                    route_id=route_id_for_chat(message.chat_id),
+                    context={"update_id": message.update_id},
                 )
                 return None
 
@@ -672,6 +902,7 @@ class TelegramGatewayBridge:
                     chat_id=chat_id,
                     submitted_turn=submitted_turn,
                     turn_id=event.turn_id,
+                    session_id=event.session_id,
                 )
             return
 
@@ -690,6 +921,7 @@ class TelegramGatewayBridge:
                     chat_id=chat_id,
                     submitted_turn=submitted_turn,
                     turn_id=event.turn_id or event.client_message_id,
+                    session_id=event.session_id,
                 )
         if isinstance(event, GatewayErrorEvent):
             if active_turn is not None:
@@ -867,10 +1099,12 @@ class TelegramGatewayBridge:
         chat_id: int,
         submitted_turn: _SubmittedTelegramTurn,
         turn_id: str,
+        session_id: str | None,
     ) -> _ActiveTelegramTurn:
         active_turn = _ActiveTelegramTurn(
             client_message_id=submitted_turn.client_message_id,
             turn_id=turn_id,
+            session_id=session_id,
             completion=submitted_turn.completion,
             current_draft_id=self._next_draft_id_for_chat(chat_id),
             stream_transport=self._settings.stream_transport,
@@ -920,8 +1154,18 @@ class TelegramGatewayBridge:
                         chat_id=chat_id,
                         action=_TYPING_ACTION,
                     )
-                except TelegramAPIError:
-                    LOGGER.exception("Failed to send Telegram typing indicator.")
+                except TelegramAPIError as exc:
+                    self._record_runtime_error(
+                        exc,
+                        event="telegram_typing_indicator_send_failed",
+                        error_code=_exception_error_code(
+                            exc,
+                            "telegram_typing_indicator_send_failed",
+                        ),
+                        message="Telegram typing-indicator delivery failed.",
+                        chat_id=chat_id,
+                        route_id=route_id_for_chat(chat_id),
+                    )
                 next_delay = self._settings.stream_typing_indicator_interval_seconds
         except asyncio.CancelledError:
             raise
@@ -971,26 +1215,14 @@ class TelegramGatewayBridge:
             return
         error = task.exception()
         if error is not None:
-            LOGGER.error(
-                "Telegram typing indicator task failed unexpectedly.",
-                exc_info=(type(error), error, error.__traceback__),
-            )
             if isinstance(error, Exception):
-                route_id = route_id_for_chat(chat_id)
-                workspace_dir = self._settings.telegram_temp_dir.parent
-                record_runtime_error(
-                    transcript_archive_dir=workspace_dir / "archive" / "transcripts",
-                    route_id=route_id,
-                    session_id=None,
-                    component="ui.telegram.bot",
+                self._record_runtime_error(
+                    error,
                     event="typing_indicator_task_failed",
-                    agent_kind="main",
-                    exc=error,
                     error_code="typing_indicator_task_failed",
-                    message=(
-                        f"Telegram typing indicator task failed for route {route_id}."
-                    ),
-                    context={"chat_id": chat_id},
+                    message="Telegram typing-indicator task failed unexpectedly.",
+                    chat_id=chat_id,
+                    route_id=route_id_for_chat(chat_id),
                 )
         self._typing_indicator_by_chat.pop(chat_id, None)
         if self._task_status_active_by_chat.get(chat_id):
@@ -1058,17 +1290,22 @@ class TelegramGatewayBridge:
             except TelegramAPIError as exc:
                 if active_turn.stream_transport != "draft":
                     raise
+                self._record_runtime_error(
+                    exc,
+                    event="telegram_draft_send_failed",
+                    error_code=_exception_error_code(exc, "telegram_draft_send_failed"),
+                    message="Telegram draft delivery failed; continuing without draft streaming.",
+                    chat_id=chat_id,
+                    route_id=route_id_for_chat(chat_id),
+                    session_id=active_turn.session_id,
+                    context={
+                        "turn_id": active_turn.turn_id,
+                        "stream_transport": active_turn.stream_transport,
+                        "retry_after_seconds": exc.retry_after_seconds,
+                    },
+                )
                 active_turn.drafts_enabled = False
                 self._record_draft_backoff(chat_id=chat_id, exc=exc)
-                if exc.retry_after_seconds is not None:
-                    LOGGER.warning(
-                        "sendMessageDraft rate-limited; pausing drafts for %ss.",
-                        exc.retry_after_seconds,
-                    )
-                else:
-                    LOGGER.exception(
-                        "sendMessageDraft failed; continuing this turn without draft streaming."
-                    )
                 return
             active_turn.published_text += next_chunk
             active_turn.last_publish_at = now
@@ -1298,14 +1535,36 @@ class TelegramGatewayBridge:
             if completion is None:
                 return
             await completion
-        except GatewayBridgeError:
-            LOGGER.exception(
-                "Gateway bridge failed; suppressing Telegram error text."
+        except GatewayBridgeError as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_message_gateway_submit_failed",
+                error_code=_exception_error_code(exc, "telegram_message_gateway_submit_failed"),
+                message="Failed to submit a Telegram message to the gateway.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
+                context={"update_id": message.update_id},
             )
-        except TelegramAPIError:
-            LOGGER.exception("Telegram API send failed.")
-        except Exception:
-            LOGGER.exception("Unexpected bridge error; suppressing Telegram error text.")
+        except TelegramAPIError as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_message_delivery_failed",
+                error_code=_exception_error_code(exc, "telegram_message_delivery_failed"),
+                message="Telegram message delivery failed.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
+                context={"update_id": message.update_id},
+            )
+        except Exception as exc:
+            self._record_runtime_error(
+                exc,
+                event="telegram_message_handler_failed",
+                error_code="telegram_message_handler_failed",
+                message="Unexpected Telegram message-handler failure.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
+                context={"update_id": message.update_id},
+            )
 
     async def aclose(self) -> None:
         chat_workers = tuple(self._chat_workers.values())
@@ -1503,10 +1762,13 @@ class TelegramGatewayBridge:
         except GatewayBridgeError as exc:
             if not output_was_paused:
                 self._output_pause_state_by_chat.pop(message.chat_id, None)
-            LOGGER.exception(
-                "Gateway stop request failed; suppressing Telegram error text (code=%s, message=%s).",
-                exc.code,
-                exc.message,
+            self._record_runtime_error(
+                exc,
+                event="telegram_stop_gateway_request_failed",
+                error_code=_exception_error_code(exc, "telegram_stop_gateway_request_failed"),
+                message="Telegram /stop could not reach the gateway.",
+                chat_id=message.chat_id,
+                route_id=route_id_for_chat(message.chat_id),
             )
             return
         except Exception:
@@ -1525,7 +1787,17 @@ class TelegramGatewayBridge:
             return False
         if _is_models_command_text(message.text):
             if not self._provider_configuration:
-                LOGGER.error("Runtime provider configuration is unavailable for /models.")
+                self._record_runtime_error(
+                    UIConfigurationError(
+                        "Runtime provider configuration is unavailable for /models."
+                    ),
+                    event="telegram_models_configuration_unavailable",
+                    error_code="telegram_models_configuration_unavailable",
+                    message="Telegram /models could not render runtime provider configuration.",
+                    chat_id=message.chat_id,
+                    route_id=route_id_for_chat(message.chat_id),
+                    context={"update_id": message.update_id},
+                )
                 return True
             await self._send_html_message(
                 chat_id=message.chat_id,
@@ -2716,6 +2988,16 @@ async def run_telegram_ui(
     )
     try:
         await bridge.run_forever()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        bridge._record_runtime_error(
+            exc,
+            event="telegram_ui_runtime_failed",
+            error_code=_exception_error_code(exc, "telegram_ui_runtime_failed"),
+            message="Telegram UI runtime failed; shutting down the UI.",
+            context={"phase": "run_forever"},
+        )
     finally:
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):

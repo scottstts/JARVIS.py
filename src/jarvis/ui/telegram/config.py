@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from jarvis.gateway.config import GatewaySettings
+from jarvis.storage.layout import resolve_transcript_archive_root
 from jarvis.workspace_paths import resolve_workspace_child, resolve_workspace_dir
 
 
@@ -150,6 +151,7 @@ class UISettings:
         _DEFAULT_STREAM_TYPING_INDICATOR_INTERVAL_SECONDS
     )
     telegram_max_message_chars: int = _DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS
+    transcript_archive_dir: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.telegram_token.strip():
@@ -266,4 +268,5 @@ class UISettings:
                 "JARVIS_UI_TELEGRAM_MAX_MESSAGE_CHARS",
                 _DEFAULT_TELEGRAM_MAX_MESSAGE_CHARS,
             ),
+            transcript_archive_dir=resolve_transcript_archive_root(workspace_dir),
         )
