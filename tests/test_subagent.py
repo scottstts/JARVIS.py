@@ -30,7 +30,7 @@ from jarvis.llm import (
     TextDeltaEvent,
     TextPart,
 )
-from jarvis.storage import ConversationRecord
+from jarvis.storage import ConversationRecord, SessionStorage
 from jarvis.subagent.manager import SubagentManager
 from jarvis.subagent.runtime import SubagentRuntime
 from jarvis.subagent.settings import SubagentSettings
@@ -84,9 +84,10 @@ class _FakeSubagentLoop:
         self.hard_stop_requests = 0
         self.hard_stop_reasons: list[str] = []
         self.system_notes: list[tuple[str, str | None, dict[str, object] | None]] = []
+        self.prepare_session_reasons: list[str] = []
 
     async def prepare_session(self, *, start_reason: str) -> str:
-        _ = start_reason
+        self.prepare_session_reasons.append(start_reason)
         return self._session_id
 
     async def stream_turn(self, *, user_text: str, force_session_id: str | None, pre_turn_messages):
@@ -211,6 +212,230 @@ class SubagentSettingsTests(unittest.TestCase):
 
 
 class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restore_reconstitutes_only_current_main_lineage_and_pauses_in_flight_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route_id = "route_restore"
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            registry = ToolRegistry.default(
+                ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+            )
+            manager = SubagentManager(
+                route_id=route_id,
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=registry,
+                tool_execution_guard=asyncio.Semaphore(1),
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            main_storage = SessionStorage(core_settings.transcript_archive_dir)
+            ancestor = main_storage.create_session(start_reason="initial")
+            current = main_storage.create_session(
+                parent_session_id=ancestor.session_id,
+                start_reason="compaction",
+            )
+            loops: dict[str, _FakeSubagentLoop] = {}
+            entry_specs = (
+                (
+                    "child_ancestor",
+                    "Edith",
+                    "completed",
+                    ancestor.session_id,
+                    None,
+                ),
+                (
+                    "child_clean",
+                    "Friday",
+                    "paused",
+                    current.session_id,
+                    "process_shutdown",
+                ),
+                (
+                    "child_interrupted",
+                    "Karen",
+                    "running",
+                    current.session_id,
+                    None,
+                ),
+            )
+            for subagent_id, codename, status, owner_session_id, pause_reason in entry_specs:
+                child_storage = manager._catalog.session_storage(
+                    owner_main_session_id=owner_session_id,
+                    subagent_id=subagent_id,
+                )
+                child_session = child_storage.create_session(
+                    start_reason="subagent_initial"
+                )
+                loops[subagent_id] = _FakeSubagentLoop(
+                    [],
+                    session_id=child_session.session_id,
+                )
+                manager._catalog.create_entry(
+                    SubagentCatalogEntry(
+                        subagent_id=subagent_id,
+                        codename=codename,
+                        status=status,  # type: ignore[arg-type]
+                        created_at="2026-08-25T12:00:00+00:00",
+                        updated_at="2026-08-25T12:00:00+00:00",
+                        route_id=route_id,
+                        owner_main_session_id=owner_session_id,
+                        owner_main_turn_id="main_turn",
+                        current_subagent_session_id=child_session.session_id,
+                        pause_reason=pause_reason,  # type: ignore[arg-type]
+                    )
+                )
+
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id="child_other_route_session",
+                    codename="Ultron",
+                    status="running",
+                    created_at="2026-08-25T12:00:00+00:00",
+                    updated_at="2026-08-25T12:00:00+00:00",
+                    route_id=route_id,
+                    owner_main_session_id="not-in-current-lineage",
+                    owner_main_turn_id="old_turn",
+                )
+            )
+            manager._catalog.create_entry(
+                SubagentCatalogEntry(
+                    subagent_id="child_disposed",
+                    codename="Homer",
+                    status="disposed",
+                    created_at="2026-08-25T12:00:00+00:00",
+                    updated_at="2026-08-25T12:00:00+00:00",
+                    route_id=route_id,
+                    owner_main_session_id=current.session_id,
+                    owner_main_turn_id="old_turn",
+                )
+            )
+
+            with patch.object(
+                manager,
+                "_build_subagent_loop",
+                side_effect=lambda **kwargs: loops[kwargs["subagent_id"]],
+            ) as build_loop:
+                await manager.restore(owner_main_session_id=current.session_id)
+                await manager.restore(owner_main_session_id=current.session_id)
+
+            self.assertEqual(build_loop.call_count, 3)
+            self.assertCountEqual(
+                [snapshot.subagent_id for snapshot in manager.active_snapshots()],
+                ["child_ancestor", "child_clean", "child_interrupted"],
+            )
+            clean = manager._subagents["child_clean"]
+            self.assertEqual(clean.status, "paused")
+            self.assertEqual(clean.pause_reason, "process_shutdown")
+            self.assertEqual(
+                loops["child_clean"].prepare_session_reasons,
+                ["subagent_recovery"],
+            )
+            interrupted = manager._subagents["child_interrupted"]
+            self.assertEqual(interrupted.status, "paused")
+            self.assertEqual(interrupted.pause_reason, "process_restart")
+            self.assertFalse(interrupted.report_complete)
+            self.assertTrue(
+                any(
+                    "ended before this subagent completed" in note[0]
+                    for note in loops["child_interrupted"].system_notes
+                )
+            )
+            self.assertTrue(
+                any(
+                    "graceful Jarvis process shutdown" in note[0]
+                    for note in loops["child_clean"].system_notes
+                )
+            )
+            interrupted_entry = manager._catalog.get_entry("child_interrupted")
+            self.assertIsNotNone(interrupted_entry)
+            if interrupted_entry is not None:
+                self.assertEqual(interrupted_entry.status, "paused")
+                self.assertEqual(interrupted_entry.pause_reason, "process_restart")
+
+    async def test_restore_reacquires_held_lease_and_pauses_conflicting_in_flight_child(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route_id = "route_restore_lease"
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            (core_settings.workspace_dir / "src").mkdir()
+            workspace_access = WorkspaceAccessCoordinator(
+                workspace_dir=core_settings.workspace_dir
+            )
+            manager = SubagentManager(
+                route_id=route_id,
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                workspace_access=workspace_access,
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            main_session = SessionStorage(
+                core_settings.transcript_archive_dir
+            ).create_session(start_reason="initial")
+            loops: dict[str, _FakeSubagentLoop] = {}
+            for subagent_id, status in (
+                ("child_a", "paused"),
+                ("child_b", "running"),
+            ):
+                child_storage = manager._catalog.session_storage(
+                    owner_main_session_id=main_session.session_id,
+                    subagent_id=subagent_id,
+                )
+                child_session = child_storage.create_session(
+                    start_reason="subagent_initial"
+                )
+                loops[subagent_id] = _FakeSubagentLoop(
+                    [],
+                    session_id=child_session.session_id,
+                )
+                manager._catalog.create_entry(
+                    SubagentCatalogEntry(
+                        subagent_id=subagent_id,
+                        codename="Friday" if subagent_id == "child_a" else "Edith",
+                        status=status,  # type: ignore[arg-type]
+                        created_at="2026-08-25T12:00:00+00:00",
+                        updated_at="2026-08-25T12:00:00+00:00",
+                        route_id=route_id,
+                        owner_main_session_id=main_session.session_id,
+                        owner_main_turn_id="main_turn",
+                        owned_paths=("src",),
+                        workspace_lease_status="held",
+                        current_subagent_session_id=child_session.session_id,
+                        pause_reason=(
+                            "process_shutdown" if subagent_id == "child_a" else None
+                        ),
+                    )
+                )
+
+            with patch.object(
+                manager,
+                "_build_subagent_loop",
+                side_effect=lambda **kwargs: loops[kwargs["subagent_id"]],
+            ):
+                await manager.restore(owner_main_session_id=main_session.session_id)
+
+            first = manager._subagents["child_a"]
+            second = manager._subagents["child_b"]
+            self.assertEqual(first.workspace_lease_status, "held")
+            self.assertEqual(second.workspace_lease_status, "released")
+            self.assertEqual(second.status, "paused")
+            self.assertEqual(second.pause_reason, "external_blocked")
+            second_entry = manager._catalog.get_entry("child_b")
+            self.assertIsNotNone(second_entry)
+            if second_entry is not None:
+                self.assertEqual(second_entry.workspace_lease_status, "released")
+                self.assertEqual(second_entry.pause_reason, "external_blocked")
+            with self.assertRaises(WorkspaceLeaseError):
+                await workspace_access.claim_paths(owner="main", paths=("src",))
+
     async def test_build_main_progress_message_includes_latest_subagent_report_for_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))

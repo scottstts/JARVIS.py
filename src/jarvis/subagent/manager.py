@@ -24,6 +24,7 @@ from jarvis.core import (
     AgentToolCallEvent,
     AgentTurnDoneEvent,
     CoreSettings,
+    InterruptionReason,
 )
 from jarvis.gateway.bash_job_supervisor import BashJobNotice
 from jarvis.gateway.route_events import (
@@ -89,6 +90,9 @@ from .types import (
 LOGGER = get_application_logger(__name__)
 _MAX_SUBAGENT_PROVIDER_RECOVERY_ATTEMPTS = 3
 _MAX_TRACKED_CHANGED_PATHS = 256
+_IN_FLIGHT_SUBAGENT_STATUSES = frozenset(
+    {"running", "awaiting_approval", "waiting_background"}
+)
 
 
 class SubagentManager:
@@ -137,6 +141,256 @@ class SubagentManager:
         self._pending_bash_job_notices: dict[str, dict[str, BashJobNotice]] = {}
         self._last_monitor_signatures: dict[str, str] = {}
         self._last_main_context_signature: tuple[str, str] | None = None
+        self._restore_lock = asyncio.Lock()
+        self._restored = False
+
+    async def restore(self, *, owner_main_session_id: str | None) -> None:
+        """Rebuild non-disposed child runtimes from the durable route catalog.
+
+        A process can only resume the contracts belonging to the active main session or
+        one of its compaction ancestors.  Persisted in-flight statuses are never treated
+        as proof that a child completed: they are converted to an explicitly paused
+        process-restart state and their child session reconciles any orphaned turn.
+        """
+
+        async with self._restore_lock:
+            if self._restored:
+                return
+            entries = self._entries_for_main_session(owner_main_session_id)
+            for entry in entries:
+                if entry.subagent_id in self._subagents:
+                    continue
+                await self._restore_entry(entry)
+            self._restored = True
+
+    def _entries_for_main_session(
+        self,
+        owner_main_session_id: str | None,
+    ) -> tuple[SubagentCatalogEntry, ...]:
+        normalized_owner = (owner_main_session_id or "").strip()
+        if not normalized_owner:
+            return ()
+
+        main_storage = SessionStorage(self._core_settings.transcript_archive_dir)
+        owner_session_ids = {normalized_owner}
+        cursor = main_storage.get_session(normalized_owner)
+        visited: set[str] = set()
+        while cursor is not None and cursor.session_id not in visited:
+            visited.add(cursor.session_id)
+            if cursor.start_reason != "compaction":
+                break
+            parent_session_id = (cursor.parent_session_id or "").strip()
+            if not parent_session_id:
+                break
+            owner_session_ids.add(parent_session_id)
+            cursor = main_storage.get_session(parent_session_id)
+
+        return tuple(
+            entry
+            for entry in self._catalog.list_entries()
+            if entry.route_id == self._route_id
+            and entry.status != "disposed"
+            and entry.owner_main_session_id in owner_session_ids
+        )
+
+    async def _restore_entry(self, entry: SubagentCatalogEntry) -> None:
+        skill_documents = self._load_skill_documents(entry.skill_ids)
+        bootstrap_loader = SubagentBootstrapLoader(
+            assignment_message=build_assignment_message(
+                codename=entry.codename,
+                subagent_id=entry.subagent_id,
+                task_label=entry.task_label,
+                instructions=entry.instructions,
+                user_constraints=entry.user_constraints,
+                shared_context=entry.shared_context,
+                owned_paths=entry.owned_paths,
+                skill_documents=skill_documents,
+                phase=entry.phase,
+                depends_on=entry.depends_on,
+                seam_contract=entry.seam_contract,
+                deliverable=entry.deliverable,
+            )
+        )
+        storage = self._catalog.session_storage(
+            owner_main_session_id=entry.owner_main_session_id,
+            subagent_id=entry.subagent_id,
+        )
+        was_in_flight = entry.status in _IN_FLIGHT_SUBAGENT_STATUSES
+        runtime = SubagentRuntime(
+            subagent_id=entry.subagent_id,
+            codename=entry.codename,
+            loop=self._build_subagent_loop(
+                subagent_id=entry.subagent_id,
+                codename=entry.codename,
+                storage=storage,
+                bootstrap_loader=bootstrap_loader,
+            ),
+            storage=storage,
+            owner_main_session_id=entry.owner_main_session_id,
+            owner_main_turn_id=entry.owner_main_turn_id,
+            status="paused" if was_in_flight else entry.status,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+            task_label=entry.task_label,
+            instructions=entry.instructions,
+            user_constraints=entry.user_constraints,
+            shared_context=entry.shared_context,
+            owned_paths=entry.owned_paths,
+            skill_ids=entry.skill_ids,
+            skill_selection_reason=entry.skill_selection_reason,
+            phase=entry.phase,
+            depends_on=entry.depends_on,
+            seam_contract=entry.seam_contract,
+            changed_paths=set(entry.changed_paths),
+            changed_paths_complete=entry.changed_paths_complete,
+            changed_paths_source=entry.changed_paths_source,
+            changed_test_artifact_paths=set(entry.changed_test_artifact_paths),
+            workspace_lease_status=(
+                "released"
+                if self._workspace_access is not None and entry.owned_paths
+                else "not_applicable"
+            ),
+            deliverable=entry.deliverable,
+            pause_reason=("process_restart" if was_in_flight else entry.pause_reason),
+            last_error=entry.last_error,
+            last_error_metadata=dict(entry.last_error_metadata),
+            error_log_path=entry.error_log_path,
+            last_activity_at=entry.updated_at or None,
+            notable_events=deque(),
+        )
+        runtime.run_generation = max(1, entry.run_generation + 1)
+        self._subagents[entry.subagent_id] = runtime
+
+        try:
+            session_id = await runtime.loop.prepare_session(
+                start_reason="subagent_recovery"
+            )
+            runtime.latest_report = self._latest_assistant_report(runtime)
+            runtime.report_complete = (
+                runtime.status == "completed" and runtime.latest_report is not None
+            )
+            if was_in_flight:
+                runtime.report_complete = False
+                runtime.loop.append_system_note(
+                    (
+                        "The previous Jarvis process ended before this subagent completed its "
+                        "turn. The child was recovered as interrupted and remains paused. Treat "
+                        "partial output and workspace changes as incomplete; continue only after "
+                        "explicit direction."
+                    ),
+                    session_id=session_id,
+                    metadata={
+                        "subagent_process_recovery": True,
+                        "recovery_kind": "unexpected_process_interruption",
+                        "previous_status": entry.status,
+                    },
+                )
+                self._append_notable_event(
+                    runtime,
+                    kind="process_restart_recovery",
+                    summary=(
+                        "Recovered an interrupted child turn after an unexpected process "
+                        "interruption."
+                    ),
+                )
+            elif entry.pause_reason == "process_shutdown":
+                runtime.loop.append_system_note(
+                    (
+                        "This subagent was restored after a graceful Jarvis process shutdown. "
+                        "It remains paused until explicitly continued."
+                    ),
+                    session_id=session_id,
+                    metadata={
+                        "subagent_process_recovery": True,
+                        "recovery_kind": "graceful_process_shutdown",
+                    },
+                )
+                self._append_notable_event(
+                    runtime,
+                    kind="process_shutdown_restore",
+                    summary="Restored after a graceful process shutdown; remains paused.",
+                )
+            else:
+                self._append_notable_event(
+                    runtime,
+                    kind="restored",
+                    summary="Restored from the durable subagent contract.",
+                )
+            await self._restore_workspace_lease(runtime, entry)
+            self._sync_catalog(runtime)
+        except BaseException:
+            self._subagents.pop(entry.subagent_id, None)
+            await runtime.loop.aclose()
+            raise
+
+    async def _restore_workspace_lease(
+        self,
+        runtime: SubagentRuntime,
+        entry: SubagentCatalogEntry,
+    ) -> None:
+        if self._workspace_access is None or not runtime.owned_paths:
+            runtime.workspace_lease_status = "not_applicable"
+            return
+        if entry.workspace_lease_status != "held":
+            runtime.workspace_lease_status = "released"
+            return
+        try:
+            await self._workspace_access.claim_paths(
+                owner=f"subagent:{runtime.subagent_id}",
+                paths=runtime.owned_paths,
+            )
+        except WorkspaceLeaseError as exc:
+            runtime.workspace_lease_status = "released"
+            if entry.status in _IN_FLIGHT_SUBAGENT_STATUSES:
+                runtime.status = "paused"
+                runtime.pause_reason = "external_blocked"
+                runtime.report_complete = False
+            runtime.last_error = f"WorkspaceLeaseError: {exc}"
+            runtime.last_error_metadata = _exception_metadata(exc)
+            self._append_notable_event(
+                runtime,
+                kind="workspace_lease_recovery_blocked",
+                summary=f"Could not reacquire workspace ownership: {exc}",
+            )
+            session_id = runtime.loop.active_session_id()
+            if session_id is not None:
+                runtime.loop.append_system_note(
+                    (
+                        "Jarvis restored this subagent's contract, but its previous workspace "
+                        "ownership could not be reacquired. The subagent is paused until the "
+                        "workspace conflict is resolved."
+                    ),
+                    session_id=session_id,
+                    metadata={
+                        "subagent_process_recovery": True,
+                        "workspace_lease_recovery_blocked": True,
+                        "conflict_class": exc.conflict_class,
+                        "conflict_key": exc.conflict_key,
+                    },
+                )
+            return
+
+        runtime.workspace_lease_status = "held"
+        session_id = runtime.loop.active_session_id()
+        if session_id is not None:
+            runtime.loop.append_system_note(
+                (
+                    "Jarvis reacquired this subagent's workspace ownership after process "
+                    "startup. The persisted contract and prior change evidence remain intact."
+                ),
+                session_id=session_id,
+                metadata={
+                    "workspace_lease": True,
+                    "workspace_lease_reacquired": True,
+                    "subagent_process_recovery": True,
+                    "owned_paths": list(runtime.owned_paths),
+                },
+            )
+        self._append_notable_event(
+            runtime,
+            kind="workspace_lease_reacquired",
+            summary="Reacquired workspace ownership after process startup.",
+        )
 
     async def invoke(
         self,
@@ -483,38 +737,70 @@ class SubagentManager:
         return payload
 
     def request_stop_all_for_user_stop(self) -> tuple[SubagentSnapshot, ...]:
-        affected: list[SubagentSnapshot] = []
-        for runtime in self._non_disposed_runtimes():
-            if self._request_runtime_stop(runtime, pause_reason="main_stop"):
-                affected.append(runtime.snapshot())
-        return tuple(affected)
+        return self._request_stop_all(
+            pause_reason="main_stop",
+            interruption_reason="user_stop",
+            hard=False,
+        )
 
-    def request_hard_stop_all_for_new_session(self) -> tuple[SubagentSnapshot, ...]:
-        affected: list[SubagentSnapshot] = []
-        for runtime in self._non_disposed_runtimes():
-            if self._request_runtime_stop(runtime, pause_reason="new_session"):
-                affected.append(runtime.snapshot())
-        return tuple(affected)
+    def request_hard_stop_all_for_shutdown(self) -> tuple[SubagentSnapshot, ...]:
+        return self._request_stop_all(
+            pause_reason="process_shutdown",
+            interruption_reason="process_shutdown",
+            hard=True,
+        )
 
-    def request_hard_stop_all_for_user_stop(self) -> tuple[SubagentSnapshot, ...]:
+    def _request_stop_all(
+        self,
+        *,
+        pause_reason: SubagentPauseReason,
+        interruption_reason: InterruptionReason,
+        hard: bool,
+    ) -> tuple[SubagentSnapshot, ...]:
         affected: list[SubagentSnapshot] = []
         for runtime in self._non_disposed_runtimes():
-            if runtime.status == "waiting_background":
-                runtime.pending_pause_reason = "main_stop"
+            if hard and runtime.status == "waiting_background":
+                runtime.pending_pause_reason = pause_reason
                 affected.append(runtime.snapshot())
                 continue
             if self._request_runtime_stop(
                 runtime,
-                pause_reason="main_stop",
-                hard=True,
+                pause_reason=pause_reason,
+                interruption_reason=interruption_reason,
+                hard=hard,
             ):
                 affected.append(runtime.snapshot())
         return tuple(affected)
+
+    def request_hard_stop_all_for_new_session(self) -> tuple[SubagentSnapshot, ...]:
+        return self._request_stop_all(
+            pause_reason="new_session",
+            interruption_reason="new_session",
+            hard=True,
+        )
+
+    def request_hard_stop_all_for_user_stop(self) -> tuple[SubagentSnapshot, ...]:
+        return self._request_stop_all(
+            pause_reason="main_stop",
+            interruption_reason="user_stop",
+            hard=True,
+        )
 
     async def settle_hard_user_stop(
         self,
         *,
         subagent_ids: frozenset[str],
+    ) -> tuple[SubagentSnapshot, ...]:
+        return await self.settle_hard_stop(
+            subagent_ids=subagent_ids,
+            pause_reason="main_stop",
+        )
+
+    async def settle_hard_stop(
+        self,
+        *,
+        subagent_ids: frozenset[str],
+        pause_reason: SubagentPauseReason,
     ) -> tuple[SubagentSnapshot, ...]:
         settled: list[SubagentSnapshot] = []
         for runtime in tuple(self._non_disposed_runtimes()):
@@ -523,8 +809,8 @@ class SubagentManager:
             await self._wait_for_turn_settle(runtime)
             if runtime.status in {"running", "waiting_background", "awaiting_approval"}:
                 runtime.status = "paused"
-            if runtime.pending_pause_reason == "main_stop":
-                runtime.pause_reason = "main_stop"
+            if runtime.pending_pause_reason == pause_reason:
+                runtime.pause_reason = pause_reason
                 runtime.pending_pause_reason = None
             runtime.pending_background_job_ids.clear()
             self._pending_bash_job_notices.pop(runtime.subagent_id, None)
@@ -2193,20 +2479,24 @@ class SubagentManager:
         *,
         pause_reason: SubagentPauseReason,
         hard: bool = False,
+        interruption_reason: InterruptionReason | None = None,
     ) -> bool:
         if runtime.status in {"paused", "completed", "waiting_background", "failed", "disposed"}:
             return False
         if runtime.pending_pause_reason == pause_reason:
             return False
-        interruption_reason: str
-        if pause_reason == "new_session":
-            interruption_reason = "new_session"
-        else:
-            interruption_reason = "user_stop"
+        resolved_interruption_reason = interruption_reason
+        if resolved_interruption_reason is None:
+            if pause_reason == "new_session":
+                resolved_interruption_reason = "new_session"
+            elif pause_reason == "process_shutdown":
+                resolved_interruption_reason = "process_shutdown"
+            else:
+                resolved_interruption_reason = "user_stop"
         if pause_reason == "new_session" or hard:
-            stop_requested = runtime.loop.request_hard_stop(reason=interruption_reason)
+            stop_requested = runtime.loop.request_hard_stop(reason=resolved_interruption_reason)
         else:
-            stop_requested = runtime.loop.request_stop(reason=interruption_reason)
+            stop_requested = runtime.loop.request_stop(reason=resolved_interruption_reason)
         if not stop_requested:
             return False
         runtime.pending_pause_reason = pause_reason

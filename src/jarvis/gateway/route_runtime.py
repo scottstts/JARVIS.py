@@ -33,6 +33,7 @@ from jarvis.core import (
     AgentTurnStreamEvent,
     ContextBudgetError,
     CoreSettings,
+    InterruptionReason,
 )
 from jarvis.core.commands import parse_user_command
 from jarvis.core.identities import IdentityBootstrapLoader
@@ -54,7 +55,7 @@ from jarvis.subagent import (
     build_subagent_primitive_definitions,
     render_subagent_primitive_docs,
 )
-from jarvis.subagent.types import SubagentSnapshot
+from jarvis.subagent.types import SubagentPauseReason, SubagentSnapshot
 from jarvis.tools import (
     ToolExecutionContext,
     ToolExecutionResult,
@@ -236,6 +237,10 @@ class RouteRuntime:
         self._orchestrator_wait_generation = 0
         self._orchestrator_unchanged_waits = 0
         self._hard_stop_lock = asyncio.Lock()
+        self._initialization_lock = asyncio.Lock()
+        self._initialized = False
+        self._shutdown_requested = False
+        self._shutdown_complete = False
         self._main_registry = self._tool_registry.filtered_view(agent_kind="main")
         self._main_tool_runtime = ToolRuntime(registry=self._main_registry)
         self._codex_settings = CodexBackendSettings.from_env()
@@ -263,6 +268,21 @@ class RouteRuntime:
             codex_coordinator=self._codex_coordinator,
         )
         self._main_loop: ActorRuntime = self._build_main_loop()
+
+    async def initialize(self) -> None:
+        """Restore durable child contracts before this route accepts work."""
+
+        if self._initialized:
+            return
+        async with self._initialization_lock:
+            if self._initialized:
+                return
+            if self._shutdown_requested:
+                raise RuntimeError(f"Route {self._route_id} is shutting down.")
+            await self._subagent_manager.restore(
+                owner_main_session_id=self._main_loop.active_session_id(),
+            )
+            self._initialized = True
 
     def _build_main_loop(self) -> ActorRuntime:
         provider = self._resolved_main_provider()
@@ -363,17 +383,67 @@ class RouteRuntime:
 
     async def request_stop(self) -> bool:
         """Hard-quiesce all work owned by this route without replacing the session."""
+        await self.initialize()
         async with self._hard_stop_lock:
-            return await self._request_stop_locked()
+            if self._shutdown_requested:
+                return False
+            return await self._request_stop_locked(
+                interruption_reason="user_stop",
+                subagent_pause_reason="main_stop",
+                operation_reason="user_stop",
+                emit_user_stop_events=True,
+            )
 
-    async def _request_stop_locked(self) -> bool:
-        LOGGER.info("Route hard stop requested (route=%s).", self._route_id)
+    async def graceful_shutdown(self) -> bool:
+        """Gracefully quiesce this route before the owning process exits."""
+        try:
+            await self.initialize()
+        except Exception:
+            LOGGER.exception(
+                "Route %s could not finish child restoration before shutdown.",
+                self._route_id,
+            )
+        async with self._hard_stop_lock:
+            self._shutdown_requested = True
+            if self._shutdown_complete:
+                return False
+            stopped = await self._request_stop_locked(
+                interruption_reason="process_shutdown",
+                subagent_pause_reason="process_shutdown",
+                operation_reason="process_shutdown",
+                emit_user_stop_events=False,
+            )
+            self._shutdown_complete = True
+            return stopped
+
+    async def _request_stop_locked(
+        self,
+        *,
+        interruption_reason: InterruptionReason,
+        subagent_pause_reason: SubagentPauseReason,
+        operation_reason: str,
+        emit_user_stop_events: bool,
+    ) -> bool:
+        LOGGER.info(
+            "Route hard stop requested (route=%s, reason=%s).",
+            self._route_id,
+            operation_reason,
+        )
         self._cancel_orchestrator_wait(reset_backoff=True)
         pending_bash_jobs = tuple(
             self._bash_job_supervisor.pending_jobs(include_services=True)
         )
-        affected_subagents = self._subagent_manager.request_hard_stop_all_for_user_stop()
-        main_stop_requested = self._main_loop.request_hard_stop(reason="user_stop")
+        if subagent_pause_reason == "main_stop":
+            affected_subagents = self._subagent_manager.request_hard_stop_all_for_user_stop()
+        elif subagent_pause_reason == "process_shutdown":
+            affected_subagents = self._subagent_manager.request_hard_stop_all_for_shutdown()
+        else:
+            raise ValueError(
+                f"Unsupported route hard-stop pause reason: {subagent_pause_reason}"
+            )
+        main_stop_requested = self._main_loop.request_hard_stop(
+            reason=interruption_reason
+        )
         stop_requested = (
             main_stop_requested
             or bool(affected_subagents)
@@ -395,13 +465,20 @@ class RouteRuntime:
 
         try:
             bash_reset = await self._bash_job_supervisor.terminate_route_jobs(
-                reason="user_stop"
+                reason=operation_reason
             )
-            settled_subagents = await self._subagent_manager.settle_hard_user_stop(
-                subagent_ids=frozenset(
-                    snapshot.subagent_id for snapshot in affected_subagents
+            settled_subagent_ids = frozenset(
+                snapshot.subagent_id for snapshot in affected_subagents
+            )
+            if subagent_pause_reason == "main_stop":
+                settled_subagents = await self._subagent_manager.settle_hard_user_stop(
+                    subagent_ids=settled_subagent_ids,
                 )
-            )
+            else:
+                settled_subagents = await self._subagent_manager.settle_hard_stop(
+                    subagent_ids=settled_subagent_ids,
+                    pause_reason=subagent_pause_reason,
+                )
             await self._wait_for_main_hard_stop_settle()
         except Exception as exc:
             error_log_path = record_runtime_error(
@@ -413,7 +490,10 @@ class RouteRuntime:
                 agent_kind="main",
                 exc=exc,
                 error_code="route_hard_stop_failed",
-                message=f"Route {self._route_id} failed to hard-quiesce after /stop.",
+                message=(
+                    f"Route {self._route_id} failed to hard-quiesce during "
+                    f"{operation_reason}."
+                ),
                 context={
                     "pending_bash_job_ids": [item.job_id for item in pending_bash_jobs],
                     "affected_subagent_ids": [
@@ -422,55 +502,61 @@ class RouteRuntime:
                 },
             )
             self._print_runtime_error_notice(error_log_path=error_log_path)
-            await self._publish_task_status_if_changed(reason="user_stop_failed")
+            await self._publish_task_status_if_changed(reason=f"{operation_reason}_failed")
             raise
 
-        if settled_subagents or affected_subagents:
-            self._append_user_stop_subagent_note(
-                settled_subagents or affected_subagents
+        affected = settled_subagents or affected_subagents
+        if emit_user_stop_events:
+            if settled_subagents or affected_subagents:
+                self._append_user_stop_subagent_note(affected)
+            if pending_bash_jobs:
+                self._append_user_stop_bash_job_note(pending_bash_jobs)
+            self._append_user_stop_hard_quiesce_note(
+                bash_reset=bash_reset,
+                affected_subagents=affected,
             )
-        if pending_bash_jobs:
-            self._append_user_stop_bash_job_note(pending_bash_jobs)
-        self._append_user_stop_hard_quiesce_note(
-            bash_reset=bash_reset,
-            affected_subagents=settled_subagents or affected_subagents,
-        )
-        for cancelled_request in cancelled_user_requests:
-            cancelled_turn_id = (
-                cancelled_request.client_message_id or f"stopped_{uuid4().hex}"
-            )
-            await self.publish_event(
-                RouteTurnStartedEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=self._main_loop.active_session_id(),
-                    turn_id=cancelled_turn_id,
-                    turn_kind="user",
-                    client_message_id=cancelled_request.client_message_id,
+            for cancelled_request in cancelled_user_requests:
+                cancelled_turn_id = (
+                    cancelled_request.client_message_id or f"stopped_{uuid4().hex}"
                 )
-            )
-            await self.publish_event(
-                RouteTurnDoneEvent(
-                    route_id=self._route_id,
-                    agent_kind="main",
-                    agent_name="Jarvis",
-                    session_id=self._main_loop.active_session_id(),
-                    turn_id=cancelled_turn_id,
-                    turn_kind="user",
-                    client_message_id=cancelled_request.client_message_id,
-                    response_text="",
-                    interrupted=True,
-                    completion_blocked=True,
-                    completion_block_reason="user_stop",
-                    interruption_reason="user_stop",
+                await self.publish_event(
+                    RouteTurnStartedEvent(
+                        route_id=self._route_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        session_id=self._main_loop.active_session_id(),
+                        turn_id=cancelled_turn_id,
+                        turn_kind="user",
+                        client_message_id=cancelled_request.client_message_id,
+                    )
                 )
+                await self.publish_event(
+                    RouteTurnDoneEvent(
+                        route_id=self._route_id,
+                        agent_kind="main",
+                        agent_name="Jarvis",
+                        session_id=self._main_loop.active_session_id(),
+                        turn_id=cancelled_turn_id,
+                        turn_kind="user",
+                        client_message_id=cancelled_request.client_message_id,
+                        response_text="",
+                        interrupted=True,
+                        completion_blocked=True,
+                        completion_block_reason=interruption_reason,
+                        interruption_reason=interruption_reason,
+                    )
+                )
+        else:
+            self._append_process_shutdown_note(
+                bash_reset=bash_reset,
+                affected_subagents=affected,
             )
-        await self._publish_task_status_if_changed(reason="user_stop_quiesced")
+        await self._publish_task_status_if_changed(reason=f"{operation_reason}_quiesced")
         LOGGER.info(
-            "Route hard stop completed (route=%s, subagents=%d, jobs=%d).",
+            "Route hard stop completed (route=%s, reason=%s, subagents=%d, jobs=%d).",
             self._route_id,
-            len(settled_subagents or affected_subagents),
+            operation_reason,
+            len(affected),
             len(pending_bash_jobs),
         )
         return True
@@ -532,7 +618,10 @@ class RouteRuntime:
         *,
         client_message_id: str | None = None,
     ) -> None:
+        await self.initialize()
         async with self._hard_stop_lock:
+            if self._shutdown_requested:
+                raise RuntimeError(f"Route {self._route_id} is shutting down.")
             await self._enqueue_user_message_locked(
                 user_text,
                 client_message_id=client_message_id,
@@ -726,6 +815,7 @@ class RouteRuntime:
         self,
         user_text: str,
     ) -> AsyncIterator[AgentTurnStreamEvent]:
+        await self.initialize()
         subscriber_id, queue = self.subscribe()
         client_message_id = uuid4().hex
         matched_turn_id: str | None = None
@@ -806,7 +896,7 @@ class RouteRuntime:
             await self._queue_wakeup.wait()
 
     async def _maybe_schedule_deferred_internal_followups(self) -> None:
-        if self._subagent_reset_in_progress:
+        if self._shutdown_requested or self._subagent_reset_in_progress:
             return
         if self._new_session_boundary_pending:
             return
@@ -1081,7 +1171,7 @@ class RouteRuntime:
                 await self._publish_task_status_if_changed(reason="turn_worker_idle")
 
     async def _maybe_enqueue_subagent_supervisor_followup(self, event: RouteEvent) -> None:
-        if self._subagent_reset_in_progress:
+        if self._shutdown_requested or self._subagent_reset_in_progress:
             return
         if not isinstance(event, RouteSystemNoticeEvent):
             return
@@ -1116,7 +1206,11 @@ class RouteRuntime:
     ) -> bool:
         """Queue a fresh checkpoint-based turn after a recoverable provider failure."""
 
-        if self._new_session_boundary_pending or self._main_resume_requires_user_message:
+        if (
+            self._shutdown_requested
+            or self._new_session_boundary_pending
+            or self._main_resume_requires_user_message
+        ):
             return False
         session_id = self._main_loop.active_session_id() or request.force_session_id
         if session_id is None:
@@ -1946,6 +2040,35 @@ class RouteRuntime:
             for snapshot in self._subagent_manager.active_snapshots()
         )
 
+    def _append_process_shutdown_note(
+        self,
+        *,
+        bash_reset: BashJobResetResult,
+        affected_subagents: Sequence[SubagentSnapshot],
+    ) -> None:
+        session_id = self._main_loop.active_session_id()
+        if session_id is None and affected_subagents:
+            owner_session_id = affected_subagents[0].owner_main_session_id
+            if owner_session_id.strip():
+                session_id = owner_session_id
+        if session_id is None:
+            return
+
+        self._main_loop.append_system_note(
+            "Jarvis gracefully shut down this route after hard-quiescing the active main "
+            "turn, pausing route-owned subagents, terminating detached jobs and services, "
+            "and invalidating queued automatic follow-ups. The durable route and subagent "
+            "state remain available for reconstitution after restart.",
+            session_id=session_id,
+            metadata={
+                "process_shutdown": True,
+                "subagent_ids": [item.subagent_id for item in affected_subagents],
+                "finalized_bash_job_ids": list(bash_reset.finalized_job_ids),
+                "cancelled_bash_job_ids": list(
+                    bash_reset.cancellation_requested_job_ids
+                ),
+            },
+        )
 
     def _append_user_stop_subagent_note(
         self,
@@ -2053,7 +2176,8 @@ class RouteRuntime:
 
     def _internal_followups_allowed(self) -> bool:
         return not (
-            self._main_resume_requires_user_message
+            self._shutdown_requested
+            or self._main_resume_requires_user_message
             or self._new_session_boundary_pending
             or self._subagent_reset_in_progress
         )
@@ -2061,6 +2185,7 @@ class RouteRuntime:
     def _internal_request_is_blocked(self, request: _RouteTurnRequest) -> bool:
         generally_blocked = (
             request.user_initiated
+            or self._shutdown_requested
             or self._main_resume_requires_user_message
             or self._new_session_boundary_pending
             or request.internal_generation != self._internal_followup_generation
@@ -2086,7 +2211,11 @@ class RouteRuntime:
     ) -> bool:
         if not notices:
             return False
-        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
+        if (
+            self._shutdown_requested
+            or self._main_resume_requires_user_message
+            or self._new_session_boundary_pending
+        ):
             return False
         if self._recommend_main_bash_action(notices) != "wait":
             self._cancel_orchestrator_wait(reset_backoff=True)
@@ -2116,7 +2245,11 @@ class RouteRuntime:
     ) -> bool:
         if self._subagent_reset_in_progress:
             return False
-        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
+        if (
+            self._shutdown_requested
+            or self._main_resume_requires_user_message
+            or self._new_session_boundary_pending
+        ):
             return False
         return await self._subagent_manager.enqueue_bash_job_followup(notices)
 
@@ -2126,7 +2259,11 @@ class RouteRuntime:
     ) -> None:
         if self._subagent_reset_in_progress:
             return
-        if self._main_resume_requires_user_message or self._new_session_boundary_pending:
+        if (
+            self._shutdown_requested
+            or self._main_resume_requires_user_message
+            or self._new_session_boundary_pending
+        ):
             return
         self._merge_main_subagent_notice(notice)
         if self._main_subagent_runtime_turn_queued:

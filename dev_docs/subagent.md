@@ -23,6 +23,8 @@ Subagents are implemented under `src/jarvis/subagent/`. They are not normal tool
 - The user does not directly converse with subagents.
 - `/stop` hard-quiesces the route: main/child turns are preempted, waiting children pause, and detached jobs/services are terminated.
 - `/new` hard-stops and disposes route subagents.
+- A graceful process shutdown uses the same route hard-quiescence seams as `/stop`, but records `process_shutdown` rather than a user stop and does not emit user-facing stop confirmations.
+- On the next route initialization, non-disposed contracts belonging to the active main session or its compaction ancestors are reconstituted without automatically starting child turns.
 - Ordinary user messages supersede only the active main turn; they never redirect, pause, or stop a child.
 - Jarvis decides whether to continue independent main-task work, inspect a child, step in, stop it, or wait.
 - Delegation is a coordination decision, not a parallelism target. Jarvis should identify prerequisites, stage dependent work after its boundary exists, and review a completed child before integrating it.
@@ -170,6 +172,26 @@ Statuses:
 - `completed`
 - `failed`
 - `disposed`
+
+### Process shutdown and restart
+
+The combined process entrypoint and ASGI lifespan ask each instantiated route to shut down
+gracefully before the process exits. The route closes its internal follow-up gate, hard-stops
+the active main and child turns, pauses affected children with `pause_reason=process_shutdown`,
+terminates route-owned detached jobs and services, drains queued work, and persists a durable
+shutdown note. This is a process lifecycle boundary; it does not send the `/stop` confirmation
+to the user.
+
+Route initialization restores the durable child contracts associated with the active main
+session and its compaction-parent chain. Restored children keep their assignment, transcript,
+selected skills, change evidence, and lifecycle state, but remain paused until Jarvis explicitly
+chooses how to handle them. A contract persisted as `running`, `awaiting_approval`, or
+`waiting_background` is treated conservatively as an unexpected interruption: it becomes
+`paused` with `pause_reason=process_restart`, its child actor reconciles orphaned in-progress
+turns, and no child turn is launched automatically. A clean `process_shutdown` contract remains
+paused with that reason. A held workspace lease is reacquired before continuation; a conflict
+pauses an in-flight child as `external_blocked`, while an explicitly released handoff lease is
+not reclaimed. Destructive process termination is outside this lifecycle guarantee.
 
 Important metadata:
 

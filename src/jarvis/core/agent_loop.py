@@ -157,6 +157,9 @@ _PREVIOUS_SESSION_RESET_TEXT = (
     "from the previous session as archived history, not work to resume."
 )
 _TURN_INTERRUPTED_RECORD_TEXT = "The user interrupted this turn before it completed."
+_TURN_PROCESS_SHUTDOWN_RECORD_TEXT = (
+    "The Jarvis process shut down gracefully before this turn completed."
+)
 _TURN_SUPERSEDED_RECORD_TEXT = "A newer user message superseded this turn before it completed."
 _TURN_NEW_SESSION_RECORD_TEXT = (
     "The user started a new session and terminated this turn before it completed."
@@ -175,7 +178,12 @@ _ORCHESTRATOR_MONITORED_WORK_FOLLOWUP_TEXT = (
 LOGGER = get_application_logger(__name__)
 
 AgentKind = Literal["main", "subagent"]
-InterruptionReason = Literal["user_stop", "superseded_by_user_message", "new_session"]
+InterruptionReason = Literal[
+    "user_stop",
+    "superseded_by_user_message",
+    "new_session",
+    "process_shutdown",
+]
 T = TypeVar("T")
 _STOP_PREEMPTION_CLEANUP_SECONDS = 1.0
 
@@ -5608,6 +5616,9 @@ class AgentLoop:
         elif interruption_reason == "new_session":
             interrupted_status = "interrupted"
             interrupted_record_text = _TURN_NEW_SESSION_RECORD_TEXT
+        elif interruption_reason == "process_shutdown":
+            interrupted_status = "interrupted"
+            interrupted_record_text = _TURN_PROCESS_SHUTDOWN_RECORD_TEXT
         else:
             interrupted_status = "interrupted"
             interrupted_record_text = _TURN_INTERRUPTED_RECORD_TEXT

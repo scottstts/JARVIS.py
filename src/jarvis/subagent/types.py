@@ -17,6 +17,8 @@ SubagentStatus = Literal[
 SubagentPauseReason = Literal[
     "main_stop",
     "new_session",
+    "process_shutdown",
+    "process_restart",
     "approval_rejected",
     "tool_liveness_exhausted",
     "provider_recovery_exhausted",
@@ -136,7 +138,12 @@ class SubagentCatalogEntry:
             in {
                 "main_stop",
                 "new_session",
+                "process_shutdown",
+                "process_restart",
                 "approval_rejected",
+                "tool_liveness_exhausted",
+                "provider_recovery_exhausted",
+                "external_blocked",
             }
             else None
         )

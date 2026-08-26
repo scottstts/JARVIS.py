@@ -7,12 +7,14 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import jarvis.main as jarvis_main
 from jarvis.core import ContextPolicySettings, CoreSettings
 from jarvis.core.config import CompactionSettings
 from jarvis.gateway import GatewaySettings
+from jarvis.gateway.session_router import SessionRouter
 from jarvis.llm import (
     EmbeddingSettings,
     GeminiProviderSettings,
@@ -84,6 +86,15 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         captured_provider_configurations: list[tuple[RuntimeProviderTarget, ...]] = []
         logged_provider_configurations: list[tuple[RuntimeProviderTarget, ...]] = []
         captured_app_args: list[GatewaySettings] = []
+        session_router = SessionRouter(lambda _route_id: object())  # type: ignore[arg-type]
+        fake_app = SimpleNamespace(
+            state=SimpleNamespace(session_router=session_router),
+        )
+        graceful_shutdown = patch.object(
+            session_router,
+            "graceful_shutdown",
+            new=AsyncMock(),
+        )
         provider_configuration = (
             RuntimeProviderTarget("Main Agent", "openrouter", "z-ai/glm-5.2"),
             RuntimeProviderTarget("Subagent", "gemini", "gemini-flash-latest"),
@@ -98,7 +109,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
         def fake_create_app(*, gateway_settings: GatewaySettings, **_: object) -> object:
             captured_app_args.append(gateway_settings)
-            return object()
+            return fake_app
 
         def fake_config(**kwargs: object) -> dict[str, object]:
             return dict(kwargs)
@@ -128,24 +139,25 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
             gateway_ws_base_url="ws://example.com/remote",
         )
 
-        with patch.object(jarvis_main, "create_app", side_effect=fake_create_app):
-            with patch.object(jarvis_main.uvicorn, "Config", side_effect=fake_config):
-                with patch.object(jarvis_main.uvicorn, "Server", side_effect=fake_server_factory):
-                    with patch.object(jarvis_main, "run_telegram_ui", side_effect=fake_run_telegram_ui):
-                        with patch.object(
-                            jarvis_main,
-                            "load_runtime_provider_configuration",
-                            return_value=provider_configuration,
-                        ):
+        with graceful_shutdown as shutdown:
+            with patch.object(jarvis_main, "create_app", side_effect=fake_create_app):
+                with patch.object(jarvis_main.uvicorn, "Config", side_effect=fake_config):
+                    with patch.object(jarvis_main.uvicorn, "Server", side_effect=fake_server_factory):
+                        with patch.object(jarvis_main, "run_telegram_ui", side_effect=fake_run_telegram_ui):
                             with patch.object(
                                 jarvis_main,
-                                "_log_runtime_provider_configuration",
-                                side_effect=logged_provider_configurations.append,
+                                "load_runtime_provider_configuration",
+                                return_value=provider_configuration,
                             ):
-                                await jarvis_main.run_system(
-                                    gateway_settings=gateway_settings,
-                                    ui_settings=ui_settings,
-                                )
+                                with patch.object(
+                                    jarvis_main,
+                                    "_log_runtime_provider_configuration",
+                                    side_effect=logged_provider_configurations.append,
+                                ):
+                                    await jarvis_main.run_system(
+                                        gateway_settings=gateway_settings,
+                                        ui_settings=ui_settings,
+                                    )
 
         self.assertIsNotNone(fake_server)
         if fake_server is None:
@@ -162,6 +174,7 @@ class MainEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fake_server.config["access_log"])
         self.assertEqual(fake_server.config["host"], "0.0.0.0")
         self.assertEqual(fake_server.config["port"], 8181)
+        shutdown.assert_awaited_once()
 
     def test_resolve_runtime_provider_configuration_falls_back_to_main_for_subagent(self) -> None:
         provider_configuration = resolve_runtime_provider_configuration(

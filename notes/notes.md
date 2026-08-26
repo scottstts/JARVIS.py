@@ -217,3 +217,4 @@
 - Telegram wrench notices aggregate bold raw tool names into one editable per-agent count stack ordered by recency; every user-facing Jarvis message partitions all current stacks, including subagents, while system notices do not partition them.
 - Subagent acceptance is passive Acceptance Notes only: children may always hand back complete, partial, or blocked work; Jarvis owns semantic completion, and task sidecars read only the current liveness schema.
 - Lease-backed subagent `changed_paths` is exact net evidence only when the manager's scoped workspace snapshot completes; tool-result paths remain an explicitly incomplete fallback.
+- Graceful process shutdown must close route admission, reuse hard-stop quiescence with a distinct `process_shutdown` reason, and reconstitute only the active main session's compaction lineage; persisted in-flight children restore paused with `process_restart` after orphan-turn reconciliation and never auto-launch.

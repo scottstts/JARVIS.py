@@ -94,8 +94,12 @@ def create_app(
                 await ensure_remote_tool_runtime_healthy(resolved_tool_settings)
             yield
         finally:
-            if owns_llm_service and resolved_llm_service is not None:
-                await resolved_llm_service.aclose()
+            try:
+                if isinstance(resolved_router, SessionRouter):
+                    await resolved_router.graceful_shutdown()
+            finally:
+                if owns_llm_service and resolved_llm_service is not None:
+                    await resolved_llm_service.aclose()
 
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -128,6 +132,8 @@ def create_app(
             return
 
         try:
+            if isinstance(resolved_router, SessionRouter):
+                await resolved_router.initialize(route_id)
             subscriber_id, event_queue = resolved_router.subscribe(route_id)
             ready_payload = build_ready_event(
                 route_id=route_id,
@@ -247,7 +253,7 @@ def create_app(
                 raise exception
         resolved_router.unsubscribe(route_id, subscriber_id)
 
-    return Starlette(
+    app = Starlette(
         debug=False,
         lifespan=lifespan,
         routes=[
@@ -258,6 +264,8 @@ def create_app(
             ),
         ],
     )
+    app.state.session_router = resolved_router
+    return app
 
 
 def build_asgi_app() -> Starlette:

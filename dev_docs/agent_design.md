@@ -151,6 +151,28 @@ The loop:
 
 Same-process runtime failures first persist any partial streamed assistant text, then use the same normalization immediately for the active turn.
 
+The process lifecycle adds a route-level boundary around that actor recovery. The combined
+entrypoint and ASGI lifespan call `SessionRouter.graceful_shutdown()` for every route created in
+the process. Each route closes its automatic-follow-up gate and reuses the route hard-quiescence
+path used by `/stop`: it hard-stops the main and child actors with the `process_shutdown`
+interruption reason, pauses affected children with `pause_reason=process_shutdown`, terminates
+route-owned detached jobs and services, drains queued work, and persists a durable process
+shutdown note. The lifecycle reason is distinct from `/stop`, so user-facing stop events and
+confirmations are not emitted during process shutdown.
+
+Route initialization reconstitutes non-disposed child contracts owned by the active main session
+or a compaction ancestor. The manager rebuilds each child actor from its durable assignment,
+transcript root, selected skills, coordination metadata, and change evidence, then calls the
+actor's recovery session preparation so orphaned child turns are normalized before future use.
+Reconstitution never launches a child turn automatically. Persisted `running`,
+`awaiting_approval`, and `waiting_background` entries are conservatively classified as
+unexpected interruption and restored as paused `process_restart` children; cleanly shut down
+children remain paused with `process_shutdown`. Held workspace leases are reacquired before
+continuation, while lease conflicts leave an in-flight child paused as `external_blocked` and
+preserve the conflict in its durable state. Explicitly released handoff leases remain released.
+Only a later explicit main-agent decision can step a restored child in, hand it off, or dispose
+it. Destructive termination is not covered by this recovery path.
+
 ## User Message Interruption
 
 Route-level user message interruption is preemptive at active await boundaries.
@@ -175,7 +197,11 @@ Queued user turns outrank internal runtime follow-ups. Runtime follow-ups from s
 
 Chronology stays truthful. Tool results completed by the superseded turn remain in the older turn. Priority is expressed through persisted interruption and priority notes, not by rewriting history.
 
-Detached bash jobs are intentionally distinct from in-turn awaits, but both `/stop` and `/new` terminate and finalize route-owned detached jobs and services. Foreground bash execution is best-effort cancelled when its active tool await is preempted. `/new` additionally disposes children and replaces the session; `/stop` preserves paused child/session state for an explicit resume.
+Detached bash jobs are intentionally distinct from in-turn awaits, but `/stop`, `/new`, and
+graceful process shutdown terminate and finalize route-owned detached jobs and services.
+Foreground bash execution is best-effort cancelled when its active tool await is preempted.
+`/new` additionally disposes children and replaces the session; `/stop` and graceful process
+shutdown preserve durable child/session state for later explicit handling.
 
 When route-owned children or detached jobs remain active but the main agent has no actionable work, Jarvis can call `orchestrator_wait` with a preferred liveness deadline and optional actor IDs. A successful call is a first-class turn yield: its result is persisted, the current turn completes as deferred, and no follow-up provider request is made. Before parking, routine queued notices are atomically persisted and acknowledged, stale notices are dropped, and material inspect/finalize notices are returned once as typed review evidence. The runtime clamps the deadline to 30 seconds–30 minutes and applies an exponential 60-second adaptive floor after unchanged reviews. Later material terminal/attention events cancel the timer and wake Jarvis immediately; routine running/output-growth observations are recorded by the supervisor without spending a main or child model turn. A deadline wake performs one runtime review, after which Jarvis must act or register another bounded wait. Narrow wait-only detached `sleep` polling commands are rejected.
 

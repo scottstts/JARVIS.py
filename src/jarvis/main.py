@@ -10,6 +10,7 @@ import uvicorn
 
 from jarvis.core import CoreSettings
 from jarvis.gateway import GatewaySettings, create_app
+from jarvis.gateway.session_router import SessionRouter
 from jarvis.logging_setup import configure_application_logging, get_application_logger
 from jarvis.runtime_provider_configuration import (
     RuntimeProviderConfiguration,
@@ -93,6 +94,10 @@ async def run_system(
             ui_task.cancel()
             with suppress(asyncio.CancelledError):
                 await ui_task
+
+        session_router = getattr(getattr(app, "state", None), "session_router", None)
+        if isinstance(session_router, SessionRouter):
+            await session_router.graceful_shutdown()
 
         if not server_task.done():
             server.should_exit = True

@@ -329,6 +329,42 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stop_requested)
         self.assertEqual(loop.stop_requests, 1)
 
+    async def test_graceful_shutdown_stops_existing_routes_once_and_rejects_new_work(self) -> None:
+        loops: dict[str, _TrackingLoop] = {}
+
+        def factory(route_id: str) -> _TrackingLoop:
+            loop = _TrackingLoop(session_id=f"{route_id}-session")
+            loops[route_id] = loop
+            return loop
+
+        router = SessionRouter(factory)
+        await router.run_turn("alpha", "one")
+        await router.run_turn("beta", "two")
+
+        await router.graceful_shutdown()
+        await router.graceful_shutdown()
+
+        self.assertEqual(loops["alpha"].stop_requests, 1)
+        self.assertEqual(loops["beta"].stop_requests, 1)
+        with self.assertRaises(RuntimeError):
+            await router.run_turn("gamma", "three")
+        with self.assertRaises(RuntimeError):
+            await router.run_turn("alpha", "after shutdown")
+        self.assertFalse(await router.request_stop("alpha"))
+        self.assertEqual(loops["alpha"].stop_requests, 1)
+
+    async def test_graceful_shutdown_retries_a_route_that_failed_to_quiesce(self) -> None:
+        loop = _TrackingLoop(session_id="alpha-session")
+        shutdown = AsyncMock(side_effect=[RuntimeError("shutdown failed"), None])
+        loop.graceful_shutdown = shutdown  # type: ignore[attr-defined]
+        router = SessionRouter(lambda _route_id: loop)
+        await router.run_turn("alpha", "one")
+
+        await router.graceful_shutdown()
+        await router.graceful_shutdown()
+
+        self.assertEqual(shutdown.await_count, 2)
+
     async def test_resolve_approval_delegates_to_route_loop(self) -> None:
         loop = _TrackingLoop(session_id="alpha-session")
         router = SessionRouter(lambda _route_id: loop)
@@ -1610,6 +1646,63 @@ class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("The user issued /stop.", stop_notes[0].content)
             self.assertIn("Friday (sub_1)", stop_notes[0].content)
             self.assertEqual(stop_notes[0].metadata["subagent_ids"], ["sub_1"])
+
+    async def test_graceful_shutdown_uses_process_reason_and_persists_route_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            snapshot = SubagentSnapshot(
+                subagent_id="sub_1",
+                codename="Friday",
+                status="running",
+                owner_main_session_id=session_id,
+                owner_main_turn_id="main_turn",
+                current_subagent_session_id="sub_session",
+            )
+            with (
+                patch.object(
+                    runtime._main_loop,
+                    "request_hard_stop",
+                    return_value=True,
+                ) as main_stop,
+                patch.object(
+                    runtime._subagent_manager,
+                    "request_hard_stop_all_for_shutdown",
+                    return_value=(snapshot,),
+                ) as request_stop,
+                patch.object(
+                    runtime._subagent_manager,
+                    "settle_hard_stop",
+                    new=AsyncMock(return_value=(snapshot,)),
+                ) as settle_stop,
+            ):
+                self.assertTrue(await runtime.graceful_shutdown())
+                self.assertFalse(await runtime.graceful_shutdown())
+
+            main_stop.assert_called_once_with(reason="process_shutdown")
+            request_stop.assert_called_once_with()
+            settle_stop.assert_awaited_once_with(
+                subagent_ids=frozenset({"sub_1"}),
+                pause_reason="process_shutdown",
+            )
+            self.assertTrue(runtime._shutdown_requested)
+            self.assertTrue(runtime._shutdown_complete)
+            records = runtime._main_loop._storage.load_records(session_id)
+            shutdown_notes = [
+                record
+                for record in records
+                if record.role == "system"
+                and record.metadata.get("process_shutdown") is True
+            ]
+            self.assertEqual(len(shutdown_notes), 1)
+            self.assertIn("gracefully shut down this route", shutdown_notes[0].content)
+            self.assertEqual(shutdown_notes[0].metadata["subagent_ids"], ["sub_1"])
+            with self.assertRaises(RuntimeError):
+                await runtime.enqueue_user_message("after shutdown")
 
     async def test_stop_suppresses_new_terminal_subagent_followup_until_user_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
