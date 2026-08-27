@@ -213,6 +213,7 @@
 - Subagent skills are selected only by Jarvis through exact top-level skill IDs or same-turn inheritance; the harness never infers them from assignment text or skill resource paths.
 - The real-gateway headless runner is development-only under `tests/headless/`, uses the workspace Ox Alpha settings unchanged, and must recognize command-only `/new` completion before cleaning its unique test workspace.
 - Telegram UI startup, polling, route-event, message, approval, typing, and draft failures now use the central persisted JSONL error recorder with route/session/event context, redacted Telegram request metadata, and exception-chain details; Telegram error stack traces are not emitted to the terminal.
+- The host-side `utils/run_jarvis.sh` launcher assumes the Compose containers already exist, starts them, optionally runs `install_build.sh --reinstall`, and then execs `jarvis`; a zsh alias can expose it as the host `jarvis` command.
 
 - Telegram wrench notices aggregate bold raw tool names into one editable per-agent count stack ordered by recency; every user-facing Jarvis message partitions all current stacks, including subagents, while system notices do not partition them.
 - Subagent acceptance is passive Acceptance Notes only: children may always hand back complete, partial, or blocked work; Jarvis owns semantic completion, and task sidecars read only the current liveness schema.

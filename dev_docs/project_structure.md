@@ -95,6 +95,7 @@ If this document and the code ever disagree, treat the code as source of truth a
   - supporting utilities/scripts that are not part of the installable package
   - includes `settings_gui.html`, a Chrome-oriented metadata-driven settings renderer copied into `/workspace/settings/`
   - includes `install_build.sh`, a helper that execs into `jarvis_runtime` from the host and ensures the built wheel is installed when needed
+  - includes `run_jarvis.sh`, a host-side launcher that starts the existing Compose containers, optionally rebuilds/reinstalls the wheel, and execs the installed app
   - includes `jarvis_shell_wrapper.sh`, the container-level `jarvis` wrapper installed into `/usr/local/bin/`
   - includes `migrate.sh`, a workspace archival helper copied into `/workspace/migrate.sh`
 - `vendor/`

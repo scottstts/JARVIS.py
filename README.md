@@ -103,16 +103,26 @@ docker compose exec jarvis_runtime bash -lc "cd /repo && uv run pytest --run-liv
 
 ### Build & Run App
 
-To build and install the packaged artifact into `jarvis_runtime`, run this on host:
+1. Shortcut
+
+add this to ~/.zshrc:
+
+```zsh
+alias jarvis='<path>/Jarvis/utils/run_jarvis.sh'
+```
+
+Run on host with alias: `jarvis` or `jarvis --reinstall`
+
+2. Manually
 
 ```bash
-bash utils/install_build.sh
+docker compose exec jarvis_runtime bash -lc "bash utils/install_build.sh"
 ```
 
 To force a fresh rebuild and reinstall:
 
 ```bash
-bash utils/install_build.sh --reinstall
+docker compose exec jarvis_runtime bash -lc "bash utils/install_build.sh --reinstall"
 ```
 
 Run installed artifact with:
