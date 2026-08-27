@@ -18,6 +18,7 @@ from jarvis.ui.telegram.bot import (
     IncomingTelegramApprovalCallback,
     IncomingTelegramFile,
     IncomingTextMessage,
+    _ActiveTelegramTurn,
     TelegramGatewayBridge,
     _next_stream_chunk,
     _clear_directory_contents,
@@ -279,6 +280,7 @@ class _FakeGatewayClient:
             | GatewayMessageEvent
             | GatewayToolCallEvent
             | GatewayApprovalRequestEvent
+            | GatewayLocalNoticeEvent
             | GatewayTurnDoneEvent
         ] | None = None,
         error: GatewayBridgeError | None = None,
@@ -785,6 +787,47 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ["HTML"],
         )
         self.assertEqual(telegram.sent_drafts, [])
+
+    async def test_edit_stream_preserves_structural_newline_at_chunk_boundary(self) -> None:
+        telegram = _FakeTelegramClient()
+        bridge = TelegramGatewayBridge(
+            settings=_settings(),
+            telegram_client=telegram,
+            gateway_client=_FakeGatewayClient(),
+        )
+        active_turn = _ActiveTelegramTurn(
+            client_message_id="client",
+            turn_id="turn",
+            session_id="session",
+            completion=asyncio.get_running_loop().create_future(),
+            current_draft_id=1,
+            stream_transport="edit",
+        )
+        stream_prefixes = (
+            "Lead-in\n\n",
+            "Lead-in\n\n1. first item\n",
+            "Lead-in\n\n1. first item\n2. second item",
+        )
+
+        for stream_prefix in stream_prefixes:
+            await bridge._publish_stream_text(
+                chat_id=777,
+                active_turn=active_turn,
+                text=stream_prefix,
+            )
+            active_turn.published_text = stream_prefix
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            ["Lead-in\n\n"],
+        )
+        self.assertEqual(
+            [message.text for message in telegram.edited_messages],
+            [
+                "Lead-in\n\n1. first item\n",
+                "Lead-in\n\n1. first item\n2. second item",
+            ],
+        )
 
     async def test_handle_message_streams_drafts_when_draft_transport_enabled(self) -> None:
         telegram = _FakeTelegramClient()
@@ -1614,7 +1657,7 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_background_subagent_tool_stack_partitions_on_main_message(
+    async def test_background_subagent_tool_stack_partitions_on_system_notice(
         self,
     ) -> None:
         telegram = _FakeTelegramClient()
@@ -1662,16 +1705,6 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await session.emit(
-            GatewayMessageEvent(
-                route_id="tg_777",
-                session_id="session",
-                turn_id="turn_1",
-                turn_kind="user",
-                client_message_id=client_message_id,
-                text="Main update.",
-            )
-        )
-        await session.emit(
             GatewayToolCallEvent(
                 route_id="tg_777",
                 session_id="sub_session",
@@ -1694,6 +1727,16 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await session.emit(
+            GatewayMessageEvent(
+                route_id="tg_777",
+                session_id="session",
+                turn_id="turn_1",
+                turn_kind="user",
+                client_message_id=client_message_id,
+                text="Main update.",
+            )
+        )
+        await session.emit(
             GatewayTurnDoneEvent(
                 route_id="tg_777",
                 session_id="session",
@@ -1710,8 +1753,8 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
             [
                 "🔧 <b>Friday</b>:\n• used <b>bash</b>",
                 "⚙️ <b>System:</b> <b>Friday</b> completed.",
-                "Main update.",
                 "🔧 <b>Friday</b>:\n• used <b>file_patch</b>",
+                "Main update.",
             ],
         )
         self.assertEqual(
@@ -1724,8 +1767,45 @@ class TelegramBotBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [message.message_id for message in telegram.edited_messages],
-            [4],
+            [3],
         )
+
+    async def test_active_local_system_notice_partitions_tool_stack(self) -> None:
+        telegram = _FakeTelegramClient()
+        gateway = _FakeGatewayClient(
+            events=[
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayLocalNoticeEvent(
+                    session_id="session",
+                    turn_kind="user",
+                    notice_kind="checkpoint",
+                    text="Checkpoint.",
+                ),
+                GatewayToolCallEvent(session_id="session", tool_names=("bash",)),
+                GatewayMessageEvent(session_id="session", text="Done."),
+                GatewayTurnDoneEvent(session_id="session", response_text="Done."),
+            ],
+        )
+        bridge = TelegramGatewayBridge(
+            settings=_settings(stream_chunk_min_chars=999),
+            telegram_client=telegram,
+            gateway_client=gateway,
+        )
+
+        await bridge.handle_message(
+            IncomingTextMessage(update_id=1, chat_id=777, chat_type="private", text="hi"),
+        )
+
+        self.assertEqual(
+            [message.text for message in telegram.sent_messages],
+            [
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b>",
+                "⚙️ <b>System:</b> Checkpoint.",
+                "🔧 <b>Jarvis</b>:\n• used <b>bash</b>",
+                "Done.",
+            ],
+        )
+        self.assertEqual(telegram.edited_messages, [])
 
     async def test_background_tool_stacks_are_independent_per_agent(self) -> None:
         telegram = _FakeTelegramClient()

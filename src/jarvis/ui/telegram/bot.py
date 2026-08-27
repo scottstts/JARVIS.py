@@ -869,7 +869,7 @@ class TelegramGatewayBridge:
             self._update_chat_idle_state(message.chat_id)
             raise
         if submitted_turn.show_new_session_notice:
-            await self._send_html_message(
+            await self._send_system_html_message(
                 chat_id=message.chat_id,
                 html_text=_format_local_system_notice(
                     "Prepare to start a new session."
@@ -988,7 +988,7 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayLocalNoticeEvent):
             if not output_paused:
-                await self._send_html_message(
+                await self._send_system_html_message(
                     chat_id=chat_id,
                     html_text=_format_local_system_notice(event.text),
                 )
@@ -1057,7 +1057,7 @@ class TelegramGatewayBridge:
             return
         if isinstance(event, GatewayAuthRequiredEvent):
             if not output_paused:
-                await self._send_html_message(
+                await self._send_system_html_message(
                     chat_id=chat_id,
                     html_text=_format_auth_required_message(event),
                 )
@@ -1117,8 +1117,7 @@ class TelegramGatewayBridge:
         )
         self._active_turn_by_chat[chat_id] = active_turn
         if submitted_turn.show_new_session_notice:
-            self._tool_notice_state_by_chat.pop(chat_id, None)
-            await self._send_html_message(
+            await self._send_system_html_message(
                 chat_id=chat_id,
                 html_text=_format_local_system_notice("Started a new session."),
             )
@@ -1366,21 +1365,24 @@ class TelegramGatewayBridge:
         active_turn: _ActiveTelegramTurn,
         text: str,
     ) -> None:
-        normalized_text = _coalesce_visible_text(text)
-        if normalized_text is None or normalized_text == active_turn.published_text:
+        # Keep structural whitespace at stream boundaries.  `published_text` is
+        # advanced using the raw stream chunk, so trimming a trailing newline
+        # here would make the next suffix start after a character that was never
+        # sent to Telegram.
+        if not _has_effective_text(text) or text == active_turn.published_text:
             return
         if active_turn.stream_transport == "draft":
             await self._send_draft(
                 chat_id=chat_id,
                 draft_id=active_turn.current_draft_id,
-                text=normalized_text,
+                text=text,
             )
             self._refresh_typing_indicator(chat_id)
             return
         await self._append_text_via_edit_transport(
             chat_id=chat_id,
             active_turn=active_turn,
-            text=normalized_text,
+            text=text,
         )
         self._refresh_typing_indicator(chat_id)
 
@@ -1472,20 +1474,20 @@ class TelegramGatewayBridge:
             )
             return
         if isinstance(event, GatewayAuthRequiredEvent):
-            await self._send_html_message(
+            await self._send_system_html_message(
                 chat_id=chat_id,
                 html_text=_format_auth_required_message(event),
             )
             return
         if isinstance(event, GatewayLocalNoticeEvent):
-            await self._send_html_message(
+            await self._send_system_html_message(
                 chat_id=chat_id,
                 html_text=_format_local_system_notice(event.text),
             )
             self._refresh_typing_indicator(chat_id)
             return
         if isinstance(event, GatewaySystemNoticeEvent):
-            await self._send_html_message(
+            await self._send_system_html_message(
                 chat_id=chat_id,
                 html_text=_format_system_notice(event),
             )
@@ -1776,7 +1778,7 @@ class TelegramGatewayBridge:
                 self._output_pause_state_by_chat.pop(message.chat_id, None)
             raise
 
-        await self._send_html_message(
+        await self._send_system_html_message(
             chat_id=message.chat_id,
             html_text=_format_local_system_notice("Session stopped."),
         )
@@ -1992,8 +1994,8 @@ class TelegramGatewayBridge:
         chat_id: int,
         text: str,
     ) -> dict[str, Any]:
-        plain_text = text.strip()
-        if not plain_text:
+        plain_text = text
+        if not _has_effective_text(plain_text):
             raise TelegramAPIError(
                 code="telegram_api_error_400",
                 message="Bad Request: text must be non-empty",
@@ -2020,8 +2022,8 @@ class TelegramGatewayBridge:
         message_id: int,
         text: str,
     ) -> None:
-        plain_text = text.strip()
-        if not plain_text:
+        plain_text = text
+        if not _has_effective_text(plain_text):
             return
 
         formatted_text = render_markdown_to_telegram_html(plain_text)
@@ -2070,6 +2072,20 @@ class TelegramGatewayBridge:
         if plain_text is None:
             return None
         return await self._telegram.send_message(chat_id=chat_id, text=plain_text)
+
+    async def _send_system_html_message(
+        self,
+        *,
+        chat_id: int,
+        html_text: str,
+    ) -> dict[str, Any] | None:
+        response = await self._send_html_message(
+            chat_id=chat_id,
+            html_text=html_text,
+        )
+        if response is not None:
+            self._partition_tool_notice_stacks(chat_id)
+        return response
 
     async def _edit_html_message(
         self,

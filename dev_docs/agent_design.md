@@ -250,6 +250,8 @@ For each chat, the bridge maintains:
 
 `turn_started` binds streamed output to the correct submitted Telegram message. No special Telegram “interrupting current task” acknowledgement is sent.
 
+Edit-based Telegram streaming keeps raw structural whitespace, including newlines at chunk boundaries, in both the published-text cursor and the `sendMessage`/`editMessageText` payload. Trimming those edges before the next suffix is appended would silently join adjacent paragraphs or ordered-list items even though the model response and markdown renderer are correct.
+
 Telegram treats `task_status` as the master typing indicator. Approval/auth prompts, visible progress updates, provider failures, and chat-output pause do not clear it; only an inactive route status does. If the heartbeat task exits unexpectedly while the route remains active, the bridge persists the exception and restarts the task. A terminal main-loop error tied to a user or runtime turn produces only the generic functional notice `❌ Error occurred. Try again.`; unbound gateway/transport failures are persisted with route/session context and remain silent in both Telegram and terminal output. `/stop` temporarily mutes stale in-flight output, waits for the hard-quiesce acknowledgement, and then always sends the single functional confirmation `Session stopped.`, including when the route became quiescent just before the stop request was processed.
 
 ## Approvals

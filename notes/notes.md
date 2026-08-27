@@ -3,6 +3,7 @@
 - Anthropic config now supports `JARVIS_ANTHROPIC_EFFORT` and model-aware thinking behavior (adaptive/effort only applied where model support exists).
 - Gemini thinking is model-aware: `gemini-3*` uses `thinking_level`, while `gemini-2.5*` uses `thinking_budget`.
 - Embeddings are now globally configured via `JARVIS_EMBEDDING_PROVIDER` and `JARVIS_EMBEDDING_MODEL`, decoupled from chat provider selection.
+- Telegram edit streaming must preserve raw structural whitespace at chunk boundaries in both the published cursor and API payload; trimming a trailing newline before appending the next suffix can join ordered-list items even when the model output and markdown renderer are correct.
 - `src/jarvis/settings.yml` now embeds per-field UI metadata (`label`, `description`, `type`, options, bounds) so `utils/settings_gui.html` can render new settings without hardcoded HTML schema changes.
 - Added a custom `src/jarvis/core/agent_loop.py` with one-thread session handling, `/new`, `/compact`, preflight compaction, reactive compaction enqueue, and overflow compact+retry.
 - Implemented file-backed `src/jarvis/storage/` session persistence with `sessions_index.json` metadata and per-session JSONL transcript logs.
@@ -215,7 +216,7 @@
 - Telegram UI startup, polling, route-event, message, approval, typing, and draft failures now use the central persisted JSONL error recorder with route/session/event context, redacted Telegram request metadata, and exception-chain details; Telegram error stack traces are not emitted to the terminal.
 - The host-side `utils/run_jarvis.sh` launcher assumes the Compose containers already exist, starts them, optionally runs `install_build.sh --reinstall`, and then execs `jarvis`; a zsh alias can expose it as the host `jarvis` command.
 
-- Telegram wrench notices aggregate bold raw tool names into one editable per-agent count stack ordered by recency; every user-facing Jarvis message partitions all current stacks, including subagents, while system notices do not partition them.
+- Telegram wrench notices aggregate bold raw tool names into one editable per-agent count stack ordered by recency; every user-facing Jarvis message and gear-prefixed system notice partitions all current stacks, including subagents.
 - Subagent acceptance is passive Acceptance Notes only: children may always hand back complete, partial, or blocked work; Jarvis owns semantic completion, and task sidecars read only the current liveness schema.
 - Lease-backed subagent `changed_paths` is exact net evidence only when the manager's scoped workspace snapshot completes; tool-result paths remain an explicitly incomplete fallback.
 - Graceful process shutdown must close route admission, reuse hard-stop quiescence with a distinct `process_shutdown` reason, and reconstitute only the active main session's compaction lineage; persisted in-flight children restore paused with `process_restart` after orphan-turn reconciliation and never auto-launch.
