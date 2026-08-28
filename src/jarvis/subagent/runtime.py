@@ -62,6 +62,9 @@ class SubagentRuntime:
     pending_background_job_ids: set[str] = field(default_factory=set)
     run_generation: int = 0
     provider_recovery_attempts: int = 0
+    write_scope_attention: bool = False
+    write_scope_attention_tool: str | None = None
+    write_scope_attention_path: str | None = None
 
     def snapshot(self) -> SubagentSnapshot:
         return SubagentSnapshot(
@@ -85,6 +88,9 @@ class SubagentRuntime:
             changed_paths_source=self.changed_paths_source,
             changed_test_artifact_paths=tuple(sorted(self.changed_test_artifact_paths)),
             workspace_lease_status=self.workspace_lease_status,
+            write_scope_attention=self.write_scope_attention,
+            write_scope_attention_tool=self.write_scope_attention_tool,
+            write_scope_attention_path=self.write_scope_attention_path,
             deliverable=self.deliverable,
             current_subagent_session_id=self.loop.active_session_id(),
             pause_reason=self.pause_reason,

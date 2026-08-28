@@ -14,6 +14,7 @@ from .runtime import ToolRuntime
 from .workspace_access import (
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    WorkspaceWriteScopeError,
     with_workspace_capabilities,
     with_workspace_observation,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "ToolRuntime",
     "WorkspaceAccessCoordinator",
     "WorkspaceLeaseError",
+    "WorkspaceWriteScopeError",
     "with_workspace_capabilities",
     "with_workspace_observation",
     "ToolSettings",

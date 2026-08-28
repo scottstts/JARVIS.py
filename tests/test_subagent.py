@@ -1173,6 +1173,254 @@ class SubagentManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(entry.workspace_lease_status, "held")
             await manager.dispose(agent=payload["subagent_id"])
 
+    async def test_empty_owned_paths_are_read_only_and_not_held(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            workspace_access = WorkspaceAccessCoordinator(
+                workspace_dir=core_settings.workspace_dir
+            )
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                workspace_access=workspace_access,
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Read-only inspection",
+                instructions="Inspect the workspace and report findings.",
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+
+            self.assertEqual(payload["workspace_lease_status"], "not_applicable")
+            self.assertEqual(runtime.workspace_lease_status, "not_applicable")
+            entry = manager._catalog.get_entry(runtime.subagent_id)
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertEqual(entry.workspace_lease_status, "not_applicable")
+
+            continued = await manager.step_in(
+                agent=runtime.subagent_id,
+                instructions="Continue the read-only inspection.",
+                owned_paths=(),
+            )
+            self.assertEqual(continued["owned_paths"], [])
+            self.assertEqual(continued["workspace_lease_status"], "not_applicable")
+            self.assertEqual(runtime.workspace_lease_status, "not_applicable")
+            self.assertEqual(runtime.owned_paths, ())
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            await manager.dispose(agent=runtime.subagent_id)
+
+    async def test_step_in_replacement_is_transactional_on_lease_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            (core_settings.workspace_dir / "src").mkdir()
+            (core_settings.workspace_dir / "other").mkdir()
+            workspace_access = WorkspaceAccessCoordinator(
+                workspace_dir=core_settings.workspace_dir
+            )
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                workspace_access=workspace_access,
+                publish_event=AsyncMock(),
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Keep the existing scope",
+                instructions="Inspect the assigned source directory.",
+                owned_paths=("src",),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            runtime.write_scope_attention = True
+            runtime.write_scope_attention_tool = "file_write"
+            runtime.write_scope_attention_path = "/workspace/other/new.py"
+            manager._sync_catalog(runtime)
+
+            await workspace_access.claim_paths(owner="main", paths=("other",))
+            with self.assertRaises(WorkspaceLeaseError):
+                await manager.step_in(
+                    agent=runtime.subagent_id,
+                    instructions="Continue after checking the scope.",
+                    owned_paths=("other",),
+                )
+
+            self.assertEqual(runtime.owned_paths, ("src",))
+            self.assertEqual(runtime.workspace_lease_status, "held")
+            self.assertTrue(runtime.write_scope_attention)
+            self.assertEqual(runtime.status, "completed")
+            entry = manager._catalog.get_entry(runtime.subagent_id)
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertEqual(entry.owned_paths, ("src",))
+                self.assertEqual(entry.workspace_lease_status, "held")
+                self.assertTrue(entry.write_scope_attention)
+
+            with self.assertRaises(WorkspaceLeaseError):
+                await workspace_access.claim_paths(owner="main", paths=("src",))
+            await workspace_access.release_owner(owner="main")
+            await manager.dispose(agent=runtime.subagent_id)
+
+    async def test_structured_write_scope_denial_notifies_once_and_reassignment_resolves_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            core_settings = build_core_settings(root_dir=Path(tmp))
+            (core_settings.workspace_dir / "src").mkdir()
+            (core_settings.workspace_dir / "tests").mkdir()
+            published_events: list[object] = []
+
+            async def publish_event(event: object) -> None:
+                published_events.append(event)
+
+            workspace_access = WorkspaceAccessCoordinator(
+                workspace_dir=core_settings.workspace_dir
+            )
+            manager = SubagentManager(
+                route_id="route_1",
+                llm_service=_FakeSubagentLLMService(),
+                core_settings=core_settings,
+                tool_registry=ToolRegistry.default(
+                    ToolSettings.from_workspace_dir(core_settings.workspace_dir)
+                ),
+                tool_execution_guard=asyncio.Semaphore(1),
+                workspace_access=workspace_access,
+                publish_event=publish_event,
+                register_approval_target=lambda _approval_id, _loop: None,
+            )
+            payload = await manager.invoke(
+                requester_kind="main",
+                task_label="Repair the child scope",
+                instructions="Inspect the source and report what needs changing.",
+                owned_paths=("src",),
+                owner_main_session_id="main_session",
+                owner_main_turn_id="main_turn",
+            )
+            runtime = manager._subagents[payload["subagent_id"]]
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            published_events.clear()
+
+            context = ToolExecutionContext(
+                workspace_dir=core_settings.workspace_dir,
+                route_id="route_1",
+                session_id=runtime.loop.active_session_id(),
+                agent_kind="subagent",
+                agent_name=runtime.codename,
+                subagent_id=runtime.subagent_id,
+            )
+            generic_conflict = ToolExecutionResult(
+                call_id="generic-conflict",
+                name="file_write",
+                ok=False,
+                content="generic lease conflict",
+                metadata={"error_code": "workspace_lease_conflict"},
+            )
+            await manager._observe_tool_result(
+                subagent_id=runtime.subagent_id,
+                result=generic_conflict,
+                context=context,
+            )
+            self.assertFalse(runtime.write_scope_attention)
+            self.assertEqual(published_events, [])
+
+            scope_denial = ToolExecutionResult(
+                call_id="scope-denial",
+                name="file_write",
+                ok=False,
+                content="structured scope denial",
+                metadata={
+                    "error_code": "workspace_lease_conflict",
+                    "conflict_class": "subagent_write_scope",
+                    "write_scope_violation": True,
+                    "requested_path": "/workspace/tests/new_test.py",
+                },
+            )
+            await manager._observe_tool_result(
+                subagent_id=runtime.subagent_id,
+                result=scope_denial,
+                context=context,
+            )
+            await manager._observe_tool_result(
+                subagent_id=runtime.subagent_id,
+                result=scope_denial,
+                context=context,
+            )
+
+            self.assertTrue(runtime.write_scope_attention)
+            self.assertEqual(runtime.write_scope_attention_tool, "file_write")
+            self.assertEqual(
+                runtime.write_scope_attention_path,
+                "/workspace/tests/new_test.py",
+            )
+            attention_events = [
+                event
+                for event in published_events
+                if isinstance(event, RouteSystemNoticeEvent)
+                and event.notice_kind == "subagent_needs_attention"
+            ]
+            self.assertEqual(len(attention_events), 1)
+            self.assertIn("subagent_step_in", attention_events[0].text)
+            self.assertIn("owned_paths", attention_events[0].text)
+            entry = manager._catalog.get_entry(runtime.subagent_id)
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertTrue(entry.write_scope_attention)
+            progress = manager.build_main_progress_message(
+                agent=runtime.subagent_id,
+                notice_kind="subagent_needs_attention",
+                notice_text=attention_events[0].text,
+            )
+            self.assertIsNotNone(progress)
+            if progress is not None:
+                _session_id, message = progress
+                self.assertEqual(message.metadata["write_scope_attention"], True)
+                self.assertIn("subagent_step_in", message.content)
+
+            old_session_id = runtime.loop.active_session_id()
+            await manager.step_in(
+                agent=runtime.subagent_id,
+                instructions="Continue in the newly assigned test directory.",
+                owned_paths=("tests",),
+            )
+            if runtime.task is not None:
+                await asyncio.wait_for(runtime.task, timeout=1)
+            self.assertEqual(runtime.subagent_id, payload["subagent_id"])
+            self.assertEqual(runtime.loop.active_session_id(), old_session_id)
+            self.assertEqual(runtime.owned_paths, ("tests",))
+            self.assertFalse(runtime.write_scope_attention)
+            entry = manager._catalog.get_entry(runtime.subagent_id)
+            self.assertIsNotNone(entry)
+            if entry is not None:
+                self.assertEqual(entry.owned_paths, ("tests",))
+                self.assertFalse(entry.write_scope_attention)
+            await workspace_access.claim_paths(owner="main", paths=("src",))
+            await workspace_access.release_owner(owner="main")
+            await manager.dispose(agent=runtime.subagent_id)
+
     async def test_subagent_failure_persists_provider_metadata_and_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             core_settings = build_core_settings(root_dir=Path(tmp))

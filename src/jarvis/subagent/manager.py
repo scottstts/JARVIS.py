@@ -58,6 +58,7 @@ from jarvis.tools import (
     ToolRuntime,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    WorkspaceWriteScopeError,
     with_workspace_capabilities,
     with_workspace_observation,
 )
@@ -274,6 +275,9 @@ class SubagentManager:
                 if self._workspace_access is not None and entry.owned_paths
                 else "not_applicable"
             ),
+            write_scope_attention=entry.write_scope_attention,
+            write_scope_attention_tool=entry.write_scope_attention_tool,
+            write_scope_attention_path=entry.write_scope_attention_path,
             deliverable=entry.deliverable,
             pause_reason=("process_restart" if was_in_flight else entry.pause_reason),
             last_error=entry.last_error,
@@ -524,7 +528,7 @@ class SubagentManager:
             session_id = await runtime.loop.prepare_session(
                 start_reason="subagent_initial"
             )
-            if self._workspace_access is not None:
+            if self._workspace_access is not None and normalized_owned_paths:
                 await self._workspace_access.claim_paths(
                     owner=f"subagent:{subagent_id}",
                     paths=normalized_owned_paths,
@@ -680,17 +684,32 @@ class SubagentManager:
         runtime.changed_paths_complete = False
         runtime.changed_paths_source = "scoped_workspace_snapshot_pending"
 
-    async def _finalize_workspace_snapshot(self, runtime: SubagentRuntime) -> bool:
-        """Record exact net changes for the currently held lease segment."""
+    async def _finalize_workspace_snapshot(
+        self,
+        runtime: SubagentRuntime,
+        *,
+        owned_paths: tuple[str, ...] | None = None,
+    ) -> bool:
+        """Record exact net changes for the current or just-replaced lease segment."""
 
         baseline = runtime.workspace_snapshot_baseline
         if baseline is None:
             return runtime.changed_paths_complete
+        snapshot_paths = runtime.owned_paths if owned_paths is None else owned_paths
+        if not snapshot_paths:
+            runtime.workspace_snapshot_baseline = None
+            runtime.changed_paths_complete = not runtime.workspace_snapshot_incomplete
+            runtime.changed_paths_source = (
+                "scoped_workspace_snapshot"
+                if runtime.changed_paths_complete
+                else "scoped_workspace_snapshot_incomplete"
+            )
+            return True
         try:
             current = await asyncio.to_thread(
                 workspace_snapshot_paths,
                 self._core_settings.workspace_dir,
-                runtime.owned_paths,
+                snapshot_paths,
             )
         except WorkspaceSnapshotError as exc:
             runtime.workspace_snapshot_baseline = None
@@ -878,7 +897,13 @@ class SubagentManager:
             "changed": True,
         }
 
-    async def step_in(self, *, agent: str, instructions: str) -> dict[str, Any]:
+    async def step_in(
+        self,
+        *,
+        agent: str,
+        instructions: str,
+        owned_paths: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         runtime = self._require_runtime(agent)
         if runtime.status == "disposed":
             raise ValueError(f"Subagent {agent} has already been disposed.")
@@ -886,15 +911,56 @@ class SubagentManager:
             raise ValueError(
                 "Cannot step into a subagent while detached bash jobs are still pending."
             )
+
+        replacement_paths = (
+            None
+            if owned_paths is None
+            else _normalize_unique_strings(owned_paths)
+        )
+        previous_owned_paths = runtime.owned_paths
+        ownership_replaced = replacement_paths is not None
+
+        # Claim a non-empty replacement before changing the runtime assignment. The
+        # coordinator validates the complete replacement while the current lease is
+        # still held and only updates the owner after all overlap checks pass. A
+        # conflict therefore leaves the child, its lease, and its attention state
+        # untouched so the main agent can retry with a different scope.
+        if replacement_paths:
+            if self._workspace_access is not None:
+                await self._workspace_access.claim_paths(
+                    owner=f"subagent:{runtime.subagent_id}",
+                    paths=replacement_paths,
+                )
+                runtime.workspace_lease_status = "held"
+            else:
+                runtime.workspace_lease_status = "not_applicable"
+            runtime.owned_paths = replacement_paths
+
         if runtime.status in {"running", "awaiting_approval"}:
             runtime.pending_pause_reason = "main_stop"
             runtime.loop.request_stop()
             await self._wait_for_turn_settle(runtime)
         if runtime.workspace_lease_status == "held":
-            await self._finalize_workspace_snapshot(runtime)
-        await self._reacquire_workspace_lease_if_needed(runtime)
+            await self._finalize_workspace_snapshot(
+                runtime,
+                owned_paths=(previous_owned_paths if ownership_replaced else None),
+            )
+
+        if replacement_paths == ():
+            if self._workspace_access is not None and runtime.workspace_lease_status == "held":
+                await self._workspace_access.release_owner(
+                    owner=f"subagent:{runtime.subagent_id}"
+                )
+            runtime.owned_paths = ()
+            runtime.workspace_lease_status = "not_applicable"
+            runtime.workspace_snapshot_baseline = None
+        elif replacement_paths is None:
+            await self._reacquire_workspace_lease_if_needed(runtime)
+
         if runtime.workspace_lease_status == "held" and runtime.workspace_snapshot_baseline is None:
             await self._begin_workspace_snapshot(runtime)
+        if ownership_replaced:
+            self._clear_write_scope_attention(runtime)
         runtime.pause_reason = None
         runtime.status = "running"
         runtime.report_complete = False
@@ -903,13 +969,26 @@ class SubagentManager:
         # reminder was most recently emitted. Re-arm the reminder for the next
         # settled result regardless of which main-session key was active.
         self._coordination_final_nudge_sessions.clear()
+        self._append_notable_event(
+            runtime,
+            kind="step_in",
+            summary=(
+                "Jarvis stepped in with new direction and replaced workspace ownership."
+                if ownership_replaced
+                else "Jarvis stepped in with new direction."
+            ),
+        )
         self._sync_catalog(runtime)
-        self._append_notable_event(runtime, kind="step_in", summary="Jarvis stepped in with new direction.")
         self._launch_runtime_task(
             runtime,
             user_text="Continue with the updated direction above.",
             force_session_id=runtime.loop.active_session_id(),
-            pre_turn_messages=(build_step_in_message(instructions=instructions),),
+            pre_turn_messages=(
+                build_step_in_message(
+                    instructions=instructions,
+                    owned_paths=replacement_paths,
+                ),
+            ),
             name=f"jarvis-subagent-step-in-{runtime.codename}-{runtime.subagent_id}",
         )
         return {
@@ -917,6 +996,8 @@ class SubagentManager:
             "codename": runtime.codename,
             "status": runtime.status,
             "changed": True,
+            "owned_paths": list(runtime.owned_paths),
+            "workspace_lease_status": runtime.workspace_lease_status,
         }
 
     async def handoff(self, *, agent: str) -> dict[str, Any]:
@@ -1105,6 +1186,15 @@ class SubagentManager:
                 extras.append(f"phase={snapshot.phase}")
             if snapshot.workspace_lease_status != "not_applicable":
                 extras.append(f"workspace_lease={snapshot.workspace_lease_status}")
+            if snapshot.write_scope_attention:
+                extras.append("write_scope_attention=true")
+                extras.append(
+                    "write_scope_action=use_subagent_step_in_with_owned_paths"
+                )
+                if snapshot.write_scope_attention_path is not None:
+                    extras.append(
+                        f"write_scope_path={snapshot.write_scope_attention_path}"
+                    )
             if snapshot.changed_paths_complete:
                 extras.append("changed_paths_complete=true")
             if snapshot.changed_paths_source != "tool_result_metadata":
@@ -1214,6 +1304,13 @@ class SubagentManager:
             parts.append(f"phase={snapshot.phase}")
         if snapshot.workspace_lease_status != "not_applicable":
             parts.append(f"workspace_lease={snapshot.workspace_lease_status}")
+        if snapshot.write_scope_attention:
+            parts.append("write_scope_attention=true")
+            parts.append(
+                "write_scope_action=use_subagent_step_in_with_owned_paths"
+            )
+            if snapshot.write_scope_attention_path is not None:
+                parts.append(f"write_scope_path={snapshot.write_scope_attention_path}")
         if notice_text.strip():
             parts.append(f'note="{self._truncate_for_notice(notice_text, max_length=140)}"')
         latest_report = snapshot.latest_report
@@ -1243,6 +1340,9 @@ class SubagentManager:
             "phase": snapshot.phase,
             "depends_on": list(snapshot.depends_on),
             "workspace_lease_status": snapshot.workspace_lease_status,
+            "write_scope_attention": snapshot.write_scope_attention,
+            "write_scope_attention_tool": snapshot.write_scope_attention_tool,
+            "write_scope_attention_path": snapshot.write_scope_attention_path,
             "changed_paths": list(snapshot.changed_paths),
             "changed_paths_complete": snapshot.changed_paths_complete,
             "changed_paths_source": snapshot.changed_paths_source,
@@ -1362,6 +1462,19 @@ class SubagentManager:
             lines.extend(["- seam_contract:", snapshot.seam_contract])
         if snapshot.workspace_lease_status != "not_applicable":
             lines.append(f"- workspace_lease_status: {snapshot.workspace_lease_status}")
+        if snapshot.write_scope_attention:
+            lines.append("- write_scope_attention: true")
+            lines.append(
+                "- write_scope_action: use subagent_step_in with owned_paths to assign access"
+            )
+            if snapshot.write_scope_attention_tool is not None:
+                lines.append(
+                    f"- write_scope_attention_tool: {snapshot.write_scope_attention_tool}"
+                )
+            if snapshot.write_scope_attention_path is not None:
+                lines.append(
+                    f"- write_scope_attention_path: {snapshot.write_scope_attention_path}"
+                )
         if snapshot.changed_paths:
             lines.append(f"- changed_paths: {', '.join(snapshot.changed_paths)}")
         lines.append(
@@ -1875,6 +1988,15 @@ class SubagentManager:
             summary=self._summarize_tool_result(result),
         )
         self._sync_catalog(runtime)
+        if (
+            context.agent_kind == "subagent"
+            and context.subagent_id == subagent_id
+            and not result.ok
+            and result.metadata.get("error_code") == "workspace_lease_conflict"
+            and result.metadata.get("conflict_class") == "subagent_write_scope"
+            and result.metadata.get("write_scope_violation") is True
+        ):
+            await self._record_write_scope_attention(runtime, result)
         if result.name != "bash":
             return
         if self._tool_result_observer is not None:
@@ -1917,6 +2039,54 @@ class SubagentManager:
             summary=f"Observed terminal bash job {job_id[:8]} inside the subagent turn.",
         )
         self._sync_catalog(runtime)
+
+    async def _record_write_scope_attention(
+        self,
+        runtime: SubagentRuntime,
+        result: ToolExecutionResult,
+    ) -> None:
+        if runtime.write_scope_attention:
+            return
+        raw_requested_path = result.metadata.get("requested_path")
+        requested_path = (
+            raw_requested_path.strip()
+            if isinstance(raw_requested_path, str) and raw_requested_path.strip()
+            else None
+        )
+        runtime.write_scope_attention = True
+        runtime.write_scope_attention_tool = result.name
+        runtime.write_scope_attention_path = requested_path
+        scope_target = requested_path or "an unscoped workspace write"
+        self._append_notable_event(
+            runtime,
+            kind="write_scope_attention",
+            summary=(
+                f"Write denied for {scope_target}; the child needs an owned path "
+                "assignment before retrying."
+            ),
+        )
+        self._sync_catalog(runtime)
+        display_target = self._truncate_for_notice(scope_target, max_length=64) or scope_target
+        await self._publish_lifecycle_notice(
+            runtime,
+            notice_kind="subagent_needs_attention",
+            text=(
+                f"write denied for {display_target}; use subagent_step_in with owned_paths "
+                "to assign access, or continue read-only."
+            ),
+        )
+
+    def _clear_write_scope_attention(self, runtime: SubagentRuntime) -> None:
+        if not runtime.write_scope_attention:
+            return
+        runtime.write_scope_attention = False
+        runtime.write_scope_attention_tool = None
+        runtime.write_scope_attention_path = None
+        self._append_notable_event(
+            runtime,
+            kind="write_scope_attention_resolved",
+            summary="Cleared after Jarvis reassigned the child workspace scope.",
+        )
 
     def _launch_runtime_task(
         self,
@@ -2331,7 +2501,7 @@ class SubagentManager:
     ) -> None:
         if runtime.workspace_lease_status != "released":
             return
-        if self._workspace_access is None:
+        if self._workspace_access is None or not runtime.owned_paths:
             runtime.workspace_lease_status = "not_applicable"
             return
         await self._workspace_access.claim_paths(
@@ -2491,6 +2661,7 @@ class SubagentManager:
             phase=runtime.phase,
             depends_on=runtime.depends_on,
             seam_contract=runtime.seam_contract,
+            owned_paths=runtime.owned_paths,
             changed_paths=tuple(sorted(runtime.changed_paths)),
             changed_paths_complete=runtime.changed_paths_complete,
             changed_paths_source=runtime.changed_paths_source,
@@ -2498,6 +2669,9 @@ class SubagentManager:
                 sorted(runtime.changed_test_artifact_paths)
             ),
             workspace_lease_status=runtime.workspace_lease_status,
+            write_scope_attention=runtime.write_scope_attention,
+            write_scope_attention_tool=runtime.write_scope_attention_tool,
+            write_scope_attention_path=runtime.write_scope_attention_path,
             disposed_at=disposed_at,
         )
 
@@ -2527,6 +2701,9 @@ class SubagentManager:
             "phase": snapshot.phase,
             "depends_on": list(snapshot.depends_on),
             "workspace_lease_status": snapshot.workspace_lease_status,
+            "write_scope_attention": snapshot.write_scope_attention,
+            "write_scope_attention_tool": snapshot.write_scope_attention_tool,
+            "write_scope_attention_path": snapshot.write_scope_attention_path,
             "changed_paths": list(snapshot.changed_paths),
             "changed_paths_complete": snapshot.changed_paths_complete,
             "changed_paths_source": snapshot.changed_paths_source,
@@ -2547,6 +2724,9 @@ class SubagentManager:
                     "depends_on": list(snapshot.depends_on),
                     "seam_contract": snapshot.seam_contract,
                     "workspace_lease_status": snapshot.workspace_lease_status,
+                    "write_scope_attention": snapshot.write_scope_attention,
+                    "write_scope_attention_tool": snapshot.write_scope_attention_tool,
+                    "write_scope_attention_path": snapshot.write_scope_attention_path,
                     "changed_paths": list(snapshot.changed_paths),
                     "changed_paths_complete": snapshot.changed_paths_complete,
                     "changed_paths_source": snapshot.changed_paths_source,
@@ -2758,6 +2938,8 @@ def _workspace_lease_error_result(
     call_id = str(getattr(tool_call, "call_id", ""))
     name = str(getattr(tool_call, "name", "bash"))
     arguments = getattr(tool_call, "arguments", {})
+    write_scope_violation = isinstance(error, WorkspaceWriteScopeError)
+    requested_path = getattr(error, "requested_path", None)
     return ToolExecutionResult(
         call_id=call_id,
         name=name,
@@ -2768,6 +2950,8 @@ def _workspace_lease_error_result(
             "error_code: workspace_lease_conflict\n"
             f"conflict_class: {error.conflict_class}\n"
             f"conflict_key: {error.conflict_key}\n"
+            f"write_scope_violation: {str(write_scope_violation).lower()}\n"
+            f"requested_path: {requested_path or 'unscoped'}\n"
             f"reason: {error}\n"
             f"remediation: {error.remediation}"
         ),
@@ -2776,6 +2960,8 @@ def _workspace_lease_error_result(
             "error_code": "workspace_lease_conflict",
             "conflict_class": error.conflict_class,
             "conflict_key": error.conflict_key,
+            "write_scope_violation": write_scope_violation,
+            "requested_path": str(requested_path) if requested_path is not None else None,
             "reason": str(error),
             "remediation": error.remediation,
             "arguments": dict(arguments) if isinstance(arguments, dict) else {},

@@ -82,6 +82,9 @@ class SubagentCatalogEntry:
     last_error_metadata: dict[str, Any] = field(default_factory=dict)
     error_log_path: str | None = None
     run_generation: int = 0
+    write_scope_attention: bool = False
+    write_scope_attention_tool: str | None = None
+    write_scope_attention_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +111,9 @@ class SubagentCatalogEntry:
             "changed_paths_source": self.changed_paths_source,
             "changed_test_artifact_paths": list(self.changed_test_artifact_paths),
             "workspace_lease_status": self.workspace_lease_status,
+            "write_scope_attention": self.write_scope_attention,
+            "write_scope_attention_tool": self.write_scope_attention_tool,
+            "write_scope_attention_path": self.write_scope_attention_path,
             "deliverable": self.deliverable,
             "current_subagent_session_id": self.current_subagent_session_id,
             "disposed_at": self.disposed_at,
@@ -179,6 +185,12 @@ class SubagentCatalogEntry:
             and raw_lease_status in {"not_applicable", "held", "released"}
             else "not_applicable"
         )
+        raw_write_scope_attention = payload.get("write_scope_attention", False)
+        write_scope_attention = (
+            raw_write_scope_attention
+            if isinstance(raw_write_scope_attention, bool)
+            else False
+        )
         return cls(
             subagent_id=str(payload.get("subagent_id", "")),
             codename=str(payload.get("codename", "")),
@@ -238,6 +250,17 @@ class SubagentCatalogEntry:
                 if str(item).strip()
             ),
             workspace_lease_status=lease_status,  # type: ignore[arg-type]
+            write_scope_attention=write_scope_attention,
+            write_scope_attention_tool=(
+                str(payload["write_scope_attention_tool"])
+                if payload.get("write_scope_attention_tool") is not None
+                else None
+            ),
+            write_scope_attention_path=(
+                str(payload["write_scope_attention_path"])
+                if payload.get("write_scope_attention_path") is not None
+                else None
+            ),
             deliverable=(
                 str(payload["deliverable"])
                 if payload.get("deliverable") is not None
@@ -309,6 +332,9 @@ class SubagentSnapshot:
     pending_background_job_ids: tuple[str, ...] = field(default_factory=tuple)
     notable_events: tuple[SubagentEventNote, ...] = field(default_factory=tuple)
     run_generation: int = 0
+    write_scope_attention: bool = False
+    write_scope_attention_tool: str | None = None
+    write_scope_attention_path: str | None = None
 
 
 def _nonnegative_int(value: object) -> int:

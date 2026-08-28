@@ -1740,9 +1740,15 @@ class RouteRuntime:
                 instructions = str(tool_call.arguments.get("instructions", "")).strip()
                 if not agent or not instructions:
                     raise ValueError("'agent' and 'instructions' are required.")
+                owned_paths = (
+                    _optional_string_tuple(tool_call.arguments["owned_paths"])
+                    if "owned_paths" in tool_call.arguments
+                    else None
+                )
                 payload = await self._subagent_manager.step_in(
                     agent=agent,
                     instructions=instructions,
+                    owned_paths=owned_paths,
                 )
                 return _tool_result_for_payload(
                     call_id=tool_call.call_id,
@@ -2610,6 +2616,11 @@ class RouteRuntime:
                     message.metadata.get("changed_paths_source", "tool_result_metadata")
                 ),
             }
+            if bool(message.metadata.get("write_scope_attention", False)):
+                update["write_scope_attention"] = True
+                attention_path = message.metadata.get("write_scope_attention_path")
+                if attention_path is not None:
+                    update["write_scope_attention_path"] = attention_path
             if update["subagent_id"]:
                 subagent_updates.append(update)
             changed_test_artifact_paths.update(
@@ -2839,6 +2850,8 @@ def _workspace_lease_error_result(
     tool_call: ToolCall,
     error: WorkspaceLeaseError,
 ) -> ToolExecutionResult:
+    write_scope_violation = bool(getattr(error, "write_scope_violation", False))
+    requested_path = getattr(error, "requested_path", None)
     return ToolExecutionResult(
         call_id=tool_call.call_id,
         name=tool_call.name,
@@ -2849,6 +2862,8 @@ def _workspace_lease_error_result(
             "error_code: workspace_lease_conflict\n"
             f"conflict_class: {error.conflict_class}\n"
             f"conflict_key: {error.conflict_key}\n"
+            f"write_scope_violation: {str(write_scope_violation).lower()}\n"
+            f"requested_path: {requested_path or 'unscoped'}\n"
             f"reason: {error}\n"
             f"remediation: {error.remediation}"
         ),
@@ -2857,6 +2872,8 @@ def _workspace_lease_error_result(
             "error_code": "workspace_lease_conflict",
             "conflict_class": error.conflict_class,
             "conflict_key": error.conflict_key,
+            "write_scope_violation": write_scope_violation,
+            "requested_path": str(requested_path) if requested_path is not None else None,
             "reason": str(error),
             "remediation": error.remediation,
             "arguments": dict(tool_call.arguments),

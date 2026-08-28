@@ -160,14 +160,27 @@ def build_subagent_primitive_definitions() -> tuple[ToolDefinition, ...]:
         ToolDefinition(
             name="subagent_step_in",
             description=(
-                "Cooperatively stop a subagent, wait for the turn to settle, then start a fresh "
-                "turn with updated direction."
+                "Cooperatively stop an existing subagent, wait for its turn to settle, then start "
+                "a fresh turn with updated direction. Optionally replace the child's complete "
+                "workspace write scope atomically; use owned_paths when a prior write denial says "
+                "the child needs access, and use an empty list to continue explicitly read-only."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "agent": {"type": "string"},
                     "instructions": {"type": "string"},
+                    "owned_paths": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 32,
+                        "uniqueItems": True,
+                        "description": (
+                            "Optional complete replacement for the child's workspace write scope; "
+                            "omit to preserve the current scope, or pass [] for an explicit "
+                            "read-only continuation. Paths must already exist before assignment."
+                        ),
+                    },
                 },
                 "required": ["agent", "instructions"],
                 "additionalProperties": False,
@@ -252,8 +265,8 @@ def render_subagent_primitive_docs() -> str:
         f"- `{definitions['subagent_monitor'].name}`: inspect on demand. Omit `agent` to summarize all active "
         "subagents; use `detail=\"full\"` only when you need current internals.",
         f"- `{definitions['subagent_stop'].name}`: cooperatively pause a running or approval-blocked child.",
-        f"- `{definitions['subagent_step_in'].name}`: stop, settle, then start a new child turn with updated "
-        "instructions; it is not live prompt injection.",
+        f"- `{definitions['subagent_step_in'].name}`: stop, settle, and continue the same child; "
+        "it is not live prompt injection. `owned_paths` replaces its scope when needed.",
         f"- `{definitions['subagent_handoff'].name}`: release a settled child's workspace lease while "
         "retaining its report and transcript for main-agent review and integration.",
         f"- `{definitions['subagent_dispose'].name}`: dispose completed, failed, or no-longer-needed children "

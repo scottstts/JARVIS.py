@@ -147,6 +147,8 @@ Changes direction for an existing subagent.
 
 If the target is running, Jarvis requests cooperative stop, waits for the turn to settle, and starts a fresh child turn on the same subagent loop with the new instructions.
 
+The optional `owned_paths` argument has replacement semantics: omit it to preserve the current scope, or supply the complete new scope (including `[]` for an explicit read-only continuation). A non-empty replacement is validated and claimed as one coordinator operation before the old scope is dropped; a failed claim leaves the existing child assignment and lease unchanged. The same child id, transcript/session lineage, and loop are retained. A successful replacement clears any latched write-scope attention notice.
+
 Step-in is stop, settle, then new turn. It is not mid-token prompt injection.
 
 ### `subagent_handoff`
@@ -214,6 +216,7 @@ Important metadata:
 - `changed_paths_complete`
 - `changed_paths_source`
 - `workspace_lease_status`
+- `write_scope_attention`
 - `owner_main_session_id`
 - `owner_main_turn_id`
 - `current_subagent_session_id`
@@ -242,7 +245,7 @@ Subagent primitives are not exposed to subagents, and `SubagentManager` rejects 
 
 ## Tool Execution Coordination
 
-Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until explicit handoff or disposal and must name existing files or directories. Direct path tools coordinate automatically and reject child writes outside those roots. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background and service Bash without model-declared paths or lease generations. The subagent manager captures a content/type snapshot after acquiring a lease and diffs it when the lease segment settles, hands off, or is disposed; this produces exact net `changed_paths` for the owned scope, including Bash, untracked files, deletes, and renames. Runtime-managed `archive` and `.jarvis_internal` roots are excluded from this evidence; other directories, including project caches, remain material when they are explicitly owned. A resumed child starts a new snapshot segment so main-agent integration edits are not attributed to it. This is independent of Git and is evidence for review, not a semantic acceptance gate.
+Route-level tool execution uses a workspace coordinator rather than one global tool mutex. A child’s `owned_paths` are exclusive persistent write leases until explicit handoff or disposal and must name existing files or directories. An empty scope is explicitly read-only and is reported as `workspace_lease_status=not_applicable`. Direct path tools coordinate automatically and reject child writes outside those roots. A structured direct-tool denial for a subagent write outside its scope latches one main-agent `subagent_needs_attention` notice; the notice tells Jarvis to use `subagent_step_in` with a complete `owned_paths` replacement on the existing child, or continue read-only. Generic tool failures and unrelated lease conflicts are not promoted by this path. Bash receives a runtime-derived filesystem capability view: children see the shared workspace read-only except for their owned roots, while Jarvis sees child-owned roots read-only. This enforcement applies to foreground, background and service Bash without model-declared paths or lease generations. The subagent manager captures a content/type snapshot after acquiring a lease and diffs it when the lease segment settles, hands off, or is disposed; this produces exact net `changed_paths` for the owned scope, including Bash, untracked files, deletes, and renames. Runtime-managed `archive` and `.jarvis_internal` roots are excluded from this evidence; other directories, including project caches, remain material when they are explicitly owned. A resumed child starts a new snapshot segment so main-agent integration edits are not attributed to it. This is independent of Git and is evidence for review, not a semantic acceptance gate.
 
 Detached bash jobs are supervised route-wide. Subagent background jobs carry owner metadata and terminal/attention evidence later revives the owning child loop through persisted child-system notes and runtime turns. Routine running, output-started, and output-growth observations do not spend a child model turn; accepted notices are latched while queued, and terminal notices carry bounded output plus stdout/stderr log paths for later inspection. A silent-job attention notice first resumes the owning child and remains routine from Jarvis's perspective; the main agent is escalated only if that child subsequently cannot recover, pauses, fails, needs approval, or reports an unresolved blocker. A child waiting on detached work stays `waiting_background`; terminal bash evidence may resume that same child when it was waiting on the job. `/stop` terminates the job and hard-pauses the affected child with reason `main_stop`.
 
@@ -275,6 +278,7 @@ The route-level catalog stores:
 - current run generation
 - pause reason
 - last error, structured provider metadata, and error-log path
+- current workspace lease and latched write-scope attention state
 
 Each subagent has its own `SessionStorage` root and normal session compaction lineage.
 

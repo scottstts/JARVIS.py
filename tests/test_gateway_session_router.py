@@ -477,6 +477,18 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
             {definition.name for definition in build_subagent_primitive_definitions()},
         )
 
+    def test_subagent_step_in_accepts_optional_complete_owned_path_replacement(self) -> None:
+        definitions = {
+            definition.name: definition
+            for definition in build_subagent_primitive_definitions()
+        }
+        schema = definitions["subagent_step_in"].input_schema
+
+        self.assertEqual(schema["required"], ["agent", "instructions"])
+        self.assertIn("owned_paths", schema["properties"])
+        self.assertEqual(schema["properties"]["owned_paths"]["maxItems"], 32)
+        self.assertTrue(schema["properties"]["owned_paths"]["uniqueItems"])
+
     def test_subagent_tool_results_mark_control_metadata(self) -> None:
         result = _tool_result_for_payload(
             call_id="call_1",
@@ -495,6 +507,65 @@ class RouteRuntimeToolResultTests(unittest.TestCase):
 
 
 class RouteRuntimeSupervisorFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_subagent_step_in_forwards_omitted_and_explicit_owned_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            step_in = AsyncMock(
+                return_value={
+                    "subagent_id": "sub_1",
+                    "codename": "Ultron",
+                    "status": "running",
+                    "changed": True,
+                }
+            )
+            with patch.object(runtime._subagent_manager, "step_in", step_in):
+                explicit = await runtime._execute_subagent_primitive(
+                    ToolCall(
+                        call_id="step-in-explicit",
+                        name="subagent_step_in",
+                        arguments={
+                            "agent": "sub_1",
+                            "instructions": "Continue the assigned work.",
+                            "owned_paths": ["src", "tests"],
+                        },
+                        raw_arguments="",
+                    ),
+                    ToolExecutionContext(
+                        workspace_dir=runtime._core_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                    ),
+                )
+                omitted = await runtime._execute_subagent_primitive(
+                    ToolCall(
+                        call_id="step-in-omitted",
+                        name="subagent_step_in",
+                        arguments={
+                            "agent": "sub_1",
+                            "instructions": "Continue without changing ownership.",
+                        },
+                        raw_arguments="",
+                    ),
+                    ToolExecutionContext(
+                        workspace_dir=runtime._core_settings.workspace_dir,
+                        route_id="route_1",
+                        session_id=session_id,
+                    ),
+                )
+
+            self.assertTrue(explicit.ok)
+            self.assertTrue(omitted.ok)
+            self.assertEqual(
+                step_in.await_args_list[0].kwargs["owned_paths"],
+                ("src", "tests"),
+            )
+            self.assertIsNone(step_in.await_args_list[1].kwargs["owned_paths"])
+
     async def test_orchestrator_wait_tool_requests_real_turn_yield(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RouteRuntime(

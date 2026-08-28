@@ -20,6 +20,7 @@ from jarvis.tools import (
     ToolSettings,
     WorkspaceAccessCoordinator,
     WorkspaceLeaseError,
+    WorkspaceWriteScopeError,
 )
 from jarvis.tools.basic.bash.local_executor import DirectBashToolExecutor
 from jarvis.tools.basic.bash.tool import BashToolExecutor
@@ -248,7 +249,7 @@ class ToolReliabilityTests(unittest.IsolatedAsyncioTestCase):
                     child_observation.write_allowed_paths,
                     (workspace_dir / "owned.py",),
                 )
-            with self.assertRaises(WorkspaceLeaseError):
+            with self.assertRaises(WorkspaceWriteScopeError):
                 async with coordinator.execute(
                     tool_call=_tool_call(
                         "file_write",

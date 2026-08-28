@@ -62,14 +62,39 @@ def build_assignment_message(
     )
 
 
-def build_step_in_message(*, instructions: str) -> AgentRuntimeMessage:
+def build_step_in_message(
+    *,
+    instructions: str,
+    owned_paths: tuple[str, ...] | None = None,
+) -> AgentRuntimeMessage:
+    content_lines = [
+        "Updated direction from Jarvis for the next turn.",
+        "",
+        instructions.strip(),
+    ]
+    metadata: dict[str, object] = {"subagent_step_in": True}
+    if owned_paths is not None:
+        metadata["owned_paths_replaced"] = True
+        metadata["owned_paths"] = list(owned_paths)
+        if owned_paths:
+            content_lines.extend(
+                [
+                    "",
+                    "Your complete workspace write scope is now:",
+                    *(f"- {path}" for path in owned_paths),
+                ]
+            )
+        else:
+            content_lines.extend(
+                [
+                    "",
+                    "Your workspace write scope is now empty; continue read-only unless Jarvis assigns paths.",
+                ]
+            )
     return AgentRuntimeMessage(
         role="system",
-        metadata={"subagent_step_in": True},
-        content=(
-            "Updated direction from Jarvis for the next turn.\n\n"
-            f"{instructions.strip()}"
-        ),
+        metadata=metadata,
+        content="\n".join(content_lines),
     )
 
 

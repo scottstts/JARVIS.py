@@ -31,6 +31,21 @@ class WorkspaceLeaseError(RuntimeError):
         self.remediation = _workspace_lease_remediation(self.conflict_class)
 
 
+class WorkspaceWriteScopeError(WorkspaceLeaseError):
+    """Raised when a subagent uses a workspace writer outside its assigned scope."""
+
+    def __init__(self, message: str, *, requested_path: Path | None = None) -> None:
+        super().__init__(message)
+        self.conflict_class = "subagent_write_scope"
+        self.conflict_key = "subagent_write_scope"
+        self.remediation = (
+            "Ask Jarvis to use subagent_step_in with owned_paths to assign write access, "
+            "or continue without writing."
+        )
+        self.requested_path = requested_path
+        self.write_scope_violation = True
+
+
 @dataclass(slots=True)
 class WorkspaceAccessObservation:
     """Runtime evidence about workspace state surrounding one tool execution."""
@@ -317,10 +332,11 @@ class WorkspaceAccessCoordinator:
                         path == owned_path or path.is_relative_to(owned_path)
                         for owned_path in owned_paths
                     ):
-                        raise WorkspaceLeaseError(
+                        raise WorkspaceWriteScopeError(
                             f"{_display_path(path, self._workspace_dir)} is outside the "
                             "subagent's owned workspace paths. Ask Jarvis to assign the path "
-                            "before writing it."
+                            "before writing it.",
+                            requested_path=path,
                         )
             for lease_owner, lease_paths in self._leases.items():
                 if lease_owner == owner:
@@ -439,9 +455,9 @@ class WorkspaceAccessCoordinator:
 
         async with self._lease_guard:
             if owner.startswith("subagent:"):
-                raise WorkspaceLeaseError(
+                raise WorkspaceWriteScopeError(
                     "A subagent cannot use an unscoped workspace writer. Use a tool with an "
-                    "explicit path inside its owned workspace paths."
+                    "explicit path inside its owned workspace paths.",
                 )
             other_owners = sorted(
                 lease_owner
