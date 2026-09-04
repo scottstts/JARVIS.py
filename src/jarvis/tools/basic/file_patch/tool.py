@@ -120,9 +120,8 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
         definition=ToolDefinition(
             name="file_patch",
             description=_build_file_patch_tool_description(settings),
-            input_schema={
-                "type": "object",
-                "properties": {
+            input_schema=_build_file_edit_input_schema(
+                properties={
                     "path": {
                         "type": "string",
                         "minLength": 1,
@@ -185,9 +184,8 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                         },
                     },
                 },
-                "required": ["path", "operations"],
-                "additionalProperties": False,
-            },
+                required=["path", "operations"],
+            ),
         ),
         executor=FilePatchToolExecutor(),
     )
@@ -208,9 +206,8 @@ def build_file_write_tool(settings: ToolSettings) -> RegisteredTool:
                 "mutually exclusive: use expected_file_absent=true alone for a verified new "
                 "file, or pass only a real observed SHA-256; never invent a digest."
             ),
-            input_schema={
-                "type": "object",
-                "properties": {
+            input_schema=_build_file_edit_input_schema(
+                properties={
                     "path": _path_schema(),
                     "content": {
                         "type": "string",
@@ -219,9 +216,8 @@ def build_file_write_tool(settings: ToolSettings) -> RegisteredTool:
                     "expected_sha256": _expected_sha256_schema(),
                     "expected_file_absent": _expected_file_absent_schema(),
                 },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
+                required=["path", "content"],
+            ),
         ),
         executor=FileWriteToolExecutor(),
     )
@@ -242,9 +238,8 @@ def build_file_replace_tool(settings: ToolSettings) -> RegisteredTool:
                 "exclusive: use expected_file_absent=true alone for a verified new file, or "
                 "pass only a real observed SHA-256; never invent a digest."
             ),
-            input_schema={
-                "type": "object",
-                "properties": {
+            input_schema=_build_file_edit_input_schema(
+                properties={
                     "path": _path_schema(),
                     "match": {
                         "type": "string",
@@ -258,9 +253,8 @@ def build_file_replace_tool(settings: ToolSettings) -> RegisteredTool:
                     "expected_sha256": _expected_sha256_schema(),
                     "expected_file_absent": _expected_file_absent_schema(),
                 },
-                "required": ["path", "match", "replacement"],
-                "additionalProperties": False,
-            },
+                required=["path", "match", "replacement"],
+            ),
         ),
         executor=FileReplaceToolExecutor(),
     )
@@ -297,6 +291,82 @@ def _expected_file_absent_schema() -> dict[str, object]:
             "with expected_sha256; for a new file, use this alone."
         ),
     }
+
+
+def _build_file_edit_input_schema(
+    *,
+    properties: dict[str, object],
+    required: list[str],
+) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+        "anyOf": _file_precondition_exclusivity_schema(
+            properties=properties,
+            required=required,
+        ),
+    }
+
+
+def _file_precondition_exclusivity_schema(
+    *,
+    properties: dict[str, object],
+    required: list[str],
+) -> list[dict[str, object]]:
+    """Allow at most one non-null file-state precondition.
+
+    OpenAI strict tool schemas turn optional object properties into required nullable
+    properties. These branches therefore use null as the strict-provider representation
+    of an omitted precondition. They mirror every root property with only its top-level
+    type because strict normalization adds additionalProperties=false to object branches;
+    the root schema remains responsible for each property's complete validation.
+    """
+    branch_properties = _file_precondition_branch_properties(properties)
+
+    hash_properties = dict(branch_properties)
+    hash_properties["expected_file_absent"] = {"type": "null"}
+
+    absence_properties = dict(branch_properties)
+    absence_properties["expected_sha256"] = {"type": "null"}
+
+    neither_properties = dict(branch_properties)
+    neither_properties["expected_sha256"] = {"type": "null"}
+    neither_properties["expected_file_absent"] = {"type": "null"}
+
+    return [
+        {
+            "type": "object",
+            "properties": hash_properties,
+            "required": [*required, "expected_sha256"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": absence_properties,
+            "required": [*required, "expected_file_absent"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": neither_properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+    ]
+
+
+def _file_precondition_branch_properties(
+    properties: dict[str, object],
+) -> dict[str, object]:
+    branch_properties: dict[str, object] = {}
+    for name, schema in properties.items():
+        schema_type = schema.get("type") if isinstance(schema, dict) else None
+        branch_properties[name] = (
+            {"type": schema_type} if isinstance(schema_type, str) else {}
+        )
+    return branch_properties
 
 
 def _build_file_patch_tool_description(settings: ToolSettings) -> str:

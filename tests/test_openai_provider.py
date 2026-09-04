@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from jsonschema import Draft202012Validator
 from jarvis.llm.config import OpenAIProviderSettings
 from jarvis.llm.errors import ProviderTemporaryError, StreamProtocolError
 from jarvis.llm.providers.openai_provider import OpenAIProvider
@@ -282,6 +283,52 @@ class OpenAIProviderRequestShapeTests(unittest.TestCase):
             '{"path":"src/app.py","operations":[{"type":"replace"',
             tool.description,
         )
+
+    def test_file_edit_precondition_schema_survives_openai_strict_normalization(self) -> None:
+        provider = OpenAIProvider(
+            settings=OpenAIProviderSettings(),
+            read_timeout_seconds=60.0,
+        )
+        tool = build_file_patch_tool(
+            ToolSettings.from_workspace_dir(Path("/workspace"))
+        ).definition
+        parameters = provider._to_openai_tool(tool)["parameters"]
+        validator = Draft202012Validator(parameters)
+        base_arguments = {
+            "path": "src/app.py",
+            "operations": [
+                {"type": "write", "match": "", "replacement": "content"}
+            ],
+        }
+
+        self.assertTrue(
+            validator.is_valid(
+                {
+                    **base_arguments,
+                    "expected_sha256": "a" * 64,
+                    "expected_file_absent": None,
+                }
+            )
+        )
+        self.assertTrue(
+            validator.is_valid(
+                {
+                    **base_arguments,
+                    "expected_sha256": None,
+                    "expected_file_absent": True,
+                }
+            )
+        )
+        for expected_file_absent in (False, True):
+            self.assertFalse(
+                validator.is_valid(
+                    {
+                        **base_arguments,
+                        "expected_sha256": "a" * 64,
+                        "expected_file_absent": expected_file_absent,
+                    }
+                )
+            )
 
     def test_image_input_uses_input_image_items(self) -> None:
         provider = OpenAIProvider(

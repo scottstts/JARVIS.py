@@ -2409,6 +2409,55 @@ class ToolPolicyTests(unittest.TestCase):
                     str(properties["expected_sha256"]["description"]),
                 )
 
+    def test_file_edit_schemas_reject_conflicting_preconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+            definitions = {
+                definition.name: definition for definition in registry.basic_definitions()
+            }
+            arguments_by_tool = {
+                "file_patch": {
+                    "path": "src/app.py",
+                    "operations": [
+                        {"type": "write", "match": "", "replacement": "content"}
+                    ],
+                },
+                "file_write": {
+                    "path": "src/app.py",
+                    "content": "content",
+                },
+                "file_replace": {
+                    "path": "src/app.py",
+                    "match": "old",
+                    "replacement": "new",
+                },
+            }
+            digest = "a" * 64
+
+            for tool_name, base_arguments in arguments_by_tool.items():
+                validator = Draft202012Validator(definitions[tool_name].input_schema)
+
+                with_sha = {**base_arguments, "expected_sha256": digest}
+                self.assertTrue(validator.is_valid(with_sha), tool_name)
+
+                with_absence = {**base_arguments, "expected_file_absent": True}
+                self.assertTrue(validator.is_valid(with_absence), tool_name)
+
+                with_false_absence = {**base_arguments, "expected_file_absent": False}
+                self.assertTrue(validator.is_valid(with_false_absence), tool_name)
+
+                for expected_file_absent in (False, True):
+                    conflicting = {
+                        **with_sha,
+                        "expected_file_absent": expected_file_absent,
+                    }
+                    self.assertFalse(
+                        validator.is_valid(conflicting),
+                        f"{tool_name} accepted conflicting preconditions",
+                    )
+
     def test_file_patch_denies_path_escape(self) -> None:
         outside = self.workspace_dir.parent / "outside.py"
         decision = self.policy.authorize(
