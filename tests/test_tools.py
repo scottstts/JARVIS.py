@@ -2386,6 +2386,29 @@ class ToolPolicyTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_file_edit_descriptions_explain_precondition_exclusivity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_dir = Path(tmp) / "workspace"
+            workspace_dir.mkdir()
+            registry = ToolRegistry.default(ToolSettings.from_workspace_dir(workspace_dir))
+            definitions = {
+                definition.name: definition for definition in registry.basic_definitions()
+            }
+
+            for tool_name in ("file_patch", "file_write", "file_replace"):
+                definition = definitions[tool_name]
+                self.assertIn("mutually exclusive", definition.description)
+                self.assertIn("never invent", definition.description.lower())
+                properties = definition.input_schema["properties"]
+                self.assertIn(
+                    "mutually exclusive",
+                    str(properties["expected_file_absent"]["description"]),
+                )
+                self.assertIn(
+                    "do not combine",
+                    str(properties["expected_sha256"]["description"]),
+                )
+
     def test_file_patch_denies_path_escape(self) -> None:
         outside = self.workspace_dir.parent / "outside.py"
         decision = self.policy.authorize(
@@ -3078,6 +3101,110 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result.metadata["content_sha256"],
             hashlib.sha256(b"print('hello')\n").hexdigest(),
         )
+
+    async def test_file_write_creates_missing_file_with_absence_precondition(self) -> None:
+        scripts_dir = self.workspace_dir / "scripts"
+        scripts_dir.mkdir()
+        target_path = scripts_dir / "example.py"
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_write_create",
+                name="file_write",
+                arguments={
+                    "path": "scripts/example.py",
+                    "content": "print('hello')\n",
+                    "expected_file_absent": True,
+                },
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.metadata["status"], "created")
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "print('hello')\n")
+
+    async def test_file_write_rewrites_existing_file_with_sha256_precondition(self) -> None:
+        target_path = self.workspace_dir / "note.txt"
+        original = "before\n"
+        target_path.write_text(original, encoding="utf-8")
+
+        result = await self.runtime.execute(
+            tool_call=ToolCall(
+                call_id="call_file_write_update",
+                name="file_write",
+                arguments={
+                    "path": "note.txt",
+                    "content": "after\n",
+                    "expected_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                },
+                raw_arguments="{}",
+            ),
+            context=self.context,
+        )
+
+        self.assertTrue(result.ok, result.content)
+        self.assertEqual(result.metadata["status"], "updated")
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "after\n")
+
+    async def test_file_edit_rejects_conflicting_preconditions_before_execution(self) -> None:
+        calls = (
+            (
+                "file_patch",
+                "patch.txt",
+                {
+                    "path": "patch.txt",
+                    "expected_sha256": "a" * 64,
+                    "expected_file_absent": True,
+                    "operations": [
+                        {"type": "write", "match": "", "replacement": "created\n"}
+                    ],
+                },
+            ),
+            (
+                "file_write",
+                "write.txt",
+                {
+                    "path": "write.txt",
+                    "content": "created\n",
+                    "expected_sha256": "a" * 64,
+                    "expected_file_absent": True,
+                },
+            ),
+            (
+                "file_replace",
+                "replace.txt",
+                {
+                    "path": "replace.txt",
+                    "match": "old",
+                    "replacement": "new",
+                    "expected_sha256": "a" * 64,
+                    "expected_file_absent": True,
+                },
+            ),
+        )
+
+        with patch(
+            "jarvis.tools.basic.file_patch.tool._apply_file_patch",
+            side_effect=AssertionError("conflicting preconditions reached file execution"),
+        ):
+            for tool_name, relative_path, arguments in calls:
+                result = await self.runtime.execute(
+                    tool_call=ToolCall(
+                        call_id=f"call_{tool_name}_conflicting_preconditions",
+                        name=tool_name,
+                        arguments=arguments,
+                        raw_arguments="{}",
+                    ),
+                    context=self.context,
+                )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.metadata["error_code"], "invalid_file_precondition")
+                self.assertIn("Never invent a digest", result.content)
+                self.assertIn("current_sha256: (not checked)", result.content)
+                self.assertFalse((self.workspace_dir / relative_path).exists())
 
     async def test_file_patch_applies_ordered_literal_edits(self) -> None:
         target_path = self.workspace_dir / "note.txt"

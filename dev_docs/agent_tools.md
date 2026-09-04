@@ -229,13 +229,13 @@ Writes are atomic. Non-write operations require exact single matches.
 
 Every operation has the same required shape: `type`, `match`, and `replacement`. `write` uses an empty `match` and full-file `replacement`; `delete` uses an empty `replacement`; the other operations apply their documented literal semantics. This avoids provider-incompatible operation unions and reduces malformed model calls.
 
-Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application, or `expected_file_absent=true` when inspection established a new target. These content preconditions are optional compare-and-swap controls and are independent of actor ownership. Successful results return artifact provenance and the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
+Callers may pass `expected_sha256` from a prior inspection to fail closed when the file changed before application, or `expected_file_absent=true` when inspection established a new target. These content preconditions are mutually exclusive optional compare-and-swap controls: for a verified missing file, pass `expected_file_absent=true` alone, and never invent a SHA-256. They are independent of actor ownership. The runtime rejects contradictory preconditions before inspecting the target and returns a corrective retry instruction without writing. Successful results return artifact provenance and the resulting content digest. Missing and ambiguous exact matches return bounded line candidates or exact line locations, the current digest, and an explicit reread-and-retry instruction; no operation is written until the entire ordered patch succeeds.
 
 The tool description includes a minimal valid replace payload because nested patch operations are a common model-shape failure; runtime schema errors use stable error codes, canonical examples, and a bounded retry budget without reflecting malformed raw payloads into the transcript.
 
 ### `file_write` and `file_replace`
 
-Use `file_write(path, content)` for a whole-file create or rewrite, and `file_replace(path, match, replacement)` for one exact unique replacement. These flat shapes cover the common edit cases that previously caused malformed nested `file_patch` calls. All three file-edit tools are atomic, support `expected_sha256`, and participate in route-level path coordination.
+Use `file_write(path, content)` for a whole-file create or rewrite, and `file_replace(path, match, replacement)` for one exact unique replacement. These flat shapes cover the common edit cases that previously caused malformed nested `file_patch` calls. All three file-edit tools are atomic, support the same mutually exclusive `expected_sha256` / `expected_file_absent` preconditions, and participate in route-level path coordination.
 
 ### Acceptance Notes
 

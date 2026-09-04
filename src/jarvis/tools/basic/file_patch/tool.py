@@ -25,6 +25,16 @@ _MAX_DIAGNOSTIC_LINE_CHARS = 240
 class FilePatchError(RuntimeError):
     """Raised when a file patch cannot be applied safely."""
 
+    error_code = "file_edit_failed"
+    inspect_current_sha256 = True
+
+
+class InvalidFilePreconditionError(FilePatchError):
+    """Raised when mutually exclusive file-state preconditions are combined."""
+
+    error_code = "invalid_file_precondition"
+    inspect_current_sha256 = False
+
 
 class FilePatchToolExecutor:
     """Applies structured text edits to a single workspace file."""
@@ -126,7 +136,8 @@ def build_file_patch_tool(settings: ToolSettings) -> RegisteredTool:
                         "pattern": "^[0-9a-fA-F]{64}$",
                         "description": (
                             "Optional SHA-256 of the file content inspected before this edit. "
-                            "The patch fails if the current file differs."
+                            "The patch fails if the current file differs. Never invent a digest; "
+                            "do not combine this with expected_file_absent=true."
                         ),
                     },
                     "expected_file_absent": _expected_file_absent_schema(),
@@ -193,7 +204,9 @@ def build_file_write_tool(settings: ToolSettings) -> RegisteredTool:
             description=(
                 "Write the complete UTF-8 content of one workspace file atomically. "
                 f"Only files inside {settings.workspace_dir} are allowed. Use this for "
-                "new files or broad rewrites."
+                "new files or broad rewrites. expected_file_absent and expected_sha256 are "
+                "mutually exclusive: use expected_file_absent=true alone for a verified new "
+                "file, or pass only a real observed SHA-256; never invent a digest."
             ),
             input_schema={
                 "type": "object",
@@ -225,7 +238,9 @@ def build_file_replace_tool(settings: ToolSettings) -> RegisteredTool:
             description=(
                 "Replace one unique exact text match in one workspace UTF-8 file. "
                 f"Only files inside {settings.workspace_dir} are allowed. Use this for "
-                "simple targeted edits."
+                "simple targeted edits. expected_file_absent and expected_sha256 are mutually "
+                "exclusive: use expected_file_absent=true alone for a verified new file, or "
+                "pass only a real observed SHA-256; never invent a digest."
             ),
             input_schema={
                 "type": "object",
@@ -266,7 +281,10 @@ def _expected_sha256_schema() -> dict[str, object]:
         "minLength": 64,
         "maxLength": 64,
         "pattern": "^[0-9a-fA-F]{64}$",
-        "description": "Optional SHA-256 observed before this edit.",
+        "description": (
+            "Optional SHA-256 observed before this edit. Never invent a digest; do not combine "
+            "with expected_file_absent=true."
+        ),
     }
 
 
@@ -275,7 +293,8 @@ def _expected_file_absent_schema() -> dict[str, object]:
         "type": "boolean",
         "description": (
             "Set true only when inspection established that the target does not exist. "
-            "The write fails if a file appeared before execution."
+            "The write fails if a file appeared before execution. This is mutually exclusive "
+            "with expected_sha256; for a new file, use this alone."
         ),
     }
 
@@ -292,7 +311,9 @@ def _build_file_patch_tool_description(settings: ToolSettings) -> str:
         "file_patch calls only when one patch payload would otherwise become too large or "
         "unreliable. "
         "Matching is exact literal text only and edit operations fail when the target text is "
-        "missing or ambiguous. Example: "
+        "missing or ambiguous. The expected_sha256 and expected_file_absent preconditions are "
+        "mutually exclusive: use expected_file_absent=true alone for a verified new file, or "
+        "pass only a real observed SHA-256; never invent a digest. Example: "
         '{"path":"src/app.py","operations":[{"type":"replace",'
         '"match":"x = 1","replacement":"x = 2"}]}.'
     )
@@ -308,13 +329,17 @@ def _execute_file_edit(
     expected_file_absent: object,
     context: ToolExecutionContext,
 ) -> ToolExecutionResult:
-    file_path = context.workspace_dir.resolve(strict=False)
+    file_path = context.workspace_dir
     try:
-        file_path = _resolve_workspace_relative_path(raw_path, context)
         normalized_operations = _normalize_operations(operations)
         normalized_expected_sha256 = _normalize_expected_sha256(expected_sha256)
         if not isinstance(expected_file_absent, bool):
             raise FilePatchError("expected_file_absent must be a boolean when supplied.")
+        _validate_file_preconditions(
+            expected_sha256=normalized_expected_sha256,
+            expected_file_absent=expected_file_absent,
+        )
+        file_path = _resolve_workspace_relative_path(raw_path, context)
         outcome = _apply_file_patch(
             file_path=file_path,
             operations=normalized_operations,
@@ -328,6 +353,8 @@ def _execute_file_edit(
             raw_path=raw_path,
             file_path=file_path,
             reason=str(exc),
+            error_code=exc.error_code,
+            inspect_current_sha256=exc.inspect_current_sha256,
         )
 
     content_lines = [
@@ -461,6 +488,19 @@ def _require_non_empty_string(value: object, *, field_name: str) -> str:
     return text
 
 
+def _validate_file_preconditions(
+    *,
+    expected_sha256: str | None,
+    expected_file_absent: bool,
+) -> None:
+    if expected_file_absent and expected_sha256 is not None:
+        raise InvalidFilePreconditionError(
+            "expected_file_absent and expected_sha256 are mutually exclusive preconditions; "
+            "use expected_file_absent=true alone for a verified missing file, or pass only a "
+            "real observed SHA-256. Never invent a digest."
+        )
+
+
 def _apply_file_patch(
     *,
     file_path: Path,
@@ -468,6 +508,10 @@ def _apply_file_patch(
     expected_sha256: str | None,
     expected_file_absent: bool,
 ) -> dict[str, object]:
+    _validate_file_preconditions(
+        expected_sha256=expected_sha256,
+        expected_file_absent=expected_file_absent,
+    )
     parent_dir = file_path.parent
     if not parent_dir.exists():
         raise FilePatchError(
@@ -484,10 +528,6 @@ def _apply_file_patch(
     if expected_file_absent and file_existed:
         raise FilePatchError(
             "expected_file_absent precondition failed; a file now exists. Reread before retrying."
-        )
-    if expected_file_absent and expected_sha256 is not None:
-        raise FilePatchError(
-            "expected_file_absent and expected_sha256 are mutually exclusive preconditions."
         )
     operation_types = tuple(operation["type"] for operation in operations)
 
@@ -770,8 +810,23 @@ def _file_patch_error(
     raw_path: str,
     file_path: Path,
     reason: str,
+    error_code: str = "file_edit_failed",
+    inspect_current_sha256: bool = True,
 ) -> ToolExecutionResult:
-    current_sha256 = _current_file_sha256(file_path)
+    current_sha256 = (
+        _current_file_sha256(file_path) if inspect_current_sha256 else None
+    )
+    current_sha256_display = (
+        current_sha256
+        or ("(not checked)" if not inspect_current_sha256 else "(file unavailable)")
+    )
+    next_action = (
+        "Remove expected_sha256 and retry with expected_file_absent=true if inspection proved "
+        "the file is absent. Otherwise retry with only a real observed expected_sha256."
+        if error_code == "invalid_file_precondition"
+        else "Reread the affected region and retry with current exact text. "
+        "Do not repeat the unchanged failed operation."
+    )
     return ToolExecutionResult(
         call_id=call_id,
         name=tool_name,
@@ -780,13 +835,12 @@ def _file_patch_error(
             "File patch failed\n"
             f"path: {raw_path}\n"
             f"reason: {reason}\n"
-            f"current_sha256: {current_sha256 or '(file unavailable)'}\n"
-            "next_action: Reread the affected region and retry with current exact text. "
-            "Do not repeat the unchanged failed operation."
+            f"current_sha256: {current_sha256_display}\n"
+            f"next_action: {next_action}"
         ),
         metadata={
             "path": raw_path,
-            "error_code": "file_edit_failed",
+            "error_code": error_code,
             "error": reason,
             "current_sha256": current_sha256,
         },
