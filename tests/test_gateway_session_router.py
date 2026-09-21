@@ -256,6 +256,40 @@ class SessionRouterTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 runtime.unsubscribe(subscriber_id)
 
+    async def test_provider_recovery_does_not_replay_accepted_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RouteRuntime(
+                route_id="route_1",
+                llm_service=object(),  # type: ignore[arg-type]
+                core_settings=build_core_settings(root_dir=Path(tmp)),
+            )
+            session_id = await runtime._main_loop.prepare_session()
+            recovered = await runtime._enqueue_main_provider_recovery(
+                request=_RouteTurnRequest(
+                    force_session_id=session_id,
+                    user_initiated=True,
+                    client_message_id="msg_1",
+                    provider_recovery_task_id="task_1",
+                ),
+                exc=ProviderTimeoutError(
+                    "Provider produced no semantic output before the watchdog deadline.",
+                    metadata={
+                        "timeout_kind": "first_semantic_output",
+                        "accepted": True,
+                        "emitted_output": False,
+                        "retry_safe_after_acceptance": False,
+                    },
+                ),
+                error_log_path=Path(tmp) / "provider-error.jsonl",
+            )
+
+            self.assertFalse(recovered)
+            self.assertTrue(runtime._message_queue.empty())
+            self.assertNotIn(
+                "provider_recovery",
+                runtime._main_backend_state(session_id=session_id),
+            )
+
     async def test_reuses_same_loop_for_same_route(self) -> None:
         created_routes: list[str] = []
         loops: dict[str, _TrackingLoop] = {}

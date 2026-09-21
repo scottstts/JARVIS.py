@@ -217,6 +217,7 @@ Current OpenRouter note:
 - provider request budgets are split into a 3600-second absolute logical deadline (`JARVIS_LLM_REQUEST_DEADLINE_SECONDS`), a 30-second connection timeout (`JARVIS_LLM_CONNECT_TIMEOUT_SECONDS`), and a 3600-second raw-read inactivity timeout (`JARVIS_LLM_READ_TIMEOUT_SECONDS`)
 - the absolute deadline spans all attempts/backoff and never resets on stream activity; provider adapters never receive it as a provider payload timeout
 - provider lifecycle, keepalive, reasoning, and empty-signature chunks become internal `ProviderActivityEvent` values that `LLMService` consumes without forwarding or persisting
+- before semantic output, provider events reset a 300-second inactivity watchdog while a fixed 1200-second first-semantic-output ceiling and the 3600-second absolute request deadline remain in force; accepted active generations are not replayed when either service watchdog expires
 - Anthropic and Gemini use native incremental streaming rather than buffering a complete response before producing normalized events
 - streaming retries are normally allowed only before provider acceptance and normalized output; explicitly terminal provider failures may opt into retry after acceptance but never after normalized output, and ambiguous read/write timeouts are not blindly replayed
 

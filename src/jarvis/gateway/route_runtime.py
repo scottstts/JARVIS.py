@@ -1213,6 +1213,13 @@ class RouteRuntime:
     ) -> bool:
         """Queue a fresh checkpoint-based turn after a recoverable provider failure."""
 
+        exception_metadata = _exception_metadata(exc)
+        if (
+            isinstance(exc, ProviderTimeoutError)
+            and exception_metadata.get("accepted") is True
+            and exception_metadata.get("retry_safe_after_acceptance") is not True
+        ):
+            return False
         if (
             self._shutdown_requested
             or self._new_session_boundary_pending
@@ -1289,7 +1296,6 @@ class RouteRuntime:
             )
             return True
 
-        exception_metadata = _exception_metadata(exc)
         emitted_output = bool(exception_metadata.get("emitted_output"))
         self._update_main_backend_state(
             session_id=session_id,

@@ -33,7 +33,8 @@ from .types import (
 
 T = TypeVar("T")
 _DEFAULT_PROVIDER_GENERATION_CONCURRENCY = 3
-_FIRST_SEMANTIC_OUTPUT_TIMEOUT_SECONDS = 300.0
+_PROVIDER_INACTIVITY_TIMEOUT_SECONDS = 300.0
+_FIRST_SEMANTIC_OUTPUT_TIMEOUT_SECONDS = 20 * 60.0
 _STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 _PROVIDER_CIRCUIT_FAILURE_THRESHOLD = 5
 _PROVIDER_CIRCUIT_COOLDOWN_SECONDS = 30.0
@@ -45,8 +46,10 @@ class _StreamAttemptState:
     model: str | None
     request_started_at: float
     attempt_started_at: float
+    last_event_at: float
     accepted: bool = False
     emitted_output: bool = False
+    provider_activity_events: int = 0
     last_provider_event_type: str | None = None
     last_normalized_event_type: str | None = None
     response_id: str | None = None
@@ -185,11 +188,13 @@ class LLMService:
             attempts = max(1, self.settings.retry_attempts + 1)
             try:
                 for attempt_index in range(attempts):
+                    attempt_started_at = loop.time()
                     state = _StreamAttemptState(
                         provider=resolved.provider,
                         model=resolved.model,
                         request_started_at=request_started_at,
-                        attempt_started_at=loop.time(),
+                        attempt_started_at=attempt_started_at,
+                        last_event_at=attempt_started_at,
                     )
                     try:
                         stream = provider.stream_generate(resolved)
@@ -472,7 +477,9 @@ class LLMService:
                     return
 
                 state.accepted = True
+                state.last_event_at = asyncio.get_running_loop().time()
                 if isinstance(event, ProviderActivityEvent):
+                    state.provider_activity_events += 1
                     state.last_provider_event_type = event.provider_event_type
                     if event.response_id is not None:
                         state.response_id = event.response_id
@@ -506,17 +513,32 @@ class LLMService:
         deadline_at: float | None,
         state: _StreamAttemptState,
     ) -> tuple[float | None, str]:
+        candidates: list[tuple[float, str]] = []
+        if deadline_at is not None:
+            candidates.append((deadline_at, "request_deadline"))
+
         if state.emitted_output:
-            idle_deadline = asyncio.get_running_loop().time() + _STREAM_IDLE_TIMEOUT_SECONDS
-            if deadline_at is None or idle_deadline <= deadline_at:
-                return idle_deadline, "stream_idle"
-            return deadline_at, "request_deadline"
-        first_output_deadline = (
-            state.attempt_started_at + _FIRST_SEMANTIC_OUTPUT_TIMEOUT_SECONDS
-        )
-        if deadline_at is None or first_output_deadline <= deadline_at:
-            return first_output_deadline, "first_semantic_output"
-        return deadline_at, "request_deadline"
+            candidates.append(
+                (state.last_event_at + _STREAM_IDLE_TIMEOUT_SECONDS, "stream_idle")
+            )
+        else:
+            candidates.extend(
+                (
+                    (
+                        state.last_event_at + _PROVIDER_INACTIVITY_TIMEOUT_SECONDS,
+                        "provider_inactivity",
+                    ),
+                    (
+                        state.attempt_started_at
+                        + _FIRST_SEMANTIC_OUTPUT_TIMEOUT_SECONDS,
+                        "first_semantic_output",
+                    ),
+                )
+            )
+
+        if not candidates:
+            return None, "request_deadline"
+        return min(candidates, key=lambda candidate: candidate[0])
 
     def _stream_wait_timeout_error(
         self,
@@ -552,6 +574,28 @@ class LLMService:
                     "retry_safe_after_acceptance": False,
                 },
             )
+        if timeout_kind == "provider_inactivity":
+            return ProviderTimeoutError(
+                "Provider produced no stream activity before the inactivity deadline.",
+                metadata={
+                    "timeout_kind": "provider_inactivity",
+                    "provider_inactivity_timeout_seconds": (
+                        _PROVIDER_INACTIVITY_TIMEOUT_SECONDS
+                    ),
+                    "elapsed_seconds": max(0.0, now - state.request_started_at),
+                    "attempt_elapsed_seconds": max(0.0, now - state.attempt_started_at),
+                    "seconds_since_last_event": max(0.0, now - state.last_event_at),
+                    "provider": state.provider,
+                    "model": state.model,
+                    "accepted": state.accepted,
+                    "emitted_output": state.emitted_output,
+                    "provider_activity_events": state.provider_activity_events,
+                    "last_provider_event_type": state.last_provider_event_type,
+                    "last_normalized_event_type": state.last_normalized_event_type,
+                    "response_id": state.response_id,
+                    "retry_safe_after_acceptance": False,
+                },
+            )
         return ProviderTimeoutError(
             "Provider produced no semantic output before the watchdog deadline.",
             metadata={
@@ -565,10 +609,11 @@ class LLMService:
                 "model": state.model,
                 "accepted": state.accepted,
                 "emitted_output": False,
+                "provider_activity_events": state.provider_activity_events,
                 "last_provider_event_type": state.last_provider_event_type,
                 "last_normalized_event_type": state.last_normalized_event_type,
                 "response_id": state.response_id,
-                "retry_safe_after_acceptance": True,
+                "retry_safe_after_acceptance": False,
             },
         )
 
@@ -814,7 +859,11 @@ class LLMService:
             return True
         if not isinstance(error, ProviderTimeoutError):
             return True
-        return error.metadata.get("timeout_kind") in {"connect", "pool"}
+        return error.metadata.get("timeout_kind") in {
+            "connect",
+            "pool",
+            "provider_inactivity",
+        }
 
     def _is_retry_safe_after_acceptance(self, error: Exception) -> bool:
         return (

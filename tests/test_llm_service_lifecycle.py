@@ -160,8 +160,10 @@ class _ContinuouslyActiveStreamProvider(_FakeProvider):
     def __init__(self, name: str) -> None:
         super().__init__(name)
         self.stream_closed = False
+        self.stream_attempts = 0
 
     async def stream_generate(self, request):
+        self.stream_attempts += 1
         try:
             while True:
                 await asyncio.sleep(0.005)
@@ -171,6 +173,28 @@ class _ContinuouslyActiveStreamProvider(_FakeProvider):
                 )
         finally:
             self.stream_closed = True
+
+
+class _SilentStreamProvider(_FakeProvider):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.stream_attempts = 0
+
+    async def stream_generate(self, request):
+        self.stream_attempts += 1
+        await asyncio.sleep(3600)
+        yield None
+
+
+class _ActivityThenSilentStreamProvider(_SilentStreamProvider):
+    async def stream_generate(self, request):
+        self.stream_attempts += 1
+        yield ProviderActivityEvent(
+            provider_event_type="response.created",
+            response_id="resp_accepted",
+        )
+        await asyncio.sleep(3600)
+        yield None
 
 
 class _TimeoutThenSuccessfulProvider(_SuccessfulProvider):
@@ -444,7 +468,7 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         service = LLMService(
             settings=LLMSettings(
                 default_provider="openai",
-                retry_attempts=0,
+                retry_attempts=2,
                 embedding=EmbeddingSettings(
                     provider="openai",
                     model="text-embedding-test",
@@ -454,6 +478,7 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
+            patch("jarvis.llm.service._PROVIDER_INACTIVITY_TIMEOUT_SECONDS", 0.01),
             patch("jarvis.llm.service._FIRST_SEMANTIC_OUTPUT_TIMEOUT_SECONDS", 0.03),
             self.assertRaises(ProviderTimeoutError) as raised,
         ):
@@ -466,8 +491,74 @@ class LLMServiceLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         self.assertEqual(raised.exception.metadata["timeout_kind"], "first_semantic_output")
-        self.assertTrue(raised.exception.metadata["retry_safe_after_acceptance"])
+        self.assertFalse(raised.exception.metadata["retry_safe_after_acceptance"])
+        self.assertGreater(raised.exception.metadata["provider_activity_events"], 0)
+        self.assertEqual(provider.stream_attempts, 1)
         self.assertTrue(provider.stream_closed)
+
+    async def test_stream_inactivity_before_acceptance_retries(self) -> None:
+        provider = _SilentStreamProvider("openai")
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openai",
+                retry_attempts=1,
+                retry_backoff_seconds=0,
+                embedding=EmbeddingSettings(
+                    provider="openai",
+                    model="text-embedding-test",
+                ),
+            ),
+            providers=(provider,),
+        )
+
+        with (
+            patch("jarvis.llm.service._PROVIDER_INACTIVITY_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ProviderTimeoutError) as raised,
+        ):
+            async for _event in service.stream_generate(
+                LLMRequest(
+                    model="gpt-5.4-2026-03-05",
+                    messages=(LLMMessage.text("user", "hello"),),
+                )
+            ):
+                pass
+
+        self.assertEqual(raised.exception.metadata["timeout_kind"], "provider_inactivity")
+        self.assertFalse(raised.exception.metadata["accepted"])
+        self.assertEqual(raised.exception.metadata["provider_activity_events"], 0)
+        self.assertEqual(provider.stream_attempts, 2)
+
+    async def test_stream_inactivity_after_acceptance_does_not_retry(self) -> None:
+        provider = _ActivityThenSilentStreamProvider("openai")
+        service = LLMService(
+            settings=LLMSettings(
+                default_provider="openai",
+                retry_attempts=2,
+                retry_backoff_seconds=0,
+                embedding=EmbeddingSettings(
+                    provider="openai",
+                    model="text-embedding-test",
+                ),
+            ),
+            providers=(provider,),
+        )
+
+        with (
+            patch("jarvis.llm.service._PROVIDER_INACTIVITY_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ProviderTimeoutError) as raised,
+        ):
+            async for _event in service.stream_generate(
+                LLMRequest(
+                    model="gpt-5.4-2026-03-05",
+                    messages=(LLMMessage.text("user", "hello"),),
+                )
+            ):
+                pass
+
+        self.assertEqual(raised.exception.metadata["timeout_kind"], "provider_inactivity")
+        self.assertTrue(raised.exception.metadata["accepted"])
+        self.assertEqual(raised.exception.metadata["provider_activity_events"], 1)
+        self.assertEqual(provider.stream_attempts, 1)
 
     async def test_generate_retries_connect_timeout(self) -> None:
         provider = _TimeoutThenSuccessfulProvider("openai", timeout_kind="connect")
