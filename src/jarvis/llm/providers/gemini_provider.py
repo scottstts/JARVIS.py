@@ -6,8 +6,10 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import os
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from typing import Any, cast
 
 import httpx
@@ -54,6 +56,7 @@ from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_
 _GEMINI_3_MODEL_PREFIX = "gemini-3"
 _GEMINI_25_MODEL_PREFIX = "gemini-2.5"
 _GEMINI_CACHED_CONTENT_TTL = "3600s"
+_LOGGER = logging.getLogger(__name__)
 
 
 class GeminiProvider:
@@ -73,6 +76,7 @@ class GeminiProvider:
         )
         self._client: genai.Client | None = None
         self._client_lock = asyncio.Lock()
+        self._models_without_explicit_caching: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -92,11 +96,9 @@ class GeminiProvider:
             raise LLMConfigurationError("request.model must be set before provider dispatch.")
 
         client = await self._client_instance()
-        contents, config = self._build_generate_payload(request)
-        cache_metadata = await self._ensure_cached_content(
+        contents, config, cache_metadata = await self._prepare_generate_payload(
             client=client,
             request=request,
-            config=config,
         )
 
         try:
@@ -122,11 +124,9 @@ class GeminiProvider:
             raise LLMConfigurationError("request.model must be set before provider dispatch.")
 
         client = await self._client_instance()
-        contents, config = self._build_generate_payload(request)
-        cache_metadata = await self._ensure_cached_content(
+        contents, config, cache_metadata = await self._prepare_generate_payload(
             client=client,
             request=request,
-            config=config,
         )
 
         text_parts: list[str] = []
@@ -324,6 +324,47 @@ class GeminiProvider:
                 await async_http_client.aclose()
                 raise
             return self._client
+
+    async def _prepare_generate_payload(
+        self,
+        *,
+        client: genai.Client,
+        request: LLMRequest,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+        if request.model not in self._models_without_explicit_caching:
+            contents, config = self._build_generate_payload(request)
+            try:
+                cache_metadata = await self._ensure_cached_content(
+                    client=client,
+                    request=request,
+                    config=config,
+                )
+            except ProviderBadRequestError as exc:
+                cause = exc.__cause__
+                if not (
+                    isinstance(cause, genai_errors.ClientError)
+                    and cause.code == 400
+                    and "explicit caching is not supported" in str(cause).lower()
+                ):
+                    raise
+                assert request.model is not None
+                self._models_without_explicit_caching.add(request.model)
+                _LOGGER.info(
+                    "Gemini model %s does not support explicit caching; sending context inline.",
+                    request.model,
+                )
+            else:
+                return contents, config, cache_metadata
+
+        inline_request = replace(
+            request,
+            messages=tuple(request.cached_content_messages) + tuple(request.messages),
+            cached_content_name=None,
+            cached_content_model=None,
+            cached_content_messages=(),
+        )
+        contents, config = self._build_generate_payload(inline_request)
+        return contents, config, {}
 
     def _build_generate_payload(self, request: LLMRequest) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         uses_cached_context = bool(

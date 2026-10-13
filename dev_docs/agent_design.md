@@ -65,7 +65,7 @@ Replayable transcript records are always stored as Jarvis archive/debug/audit hi
 
 - OpenAI native: provider-side continuation through stored `conversationId` and `previousResponseId`
 - Grok/xAI native: provider-side continuation through stored `previousResponseId`
-- Gemini native: cached base context and tool schemas through Gemini `cachedContent`
+- Gemini native: cached base context and tool schemas through Gemini `cachedContent`; if cache creation returns HTTP 400 stating explicit caching is unsupported, the adapter sends the stable context, current messages, and tools inline for both generation and streaming, and skips further cache attempts for that model for the provider instance's lifetime. Other cache errors still propagate normally.
 - Anthropic native: local transcript replay with prompt-cache blocks
 - OpenRouter: local transcript replay with prompt-cache best effort, Anthropic `cache_control` when routing Claude models, sticky `session_id`, and OpenRouter response-cache headers
 

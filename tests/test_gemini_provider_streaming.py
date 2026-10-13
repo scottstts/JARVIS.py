@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
+
+from google.genai import errors as genai_errors
 
 from jarvis.llm.config import GeminiProviderSettings
+from jarvis.llm.errors import (
+    ProviderAuthenticationError,
+    ProviderBadRequestError,
+    ProviderRateLimitError,
+    ProviderTemporaryError,
+)
 from jarvis.llm.providers.gemini_provider import GeminiProvider
 from jarvis.llm.types import (
     DoneEvent,
@@ -39,6 +49,10 @@ class _FakeGeminiModels:
         self._chunks = chunks
         self.stream_kwargs: dict[str, Any] | None = None
 
+    async def generate_content(self, **kwargs: Any) -> Any:
+        self.stream_kwargs = kwargs
+        return self._chunks[-1]
+
     async def generate_content_stream(self, **kwargs: Any) -> _FakeGeminiStream:
         self.stream_kwargs = kwargs
         return _FakeGeminiStream(self._chunks)
@@ -56,6 +70,111 @@ def _candidate(*parts: Any, finish_reason: str | None = None) -> Any:
 
 
 class GeminiProviderStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unsupported_cache_falls_back_for_generate_and_stream(self) -> None:
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                provider = GeminiProvider(
+                    settings=GeminiProviderSettings(),
+                    read_timeout_seconds=60.0,
+                )
+                request = LLMRequest(
+                    model="gemini-4-argon",
+                    messages=(
+                        LLMMessage.text("system", "Turn context"),
+                        LLMMessage.text("user", "Hello"),
+                    ),
+                    cached_content_messages=(
+                        LLMMessage.text("system", "Stable system"),
+                        LLMMessage.text("user", "Prior user"),
+                        LLMMessage.text("assistant", "Prior assistant"),
+                    ),
+                    tools=(ToolDefinition(name="bash", input_schema={"type": "object"}),),
+                    temperature=0.5,
+                    max_output_tokens=100,
+                )
+                fake_models = _FakeGeminiModels([
+                    SimpleNamespace(
+                        candidates=[_candidate(SimpleNamespace(text="Done", thought=False))],
+                    ),
+                ])
+                create_cache = AsyncMock(side_effect=genai_errors.ClientError(
+                    400,
+                    {"error": {"message": "Explicit caching is not supported for models/gemini-4-argon."}},
+                ))
+                provider._client = SimpleNamespace(  # type: ignore[assignment]
+                    aio=SimpleNamespace(
+                        models=fake_models,
+                        caches=SimpleNamespace(create=create_cache),
+                    ),
+                )
+
+                for _ in range(2):
+                    if streaming:
+                        events = [event async for event in provider.stream_generate(request)]
+                        response = events[-1].response
+                    else:
+                        response = await provider.generate(request)
+                    self.assertEqual(response.text, "Done")
+                    self.assertNotIn("cached_content_name", response.provider_metadata)
+                    kwargs = fake_models.stream_kwargs
+                    self.assertEqual(kwargs["contents"], [
+                        {"role": "user", "parts": [{"text": "Prior user"}]},
+                        {"role": "model", "parts": [{"text": "Prior assistant"}]},
+                        {"role": "user", "parts": [{"text": "Hello"}]},
+                    ])
+                    config = kwargs["config"]
+                    self.assertNotIn("cached_content", config)
+                    self.assertEqual(config["system_instruction"], "Stable system\n\nTurn context")
+                    self.assertEqual(config["tools"][0]["function_declarations"][0]["name"], "bash")
+                    self.assertIn("tool_config", config)
+                    self.assertEqual(config["temperature"], 0.5)
+                    self.assertEqual(config["max_output_tokens"], 100)
+                create_cache.assert_awaited_once()
+                self.assertEqual(len(request.cached_content_messages), 3)
+
+                # Capability detection is per model; supported models still cache.
+                create_cache.side_effect = None
+                create_cache.return_value = SimpleNamespace(name="cachedContents/supported")
+                supported = replace(request, model="gemini-3-flash-preview")
+                response = await provider.generate(supported)
+                self.assertEqual(create_cache.await_count, 2)
+                self.assertEqual(response.provider_metadata["cached_content_name"], "cachedContents/supported")
+                self.assertEqual(fake_models.stream_kwargs["config"]["cached_content"], "cachedContents/supported")
+                self.assertNotIn("tools", fake_models.stream_kwargs["config"])
+
+    async def test_other_cache_errors_propagate_without_generation(self) -> None:
+        for code, message, expected in (
+            (400, "Invalid tool schema", ProviderBadRequestError),
+            (403, "Explicit caching is not supported", ProviderAuthenticationError),
+            (429, "Quota exceeded", ProviderRateLimitError),
+            (500, "Internal error", ProviderTemporaryError),
+        ):
+            with self.subTest(code=code):
+                provider = GeminiProvider(
+                    settings=GeminiProviderSettings(),
+                    read_timeout_seconds=60.0,
+                )
+                error_type = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
+                create_cache = AsyncMock(side_effect=error_type(code, {"error": {"message": message}}))
+                generate = AsyncMock()
+                provider._client = SimpleNamespace(  # type: ignore[assignment]
+                    aio=SimpleNamespace(
+                        models=SimpleNamespace(generate_content=generate, generate_content_stream=generate),
+                        caches=SimpleNamespace(create=create_cache),
+                    ),
+                )
+                request = LLMRequest(
+                    model="gemini-4-argon",
+                    messages=(LLMMessage.text("user", "Hello"),),
+                    cached_content_messages=(LLMMessage.text("system", "Stable system"),),
+                )
+                with self.assertRaises(expected):
+                    await provider.generate(request)
+                with self.assertRaises(expected):
+                    _ = [event async for event in provider.stream_generate(request)]
+                self.assertEqual(create_cache.await_count, 2)
+                generate.assert_not_awaited()
+
     async def test_stream_generate_aggregates_native_chunks_and_signatures(self) -> None:
         provider = GeminiProvider(
             settings=GeminiProviderSettings(),
