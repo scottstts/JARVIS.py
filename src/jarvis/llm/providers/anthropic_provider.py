@@ -467,7 +467,7 @@ class AnthropicProvider:
     def _to_anthropic_tool(self, tool: ToolDefinition) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "name": tool.name,
-            "input_schema": dict(tool.input_schema),
+            "input_schema": _anthropic_tool_input_schema(tool),
         }
         if tool.description is not None:
             payload["description"] = tool.description
@@ -662,6 +662,44 @@ class AnthropicProvider:
         if isinstance(error, AnthropicError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _anthropic_tool_input_schema(tool: ToolDefinition) -> dict[str, Any]:
+    """Project root validation constraints onto Anthropic's object-only wire shape.
+
+    The original ToolDefinition remains authoritative for returned argument
+    validation. Nested combinators are supported and must remain intact.
+    """
+    schema = deepcopy(dict(tool.input_schema))
+    combinators = ("allOf", "anyOf", "oneOf")
+    if not any(key in schema for key in combinators):
+        return schema
+
+    properties = schema.get("properties")
+    if schema.get("type") != "object" or not isinstance(properties, dict):
+        raise LLMConfigurationError(
+            f"Anthropic tool {tool.name!r} requires an object schema with root properties; "
+            "root allOf/anyOf/oneOf alone cannot describe its arguments to Anthropic."
+        )
+
+    # A branch may narrow a declared property, but must not introduce a field
+    # that would disappear from the schema shown to the model.
+    pending = [schema]
+    while pending:
+        branch = pending.pop()
+        branch_properties = branch.get("properties", {})
+        if isinstance(branch_properties, dict) and not branch_properties.keys() <= properties.keys():
+            raise LLMConfigurationError(
+                f"Anthropic tool {tool.name!r} must declare every argument in root properties."
+            )
+        for key in combinators:
+            children = branch.get(key)
+            if isinstance(children, list):
+                pending.extend(child for child in children if isinstance(child, dict))
+
+    for key in combinators:
+        schema.pop(key, None)
+    return schema
 
 
 def _anthropic_replay_metadata(message: LLMMessage) -> dict[str, Any] | None:

@@ -6,12 +6,14 @@ import json
 import unittest
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import httpx2
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient, Timeout
 from anthropic.types import Message
+from jsonschema import Draft202012Validator
 
 from jarvis.llm.config import AnthropicProviderSettings
 from jarvis.llm.errors import LLMConfigurationError, ProviderTemporaryError, ProviderTimeoutError
@@ -29,6 +31,8 @@ from jarvis.llm.types import (
     ToolDefinition,
     ToolResultPart,
 )
+from jarvis.llm.validation import TOOL_CALL_VALIDATION_ERROR_METADATA_KEY
+from jarvis.tools import ToolRegistry, ToolSettings
 
 
 def _request(model: str = "claude-opus-5-5", **kwargs: Any) -> LLMRequest:
@@ -65,7 +69,7 @@ def _sse(message: Message) -> bytes:
         events.append({"type": "content_block_start", "index": index, "content_block": block})
         events.append({"type": "content_block_stop", "index": index})
     events.extend([
-        {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+        {"type": "message_delta", "delta": {"stop_reason": message.stop_reason, "stop_sequence": None},
          "usage": {"output_tokens": 5}},
         {"type": "message_stop"},
     ])
@@ -75,6 +79,43 @@ def _sse(message: Message) -> bytes:
 
 
 class AnthropicSDKTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_sdk_sends_actual_registry_schemas_without_root_combinators(self) -> None:
+        tools = ToolRegistry.default(ToolSettings.from_workspace_dir(Path("/workspace"))).basic_definitions()
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                requests: list[dict[str, Any]] = []
+
+                def handler(request: httpx2.Request) -> httpx2.Response:
+                    payload = json.loads(request.content)
+                    requests.append(payload)
+                    for tool in payload["tools"]:
+                        self.assertFalse({"allOf", "anyOf", "oneOf"}.intersection(tool["input_schema"]), tool["name"])
+                    message = Message.model_validate({
+                        **_message().model_dump(), "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Ready"}],
+                    })
+                    if streaming:
+                        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=_sse(message))
+                    return httpx2.Response(200, json=message.model_dump(mode="json"))
+
+                def make_client(**kwargs: Any) -> AsyncAnthropic:
+                    return AsyncAnthropic(
+                        http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)), **kwargs,
+                    )
+
+                provider = AnthropicProvider(settings=AnthropicProviderSettings(api_key="test-key"), read_timeout_seconds=60)
+                self.addAsyncCleanup(provider.aclose)
+                with patch("jarvis.llm.providers.anthropic_provider.AsyncAnthropic", make_client):
+                    if streaming:
+                        events = [event async for event in provider.stream_generate(_request(tools=tools))]
+                        response = events[-1].response
+                    else:
+                        response = await provider.generate(_request(tools=tools))
+                self.assertEqual(response.text, "Ready")
+                self.assertEqual(response.finish_reason, "stop")
+                self.assertEqual(len(requests), 1)
+                self.assertIn("file_patch", {tool["name"] for tool in requests[0]["tools"]})
+
     async def test_constructs_real_sdk_client_with_split_timeout(self) -> None:
         provider = AnthropicProvider(
             settings=AnthropicProviderSettings(api_key="test-key", base_url="https://example.test"),
@@ -179,6 +220,78 @@ class AnthropicSDKTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AnthropicRequestTests(unittest.TestCase):
+    def test_actual_registry_tools_have_anthropic_compatible_root_schemas(self) -> None:
+        tools = ToolRegistry.default(ToolSettings.from_workspace_dir(Path("/workspace"))).basic_definitions()
+        originals = [deepcopy(tool.input_schema) for tool in tools]
+        provider = AnthropicProvider(settings=AnthropicProviderSettings(), read_timeout_seconds=60)
+        kwargs = provider._build_messages_create_kwargs(_request(tools=tools))
+        for tool in kwargs["tools"]:
+            with self.subTest(tool=tool["name"]):
+                schema = tool["input_schema"]
+                self.assertEqual(schema["type"], "object")
+                self.assertFalse({"allOf", "anyOf", "oneOf"}.intersection(schema))
+                Draft202012Validator.check_schema(schema)
+        self.assertEqual([tool.input_schema for tool in tools], originals)
+
+    def test_file_preconditions_still_validate_against_original_schema(self) -> None:
+        tools = ToolRegistry.default(ToolSettings.from_workspace_dir(Path("/workspace"))).basic_definitions()
+        definitions = {tool.name: tool for tool in tools}
+        provider = AnthropicProvider(settings=AnthropicProviderSettings(), read_timeout_seconds=60)
+        examples = {
+            "file_patch": {"path": "new.txt", "operations": [{"type": "write", "match": "", "replacement": "hi"}]},
+            "file_write": {"path": "new.txt", "content": "hi"},
+            "file_replace": {"path": "new.txt", "match": "old", "replacement": "new"},
+        }
+        for name, base in examples.items():
+            tool = definitions[name]
+            wire_schema = provider._to_anthropic_tool(tool)["input_schema"]
+            self.assertNotIn("anyOf", wire_schema)
+            self.assertIn("anyOf", tool.input_schema)
+            for preconditions in ({}, {"expected_sha256": "a" * 64}, {"expected_file_absent": True}):
+                with self.subTest(name=name, preconditions=preconditions):
+                    arguments = {**base, **preconditions}
+                    self.assertTrue(Draft202012Validator(wire_schema).is_valid(arguments))
+                    calls = provider._extract_tool_calls(
+                        content_blocks=[Message.model_validate({
+                            **_message().model_dump(),
+                            "content": [{"type": "tool_use", "id": "edit_1", "name": name, "input": arguments}],
+                        }).content[0]], request_tools=tools,
+                    )
+                    self.assertEqual(calls[0].arguments, arguments)
+                    self.assertNotIn(TOOL_CALL_VALIDATION_ERROR_METADATA_KEY, calls[0].provider_metadata)
+            for absence in (False, True):
+                with self.subTest(name=name, conflicting_absence=absence):
+                    arguments = {**base, "expected_sha256": "a" * 64, "expected_file_absent": absence}
+                    calls = provider._extract_tool_calls(
+                        content_blocks=[Message.model_validate({
+                            **_message().model_dump(),
+                            "content": [{"type": "tool_use", "id": "edit_1", "name": name, "input": arguments}],
+                        }).content[0]], request_tools=tools,
+                    )
+                    self.assertIn(TOOL_CALL_VALIDATION_ERROR_METADATA_KEY, calls[0].provider_metadata)
+
+    def test_root_combinator_projection_keeps_nested_constraints(self) -> None:
+        provider = AnthropicProvider(settings=AnthropicProviderSettings(), read_timeout_seconds=60)
+        for key in ("allOf", "anyOf", "oneOf"):
+            with self.subTest(key=key):
+                original = {
+                    "type": "object", "properties": {"value": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+                    "required": ["value"], "additionalProperties": False,
+                    key: [{"properties": {"value": {"type": "string"}}}],
+                }
+                projected = provider._to_anthropic_tool(ToolDefinition(name="example", input_schema=original))["input_schema"]
+                self.assertNotIn(key, projected)
+                self.assertEqual(projected["properties"], original["properties"])
+                self.assertEqual(projected["required"], ["value"])
+                self.assertFalse(projected["additionalProperties"])
+                self.assertIn(key, original)
+        for schema in (
+            {"anyOf": [{"type": "object", "properties": {"x": {"type": "string"}}}]},
+            {"type": "object", "properties": {}, "anyOf": [{"properties": {"x": {"type": "string"}}}]},
+        ):
+            with self.subTest(schema=schema), self.assertRaisesRegex(LLMConfigurationError, "example"):
+                provider._to_anthropic_tool(ToolDefinition(name="example", input_schema=schema))
+
     def test_documented_model_effort_and_adaptive_thinking(self) -> None:
         for model in (
             "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5",
