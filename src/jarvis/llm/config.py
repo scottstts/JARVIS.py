@@ -218,8 +218,16 @@ class AnthropicProviderSettings:
     def __post_init__(self) -> None:
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
             raise LLMConfigurationError("JARVIS_ANTHROPIC_MAX_OUTPUT_TOKENS must be > 0.")
-        if self.thinking_budget_tokens is not None and self.thinking_budget_tokens <= 0:
-            raise LLMConfigurationError("JARVIS_ANTHROPIC_THINKING_BUDGET_TOKENS must be > 0.")
+        if self.thinking_budget_tokens is not None and self.thinking_budget_tokens < 1024:
+            raise LLMConfigurationError("JARVIS_ANTHROPIC_THINKING_BUDGET_TOKENS must be >= 1024.")
+        if self.thinking_mode not in {None, "adaptive", "enabled", "disabled", "between_tools"}:
+            raise LLMConfigurationError(
+                "JARVIS_ANTHROPIC_THINKING_MODE must be adaptive, enabled, disabled, or between_tools."
+            )
+        if self.effort not in {None, "low", "medium", "high", "xhigh", "max"}:
+            raise LLMConfigurationError(
+                "JARVIS_ANTHROPIC_EFFORT must be low, medium, high, xhigh, or max."
+            )
 
     @classmethod
     def from_env(cls) -> "AnthropicProviderSettings":

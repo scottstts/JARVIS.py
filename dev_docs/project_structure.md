@@ -203,6 +203,7 @@ Includes:
 - validation
 - service lifecycle
 - provider implementations under `llm/providers/`
+- Anthropic SDK 1.x compatibility and a documented model-capability table in `llm/providers/anthropic_models.py`; signed assistant blocks replay through opaque transcript metadata, with prefix validation after context edits
 - provider-local translation for cache/state quirks such as OpenRouter response-cache headers, LM Studio `previous_response_id` reuse, and Grok Responses continuation via persisted `previous_response_id`
 
 Current OpenRouter note:

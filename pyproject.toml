@@ -9,9 +9,10 @@ description = "Jarvis, the personal AI assistant."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "anthropic>=0.84.0",
+    "anthropic>=1.15.0,<2",
     "google-genai>=1.66.0",
     "httpx>=0.28.1",
+    "httpx2>=2.0.0,<3",
     "jsonschema>=4.25.1",
     "openai>=2.24.0",
     "pillow>=11.3.0",

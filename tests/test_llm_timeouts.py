@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 import httpx
+import httpx2
 import requests
 
 from jarvis.llm.timeouts import (
@@ -56,4 +57,20 @@ class ProviderTransportTimeoutTests(unittest.TestCase):
     def test_non_positive_transport_timeout_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "connect_seconds"):
             ProviderTransportTimeouts(connect_seconds=0, read_seconds=90)
+
+    def test_httpx2_timeout_causes_keep_phase_and_limit(self) -> None:
+        for kind, exception, limit in (
+            ("connect", httpx2.ConnectTimeout, 12),
+            ("read_idle", httpx2.ReadTimeout, 90),
+            ("write", httpx2.WriteTimeout, 12),
+            ("pool", httpx2.PoolTimeout, 12),
+        ):
+            with self.subTest(kind=kind):
+                wrapped = RuntimeError("SDK wrapper")
+                wrapped.__cause__ = exception("timeout")
+                metadata = transport_timeout_metadata(
+                    wrapped, timeouts=ProviderTransportTimeouts(connect_seconds=12, read_seconds=90),
+                )
+                self.assertEqual(metadata["timeout_kind"], kind)
+                self.assertEqual(metadata["timeout_limit_seconds"], limit)
 

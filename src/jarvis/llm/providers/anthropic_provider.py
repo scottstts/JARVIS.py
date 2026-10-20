@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Sequence
+from copy import deepcopy
 from typing import Any
 
+import httpx2
 from anthropic import (
     APIConnectionError,
     APIStatusError,
@@ -20,7 +23,9 @@ from anthropic import (
     InternalServerError,
     PermissionDeniedError,
     RateLimitError,
+    Timeout,
 )
+from pydantic import BaseModel
 
 from ..config import AnthropicProviderSettings
 from ..errors import (
@@ -57,17 +62,7 @@ from ..types import (
 )
 from ..timeouts import ProviderTransportTimeouts, transport_timeout_metadata
 from ..validation import build_tool_schema_map, parse_and_validate_tool_call_or_recover
-
-_ANTHROPIC_ADAPTIVE_THINKING_MODEL_MARKERS = (
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-)
-_ANTHROPIC_EFFORT_MODEL_MARKERS = (
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-)
-_ANTHROPIC_MAX_EFFORT_MODEL_MARKERS = ("claude-opus-4-6",)
+from .anthropic_models import anthropic_model_capabilities
 
 
 class AnthropicProvider:
@@ -227,7 +222,12 @@ class AnthropicProvider:
             self._client = AsyncAnthropic(
                 api_key=api_key,
                 base_url=self._settings.base_url or os.getenv("ANTHROPIC_BASE_URL"),
-                timeout=self._transport_timeouts.as_httpx(),
+                timeout=Timeout(
+                    connect=self._transport_timeouts.connect_seconds,
+                    read=self._transport_timeouts.read_seconds,
+                    write=self._transport_timeouts.connect_seconds,
+                    pool=self._transport_timeouts.connect_seconds,
+                ),
                 max_retries=0,
             )
             return self._client
@@ -242,9 +242,12 @@ class AnthropicProvider:
             )
 
         prompt_cache_ttl = self._settings.prompt_cache_ttl
+        tools = [self._to_anthropic_tool(tool) for tool in request.tools]
         system_prompt, messages = self._to_anthropic_messages(
             request.messages,
             prompt_cache_ttl=prompt_cache_ttl,
+            model=request.model,
+            tools=tools,
         )
         if not messages:
             raise LLMConfigurationError("Anthropic requests require at least one user/assistant message.")
@@ -262,10 +265,18 @@ class AnthropicProvider:
 
         if system_prompt is not None:
             kwargs["system"] = system_prompt
+        capabilities = anthropic_model_capabilities(request.model)
         if request.temperature is not None:
-            kwargs["temperature"] = request.temperature
+            if capabilities.sampling:
+                # SDK 1.x removed the keyword; older models still accept it in JSON.
+                kwargs["extra_body"] = {"temperature": request.temperature}
+            elif request.temperature != 1:
+                raise LLMConfigurationError(
+                    f"{request.model} does not support custom temperature. "
+                    "Unset JARVIS_ANTHROPIC_TEMPERATURE or use 1."
+                )
         if request.tools:
-            kwargs["tools"] = [self._to_anthropic_tool(tool) for tool in request.tools]
+            kwargs["tools"] = tools
             kwargs["tool_choice"] = self._to_anthropic_tool_choice(request.tool_choice)
         elif request.tool_choice.mode not in {ToolChoiceMode.AUTO, ToolChoiceMode.NONE}:
             raise LLMConfigurationError(
@@ -274,7 +285,29 @@ class AnthropicProvider:
 
         thinking = self._to_anthropic_thinking(model=request.model)
         if thinking is not None:
+            if thinking["type"] == "enabled" and thinking["budget_tokens"] >= request.max_output_tokens:
+                raise LLMConfigurationError(
+                    "Anthropic thinking_budget_tokens must be less than max_output_tokens."
+                )
             kwargs["thinking"] = thinking
+
+        manual_thinking = thinking is not None and thinking["type"] == "enabled"
+        thinking_active = (
+            thinking["type"] != "disabled" if thinking else capabilities.thinking_default
+        )
+        if thinking_active and request.temperature is not None:
+            if request.temperature != 1:
+                raise LLMConfigurationError("Anthropic thinking requires the default temperature 1.")
+            kwargs.pop("extra_body", None)
+        if (
+            request.tools
+            and request.tool_choice.mode in {ToolChoiceMode.REQUIRED, ToolChoiceMode.TOOL}
+            and (manual_thinking or not capabilities.forced_tools)
+        ):
+            raise LLMConfigurationError(
+                f"{request.model} cannot force tool use with this thinking configuration; "
+                "use tool_choice auto or none."
+            )
 
         output_config = self._to_anthropic_output_config(model=request.model)
         if output_config is not None:
@@ -287,10 +320,13 @@ class AnthropicProvider:
         messages: Sequence[LLMMessage],
         *,
         prompt_cache_ttl: str | None,
+        model: str,
+        tools: list[dict[str, Any]],
     ) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
         system_parts: list[str] = []
         out_messages: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
+        replay_by_index: dict[int, dict[str, Any]] = {}
 
         for message in messages:
             if message.role == "system":
@@ -335,6 +371,13 @@ class AnthropicProvider:
             if not content_blocks:
                 continue
             role = "assistant" if message.role == "assistant" else "user"
+            replay = _anthropic_replay_metadata(message)
+            if replay is not None and (
+                _visible_anthropic_blocks(replay["content"])
+                == _visible_anthropic_blocks(content_blocks)
+            ):
+                content_blocks = deepcopy(replay["content"])
+                replay_by_index[len(out_messages)] = replay
             out_messages.append(
                 {
                     "role": role,
@@ -357,6 +400,20 @@ class AnthropicProvider:
                 system_parts,
                 prompt_cache_ttl=prompt_cache_ttl,
             )
+        prefix = _anthropic_prefix_hasher(system_prompt, tools)
+        for index, payload in enumerate(out_messages):
+            replay = replay_by_index.get(index)
+            if replay is not None:
+                preserve_thinking = (
+                    replay.get("model") == model
+                    and replay.get("prefix") == prefix.hexdigest()
+                )
+                if not preserve_thinking:
+                    payload["content"] = [
+                        block for block in payload["content"]
+                        if block.get("type") not in {"thinking", "redacted_thinking"}
+                    ]
+            _update_anthropic_prefix(prefix, payload)
         return system_prompt, out_messages
 
     def _to_anthropic_content_blocks(self, message: LLMMessage) -> list[dict[str, Any]]:
@@ -428,62 +485,51 @@ class AnthropicProvider:
     def _to_anthropic_thinking(self, *, model: str) -> dict[str, Any] | None:
         thinking_mode = self._settings.thinking_mode
         budget_tokens = self._settings.thinking_budget_tokens
-        supports_adaptive = self._supports_adaptive_thinking(model)
+        capabilities = anthropic_model_capabilities(model)
 
-        if thinking_mode == "disabled":
-            return None
+        if thinking_mode in {"disabled", "between_tools"}:
+            if thinking_mode == "between_tools" and not capabilities.between_tools:
+                raise LLMConfigurationError(f"{model} does not support between_tools thinking.")
+            if thinking_mode == "disabled" and not capabilities.can_disable_thinking:
+                raise LLMConfigurationError(
+                    f"{model} cannot disable thinking; use adaptive thinking and effort"
+                    + (", or between_tools for no up-front thinking." if capabilities.between_tools else ".")
+                )
+            if capabilities.high_effort_requires_thinking and self._settings.effort in {"xhigh", "max"}:
+                raise LLMConfigurationError(
+                    f"{model} requires adaptive thinking at xhigh/max effort."
+                )
+            return {"type": thinking_mode}
 
-        if thinking_mode == "adaptive":
-            if supports_adaptive:
-                return {"type": "adaptive"}
-            if budget_tokens is not None:
-                return {"type": "enabled", "budget_tokens": budget_tokens}
-            return None
-
-        if thinking_mode == "enabled":
-            if budget_tokens is not None:
-                return {"type": "enabled", "budget_tokens": budget_tokens}
-            if supports_adaptive:
-                return {"type": "adaptive"}
-            return None
-
-        if thinking_mode is None:
-            if budget_tokens is not None:
-                return {"type": "enabled", "budget_tokens": budget_tokens}
-            return None
-
-        payload: dict[str, Any] = {"type": thinking_mode}
         if budget_tokens is not None:
-            payload["budget_tokens"] = budget_tokens
-        return payload
+            if not capabilities.manual_thinking:
+                raise LLMConfigurationError(
+                    f"{model} does not support thinking_budget_tokens; use adaptive thinking and effort."
+                )
+            if thinking_mode != "adaptive":
+                return {"type": "enabled", "budget_tokens": budget_tokens}
+
+        if thinking_mode in {"adaptive", "enabled"}:
+            if capabilities.adaptive:
+                if thinking_mode == "enabled" and not capabilities.manual_thinking:
+                    raise LLMConfigurationError(
+                        f"{model} requires thinking_mode adaptive instead of enabled."
+                    )
+                return {"type": "adaptive"}
+            if budget_tokens is not None:
+                return {"type": "enabled", "budget_tokens": budget_tokens}
+            raise LLMConfigurationError(
+                f"{model} requires a thinking_budget_tokens value for extended thinking."
+            )
+        return None
 
     def _to_anthropic_output_config(self, *, model: str) -> dict[str, Any] | None:
         effort = self._settings.effort
         if effort is None:
             return None
-        if not self._supports_effort(model):
-            return None
-        if effort == "max" and not self._supports_max_effort(model):
-            return None
+        if effort not in anthropic_model_capabilities(model).efforts:
+            raise LLMConfigurationError(f"{model} does not support effort {effort!r}.")
         return {"effort": effort}
-
-    def _supports_adaptive_thinking(self, model: str) -> bool:
-        normalized_model = model.lower()
-        return any(
-            marker in normalized_model
-            for marker in _ANTHROPIC_ADAPTIVE_THINKING_MODEL_MARKERS
-        )
-
-    def _supports_effort(self, model: str) -> bool:
-        normalized_model = model.lower()
-        return any(marker in normalized_model for marker in _ANTHROPIC_EFFORT_MODEL_MARKERS)
-
-    def _supports_max_effort(self, model: str) -> bool:
-        normalized_model = model.lower()
-        return any(
-            marker in normalized_model
-            for marker in _ANTHROPIC_MAX_EFFORT_MODEL_MARKERS
-        )
 
     def _normalize_message_response(self, *, request: LLMRequest, response: Any) -> LLMResponse:
         tool_calls = self._extract_tool_calls(
@@ -493,13 +539,16 @@ class AnthropicProvider:
         text = "".join(
             block.text for block in response.content if getattr(block, "type", None) == "text"
         )
+        uncached_input_tokens = getattr(response.usage, "input_tokens", None)
+        input_tokens = sum(
+            getattr(response.usage, key, 0) or 0
+            for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        ) if uncached_input_tokens is not None else None
+        output_tokens = getattr(response.usage, "output_tokens", None)
         usage = LLMUsage(
-            input_tokens=getattr(response.usage, "input_tokens", None),
-            output_tokens=getattr(response.usage, "output_tokens", None),
-            total_tokens=(
-                (getattr(response.usage, "input_tokens", 0) or 0)
-                + (getattr(response.usage, "output_tokens", 0) or 0)
-            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=(input_tokens or 0) + (output_tokens or 0),
         )
 
         finish_reason = "unknown"
@@ -526,6 +575,23 @@ class AnthropicProvider:
                 cache_creation_metadata = None
 
         provider_metadata: dict[str, Any] = {"stop_reason": stop_reason}
+        if isinstance(uncached_input_tokens, int):
+            provider_metadata["uncached_input_tokens"] = uncached_input_tokens
+        if response.content and all(isinstance(block, BaseModel) for block in response.content):
+            request_kwargs = self._build_messages_create_kwargs(request)
+            prefix = _anthropic_prefix_hasher(
+                request_kwargs.get("system"), request_kwargs.get("tools", []),
+            )
+            for message in request_kwargs["messages"]:
+                _update_anthropic_prefix(prefix, message)
+            provider_metadata["anthropic_replay"] = {
+                "model": request.model,
+                "prefix": prefix.hexdigest(),
+                "content": [block.model_dump(mode="json", exclude_none=True) for block in response.content],
+            }
+        stop_details = getattr(response, "stop_details", None)
+        if isinstance(stop_details, BaseModel):
+            provider_metadata["stop_details"] = stop_details.model_dump(mode="json", exclude_none=True)
         cache_read_input_tokens = getattr(usage_metadata, "cache_read_input_tokens", None)
         if isinstance(cache_read_input_tokens, int):
             provider_metadata["cache_read_input_tokens"] = cache_read_input_tokens
@@ -573,7 +639,7 @@ class AnthropicProvider:
             return ProviderAuthenticationError(str(error))
         if isinstance(error, RateLimitError):
             return ProviderRateLimitError(str(error))
-        if isinstance(error, APITimeoutError):
+        if isinstance(error, (APITimeoutError, httpx2.TimeoutException)):
             return ProviderTimeoutError(
                 str(error),
                 metadata=transport_timeout_metadata(
@@ -581,7 +647,7 @@ class AnthropicProvider:
                     timeouts=self._transport_timeouts,
                 ),
             )
-        if isinstance(error, (APIConnectionError, InternalServerError)):
+        if isinstance(error, (APIConnectionError, InternalServerError, httpx2.TransportError)):
             return ProviderTemporaryError(str(error))
         if isinstance(error, BadRequestError):
             return ProviderBadRequestError(str(error))
@@ -596,6 +662,41 @@ class AnthropicProvider:
         if isinstance(error, AnthropicError):
             return ProviderResponseError(str(error))
         return ProviderResponseError(str(error))
+
+
+def _anthropic_replay_metadata(message: LLMMessage) -> dict[str, Any] | None:
+    if message.role != "assistant" or message.metadata.get("provider") != "anthropic":
+        return None
+    metadata = message.metadata.get("provider_metadata")
+    replay = metadata.get("anthropic_replay") if isinstance(metadata, dict) else None
+    if not isinstance(replay, dict):
+        return None
+    content = replay.get("content")
+    if not isinstance(content, list) or not all(isinstance(block, dict) for block in content):
+        return None
+    return replay
+
+
+def _visible_anthropic_blocks(content: list[dict[str, Any]]) -> dict[str, Any]:
+    text: list[str] = []
+    tools: list[dict[str, Any]] = []
+    for block in content:
+        if block.get("type") == "text":
+            text.append(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            tools.append({key: block.get(key) for key in ("type", "id", "name", "input")})
+    return {"text": "".join(text), "tools": tools}
+
+
+def _anthropic_prefix_hasher(system: Any, tools: list[dict[str, Any]]) -> Any:
+    prefix = hashlib.sha256()
+    _update_anthropic_prefix(prefix, {"system": system, "tools": tools})
+    return prefix
+
+
+def _update_anthropic_prefix(prefix: Any, payload: dict[str, Any]) -> None:
+    prefix.update(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    prefix.update(b"\n")
 
 
 def _anthropic_event_response_id(event: Any) -> str | None:

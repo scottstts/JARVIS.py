@@ -66,12 +66,20 @@ Replayable transcript records are always stored as Jarvis archive/debug/audit hi
 - OpenAI native: provider-side continuation through stored `conversationId` and `previousResponseId`
 - Grok/xAI native: provider-side continuation through stored `previousResponseId`
 - Gemini native: cached base context and tool schemas through Gemini `cachedContent`; if cache creation returns HTTP 400 stating explicit caching is unsupported, the adapter sends the stable context, current messages, and tools inline for both generation and streaming, and skips further cache attempts for that model for the provider instance's lifetime. Other cache errors still propagate normally.
-- Anthropic native: local transcript replay with prompt-cache blocks
+- Anthropic native: local transcript replay with prompt-cache blocks and opaque signed assistant content
 - OpenRouter: local transcript replay with prompt-cache best effort, Anthropic `cache_control` when routing Claude models, sticky `session_id`, and OpenRouter response-cache headers
 
 Provider session state is persisted on `SessionMetadata.provider_session_state`. Transcript JSONL stays normalized around Jarvis messages, tool calls, and tool results. Provider-specific replay aids may be stored in record metadata, but the core loop treats them as opaque and round-trips them through `LLMMessage.metadata`.
 
 Provider request context construction is built in. It is not user-configurable.
+
+### Anthropic SDK and request compatibility
+
+The Anthropic adapter uses SDK 1.x (minimum 1.15.0, locked in `uv.lock`) and constructs split transport timeouts through `anthropic.Timeout`. Anthropic uses `httpx2`; shared timeout classification recognizes both `httpx` and `httpx2`, and native streaming transport failures map to normalized timeout/temporary errors without changing retry policy.
+
+`llm/providers/anthropic_models.py` records documented model capabilities, reviewed on 2026-10-20 against the [thinking configuration table](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting), [effort guide](https://platform.claude.com/docs/en/build-with-claude/effort), and [Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide). Opus 5.5 uses adaptive thinking and supports `low`, `medium`, `high`, `xhigh`, and `max` effort; it rejects disabled/manual thinking and forced tool choice. Sonnet 5.5 supports `between_tools` at `high` effort or below. Forced tool use works with adaptive thinking on models that support it, but never with manual extended thinking. Invalid model/setting combinations fail locally with `LLMConfigurationError`. SDK 1.x removed the `temperature` keyword: older models receive custom sampling via `extra_body`, while newer models omit the default and reject custom temperature. Manual budgets require at least 1024 tokens and must be below the output limit. Unknown future model IDs do not inherit an older model's capabilities by substring.
+
+Complete SDK assistant content is stored as `provider_metadata.anthropic_replay` and round-tripped through the existing transcript metadata path. The adapter restores the original ordering of text, tool-use, thinking (including empty signed blocks), and redacted-thinking blocks when normalized text/tool arguments still match. A SHA-256 fingerprint binds replay to the prior rendered system prompt, tools, and messages; changed history, compaction, tools, or model drops invalidated thinking and all subsequent thinking blocks while retaining visible text/tool calls. Transcript metadata remains unchanged. Reasoning stays out of user-visible stream deltas. Cache reads/writes count toward normalized input/total usage, with uncached counts and cache breakdowns retained in metadata; refusal `stop_details` are retained too.
 
 ## Persistence Rules
 

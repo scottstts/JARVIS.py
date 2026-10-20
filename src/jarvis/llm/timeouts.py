@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+import httpx2
 import requests
 
 
@@ -44,19 +45,19 @@ def transport_timeout_metadata(
     timeout_kind = "transport"
     timeout_limit_seconds = timeouts.read_seconds
     for current in _exception_chain(error):
-        if isinstance(current, (httpx.ConnectTimeout, requests.ConnectTimeout)):
+        if isinstance(current, (httpx.ConnectTimeout, httpx2.ConnectTimeout, requests.ConnectTimeout)):
             timeout_kind = "connect"
             timeout_limit_seconds = timeouts.connect_seconds
             break
-        if isinstance(current, (httpx.ReadTimeout, requests.ReadTimeout)):
+        if isinstance(current, (httpx.ReadTimeout, httpx2.ReadTimeout, requests.ReadTimeout)):
             timeout_kind = "read_idle"
             timeout_limit_seconds = timeouts.read_seconds
             break
-        if isinstance(current, httpx.WriteTimeout):
+        if isinstance(current, (httpx.WriteTimeout, httpx2.WriteTimeout)):
             timeout_kind = "write"
             timeout_limit_seconds = timeouts.connect_seconds
             break
-        if isinstance(current, httpx.PoolTimeout):
+        if isinstance(current, (httpx.PoolTimeout, httpx2.PoolTimeout)):
             timeout_kind = "pool"
             timeout_limit_seconds = timeouts.connect_seconds
             break
